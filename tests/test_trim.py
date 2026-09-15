@@ -100,3 +100,24 @@ def test_context_overflow_error_carries_numbers():
     assert err.budget == 100
     assert "500" in str(err)
     assert "100" in str(err)
+
+
+def test_select_history_does_not_skip_oversized_newest_round():
+    """最新一轮装不下时直接停止,不回退去保留更老的小轮次。"""
+    small = [_u("小问题"), _a("小回答")]
+    big = [_u("超长" * 100), _a("超长" * 100)]
+    history = small + big
+
+    budget = count_tokens("小问题") + count_tokens("小回答")
+
+    assert select_history(history, available_tokens=budget) == []
+
+
+def test_select_history_treats_trailing_user_as_own_round():
+    """末尾孤立的 user 单独成轮,作为整体被保留或丢弃,不拆开也不丢失。"""
+    history = [_u("完整问题"), _a("完整回答"), _u("被打断的问题")]
+    lone_round_tokens = count_tokens("被打断的问题")
+
+    kept = select_history(history, available_tokens=lone_round_tokens)
+
+    assert kept == [_u("被打断的问题")]
