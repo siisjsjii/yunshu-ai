@@ -1,11 +1,12 @@
 from langchain.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.prompts import (
+    EXTRACT_SYSTEM_PROMPT,
     build_extract_messages,
     build_messages,
     render_system_prompt,
 )
-from app.schemas import Message
+from app.schemas import Message, RequestType
 
 
 def test_render_system_prompt_substitutes_brand():
@@ -73,3 +74,27 @@ def test_extract_prompt_forbids_fabricating_order_id():
     system_text = messages[0].content
     assert "null" in system_text
     assert "编造" in system_text or "猜测" in system_text
+
+
+def test_extract_prompt_mentions_json():
+    """json_mode 的硬前提:DeepSeek 要求提示词里出现 'json' 才会接受
+    response_format=json_object,否则整个抽取接口 400。
+    这条约束只存在于提示词文本里,没有它就没有任何东西挡得住一次
+    删掉 "JSON" 的措辞改动。大小写不敏感 —— 接口只要求"以某种形式出现"。
+    """
+    assert "json" in EXTRACT_SYSTEM_PROMPT.lower()
+
+
+def test_extract_prompt_lists_every_request_type_value():
+    """json_mode 下没有任何机器可读的 schema 到达模型,七个枚举值
+    只以提示词文本的形式存在。提示词漏掉/写错某个值,schema 仍然合法、
+    测试全绿,而模型会给出枚举外的值 → 运行时 ExtractionError。
+
+    直接迭代枚举而非硬编码第二份字符串:硬编码会重新制造这层漂移。
+    """
+    missing = [
+        member.value
+        for member in RequestType
+        if member.value not in EXTRACT_SYSTEM_PROMPT
+    ]
+    assert missing == [], f"提示词缺少这些 RequestType 取值:{missing}"
