@@ -53,14 +53,21 @@ app/
   api/
     chat.py       # POST /api/chat/stream
     extract.py    # POST /api/extract
-  main.py         # FastAPI app、lifespan、路由挂载
+  main.py         # FastAPI app、路由挂载
 ```
 
 依赖方向单向:`api → services → {memory, prompts, llm} → config`。`memory/` 不依赖 LangChain(见 5.3)。
 
 ### 3.1 依赖注入约束
 
-`services/` 中的函数**接收 llm 实例作为参数**,不在模块层创建全局单例。FastAPI 侧在 lifespan 中创建实例并通过 dependency 注入。
+`services/` 中的函数**接收 llm 实例作为参数**,不在模块层创建全局单例。FastAPI 侧通过 dependency 注入。
+
+**实现订正**:本节原写"在 lifespan 中创建实例"。实际交付**没有 lifespan** —— `app/api/chat.py` 用 `Depends` 里的工厂**每请求构造** `ChatOpenAI`。这不违反本节的目的(可测性由"services 接收实例作为参数"满足,测试可用 `dependency_overrides` 替换),但成本与本节的原始设想不同:
+
+- `langchain_openai` 对底层 httpx 客户端做了 `lru_cache`(键为 `base_url`/`timeout`/`socket_options`),故并未每请求重建连接池;
+- 但 pydantic 校验、同步与异步两个根客户端仍是每请求构造。
+
+若 ch02 关注这部分开销,改成 lifespan 单例即可,不必动 `services/` 一层。
 
 理由:若在模块层实例化,单测 `chat_service` 就必须 patch 真实网络调用,测试会退化成"测试 mock 本身"。
 
@@ -102,23 +109,25 @@ POST /api/chat/stream {session_id?, message}
 
 `session_id` 省略时由服务端生成,在 `meta` 事件中返回。
 
+**字段约束**(实现后补):`session_id` 为 `None` 或 1–128 字符的字符串。空字符串**非法**(返回 422),不再被静默当作"新建会话" —— 否则客户端传 `""` 会得到一个与预期不符的新会话且毫无提示。上限 128 同时也限制了它作为 `_sessions`/`_locks`/`_touched` 字典键的长度(见第 5.3 节关于 `_locks` 无硬数量上限的说明)。
+
 `data` 由 FastAPI 自动 JSON 序列化:`ServerSentEvent(data="hello")` 在线上是 `data: "hello"`(带引号)。客户端每帧需 `JSON.parse`。
 
 选用该序列化方式而非手拼 `data:` 字符串,是因为 token 中可能含换行符,手拼会破坏 SSE 帧结构。
 
 ### 4.3 SSE 实现方式
 
-使用 FastAPI 原生 `fastapi.sse.EventSourceResponse` 与 `ServerSentEvent`(已读 `fastapi/sse.py` 源码核实 0.141.1 中存在)。
+使用 FastAPI 原生 `fastapi.sse.EventSourceResponse` 与 `format_sse_event`(已读 `fastapi/sse.py` 源码核实 0.141.1 中存在)。**不使用路由层的隐式编码。**
 
-```python
-from fastapi.sse import EventSourceResponse, ServerSentEvent
+**实现订正** —— 本节原写"用 `response_class=EventSourceResponse` + `yield ServerSentEvent`"。实际交付**不是这个形状**,原因是本设计第 6 节的一条硬需求:
 
-@app.post("/api/chat/stream", response_class=EventSourceResponse)
-async def chat_stream(req: ChatRequest) -> AsyncIterable[ServerSentEvent]:
-    ...
-```
+> 端点必须在流开始**之前**返回 400(超长输入)与 409(会话占用)。
 
-`EventSourceResponse` 自动设置 `text/event-stream`、`cache-control: no-cache`、`x-accel-buffering: no`。
+而一旦 SSE 生成器 yield 过第一帧,响应头就已发出,状态码再也改不了。因此端点被写成**普通 `async def`**,在函数体里完成取锁与预算校验,然后返回一个显式构造的 `EventSourceResponse`;只有通过校验的生成器才开始产帧。帧由 `format_sse_event(event=..., data_str=json.dumps(payload, ensure_ascii=False))` 手工组装(`data_str` 是**已序列化**的字符串,不是对象),直接产 bytes。
+
+代价与收益:放弃了路由层的自动编码,换来了"校验失败能返回真实 HTTP 状态码"这一能力。另需自行设置 `Cache-Control: no-cache` 与 `X-Accel-Buffering: no`(路由层不再代劳)。
+
+注:原设计里"token 含换行符会破坏 SSE 帧结构"的担忧在本实现下**不成立** —— `json.dumps` 会把换行转义成 `\n`,`format_sse_event` 再做一次分行,故多行 token 不会破坏帧。
 
 ### 4.4 `POST /api/extract`
 
@@ -170,6 +179,8 @@ history = 从最新往最老累加整轮,直到超出 available
 
 **不强制保留最近 1 轮。** 历史轮数由预算决定,可以为 0 轮。理由:强制保留会打破"请求 token 数有硬上界"这一不变量,而该不变量是防止上游报错的唯一保障。丢历史只是体验降级,超上下文是直接报错。
 
+**但该上界只约束了输入侧** —— 最终 code review 指出:`reserved_output_tokens` 只是从上下文预算里**扣掉**一个数字,**没有任何东西真的限制了模型的输出长度**(未传 `max_tokens`)。所以这个不变量应表述为"**输入 token 有硬上界**",而非"请求 token 有硬上界"。ch01 的实际风险很低(真实上下文窗口远大于 8192),但原表述强于代码。ch02 要么真的传输出上限,要么保持这个更弱的准确表述。
+
 ### 5.2 token 计数
 
 使用 tiktoken `cl100k_base` 估算。
@@ -200,13 +211,29 @@ class SessionStore:
 
 **回收**:惰性 TTL(默认 30 分钟未活跃)+ `max_sessions` LRU 上限(默认 1000)。
 
-**不做后台清理任务**:LRU 上限已给出内存硬上界,后台任务只改变"何时释放",不改变"是否释放",本章不值得为此引入生命周期管理。
+**内存上界的确切构成** —— 实现后经 code review 核实,此处原先写的"LRU 上限已给出内存硬上界"是**不准确的**,订正如下:
+
+| 结构 | 上界 | 由谁约束 |
+|---|---|---|
+| 会话历史 `_sessions` | 硬上界 `max_sessions` 条 | LRU 淘汰 |
+| 锁与时间戳 `_locks` / `_touched` | **无硬数量上限** | 约「TTL 时间窗内的不同 session_id 到达数」 |
+| 被持锁的孤儿条目 | 永不清扫 | 并发在途流数量 |
+
+`_locks` / `_touched` 不受 `max_sessions` 约束的原因:`lock_for` 会为**任何** session_id 创建条目,而端点在校验失败时(例如超长输入返回 400)该 session 不会进入历史表,条目遂成孤儿。孤儿由 `_purge` 在"超过 TTL **且**锁未被持有"时清扫,故其上界是到达速率 × TTL,而非常数。
+
+**本章接受此风险**:端点在本章本就没有任何认证,内存耗尽只是诸多 DoS 向量之一,为此给锁对象再加第二套淘汰策略属过度工程。**若 ch02 引入认证,应同时给这两个 dict 加数量上限。**
+
+**不做后台清理任务**:后台任务只改变"何时释放",不改变"是否释放",本章不值得为此引入生命周期管理。注意它**不是**内存上界的来源。
 
 ### 5.4 结构化输出
 
-使用 `with_structured_output(ExtractResult, method="function_calling")`。
+使用 `with_structured_output(ExtractResult, method="json_mode")`。
 
-选择 `function_calling` 而非 `json_schema`,因为 DeepSeek 明确支持 function calling,而 strict `json_schema` 的支持情况未经确认。**这是本文档唯一的待实测项**,详见第 9 节。
+**这一条经实测后已从 `function_calling` 改为 `json_mode`**,原因是原选择在本项目实际使用的模型上完全不可用(见第 9 节第 1 行的实测记录)。`json_mode` 走 `response_format={"type": "json_object"}`,仍然由 `with_structured_output` 提供 schema 校验与解析 —— **"用 with_structured_output 实现"这一要求未变**,变更的只是其内部 `method` 参数,而该参数在本设计中被预先标注为待实测项。
+
+`json_mode` 有一个端点强制的附加要求:**提示词中必须出现 "json" 字样**,且需自行描述字段结构。因此 `EXTRACT_SYSTEM_PROMPT` 中写明了三个字段的 JSON 结构。
+
+**注意**:`EXTRACT_PROMPT` 是 `ChatPromptTemplate`,默认按 f-string 解析,**提示词中的字面花括号会被当成模板变量并报错**。提示词描述结构时不得使用裸 `{` / `}`(需转义为 `{{` `}}`,或改用无花括号的描述方式)。
 
 抽取使用**独立的 ChatOpenAI 实例**,`temperature=0`;对话实例 `temperature=0.7`。两者均由 `app/llm.py` 的同一工厂产出,避免密钥与 base_url 配置散落。
 
@@ -220,9 +247,17 @@ class SessionStore:
 | 上游超时 / 限流 | SSE `error` 事件,已推送的 token 保留 |
 | 客户端中途断开 | 丢弃本轮,不写历史,不记错误 |
 | `session_id` 不存在 | 静默新建,`meta` 事件返回实际生效的 session_id |
+| `session_id` 为空串 / 超 128 字符 | `422`(不再静默当作新建) |
 | 单轮输入超预算 | `400`,附带实际 token 数与预算 |
 | 抽取 schema 不符 | `422` |
+| **`/api/extract` 的上游故障**(401 / 超时 / 限流 / 连接失败) | **`502`**,返回固定文案「抽取服务暂时不可用」;原始异常只进服务端日志 |
 | 同 session 并发 | 等待锁;超时返回 `409` |
+
+**关于"不回显 key"—— 实现后补正。** 本节最初只写了要求,没写实现方式,而实现确实缺失了一段:所有出口错误文本此前都是 `str(exc)` 原样透出,而 OpenAI SDK 异常的 `str()` 形如 `"Error code: {status} - {response_body}"`,即**上游响应体原文** —— 认证失败时可能含掩码后的 key 片段。
+
+现已收口为一个统一的脱敏函数,作用于**两条**出口:对话端的 SSE `error` 帧,以及抽取端的 `HTTPException` detail(422 与 502 两处)。`/api/extract` 的上游故障不再回显原始异常文本,只回固定文案,原始异常进日志。
+
+**注意 `422` 的语义边界**:它**只**表示"模型输出无法解析为约定结构"。上游故障一律 `502`,不再伪装成"用户输入不符合 schema"。这条边界是最终审查发现的缺陷,此前实现把所有异常都判成 422。
 
 `session_id` 不存在时静默新建而非 404:因为 `meta` 会回传实际 ID,客户端能自行发现不一致 —— 既不让首次调用必须分两步,又不掩盖客户端 bug。
 
@@ -254,6 +289,21 @@ class SessionStore:
 `evals/run_extract_eval.py` 逐条调用真实模型,**按字段分别计算准确率**(非整体对/错),输出表格。
 
 分字段计算的原因:`order_id` 抽错与 `expected_solution` 表述不佳,严重程度完全不同,混在一起会掩盖问题。
+
+**两个字段的评分方式不同,这是刻意的**:
+
+- `order_id` / `request_type` 是**闭式**的,用精确相等评分。
+- `expected_solution` 是**自由文本**,精确相等没有意义 —— 首次运行时它报出 0/12,而输出实际语义正确。改为**关键词命中**(标注里为每条用例给出若干个正确摘要必然包含的短子串,去除空白与常见标点后判包含),并**同时打印精确匹配作为对照基线**,以免掩盖真实情况。
+
+该指标的实际强度**弱于设计意图**:交付的关键词集合是 1–2 个、且多为单个词,部分弱到只剩单个字(如 `退`、`质量`、`具体`、`核实`)。这不是笔误,而是上面第 1 条(反复放宽)的必然结果。
+
+**但 `expected_solution` 的评分在本章不具备可信度,不应作为准确率结论引用。** 原因有三,均由实现过程实测暴露:
+
+1. 关键词集合是**观察到模型输出的措辞之后才放宽的**(首轮 9/11,两处未命中语义均正确)。这是对样本的拟合,不是对能力的度量。
+2. 放宽后有若干组关键词弱到只剩单个字(如 `退`、`质量`、`具体`),几乎任何相关摘要都能命中。
+3. 分母是 11 而非 12 —— 有一条用例的标注与模型输出之间不存在有区分度的共同子串,该条被排除(分母已在输出中打印)。
+
+**结论:`order_id` 与 `request_type` 的 100% 是可信的(闭式、跨多次运行稳定);`expected_solution` 的分数仅作指示,真实质量需人工审阅这 12 条输出,或引入带自身校验的 LLM 评判。** ch02 若需要该字段的可信度量,应改为 LLM-as-judge 并对评判者本身做一致性校验。
 
 规模说明:12 条只能说明"大致能跑",无法给出置信区间。需要更硬结论时应扩到 30 条以上。
 
@@ -316,9 +366,12 @@ bash scripts/acceptance.sh                            # 端到端,需真实 key
 
 | 项 | 说明 | 处置 |
 |---|---|---|
-| `with_structured_output` 的 method | `function_calling` vs `json_schema` 在 DeepSeek 上的实际表现 | 实现时两种各试一次,以实测为准并回写本文档 |
-| tiktoken 对 DeepSeek 的偏差方向 | 假设为高估(安全侧),未在真实模型上验证 | 首次评估集运行时记录实际 `usage.prompt_tokens` 与估算值对比 |
+| ~~`with_structured_output` 的 method~~ | **已实测,已解决。** 在本项目可用端点(仅有 `deepseek-flash` 与 `deepseek-v4-pro`,均为 thinking 模型)上:`function_calling` → 400 `Thinking mode does not support this tool_choice`;`json_schema` → 400 `This response_format type is unavailable now`。**两者全部不可用,换模型也解决不了。** `json_mode` 可用,但端点强制要求提示词含 "json" 字样。 | 已改为 `json_mode` 并回写第 5.4 节。 |
+| ~~tiktoken 对 DeepSeek 的偏差方向~~ | **已实测:假设成立。** `count_tokens` 对 DeepSeek 实际输入 token **高估约 1.32–1.34 倍**,偏差落在安全一侧(更早触发裁剪,不会超出上下文)。 | 无需处置。第 5.2 节的安全论证得到实测支持。 |
+| `expected_solution` 的评分方式 | 自由文本字段无法用精确字符串相等评分 —— 首次评估集因此报出 0/12,而输出实际语义正确("将鞋子换成大一码" vs 标注"换成大一码")。改为关键词命中后得 11/11,**但该分数不可信** —— 关键词是看到输出措辞后才放宽的,属样本拟合。 | 已在 §7.2 记录其不可引用性。ch02 若需该字段的可信度量,应改用带一致性校验的 LLM-as-judge。 |
+| `deepseek-flash` 的自由文本非确定性 | 即使 `temperature=0`,同一输入在 4 次运行中产出明显不同的自由文本措辞。`order_id` / `request_type` 这类闭式字段不受影响(始终 12/12)。 | 接受。这意味着任何针对 `expected_solution` 措辞的回归测试都会脆弱 —— 不要为自由文本字段写字符串断言。 |
 | 锁超时阈值 | 默认 60s 是估计值。太小会让正常的长回复产生假 409,太大则失去"防卡死"的意义 | 先用 60s;拿到真实流式耗时分布后再调整 |
+| 锁获取的取消竞态 | `asyncio.wait_for(lock.acquire(), timeout)` 存在极窄窗口:锁已获取,但 `wait_for` 抛出取消(3.12+ 的 `wait_for` 在当前 task 内运行 `acquire`,故取消可能落在 future 已决议、端点尚未恢复之间)。此时该 session 的锁无人释放,而**持锁会话不被 TTL 或 LRU 淘汰**,故泄漏是**永久**的(该 session_id 之后每次请求都 409) | **ch01 未关闭,已接受并记录。** 实现时试过 guard flag 与 `except BaseException` 两种形状,均无法关闭。**但最终审查纠正了本文档原先"无法用合理形状关闭"的说法** —— 该说法过强:给 `SessionStore` 的锁记录**获取它的 task**,在 409 处理里比对 `lock.owner is asyncio.current_task()` 后释放,约 10 行即可关闭,且不改变正常路径。ch02 若需要,这就是该用的形状 |
 
 ## 10. 配置项(.env)
 
@@ -327,8 +380,10 @@ bash scripts/acceptance.sh                            # 端到端,需真实 key
 ```
 OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_API_KEY=
-OPENAI_MODEL=deepseek-chat
+OPENAI_MODEL=deepseek-flash
 ```
+
+(上面的模型名是本项目实际使用的值。写文档时曾假设为 `deepseek-chat` —— 实测发现该账号下用的是 `deepseek-flash`。这正是 `OPENAI_MODEL` 设为必填、不给默认值的原因:默认值会拿一个可能不存在的模型名去请求,报错指向"模型不存在",而真实原因是配置。) 
 
 `OPENAI_MODEL` **刻意不设默认值**。若默认成 `deepseek-chat`,用户换模型(如换 Ollama)却忘改配置时,应用会拿错误的模型名去请求,报错指向"模型不存在" —— 与 2.1 节 `use_responses_api` 属同类难以定位的故障。必填则启动即报 `OPENAI_MODEL is required`,一眼可辨。
 
