@@ -322,10 +322,19 @@ bash scripts/acceptance.sh                            # 端到端,需真实 key
 
 ## 10. 配置项(.env)
 
+**必填,无默认值**:
+
 ```
 OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_API_KEY=
 OPENAI_MODEL=deepseek-chat
+```
+
+`OPENAI_MODEL` **刻意不设默认值**。若默认成 `deepseek-chat`,用户换模型(如换 Ollama)却忘改配置时,应用会拿错误的模型名去请求,报错指向"模型不存在" —— 与 2.1 节 `use_responses_api` 属同类难以定位的故障。必填则启动即报 `OPENAI_MODEL is required`,一眼可辨。
+
+**可选,均有默认值**:
+
+```
 CHAT_TEMPERATURE=0.7
 EXTRACT_TEMPERATURE=0.0
 CONTEXT_BUDGET_TOKENS=8192
