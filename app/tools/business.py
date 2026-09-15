@@ -28,11 +28,22 @@ def _rng(*parts: str) -> random.Random:
     return random.Random(int.from_bytes(digest, "big"))
 
 
+#: 回显给模型的入参最多截这么长 —— 模型给的输入不受我们控制,原样回灌
+#: 等于让它自己决定往上下文里塞多少 token。
+_ECHO_LIMIT = 32
+
+
 def _require_order_no(order_id: str) -> str:
-    """订单号须为 4-32 位数字。不符合视为查无此单,而不是编一个结果。"""
+    """订单号须为 4-32 位 ASCII 数字。不符合视为查无此单,而不是编一个结果。
+
+    必须是 `isascii() and isdigit()` 两个条件:单独一个 `isdigit()` 是
+    Unicode 感知的,`"١٢٣٤".isdigit()`(阿拉伯-印度数字)与 `"²²²²".isdigit()`
+    (上标)都为 True —— 这类输入会**通过**校验并拿到一张凭空编造的订单,
+    而不是 ToolNotFound。
+    """
     cleaned = order_id.strip()
-    if not cleaned.isdigit() or not (4 <= len(cleaned) <= 32):
-        raise ToolNotFound(f"未找到订单 {order_id},请核对订单号后重试")
+    if not (cleaned.isascii() and cleaned.isdigit()) or not (4 <= len(cleaned) <= 32):
+        raise ToolNotFound(f"未找到订单 {cleaned[:_ECHO_LIMIT]},请核对订单号后重试")
     return cleaned
 
 
@@ -70,13 +81,17 @@ async def query_product(keyword: str) -> str:
     if not cleaned:
         raise ToolNotFound("请提供商品名称或关键词")
     r = _rng("product", cleaned)
+    # 只抽一次。抽两次的话 name 里的规格与 spec 字段相互独立,四次里只有一次
+    # 对得上 —— 工具会把自相矛盾的数据喂给模型,而本章验收全靠模型如实转述
+    # 工具结果,喂矛盾数据等于从源头破坏它。
+    spec = r.choice(_PRODUCT_SPECS)
     return json.dumps(
         {
             "keyword": cleaned,
-            "name": f"{cleaned}({r.choice(_PRODUCT_SPECS)})",
+            "name": f"{cleaned}({spec})",
             "price": f"{r.randint(29, 1299)}.{r.randint(0, 99):02d}",
             "stock": r.randint(0, 200),
-            "spec": r.choice(_PRODUCT_SPECS),
+            "spec": spec,
         },
         ensure_ascii=False,
     )
@@ -109,3 +124,108 @@ async def query_logistics(order_id: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+# ---- 以下两个工具需要数据库会话,故每请求构造 ----
+#
+# 为什么用闭包工厂而不是 InjectedToolArg:实测发现后者虽然能把参数从
+# 发给模型的 schema 里隐藏(tool_call_schema 确实不含它),但调用时该值
+# **必须另行注入**,而注入机制在 langchain-core 1.6.3 上没有现成文档,
+# 直接调用会抛 ValidationError。闭包让参数**根本不在签名里**,模型既看
+# 不见也传不错,且不依赖任何注入机制。
+
+FAQ_LIMIT = 3
+
+
+def make_query_faq(session):
+    """构造 FAQ 查询工具。会话绑在闭包里,模型看不到。"""
+
+    @tool
+    async def query_faq(keyword: str) -> str:
+        """查询常见问题库:退货政策、发票、物流规则等。用户问政策或规则类问题时使用。"""
+        from sqlalchemy import or_, select
+
+        from app.db.models import Faq
+
+        cleaned = keyword.strip()
+        if not cleaned:
+            raise ToolNotFound("请提供要查询的关键词")
+
+        pattern = f"%{cleaned}%"
+        rows = (
+            (
+                await session.execute(
+                    select(Faq)
+                    .where(or_(Faq.question.like(pattern), Faq.answer.like(pattern)))
+                    .limit(FAQ_LIMIT)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            raise ToolNotFound(
+                f"常见问题库里没有与「{cleaned}」相关的内容,请如实告知用户暂未收录,"
+                f"不要自行编造答案"
+            )
+        return json.dumps(
+            {
+                "keyword": cleaned,
+                "count": len(rows),
+                "items": [
+                    {"question": r.question, "answer": r.answer, "category": r.category}
+                    for r in rows
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    return query_faq
+
+
+def make_create_ticket(session, conversation_id: str):
+    """构造建工单工具。conversation_id 绑在闭包里,模型看不到。
+
+    非幂等写操作 —— executor 的重试白名单不含它,超时也绝不重试,
+    否则会建出两张工单。
+    """
+    import secrets
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from app.db.models import Conversation, Ticket
+
+    @tool
+    async def create_ticket(description: str, ticket_type: str) -> str:
+        """创建人工工单转交人工处理。用户明确要求人工介入、投诉或需人工核实时使用。"""
+        cleaned = description.strip()
+        if not cleaned:
+            raise ToolNotFound("请描述需要人工处理的问题")
+
+        ticket_no = f"T-{datetime.now():%Y%m%d%H%M%S}-{secrets.token_hex(2).upper()}"
+        session.add(
+            Ticket(
+                ticket_no=ticket_no,
+                conversation_id=conversation_id,
+                description=cleaned,
+                ticket_type=ticket_type.strip() or "其他",
+                status="open",
+            )
+        )
+        # 建单即转人工 —— 否则 conversations.status 是死列。
+        conversation = (
+            await session.execute(
+                select(Conversation).where(Conversation.id == conversation_id)
+            )
+        ).scalars().one_or_none()
+        if conversation is not None:
+            conversation.status = "pending_human"
+        await session.commit()
+
+        return json.dumps(
+            {"ticket_no": ticket_no, "conversation_id": conversation_id, "status": "open"},
+            ensure_ascii=False,
+        )
+
+    return create_ticket

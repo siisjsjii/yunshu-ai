@@ -85,3 +85,44 @@ def test_query_product_uses_keyword():
     b = _call(query_product, {"keyword": "保温杯"})
     assert a != b
     assert "无线耳机" in a
+
+
+# ---- 以下两条是 Task 5 修的 T4 遗留缺陷的钉子 ----
+
+
+def test_query_product_name_and_spec_never_contradict():
+    """name 里的规格与 spec 字段必须来自同一次抽取。
+
+    抽两次的话两者相互独立,四次里只有一次对得上 —— 工具会把自相矛盾的
+    数据喂给模型,而本章验收全靠模型如实转述工具结果。
+
+    为什么不只测一个关键词:单次抽中同一规格的概率是 1/4,一个关键词
+    有 1/4 的概率**漏报**(假绿)。20 个相互独立的入参把假绿压到 4^-20。
+    """
+    for i in range(20):
+        keyword = f"商品{i}"
+        payload = json.loads(_call(query_product, {"keyword": keyword}))
+        assert payload["name"] == f"{keyword}({payload['spec']})"
+
+
+def test_non_ascii_digits_are_not_order_numbers():
+    """`isdigit()` 是 Unicode 感知的:阿拉伯-印度数字、上标、全角数字都为 True。
+
+    只判 `isdigit()` 的话这些入参会**通过**校验,拿到一张凭空编造的订单,
+    而不是 ToolNotFound —— 即"查无此单"被伪装成"查到了"。
+    """
+    for bad in ("١٢٣٤", "²²²²", "１２３４"):  # 阿拉伯-印度、上标、全角
+        with pytest.raises(ToolNotFound):
+            _call(query_logistics, {"order_id": bad})
+
+
+def test_error_message_does_not_echo_unbounded_input():
+    """回显给模型的错误文本必须有界。
+
+    入参是模型给的,长度不受我们控制;原样回灌等于把上下文预算交给它。
+    """
+    huge = "9" * 5000
+    with pytest.raises(ToolNotFound) as exc:
+        _call(query_order, {"order_id": huge})
+    assert huge not in str(exc.value)
+    assert len(str(exc.value)) < 200
