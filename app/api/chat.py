@@ -69,6 +69,14 @@ async def chat_stream(
     except ContextOverflowError as exc:
         lock.release()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BaseException:
+        # 拿到锁之后,凡是不返回 EventSourceResponse 的退出都必须释放锁,
+        # 否则该会话会永久 409(lock_for 一直返回同一把被持锁)。
+        # 用 BaseException 而非 Exception 兜住一切 —— 客户端在响应开始前
+        # 断开会让 Starlette 取消端点任务,抛出的 asyncio.CancelledError
+        # 是 BaseException 的子类,不是 Exception。
+        lock.release()
+        raise
 
     async def generate():
         try:

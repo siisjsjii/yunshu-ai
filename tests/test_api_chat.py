@@ -167,3 +167,22 @@ def test_upstream_error_becomes_sse_error_event(client):
     assert events[-1][0] == "error"
     assert "上游超时" in events[-1][1]["message"]
     assert "sk-test" not in resp.text
+
+
+def test_validation_failure_releases_lock(client, monkeypatch):
+    from app.api import chat as chat_api
+
+    def boom(*, settings, store, session_id, user_input):
+        raise RuntimeError("组装消息失败")
+
+    monkeypatch.setattr(chat_api, "prepare_turn", boom)
+
+    # 未处理的异常在默认 TestClient(raise_server_exceptions=True)下会被
+    # 重新抛出,而不是变成 500 响应 —— 生产环境下它才是 500。这里用
+    # pytest.raises 断言"没有得到 200 SSE 流",再断言锁已释放。
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/api/chat/stream", json={"session_id": "s1", "message": "你好"}
+        )
+
+    assert client.store.lock_for("s1").locked() is False
