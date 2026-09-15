@@ -57,6 +57,7 @@ async def test_extract_requests_the_extract_result_schema():
     await extract_structured(model=model, text="随便问问")
 
     assert model.schema is ExtractResult
+    assert model.method == "function_calling"
 
 
 @pytest.mark.anyio
