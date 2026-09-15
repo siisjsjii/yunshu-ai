@@ -83,22 +83,66 @@
 
 ```python
 def test_database_url_is_required():
-    """DATABASE_URL 必填,不给默认值 —— 默认值会拿一个可能不对的连接串去连。"""
+    """DATABASE_URL 必填,不给默认值 —— 默认值会拿一个可能不对的连接串去连。
+
+    注意不能直接写 Settings(_env_file=None, **REQUIRED):REQUIRED 是"一份
+    完整的合法载荷"(其它测试都靠它),而本测试要的恰恰是"缺一个字段"。
+    两者矛盾 —— 必须显式把该字段剔出去。
+    """
+    missing = {k: v for k, v in REQUIRED.items() if k != "database_url"}
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, **REQUIRED)
+        Settings(_env_file=None, **missing)
 
 
 def test_database_url_is_read_from_settings():
-    settings = Settings(_env_file=None, **REQUIRED, database_url="mysql+asyncmy://u:p@h:3306/db")
+    settings = Settings(_env_file=None, **REQUIRED)
     assert settings.database_url == "mysql+asyncmy://u:p@h:3306/db"
 
 
 def test_tool_defaults():
-    settings = Settings(_env_file=None, **REQUIRED, database_url="mysql+asyncmy://u:p@h:3306/db")
+    settings = Settings(_env_file=None, **REQUIRED)
     assert settings.tool_timeout_seconds == 10.0
     assert settings.tool_retry_attempts == 1
     assert settings.tool_retry_delay_seconds == 0.3
 ```
+
+- [ ] **Step 1b: 修复三个因本次改动而"为错误原因通过"的 ch01 测试**
+
+`database_url` 变成必填后,`tests/test_config.py` 里 ch01 的三条拒绝测试**同时缺了它**,
+于是它们无论各自命名的那个字段是否仍必填都会抛错、都会通过:
+
+```python
+def test_missing_model_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, openai_base_url="x", openai_api_key="y")
+        # ← 这里也缺 database_url,所以即使 openai_model 有了默认值,本测试照样通过
+```
+
+也就是说:**把 `openai_model` 改成有默认值,这条测试不会报警** —— 它还在,但不再钉住
+它名字声称的东西。这正是 ch01 复盘的头号问题。
+
+把这三条(`test_missing_model_is_rejected` / `test_missing_base_url_is_rejected` /
+`test_missing_api_key_is_rejected`)改成"除命名字段外全部给齐 + 断言错误里出现该字段名":
+
+```python
+def test_missing_model_is_rejected():
+    """OPENAI_MODEL 必填:不给默认值,避免换模型时静默用错模型名。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            _env_file=None,
+            openai_base_url="x",
+            openai_api_key="y",
+            database_url="mysql+asyncmy://u:p@h:3306/db",
+        )
+    assert "openai_model" in str(exc.value)
+```
+
+另两条同形:`test_missing_base_url_is_rejected` 给齐 `openai_api_key` / `openai_model` /
+`database_url` 并断言 `"openai_base_url" in str(exc.value)`;`test_missing_api_key_is_rejected`
+给齐其余三项并断言 `"openai_api_key" in str(exc.value)`。
+
+**并附「断言能区分」的证据**:临时给 `openai_model` 加一个默认值,证明
+`test_missing_model_is_rejected` **会失败**,再改回来证明通过。两次输出都写进报告。
 
 **同时,必须在下面全部 5 个测试文件的 `REQUIRED` 字典里加 `database_url`** ——
 把 `database_url` 设为必填会打断**每一个**构造 `Settings(...)` 的测试,漏掉一个
