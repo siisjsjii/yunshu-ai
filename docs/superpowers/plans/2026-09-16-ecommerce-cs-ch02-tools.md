@@ -100,16 +100,37 @@ def test_tool_defaults():
     assert settings.tool_retry_delay_seconds == 0.3
 ```
 
-同时把该文件顶部的 `REQUIRED` 字典加上 `database_url`,否则**上面三个测试之外**的既有测试会因为缺字段而失败:
+**同时,必须在下面全部 5 个测试文件的 `REQUIRED` 字典里加 `database_url`** ——
+把 `database_url` 设为必填会打断**每一个**构造 `Settings(...)` 的测试,漏掉一个
+整套就红:
+
+```
+tests/test_config.py         ← 本任务要改的
+tests/test_llm.py
+tests/test_api_chat.py
+tests/test_chat_service.py
+tests/test_api_extract.py    ← 本章不动 /api/extract,但它的测试同样构造 Settings
+```
+
+在每个文件的 `REQUIRED` 字典里加同一行(**不要改动该文件里其它内容**):
+
+```python
+    "database_url": "mysql+asyncmy://u:p@h:3306/db",
+```
+
+`tests/test_config.py` 的 `REQUIRED` 加完后应形如:
 
 ```python
 REQUIRED = {
-    "openai_base_url": "https://example.invalid/v1",
+    "openai_base_url": "https://api.deepseek.com/v1",
     "openai_api_key": "sk-test",
-    "openai_model": "test-model",
+    "openai_model": "deepseek-chat",
     "database_url": "mysql+asyncmy://u:p@h:3306/db",
 }
 ```
+
+`tests/test_api_chat.py` 与 `tests/test_chat_service.py` 会在 Task 11 / Task 10 被
+**重写**,但本任务同样要改它们 —— 否则从此刻到那两个任务之间,测试套件一直是红的。
 
 - [ ] **Step 2: 运行测试,确认失败**
 
