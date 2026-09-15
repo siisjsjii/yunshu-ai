@@ -25,7 +25,7 @@
 | langchain-core | 1.6.3 | `langchain.__version__` 实测 |
 | SQLAlchemy | 2.0.53 | `pip index versions` |
 | asyncmy | 0.2.14 | `pip download --only-binary=:all:` 确认有 `cp313-cp313-win_amd64` 原生轮子,**无需本地编译** |
-| MySQL | 8.4 | **待实测** —— Docker daemon 未启动,镜像尚未拉取 |
+| MySQL | **8.0.46** | 实测:`SELECT VERSION()`。由用户自行以 Docker 提供,见 §7.4 |
 | 上游模型 | `deepseek-flash` | ch01 已核实;本章新增的 tool calling 能力见 §9 |
 
 ## 3. 已完成的实测(本章设计的地基)
@@ -272,11 +272,25 @@ create_ticket(description: str, ticket_type: str)  # 写 tickets 表
   **刻意不含「邮费」「运费」相关条目** —— 验收 3 的漏召回是预期结果,种子数据必须保证它确实查不到,否则验收 3 会**假通过**。
 - 其余三张表:灌一组样例(1 个会话 + 2 条消息 + 1 张工单),让表非空、便于肉眼验证 schema。运行时数据照常写入。
 
-### 7.4 Docker
+### 7.4 数据库实例(实现订正)
 
-`docker-compose.yml` 起 MySQL 8.4,端口 3306,`utf8mb4` 字符集。数据库名 `mewhelp`。
+**本节原写「`docker-compose.yml` 起 MySQL 8.4,端口 3306」,与实际不符,订正如下。**
 
-**前置**:本机 Docker CLI 与 Compose 已装,但 **daemon 未启动** —— 需先启动 Docker Desktop。MySQL 8.4 镜像本身**待实测**(daemon 未起,尚未拉取)。
+数据库实例**由用户自行提供**,不在本仓库的管理范围内:
+
+| 项 | 实际值 | 如何核实 |
+|---|---|---|
+| 镜像 | `mysql:8.0`(服务器版本 **8.0.46**) | `docker ps` + `SELECT VERSION()` |
+| 主机端口 | **3307** → 容器 3306 | `docker ps` |
+| 库名 | `mewhelp` | 用户已建,初始为空 |
+| 字符集 / 排序规则 | `utf8mb4` / **`utf8mb4_0900_ai_ci`** | `SELECT @@character_set_database, @@collation_database` |
+| 连接串 | `mysql+asyncmy://root:***@127.0.0.1:3307/mewhelp?charset=utf8mb4` | 已配在 `.env`,非跟踪文件 |
+
+仓库**不提交 `docker-compose.yml`** —— 实例已存在,再提交一份会与用户的运行中容器冲突(同名服务、同端口),制造"起不来"的困惑。复现环境所需的全部信息是上表,写在这里即可。
+
+**`DATABASE_URL` 已由用户配进 `.env`**,但 **`.env.example`(入库模板)里缺这一项**,需补 —— 否则新克隆的仓库不知道要配它。
+
+**字符集风险已实测排除**:`utf8mb4_0900_ai_ci` 下中文 `LIKE` 子串匹配正常(正反例均验证),**无需改用 `utf8mb4_unicode_ci`**。§9 中原列的那条风险据此关闭。
 
 ## 8. 测试与验收
 
@@ -340,8 +354,9 @@ ch01 复盘的头号结论是「测试要能区分正确与错误实现」。以
 
 | 项 | 说明 | 处置 |
 |---|---|---|
-| MySQL 8.4 镜像与 compose | daemon 未启动,镜像未拉取 | 启动 Docker Desktop 后实测;若 8.4 有问题退回 8.0 |
-| `utf8mb4` 下的中文 LIKE | MySQL collation 对中文子串匹配的行为未实测 | Tier 2 测试覆盖;若 `LIKE %关键词%` 在默认 collation 下不命中,改用 `utf8mb4_unicode_ci` |
+| ~~MySQL 版本与实例~~ | **已实测,已解决。** 实际为 `mysql:8.0`,服务器 **8.0.46**,主机端口 **3307**;实例由用户提供,仓库不管理 | 已回写 §7.4。原「8.4 + 端口 3306」的设想作废 |
+| ~~`utf8mb4` 下的中文 LIKE~~ | **已实测,已解决。** `utf8mb4_0900_ai_ci` 下中文子串匹配正常,正反例均验证通过 | 无需改用 `utf8mb4_unicode_ci`。Tier 2 仍保留中文往返测试作为回归防护 |
+| `.env.example` 缺 `DATABASE_URL` | 入库模板里没有这一项,新克隆的仓库不知道要配 | 实现时补上(已列入计划) |
 | 第二轮不绑 tools 是否影响回复质量 | 实测第 5 条只验证了"能收敛成文本",未评估质量 | 评估集与验收观察;若质量下降,退回"绑 tools 但限制轮数" |
 | **参数校验失败无第二次机会** | §6.7 已记录;单轮的必然代价 | 用户已确认接受;评估集可观察到发生频率 |
 | 「文本先出后又调工具」 | §6.2 已定义行为 | 实测未出现;若频繁出现需重新评估第一轮策略 |
