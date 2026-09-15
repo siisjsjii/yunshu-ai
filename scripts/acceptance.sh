@@ -50,9 +50,11 @@ sys.stdout.buffer.write("".join(texts).encode("utf-8"))
 # 否则整份脚本的断言全是 ASCII,一份彻底乱码的回复照样能刷出"通过 N 项"。
 #
 # 不能用 grep '[一-龥]'。实测(本机 MSYS2):对 real UTF-8 和三种 mojibake
-# 样本它**全部 MATCH** —— U+FFFD 的字节序列是 ef bf bd,C locale 下该区间
-# 退化成字节范围 0xe4-0xe9,ef 正好落在里面,于是这个 grep 永远通过,
-# 是个假断言。Python 按码点判断,与 locale 无关。
+# 样本它**全部 MATCH** —— LC_ALL=C 下 bracket expression 逐字节比较,
+# '[一-龥]' 退化成字节区间 0x80-0xe9(U+FFFD 的字节序列是 ef bf bd:
+# 首字节 ef 不在区间内,但后两个**续字节** bf / bd 落在里面),于是任何
+# 含 U+FFFD 的文本都会命中,这个 grep 永远通过,是个假断言。
+# Python 按码点判断,与 locale 无关。
 has_cjk() {
   "$PYTHON" -c '
 import sys

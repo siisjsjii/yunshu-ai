@@ -25,10 +25,34 @@ def test_chat_request_rejects_empty_message():
 
 
 def test_request_type_values_are_chinese_labels():
-    assert RequestType.REFUND.value == "退货退款"
-    assert RequestType.EXCHANGE.value == "换货"
-    assert RequestType.OTHER.value == "其他"
+    """逐个钉住枚举字面量,7 个全钉。
+
+    提示词耦合测试(test_prompts.py)覆盖不到这些取值:它只查提示词里
+    是否出现枚举值,而 "发票" 是 "发票问题" 的子串 —— 把枚举改成
+    "发票" 它照样通过。这里钉的是契约本身(设计文档 §4.4 列出的取值)。
+    """
+    assert {member.name: member.value for member in RequestType} == {
+        "REFUND": "退货退款",
+        "EXCHANGE": "换货",
+        "LOGISTICS": "物流异常",
+        "INVOICE": "发票问题",
+        "PRODUCT": "商品咨询",
+        "COMPLAINT": "投诉",
+        "OTHER": "其他",
+    }
     assert len(RequestType) == 7
+
+
+def test_chat_request_rejects_empty_session_id():
+    """空串不再等同于"新建会话" —— 静默当成新会话会掩盖客户端 bug。"""
+    with pytest.raises(ValidationError):
+        ChatRequest(session_id="", message="你好")
+
+
+def test_chat_request_rejects_oversized_session_id():
+    with pytest.raises(ValidationError):
+        ChatRequest(session_id="s" * 129, message="你好")
+    assert ChatRequest(session_id="s" * 128, message="你好").session_id == "s" * 128
 
 
 def test_extract_result_allows_null_order_id():

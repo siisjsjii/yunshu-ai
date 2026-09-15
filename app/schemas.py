@@ -12,7 +12,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    session_id: str | None = None
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1)
 
 

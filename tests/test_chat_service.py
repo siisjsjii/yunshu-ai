@@ -1,4 +1,5 @@
 import pytest
+from langchain_core.messages import SystemMessage
 
 from app.config import Settings
 from app.memory.store import SessionStore
@@ -48,7 +49,10 @@ def test_prepare_turn_returns_system_plus_input_for_new_session():
         user_input="你好",
     )
     assert len(messages) == 2
+    assert messages[0].content  # 非空 system prompt
     assert messages[-1].content == "你好"
+    # 只断长度和末条的话,[user_input, user_input] 这种实现也能过。
+    assert isinstance(messages[0], SystemMessage)
 
 
 def test_prepare_turn_includes_existing_history():
@@ -171,6 +175,39 @@ async def test_stream_turn_done_event_carries_usage_when_available():
         [
             FakeChunk("好"),
             FakeChunk("", usage={"input_tokens": 10, "output_tokens": 1}),
+        ]
+    )
+    messages = prepare_turn(
+        settings=_settings(), store=store, session_id="s1", user_input="你好"
+    )
+
+    events = [
+        ev
+        async for ev in stream_turn(
+            settings=_settings(),
+            store=store,
+            model=model,
+            session_id="s1",
+            user_input="你好",
+            messages=messages,
+        )
+    ]
+
+    assert events[-1][1]["usage"] == {"input_tokens": 10, "output_tokens": 1}
+
+
+@pytest.mark.anyio
+async def test_stream_turn_keeps_earlier_usage_when_a_later_chunk_has_none():
+    """后一个 chunk 的 usage_metadata 为 None 时,不能把先前的 usage 冲掉。
+
+    真实上游只有最后一帧带 usage;若实现写成 `usage = chunk.usage_metadata`
+    (丢掉 `or usage`),这一条会退化成 None。
+    """
+    store = _store()
+    model = FakeModel(
+        [
+            FakeChunk("好", usage={"input_tokens": 10, "output_tokens": 1}),
+            FakeChunk("", usage=None),
         ]
     )
     messages = prepare_turn(

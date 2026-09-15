@@ -90,8 +90,6 @@ def test_select_history_never_returns_half_a_round():
     kept = select_history(history, available_tokens=1)
 
     assert kept == []
-    for msg in kept:
-        assert msg.role in ("user", "assistant")
 
 
 def test_context_overflow_error_carries_numbers():

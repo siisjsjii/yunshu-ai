@@ -37,3 +37,13 @@ def test_missing_model_is_rejected():
 def test_missing_base_url_is_rejected():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, openai_api_key="y", openai_model="z")
+
+
+def test_missing_api_key_is_rejected():
+    """OPENAI_API_KEY 必填:不给默认值,避免无密钥时静默启动、首请求才炸。"""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, openai_base_url="x", openai_model="z")
+
+
+def test_reads_api_key():
+    assert Settings(_env_file=None, **REQUIRED).openai_api_key == "sk-test"
