@@ -1,0 +1,53 @@
+from enum import Enum
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class Message(BaseModel):
+    """会话历史中的一条消息。纯数据,不依赖 LangChain。"""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str = Field(min_length=1)
+
+
+class ExtractRequest(BaseModel):
+    text: str = Field(min_length=1)
+
+
+class RequestType(str, Enum):
+    """诉求类型。用枚举收口,便于下游统计路由与评估集计算准确率。"""
+
+    REFUND = "退货退款"
+    EXCHANGE = "换货"
+    LOGISTICS = "物流异常"
+    INVOICE = "发票问题"
+    PRODUCT = "商品咨询"
+    COMPLAINT = "投诉"
+    OTHER = "其他"
+
+
+class ExtractResult(BaseModel):
+    """从用户售后描述中抽取的结构化信息。"""
+
+    order_id: str | None = Field(
+        default=None,
+        description=(
+            "订单号。仅当用户明确给出时填写。"
+            "无法确定时必须为 null,禁止编造。"
+        ),
+    )
+    request_type: RequestType = Field(
+        description="诉求类型,从给定枚举中选择最贴近的一项。",
+    )
+    expected_solution: str = Field(
+        description=(
+            "用户期望的解决方案,用一句话概括。"
+            "用户未明说时,依据诉求类型给出最合理的一种。"
+        ),
+    )
