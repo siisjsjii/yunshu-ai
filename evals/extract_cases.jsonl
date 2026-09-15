@@ -1,12 +1,12 @@
-{"text": "订单 20240915 的鞋码不对，我想换大一码", "expected": {"order_id": "20240915", "request_type": "换货", "expected_solution": "换成大一码"}}
-{"text": "我上周买的那个包到现在还没发货，订单号是 20240916", "expected": {"order_id": "20240916", "request_type": "物流异常", "expected_solution": "尽快发货"}}
-{"text": "东西收到就坏了，我要退款", "expected": {"order_id": null, "request_type": "退货退款", "expected_solution": "退款"}}
-{"text": "单号 A20240917，买了两件衣服其中一件有色差，想退掉", "expected": {"order_id": "A20240917", "request_type": "退货退款", "expected_solution": "退货"}}
-{"text": "买了 2 双鞋，9 月 15 号下的单，到现在物流一直没更新", "expected": {"order_id": null, "request_type": "物流异常", "expected_solution": "查询物流进度"}}
-{"text": "订单 20240918 我要开发票，抬头是某某公司", "expected": {"order_id": "20240918", "request_type": "发票问题", "expected_solution": "开具发票"}}
-{"text": "20240919 这个订单的快递显示签收了但是我根本没收到", "expected": {"order_id": "20240919", "request_type": "物流异常", "expected_solution": "核实签收情况"}}
-{"text": "你们家这个面霜孕妇能用吗", "expected": {"order_id": null, "request_type": "商品咨询", "expected_solution": "了解商品适用人群"}}
-{"text": "订单 20240920 的锅有质量问题，我要投诉，太气人了", "expected": {"order_id": "20240920", "request_type": "投诉", "expected_solution": "投诉并处理质量问题"}}
-{"text": "订单号 20240921，尺码买小了，能换个 XL 吗", "expected": {"order_id": "20240921", "request_type": "换货", "expected_solution": "换成 XL 码"}}
-{"text": "在吗", "expected": {"order_id": null, "request_type": "其他", "expected_solution": "询问用户具体需求"}}
-{"text": "订单 20240922 的东西我不想要了，能退吗，我 3 月 8 号买的", "expected": {"order_id": "20240922", "request_type": "退货退款", "expected_solution": "退货退款"}}
+{"text": "订单 20240915 的鞋码不对，我想换大一码", "expected": {"order_id": "20240915", "request_type": "换货", "expected_solution": "换成大一码"}, "solution_keywords": ["换", "大"]}
+{"text": "我上周买的那个包到现在还没发货，订单号是 20240916", "expected": {"order_id": "20240916", "request_type": "物流异常", "expected_solution": "尽快发货"}, "solution_keywords": ["发货"]}
+{"text": "东西收到就坏了，我要退款", "expected": {"order_id": null, "request_type": "退货退款", "expected_solution": "退款"}, "solution_keywords": ["退款"]}
+{"text": "单号 A20240917，买了两件衣服其中一件有色差，想退掉", "expected": {"order_id": "A20240917", "request_type": "退货退款", "expected_solution": "退货"}, "solution_keywords": ["退"]}
+{"text": "买了 2 双鞋，9 月 15 号下的单，到现在物流一直没更新", "expected": {"order_id": null, "request_type": "物流异常", "expected_solution": "查询物流进度"}, "solution_keywords": ["物流"]}
+{"text": "订单 20240918 我要开发票，抬头是某某公司", "expected": {"order_id": "20240918", "request_type": "发票问题", "expected_solution": "开具发票"}, "solution_keywords": ["发票"]}
+{"text": "20240919 这个订单的快递显示签收了但是我根本没收到", "expected": {"order_id": "20240919", "request_type": "物流异常", "expected_solution": "核实签收情况"}, "solution_keywords": ["核实"]}
+{"text": "你们家这个面霜孕妇能用吗", "expected": {"order_id": null, "request_type": "商品咨询", "expected_solution": "了解商品适用人群"}, "solution_keywords": []}
+{"text": "订单 20240920 的锅有质量问题，我要投诉，太气人了", "expected": {"order_id": "20240920", "request_type": "投诉", "expected_solution": "投诉并处理质量问题"}, "solution_keywords": ["质量"]}
+{"text": "订单号 20240921，尺码买小了，能换个 XL 吗", "expected": {"order_id": "20240921", "request_type": "换货", "expected_solution": "换成 XL 码"}, "solution_keywords": ["XL"]}
+{"text": "在吗", "expected": {"order_id": null, "request_type": "其他", "expected_solution": "询问用户具体需求"}, "solution_keywords": ["具体"]}
+{"text": "订单 20240922 的东西我不想要了，能退吗，我 3 月 8 号买的", "expected": {"order_id": "20240922", "request_type": "退货退款", "expected_solution": "退货退款"}, "solution_keywords": ["退款"]}
