@@ -81,6 +81,19 @@ class SessionStore:
             if now - self._touched.get(session_id, now) > self._ttl:
                 if not self._is_locked(session_id):
                     self._drop(session_id)
+        # 清理孤儿条目:lock_for 建过锁/时间戳、但从未 append 的会话。
+        # 否则 _touched/_locks 不受 max_sessions 约束,长期运行会无界增长。
+        # 同样按 TTL 判惰性 —— 立刻扫掉刚建的锁会破坏"同一 session 两次
+        # lock_for 返回同一把锁"的幂等性;持锁的不动,否则请求刚拿锁就 400
+        # 时,并发请求会拿到第二把锁,破坏互斥。
+        for session_id in list(self._touched.keys()):
+            if (
+                session_id not in self._sessions
+                and not self._is_locked(session_id)
+                and now - self._touched[session_id] > self._ttl
+            ):
+                self._touched.pop(session_id, None)
+                self._locks.pop(session_id, None)
 
     def _enforce_capacity(self) -> None:
         """超容量时从最老的开始淘汰。

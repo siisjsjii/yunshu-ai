@@ -141,6 +141,39 @@ def test_locked_session_is_not_evicted_by_lru():
     assert store.history("s2") == [_msg("二")]
 
 
+def test_lock_for_orphan_is_swept_after_ttl(clock):
+    """lock_for 建过锁/时间戳、但从未 append 的会话,TTL 后应被清扫。
+
+    否则 _touched/_locks 不受 max_sessions 约束,长期运行无界增长。
+    """
+    store = SessionStore(ttl_seconds=60, max_sessions=10)
+    store.lock_for("ghost")  # 建锁但从不 append
+
+    assert "ghost" in store._locks
+    assert "ghost" in store._touched
+
+    clock["now"] += 61  # 超过 TTL
+    store.active_session_count()  # 触发 _purge 清扫
+
+    assert "ghost" not in store._locks
+    assert "ghost" not in store._touched
+
+
+def test_held_lock_orphan_is_not_swept(clock):
+    """持锁的孤儿条目不能被清扫 —— 否则请求刚拿锁就 400 时,
+    并发请求会拿到第二把锁,破坏互斥。"""
+    store = SessionStore(ttl_seconds=60, max_sessions=10)
+    lock = store.lock_for("ghost")
+
+    async def hold():
+        async with lock:
+            clock["now"] += 61  # 超过 TTL,但锁被持有
+            store.active_session_count()
+            return store._locks.get("ghost")
+
+    assert asyncio.run(hold()) is lock
+
+
 @pytest.mark.anyio
 async def test_same_session_lock_serialises_access():
     store = SessionStore(ttl_seconds=60, max_sessions=10)
