@@ -43,8 +43,12 @@ def select_history(
 ) -> list[Message]:
     """保留能放下的最近若干整轮历史,按时间正序返回。
 
-    一轮 = (user, assistant) 两条。按整轮裁剪保证历史中不出现
-    "有问无答"的孤立消息 —— 那会让模型以为上一轮它没回复。
+    轮的定义见 `_to_rounds`(user 边界)。按整轮裁剪保证历史中不出现
+    "有问无答"的孤立消息 —— 那会让模型以为上一轮它没回复;
+    也保证 tool 消息不会被与它的 assistant 父亲切开。
+
+    计费只算 `content`:`tool_calls` / `tool_call_id` 是结构性元数据,
+    不计入预算,否则预算的含义会被悄悄改掉。
     """
     kept: list[list[Message]] = []
     used = 0
@@ -59,14 +63,19 @@ def select_history(
 
 
 def _to_rounds(history: Sequence[Message]) -> list[list[Message]]:
-    """把消息序列切成整轮。末尾孤立的 user(上一轮流被打断)单独成轮。"""
+    """把消息序列切成整轮。
+
+    一轮 = **从一条 user 消息开始,到(不含)下一条 user 消息为止**。
+
+    为什么不用"遇到 assistant 就收一轮"(ch01 的旧规则):引入 tool 角色后,
+    后者会把 tool 消息与它的 assistant 父亲切到不同轮里。OpenAI 兼容 API
+    要求 tool 消息前面必须紧跟着带对应 tool_call_id 的 assistant 消息,
+    切开就会 400,且只在历史长到触发裁剪时复现,极难定位。
+    """
     rounds: list[list[Message]] = []
-    pending: list[Message] = []
     for msg in history:
-        pending.append(msg)
-        if msg.role == "assistant":
-            rounds.append(pending)
-            pending = []
-    if pending:
-        rounds.append(pending)
+        if msg.role == "user" or not rounds:
+            rounds.append([msg])
+        else:
+            rounds[-1].append(msg)
     return rounds

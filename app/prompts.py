@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 
-from langchain.messages import AIMessage, HumanMessage, SystemMessage
+from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from app.schemas import Message
@@ -73,10 +73,31 @@ def render_system_prompt(brand_name: str) -> str:
     return _SYSTEM_PROMPT.format_messages(brand_name=brand_name)[0].content
 
 
-def _to_lc_message(message: Message):
-    if message.role == "user":
-        return HumanMessage(message.content)
-    return AIMessage(message.content)
+def to_lc_messages(history: Sequence[Message]) -> list:
+    """把纯数据 Message 转成 LangChain 消息。本模块是唯一的转换点。
+
+    role="assistant" 且带 tool_calls 时,content 通常是空串 —— 这在
+    上游是合法的(模型只申请调用、还没产出文字)。
+    """
+    converted = []
+    for message in history:
+        if message.role == "user":
+            converted.append(HumanMessage(message.content))
+        elif message.role == "tool":
+            converted.append(
+                ToolMessage(
+                    content=message.content,
+                    tool_call_id=message.tool_call_id or "",
+                )
+            )
+        else:
+            converted.append(
+                AIMessage(
+                    content=message.content,
+                    tool_calls=message.tool_calls or [],
+                )
+            )
+    return converted
 
 
 def build_messages(
@@ -88,7 +109,7 @@ def build_messages(
     """按 system + 历史 + 本轮输入的顺序组装消息。"""
     return CHAT_PROMPT.format_messages(
         brand_name=brand_name,
-        history=[_to_lc_message(m) for m in history],
+        history=to_lc_messages(history),
         input=user_input,
     )
 

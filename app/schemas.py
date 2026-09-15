@@ -5,10 +5,19 @@ from pydantic import BaseModel, Field
 
 
 class Message(BaseModel):
-    """会话历史中的一条消息。纯数据,不依赖 LangChain。"""
+    """会话历史中的一条消息。纯数据,不依赖 LangChain。
 
-    role: Literal["user", "assistant"]
-    content: str
+    role 含 "tool" 是因为模型可能要求调用工具 —— 那一轮的历史由
+    assistant(带 tool_calls)+ tool(带 tool_call_id)两条构成。
+
+    content 默认为空串:模型只申请调用工具、还没产出文字时,
+    assistant 的 content 就是空的(上游确实会返回 text == "")。
+    """
+
+    role: Literal["user", "assistant", "tool"]
+    content: str = ""
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatRequest(BaseModel):

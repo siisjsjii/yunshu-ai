@@ -5,6 +5,7 @@ from app.prompts import (
     build_extract_messages,
     build_messages,
     render_system_prompt,
+    to_lc_messages,
 )
 from app.schemas import Message, RequestType
 
@@ -74,6 +75,23 @@ def test_extract_prompt_forbids_fabricating_order_id():
     system_text = messages[0].content
     assert "null" in system_text
     assert "编造" in system_text or "猜测" in system_text
+
+
+def test_to_lc_messages_handles_tool_role():
+    from langchain.messages import AIMessage, HumanMessage, ToolMessage
+
+    history = [
+        Message(role="user", content="订单 1001 到哪了"),
+        Message(role="assistant", content="", tool_calls=[{"id": "c1", "name": "query_logistics", "args": {"order_id": "1001"}}]),
+        Message(role="tool", content="已揽件", tool_call_id="c1"),
+        Message(role="assistant", content="已揽件。"),
+    ]
+    converted = to_lc_messages(history)
+    assert isinstance(converted[0], HumanMessage)
+    assert isinstance(converted[1], AIMessage)
+    assert converted[1].tool_calls[0]["id"] == "c1"
+    assert isinstance(converted[2], ToolMessage)
+    assert converted[2].tool_call_id == "c1"
 
 
 def test_extract_prompt_mentions_json():
