@@ -888,11 +888,22 @@ def _rng(*parts: str) -> random.Random:
     return random.Random(int.from_bytes(digest, "big"))
 
 
+#: 回显给模型的入参最多截这么长 —— 模型给的输入不受我们控制,原样回灌
+#: 等于让它自己决定往上下文里塞多少 token。
+_ECHO_LIMIT = 32
+
+
 def _require_order_no(order_id: str) -> str:
-    """订单号须为 4-32 位数字。不符合视为查无此单,而不是编一个结果。"""
+    """订单号须为 4-32 位 ASCII 数字。不符合视为查无此单,而不是编一个结果。
+
+    必须是 `isascii() and isdigit()` 两个条件:单独一个 `isdigit()` 是
+    Unicode 感知的,`"١٢٣٤".isdigit()`(阿拉伯-印度数字)与 `"²²²²".isdigit()`
+    (上标)都为 True —— 这类输入会**通过**校验并拿到一张凭空编造的订单,
+    而不是 ToolNotFound。
+    """
     cleaned = order_id.strip()
-    if not cleaned.isdigit() or not (4 <= len(cleaned) <= 32):
-        raise ToolNotFound(f"未找到订单 {order_id},请核对订单号后重试")
+    if not (cleaned.isascii() and cleaned.isdigit()) or not (4 <= len(cleaned) <= 32):
+        raise ToolNotFound(f"未找到订单 {cleaned[:_ECHO_LIMIT]},请核对订单号后重试")
     return cleaned
 
 
@@ -930,13 +941,17 @@ async def query_product(keyword: str) -> str:
     if not cleaned:
         raise ToolNotFound("请提供商品名称或关键词")
     r = _rng("product", cleaned)
+    # 只抽一次。抽两次的话 name 里的规格与 spec 字段相互独立,四次里只有一次
+    # 对得上 —— 工具会把自相矛盾的数据喂给模型,而本章验收全靠模型如实转述
+    # 工具结果,喂矛盾数据等于从源头破坏它。
+    spec = r.choice(_PRODUCT_SPECS)
     return json.dumps(
         {
             "keyword": cleaned,
-            "name": f"{cleaned}({r.choice(_PRODUCT_SPECS)})",
+            "name": f"{cleaned}({spec})",
             "price": f"{r.randint(29, 1299)}.{r.randint(0, 99):02d}",
             "stock": r.randint(0, 200),
-            "spec": r.choice(_PRODUCT_SPECS),
+            "spec": spec,
         },
         ensure_ascii=False,
     )
@@ -1213,12 +1228,29 @@ def make_query_faq(session):
         if not cleaned:
             raise ToolNotFound("请提供要查询的关键词")
 
-        pattern = f"%{cleaned}%"
+        # 关键词里的 % 与 _ 必须按字面匹配,否则 LIKE 会把它们当通配符:
+        # "%" 能命中表里任意一行,于是这条查询**永远查得到**,返回 ok=true
+        # 加三条与用户问题无关的答案,模型会照着它们自信作答 —— 漏召回这条
+        # 防线(见下面的 ToolNotFound)就被从另一头绕过了。关键词由模型从
+        # 用户原话里摘("100% 纯棉"这类),% 与 _ 会原样传进来。
+        #
+        # 反斜杠必须**第一个**替换:放后面会把它自己刚加进去的转义符再翻一倍。
+        # 不用 contains(autoescape=True):它在 MySQL 上的渲染没实测过,而显式
+        # 写法的语义毫无歧义。
+        escaped = (
+            cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
         rows = (
             (
                 await session.execute(
                     select(Faq)
-                    .where(or_(Faq.question.like(pattern), Faq.answer.like(pattern)))
+                    .where(
+                        or_(
+                            Faq.question.like(pattern, escape="\\"),
+                            Faq.answer.like(pattern, escape="\\"),
+                        )
+                    )
                     .limit(FAQ_LIMIT)
                 )
             )
@@ -1226,9 +1258,11 @@ def make_query_faq(session):
             .all()
         )
         if not rows:
+            # 回显同样截断:这段文本会回灌进模型上下文(可恢复路径),而关键词
+            # 是模型给的。理由与 _require_order_no 那处一致。
             raise ToolNotFound(
-                f"常见问题库里没有与「{cleaned}」相关的内容,请如实告知用户暂未收录,"
-                f"不要自行编造答案"
+                f"常见问题库里没有与「{cleaned[:_ECHO_LIMIT]}」相关的内容,"
+                f"请如实告知用户暂未收录,不要自行编造答案"
             )
         return json.dumps(
             {
@@ -1271,7 +1305,11 @@ def make_create_ticket(session, conversation_id: str):
                 ticket_no=ticket_no,
                 conversation_id=conversation_id,
                 description=cleaned,
-                ticket_type=ticket_type.strip() or "其他",
+                # 夹到列宽(String(64))而不是抛错:这是**写**路径,目的是把
+                # 用户的问题留下来。超长在 MySQL 严格模式下抛 DataError,
+                # T6 归类为不可恢复 → 502 且整单丢失 —— 一个被模型撑爆的
+                # 标签字段不该毁掉 description 里真正的问题描述。
+                ticket_type=ticket_type.strip()[:64] or "其他",
                 status="open",
             )
         )
