@@ -1291,7 +1291,6 @@ git commit -m "feat: query_faq 与 create_ticket 闭包工厂,工具注册表"
 """执行器测试。全部用替身工具,不联网、不碰 DB。"""
 
 import asyncio
-from dataclasses import replace
 
 import pytest
 from langchain.tools import tool
@@ -1852,15 +1851,19 @@ def test_lock_for_refreshes_recency():
     否则淘汰的是插入序而非最近使用序,刚建的锁会被优先选中,
     破坏「同一 session 两次 lock_for 返回同一把锁」的幂等性
     —— ch01 Task 4 已经在这上面栽过一次。
+
+    断言用**持有的引用**比对而非 `is not None`:后者恒真,区分不了
+    正确与错误实现(去掉 _touch 里的 move_to_end,它照样通过)。
     """
     store = SessionStore(ttl_seconds=600, max_sessions=3)
-    store.lock_for("s1")
-    store.lock_for("s2")
+    lock_s1 = store.lock_for("s1")
+    lock_s2 = store.lock_for("s2")
     store.lock_for("s3")
-    store.lock_for("s1")          # s1 变成最近使用
-    store.lock_for("s4")          # 触发淘汰,应淘汰 s2 而不是 s1
-    assert store.lock_for("s1") is not None
-    assert store.active_lock_count() <= 3
+    store.lock_for("s1")            # s1 变成最近使用
+    store.lock_for("s4")            # 触发淘汰:应淘汰 s2,而不是 s1
+
+    assert store.lock_for("s1") is lock_s1      # s1 存活
+    assert store.lock_for("s2") is not lock_s2  # s2 已被淘汰(插入序下会淘汰 s1)
 
 
 def test_capacity_bounds_the_lock_table():
@@ -2021,8 +2024,8 @@ git commit -m "refactor: SessionStore 瘦身为锁注册表,MAX_SESSIONS 改限�
   - `app.services.history.append_turn(*, session, conversation_id, messages) -> None`
 
 - [ ] **Step 1: 写失败测试**
-
 创建 `tests/test_history.py`:
+
 
 ```python
 """历史服务测试。需要 MySQL。"""
