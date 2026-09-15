@@ -798,8 +798,13 @@ def test_seed_is_stable_across_processes():
     )
     outs = []
     for _ in range(2):
+        # 子进程的输出编码必须显式钉成 UTF-8。本机 locale 是 cp936,Python 会把
+        # 管道上的 stdout 按 GBK 编码,而下面按 UTF-8 解码 —— 不钉的话子进程输的
+        # 中文会在解码时炸掉,表现为 proc.stdout 为 None(随后 .strip() 报
+        # AttributeError)。这与工具逻辑无关,纯属平台差异:同一份代码在
+        # PYTHONUTF8=1 下 6 passed,不加就红。见 ch01 记录的同类 MSYS2 CP936 陷阱。
         proc = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-X", "utf8", "-c", code],
             capture_output=True,
             text=True,
             encoding="utf-8",
