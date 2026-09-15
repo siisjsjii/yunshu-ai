@@ -24,6 +24,11 @@
 - **单测不联网**:除 `@pytest.mark.db`(需 MySQL)与评估集/验收脚本外,一律不打网络。
 - **测试中的 `Settings(...)` 必须传 `_env_file=None`** —— 否则真实 `.env` 会补上字段,「缺字段应报错」的测试会**静默通过**(ch01 教训)。
 - **提交信息用中文**,格式 `type: 描述`(沿用 ch01 风格)。
+- **跑测试时不要再加 CLI `-q`。** `pytest.ini` 已有 `addopts = -q`,再加一个 `-q` 会变成
+  `-qq`,而 pytest 在 `verbosity < -1` 时**整行不打印 `N passed`**(`_pytest/terminal.py`,
+  `MoreQuietAction` 是逐次递减的 action)。失败仍会报,所以不会造成假绿,但**看不到通过数** ——
+  等于把"我验过"这句话的证据抹掉了。用 `.venv/Scripts/python.exe -m pytest`,
+  需要过滤时用 `.venv/Scripts/python.exe -m pytest -m "not db"`。
 
 ### 已实测确认的 API 事实(不要再猜)
 
@@ -243,7 +248,7 @@ Expected: PASS
 
 - [ ] **Step 5: 运行全量,确认没有打破既有测试**
 
-Run: `.venv/Scripts/python.exe -m pytest -q -m "not db"`
+Run: `.venv/Scripts/python.exe -m pytest -m "not db"`
 Expected: PASS(此时还没有 db 标记的测试,行为应与 ch01 的 96 passed 一致)
 
 - [ ] **Step 6: 提交**
@@ -2994,7 +2999,7 @@ Expected: PASS
 
 - [ ] **Step 5: 全量回归**
 
-Run: `.venv/Scripts/python.exe -m pytest -q`
+Run: `.venv/Scripts/python.exe -m pytest`
 Expected: PASS(含 db 标记的测试,MySQL 在跑)
 
 - [ ] **Step 6: 提交**
@@ -3468,7 +3473,7 @@ git commit -m "feat: 浅蓝配色聊天页,气泡内显示工具调用徽章"
 - [ ] **全量测试**
 
 ```bash
-.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe -m pytest
 ```
 全部通过(含 `@pytest.mark.db`)。
 
