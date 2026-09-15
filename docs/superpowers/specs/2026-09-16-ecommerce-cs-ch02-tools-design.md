@@ -25,6 +25,7 @@
 | langchain-core | 1.6.3 | `langchain.__version__` 实测 |
 | SQLAlchemy | 2.0.53 | `pip index versions` |
 | asyncmy | 0.2.14 | `pip download --only-binary=:all:` 确认有 `cp313-cp313-win_amd64` 原生轮子,**无需本地编译** |
+| cryptography | 50.0.1 | **实测必需,原设计遗漏。** MySQL 8.0 默认认证插件是 `caching_sha2_password`,asyncmy 走该认证需要此包,否则连接直接抛 `RuntimeError: 'cryptography' package is required` |
 | MySQL | **8.0.46** | 实测:`SELECT VERSION()`。由用户自行以 Docker 提供,见 §7.4 |
 | 上游模型 | `deepseek-flash` | ch01 已核实;本章新增的 tool calling 能力见 §9 |
 
@@ -177,7 +178,17 @@ ch01 的 `_to_rounds` 规则是「遇到 `assistant` 就收一轮」。引入 `t
 
 **测试影响**:ch01 的 `tests/test_store.py` 中,LRU 淘汰、TTL 过期、容量上限等测试**失去被测对象,应删除**,而不是保留成空壳。锁相关测试保留并改写。ch01 复盘明确反对「为了绿而绿」的测试,此处照此办理。
 
-注:ch01 spec §9 记录的「`_locks`/`_touched` 无硬数量上限」风险与「锁获取取消竞态」在本章**依然存在**,本章不处理(见 §9)。
+注:ch01 spec §9 记录的「锁获取取消竞态」在本章**依然存在**,本章不处理(见 §9)。
+
+**订正(写计划时发现,经用户裁决)**:本节原写「「`_locks`/`_touched` 无硬数量上限」在本章依然存在,本章不处理」。但历史外迁后,**`MAX_SESSIONS` 这个配置项失去了它唯一的用途** —— 它当初就是为「限制进程内历史条数」而存在的,`_sessions` 一退役,它就成了死配置(读 `.env.example` 的人会以为它在管事)。死配置是 ch01 最反对的那类东西。
+
+> **用户裁决**:把 `max_sessions` 改用于限制 `_locks` / `_touched`。
+
+于是 `SessionStore(ttl_seconds, max_sessions)` 的容量上限从「限制历史」变为「限制锁表」,**ch01 那条「锁表无硬数量上限」的风险由此关闭**。
+
+淘汰规则沿用 ch01 Task 4 的教训:**遇到被持锁的条目整个停下,不跳过** —— 跳过会删掉比它更新的条目,把 LRU 语义弄反。同时 `lock_for` 在刷新时间戳时要把条目 `move_to_end`,否则淘汰的就不是 LRU 而是插入序,刚建的锁会被优先选中,破坏「同一 session 两次 `lock_for` 返回同一把锁」的幂等性(ch01 Task 4 已栽过一次)。
+
+淘汰一个**未被持有**的锁是安全的:没有持锁者,就不存在被破坏的互斥;后续请求会拿到一把全新的、未锁定的锁。
 
 ### 6.5 五个工具
 
@@ -199,13 +210,34 @@ create_ticket(description: str, ticket_type: str)  # 写 tickets 表
 
 **工具返回显式 `json.dumps(..., ensure_ascii=False)` 的字符串**,不返回 dict:`ToolMessage.content` 本就应为字符串,且 `ensure_ascii=True` 会把中文转成 `\uXXXX` 白烧 token。
 
-**`create_ticket` 的 `conversation_id` 由服务端在 executor 中注入,不进模型的参数 schema** —— 让模型自己填会编造 id。
+**`create_ticket` 的 `conversation_id` 不进模型的参数 schema** —— 让模型自己填会编造 id。
+
+**实现机制经实测订正。** 原设计写「用 `InjectedToolArg` 注入,由 executor 绑定」,实测发现该机制在本版本上不完整:
+
+| 实测项 | 结果 |
+|---|---|
+| `create_ticket.args_schema`(原始) | **含** `conversation_id` |
+| `create_ticket.tool_call_schema`(真正发给模型的) | **不含** ✓ —— 对模型确实隐藏了 |
+| 直接用 `tool_call` 调用 | **`ValidationError: conversation_id Field required`** —— 值必须另行注入,而该注入机制在 langchain-core 1.6.3 上无现成文档 |
+
+**改用闭包工厂**(已验证可用):
+
+```python
+def make_create_ticket(conversation_id: str):
+    @tool
+    async def create_ticket(description: str, ticket_type: str) -> str:
+        """创建人工工单,会话由系统自动关联。"""
+        ...
+    return create_ticket
+```
+
+`conversation_id` **根本不在签名里**,值从闭包来,模型既看不见也传不错,且不需要依赖任何注入机制。代价:`create_ticket` 需**每请求构造**,故工具集不是纯模块级常量 —— 见 §6.6 的注册表设计。
 
 ### 6.6 工具基础设施四件套
 
 | 能力 | 落法 |
 |---|---|
-| 注册管理 | `TOOL_REGISTRY: dict[str, BaseTool]`,由 `TOOLS` 列表构建;模型返回未知工具名 → 可恢复错误,回灌「工具不存在」 |
+| 注册管理 | `build_tools(conversation_id) -> list[BaseTool]` 组装本请求的工具集;**`registry_for(tools) -> dict[str, BaseTool]`** 由该列表建映射(因 `create_ticket` 每请求构造,注册表不再是纯模块级常量);模型返回未知工具名 → 可恢复错误,回灌「工具不存在」 |
 | 参数 Schema 校验 | `@tool` 已从类型注解自动生成 pydantic `args_schema`(实测第 8 条),无需手写 |
 | 执行错误处理 | 见 §6.7 |
 | 超时重试 | `asyncio.wait_for`,默认 10s;**重试白名单制** |
@@ -361,7 +393,7 @@ ch01 复盘的头号结论是「测试要能区分正确与错误实现」。以
 | **参数校验失败无第二次机会** | §6.7 已记录;单轮的必然代价 | 用户已确认接受;评估集可观察到发生频率 |
 | 「文本先出后又调工具」 | §6.2 已定义行为 | 实测未出现;若频繁出现需重新评估第一轮策略 |
 | 工具超时/重试具体阈值 | 10s / 1 次重试均为估计值 | 先用默认;拿到真实分布后再调 |
-| ch01 遗留:`_locks`/`_touched` 无硬数量上限 | 见 ch01 spec §9 | **本章不处理**,与 ch01 相同理由(端点无认证) |
+| ~~ch01 遗留:`_locks`/`_touched` 无硬数量上限~~ | **本章关闭。** `MAX_SESSIONS` 改用于限制锁表,见 §6.4 订正 | 已解决 |
 | ch01 遗留:锁获取的取消竞态 | 见 ch01 spec §9;owner-tracking 约 10 行可关 | **本章不处理**,留待需要时 |
 | 多进程 / 多 worker | 锁在进程内,历史在 MySQL | 仍不在本章范围;若引入多 worker,锁需改为分布式 |
 
