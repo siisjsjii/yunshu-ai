@@ -1,5 +1,7 @@
+import asyncio
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -167,6 +169,87 @@ def test_upstream_error_becomes_sse_error_event(client):
     assert events[-1][0] == "error"
     assert "上游超时" in events[-1][1]["message"]
     assert "sk-test" not in resp.text
+
+
+def test_error_event_does_not_echo_the_configured_key(client):
+    """异常文本里带着真实密钥时必须被抹掉。
+
+    与 test_upstream_error_becomes_sse_error_event 里的断言不同,这条
+    能真的失败:那个替身抛的是 RuntimeError("上游超时"),而夹具里配的
+    密钥是字面量 "sk-test",没有任何代码路径能把它放进响应 —— 断言恒真。
+    这里让异常文本**自带**夹具配置的密钥值,才真正检验过滤逻辑。
+    """
+    from app.api import chat as chat_api
+
+    class LeakyModel:
+        async def astream(self, messages):
+            raise RuntimeError("Incorrect API key provided: sk-test")
+            yield FakeChunk("永不产出")
+
+    app.dependency_overrides[chat_api.get_chat_model] = lambda: LeakyModel()
+
+    resp = client.post("/api/chat/stream", json={"message": "你好"})
+
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "error"
+    assert "sk-test" not in resp.text
+    assert "***" in events[-1][1]["message"]
+
+
+@pytest.mark.anyio
+async def test_concurrent_same_session_second_request_times_out_with_409():
+    """同 session 并发:一个拿到锁走完,另一个等锁超时 → 恰好一个 409。
+
+    设计文档 §6 的最后一行,也是唯一没有测试覆盖的一行。必须真并发 ——
+    顺序调用只会得到两个 200。
+
+    用 httpx.AsyncClient + ASGITransport 而不是 TestClient:TestClient
+    是同步的,两个线程里跑同一事件循环会带来额外的调度不确定性。
+    """
+    from app.api import chat as chat_api
+
+    store = SessionStore(ttl_seconds=60, max_sessions=10)
+
+    class SlowModel:
+        """持有锁约 0.8s:远长于 0.15s 的等锁超时。"""
+
+        async def astream(self, messages):
+            await asyncio.sleep(0.4)
+            yield FakeChunk("您")
+            await asyncio.sleep(0.4)
+            yield FakeChunk("好")
+
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, **REQUIRED, session_lock_timeout_seconds=0.15
+    )
+    app.dependency_overrides[chat_api.get_store] = lambda: store
+    app.dependency_overrides[chat_api.get_chat_model] = lambda: SlowModel()
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as c:
+            first, second = await asyncio.gather(
+                c.post(
+                    "/api/chat/stream",
+                    json={"session_id": "s1", "message": "你好"},
+                ),
+                c.post(
+                    "/api/chat/stream",
+                    json={"session_id": "s1", "message": "在吗"},
+                ),
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    loser = first if first.status_code == 409 else second
+    assert "正在处理另一条消息" in loser.text
+
+    # 输的那个请求没有写历史 —— 恰好一轮(user + assistant)。
+    history = store.history("s1")
+    assert [m.role for m in history] == ["user", "assistant"]
 
 
 def test_validation_failure_releases_lock(client, monkeypatch):

@@ -9,6 +9,7 @@ from app.config import Settings, get_settings
 from app.llm import create_chat_model
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
+from app.sanitize import redact_api_key
 from app.schemas import ChatRequest
 from app.services.chat import prepare_turn, stream_turn
 
@@ -94,8 +95,11 @@ async def chat_stream(
             ):
                 yield _frame(event, payload)
         except Exception as exc:
-            # 不泄漏密钥内容 —— 只回传异常本身的文字。
-            yield _frame("error", {"message": str(exc)})
+            # 上游异常文本可能带着密钥(见 app/sanitize.py),出站前抹掉。
+            yield _frame(
+                "error",
+                {"message": redact_api_key(str(exc), settings.openai_api_key)},
+            )
         finally:
             lock.release()
 

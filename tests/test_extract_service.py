@@ -1,4 +1,7 @@
+import httpx
+import openai
 import pytest
+from langchain_core.exceptions import OutputParserException
 
 from app.schemas import ExtractResult, RequestType
 from app.services.extract import ExtractionError, extract_structured
@@ -77,7 +80,26 @@ async def test_extract_passes_the_text_to_the_model():
 
 @pytest.mark.anyio
 async def test_extract_raises_extraction_error_on_schema_mismatch():
-    model = FakeStructuredModel(error=ValueError("模型输出不符合 schema"))
+    model = FakeStructuredModel(error=OutputParserException("模型输出不符合 schema"))
 
     with pytest.raises(ExtractionError, match="不符合 schema"):
+        await extract_structured(model=model, text="随便说说")
+
+
+@pytest.mark.anyio
+async def test_extract_does_not_wrap_upstream_failures():
+    """上游 401 必须原样穿透,不能被包成"输出不符合 schema"。
+
+    修前这里会拿到 ExtractionError(→ 422),客户端以为是自己输入的问题。
+    """
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    response = httpx.Response(401, request=request)
+    upstream = openai.AuthenticationError(
+        "Error code: 401 - Incorrect API key provided",
+        response=response,
+        body={"error": {"message": "Incorrect API key provided"}},
+    )
+    model = FakeStructuredModel(error=upstream)
+
+    with pytest.raises(openai.AuthenticationError):
         await extract_structured(model=model, text="随便说说")
