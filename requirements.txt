@@ -8,3 +8,6 @@ tiktoken==0.14.0
 httpx==0.28.1
 pytest==9.1.1
 anyio==4.15.1
+sqlalchemy==2.0.53
+asyncmy==0.2.14
+cryptography==50.0.1

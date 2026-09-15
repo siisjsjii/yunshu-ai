@@ -5,6 +5,7 @@ REQUIRED = {
     "openai_base_url": "https://api.deepseek.com/v1",
     "openai_api_key": "sk-test",
     "openai_model": "deepseek-chat",
+    "database_url": "mysql+asyncmy://u:p@h:3306/db",
 }
 
 

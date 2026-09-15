@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """应用配置。三个 OPENAI_* 字段必填,其余有默认值。"""
+    """应用配置。四个字段必填,其余有默认值。"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     openai_base_url: str
     openai_api_key: str
     openai_model: str
+    database_url: str
 
     # 可选:有默认值
     chat_temperature: float = 0.7
@@ -27,6 +28,11 @@ class Settings(BaseSettings):
     max_sessions: int = 1000
     session_lock_timeout_seconds: float = 60.0
     brand_name: str = "本店"
+
+    # 工具执行
+    tool_timeout_seconds: float = 10.0
+    tool_retry_attempts: int = 1
+    tool_retry_delay_seconds: float = 0.3
 
 
 @lru_cache

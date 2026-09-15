@@ -11,6 +11,7 @@ REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
     "openai_api_key": "sk-test",
     "openai_model": "test-model",
+    "database_url": "mysql+asyncmy://u:p@h:3306/db",
 }
 
 
