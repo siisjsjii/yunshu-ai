@@ -151,12 +151,29 @@ def make_query_faq(session):
         if not cleaned:
             raise ToolNotFound("请提供要查询的关键词")
 
-        pattern = f"%{cleaned}%"
+        # 关键词里的 % 与 _ 必须按字面匹配,否则 LIKE 会把它们当通配符:
+        # "%" 能命中表里任意一行,于是这条查询**永远查得到**,返回 ok=true
+        # 加三条与用户问题无关的答案,模型会照着它们自信作答 —— 漏召回这条
+        # 防线(见下面的 ToolNotFound)就被从另一头绕过了。关键词由模型从
+        # 用户原话里摘("100% 纯棉"这类),% 与 _ 会原样传进来。
+        #
+        # 反斜杠必须**第一个**替换:放后面会把它自己刚加进去的转义符再翻一倍。
+        # 不用 contains(autoescape=True):它在 MySQL 上的渲染没实测过,而显式
+        # 写法的语义毫无歧义。
+        escaped = (
+            cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
         rows = (
             (
                 await session.execute(
                     select(Faq)
-                    .where(or_(Faq.question.like(pattern), Faq.answer.like(pattern)))
+                    .where(
+                        or_(
+                            Faq.question.like(pattern, escape="\\"),
+                            Faq.answer.like(pattern, escape="\\"),
+                        )
+                    )
                     .limit(FAQ_LIMIT)
                 )
             )
