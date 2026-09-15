@@ -46,6 +46,36 @@ sys.stdout.buffer.write("".join(texts).encode("utf-8"))
 '
 }
 
+# 断言一段文本"非空且含真实 CJK 字符"。这是编码完好性的唯一自动化证据 ——
+# 否则整份脚本的断言全是 ASCII,一份彻底乱码的回复照样能刷出"通过 N 项"。
+#
+# 不能用 grep '[一-龥]'。实测(本机 MSYS2):对 real UTF-8 和三种 mojibake
+# 样本它**全部 MATCH** —— U+FFFD 的字节序列是 ef bf bd,C locale 下该区间
+# 退化成字节范围 0xe4-0xe9,ef 正好落在里面,于是这个 grep 永远通过,
+# 是个假断言。Python 按码点判断,与 locale 无关。
+has_cjk() {
+  "$PYTHON" -c '
+import sys
+
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+if not text.strip():
+    reason = "为空"
+elif not any("一" <= c <= "鿿" or "㐀" <= c <= "䶿" for c in text):
+    reason = "不含任何 CJK 字符"
+elif "�" in text:
+    reason = "含 U+FFFD 替换字符"
+else:
+    reason = None
+
+if reason is not None:
+    sys.stdout.buffer.write(reason.encode("utf-8"))
+    raise SystemExit(1)
+
+n = sum(1 for c in text if "一" <= c <= "鿿" or "㐀" <= c <= "䶿")
+sys.stdout.buffer.write(f"{n} 个 CJK 字符".encode("utf-8"))
+'
+}
+
 if [ ! -x "$PYTHON" ]; then
   echo "找不到 $PYTHON —— 请在项目根目录运行本脚本。" >&2
   exit 2
@@ -81,8 +111,14 @@ else
   fail "没有 done 帧"
 fi
 
-echo "  ── 拼回后的完整回复(中文完整性证据):"
-echo "$OUT1" | join_tokens
+REPLY1=$(echo "$OUT1" | join_tokens)
+echo "  ── 拼回后的完整回复(中文完整性证据):$REPLY1"
+
+if REASON=$(echo "$REPLY1" | has_cjk); then
+  pass "第一轮回复非空且含 $REASON(编码完好)"
+else
+  fail "第一轮回复$REASON —— 编码损坏"
+fi
 echo
 
 echo
