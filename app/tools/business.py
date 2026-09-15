@@ -181,9 +181,11 @@ def make_query_faq(session):
             .all()
         )
         if not rows:
+            # 回显同样截断:这段文本会回灌进模型上下文(可恢复路径),而关键词
+            # 是模型给的。理由与 _require_order_no 那处一致。
             raise ToolNotFound(
-                f"常见问题库里没有与「{cleaned}」相关的内容,请如实告知用户暂未收录,"
-                f"不要自行编造答案"
+                f"常见问题库里没有与「{cleaned[:_ECHO_LIMIT]}」相关的内容,"
+                f"请如实告知用户暂未收录,不要自行编造答案"
             )
         return json.dumps(
             {
@@ -226,7 +228,11 @@ def make_create_ticket(session, conversation_id: str):
                 ticket_no=ticket_no,
                 conversation_id=conversation_id,
                 description=cleaned,
-                ticket_type=ticket_type.strip() or "其他",
+                # 夹到列宽(String(64))而不是抛错:这是**写**路径,目的是把
+                # 用户的问题留下来。超长在 MySQL 严格模式下抛 DataError,
+                # T6 归类为不可恢复 → 502 且整单丢失 —— 一个被模型撑爆的
+                # 标签字段不该毁掉 description 里真正的问题描述。
+                ticket_type=ticket_type.strip()[:64] or "其他",
                 status="open",
             )
         )
