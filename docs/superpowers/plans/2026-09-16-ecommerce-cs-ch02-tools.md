@@ -1820,8 +1820,12 @@ def test_select_history_never_separates_tool_from_its_assistant():
     OpenAI 兼容 API 要求 tool 消息前面必须紧跟着带对应 tool_call_id 的
     assistant 消息,切开就会 400 —— 而且只在历史长到触发裁剪时偶发。
 
-    这条断言在旧的「遇到 assistant 就收一轮」规则下必然失败:旧规则会把
-    [tool, assistant] 切成一轮,裁剪后留下以 tool 打头的残缺序列。
+    **注意这条断言区分不出旧规则**(实测已推翻本计划原先「必然失败」的说法):
+    旧规则把一轮工具往返切成 [user, assistant(tool_calls)] 与 [tool, assistant]
+    两半,而本用例的预算恰好**同时够得着这两半** —— 丢弃线落在两者的共同边界上,
+    于是新旧两条规则输出逐字节相同,切开确实发生了、但这条测试看不见。
+    真正钉住旧规则的是紧接着的那条
+    test_select_history_drops_a_whole_tool_round_instead_of_its_tail。
     """
     old_call = {"id": "call_old", "name": "query_order", "args": {"order_id": "9001"}}
     new_call = {"id": "call_new", "name": "query_logistics", "args": {"order_id": "1001"}}
@@ -1839,6 +1843,35 @@ def test_select_history_never_separates_tool_from_its_assistant():
 
     assert _pairing_intact(kept)
     assert [m.role for m in kept] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_select_history_drops_a_whole_tool_round_instead_of_its_tail():
+    """裁剪线落在 tool 与它的 assistant 父亲之间时,必须整轮丢掉。
+
+    这是上一条测试没能覆盖到的情形:只有当预算"够得着后半段、够不着前半段"
+    时,旧规则(遇 assistant 收轮)才会真的留下以 tool 打头的残缺序列。
+
+    触发条件是"用户消息贵、工具往返便宜" —— 用户提问越大段,越容易命中;
+    这也正是它只在长对话里偶发的原因。
+    """
+    call = {"id": "call_1", "name": "query_logistics", "args": {"order_id": "1001"}}
+    history = [
+        Message(role="user", content="很早的问题" * 60),
+        Message(role="assistant", content="很早的回答" * 60),
+        # 这一轮的用户消息很贵,工具往返很便宜
+        Message(role="user", content="订单 1001 的物流到哪了" * 30),
+        Message(role="assistant", content="", tool_calls=[call]),
+        Message(role="tool", content="已揽件", tool_call_id="call_1"),
+        Message(role="assistant", content="您的包裹已揽件。"),
+        # 最新一轮很便宜,裁剪后应当只剩它
+        Message(role="user", content="那什么时候到"),
+        Message(role="assistant", content="预计明天送达。"),
+    ]
+
+    kept = select_history(history, available_tokens=40)
+
+    assert _pairing_intact(kept)
+    assert [m.role for m in kept] == ["user", "assistant"]
 
 
 def test_round_definition_is_user_delimited():
@@ -1976,10 +2009,15 @@ Expected: PASS
 
 把 `_to_rounds` 临时改回 ch01 的旧规则(`pending.append(msg)`,遇 assistant 收轮,末尾 `if pending` 补轮),重跑:
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_trim.py::test_select_history_never_separates_tool_from_its_assistant -q`
-Expected: **FAIL**
+Run: `.venv/Scripts/python.exe -m pytest tests/test_trim.py -m ""`
+Expected: **`test_select_history_drops_a_whole_tool_round_instead_of_its_tail` 与 `test_round_definition_is_user_delimited` FAIL**
 
-确认后改回 user 边界规则。把两次输出记进任务报告。
+**注意验证的是这两条,不是 `test_select_history_never_separates_tool_from_its_assistant`。**
+后者在本计划最初被写成「旧规则下必然失败」,实现时实测**推翻**了:它的预算
+(`available_tokens=40`)恰好同时够得着被切开的那对的两半,丢弃线落在共同边界上,
+新旧规则输出逐字节相同 —— 切开确实发生,只是那条测试看不见。它的 docstring 已
+如实订正。**这条经验对 Tasks 9/10 同样适用**:一条「看起来在守护某行为」的断言,
+必须实测它在错误实现下会红,否则它只是在执行代码路径。
 
 - [ ] **Step 8: 提交**
 
