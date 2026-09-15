@@ -80,7 +80,12 @@ async def execute_tool(*, tool_call: dict, registry: dict, settings) -> ToolOutc
             logger.warning("工具 %s 参数校验失败:%s", name, exc)
             break
         except ToolNotFound as exc:
+            # 业务性未找到是决定性结果:重放同一个 tool_call 送的是同样的参数,
+            # 只会同样落空。而且这是本章最常见的落空路径(FAQ 查不到),重试
+            # 白搭一次 DB 往返加 tool_retry_delay_seconds 的等待 —— 可恢复路径
+            # 本该是最便宜的那条。
             last_message = str(exc)
+            break
         except SQLAlchemyError as exc:
             logger.exception("工具 %s 命中数据库故障", name)
             raise ToolInfrastructureError("数据服务暂时不可用") from exc

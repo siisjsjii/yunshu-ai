@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,10 +30,11 @@ class Settings(BaseSettings):
     session_lock_timeout_seconds: float = 60.0
     brand_name: str = "本店"
 
-    # 工具执行
-    tool_timeout_seconds: float = 10.0
-    tool_retry_attempts: int = 1
-    tool_retry_delay_seconds: float = 0.3
+    # 工具执行。三个数都加了界:配置写错要在启动时炸,不能等到运行时
+    # 变成"重试循环一次都不跑、空错误文案交给模型"这种静默故障。
+    tool_timeout_seconds: float = Field(default=10.0, gt=0)
+    tool_retry_attempts: int = Field(default=1, ge=0)
+    tool_retry_delay_seconds: float = Field(default=0.3, ge=0)
 
 
 @lru_cache

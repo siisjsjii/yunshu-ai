@@ -85,3 +85,33 @@ def test_tool_defaults():
     assert settings.tool_timeout_seconds == 10.0
     assert settings.tool_retry_attempts == 1
     assert settings.tool_retry_delay_seconds == 0.3
+
+
+def test_negative_retry_attempts_is_rejected():
+    """重试次数为负 → 执行器的 attempts 算成 0,循环一次都不跑、
+    last_message 停在空串,最终把**空错误文案**交给模型。启动即拒。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, tool_retry_attempts=-1)
+    assert "tool_retry_attempts" in str(exc.value)
+
+
+def test_non_positive_timeout_is_rejected():
+    """超时 <= 0 会让每一次工具调用立即超时。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, tool_timeout_seconds=0)
+    assert "tool_timeout_seconds" in str(exc.value)
+
+
+def test_negative_retry_delay_is_rejected():
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, tool_retry_delay_seconds=-0.1)
+    assert "tool_retry_delay_seconds" in str(exc.value)
+
+
+def test_zero_bounds_are_allowed():
+    """下界只在负数上收:0 次重试(等价于只试一次)与零延迟都是合法配置。"""
+    settings = Settings(
+        _env_file=None, **REQUIRED, tool_retry_attempts=0, tool_retry_delay_seconds=0
+    )
+    assert settings.tool_retry_attempts == 0
+    assert settings.tool_retry_delay_seconds == 0

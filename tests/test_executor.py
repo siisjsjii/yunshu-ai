@@ -27,6 +27,24 @@ def _tc(name: str, args: dict) -> dict:
     return {"name": name, "args": args, "id": "call_1", "type": "tool_call"}
 
 
+class _CountingTool:
+    """计次壳,只透传 ainvoke,用来数"执行器尝试了几次"。
+
+    计次必须在 ainvoke 这一层,不能数工具体调用:langchain 的参数校验由
+    pydantic validate_arguments 包在工具体外层(StructuredTool.from_function
+    → create_schema_from_function),参数不合法时工具体根本不进入 ——
+    按工具体计数恒为 0,重试与否就区分不出来了。
+    """
+
+    def __init__(self, inner, counter: dict):
+        self._inner = inner
+        self._counter = counter
+
+    async def ainvoke(self, tool_call):
+        self._counter["n"] += 1
+        return await self._inner.ainvoke(tool_call)
+
+
 def test_retry_whitelist_excludes_create_ticket():
     """create_ticket 是写操作,重试会建出两张工单 —— 必须在白名单之外。"""
     assert "create_ticket" not in RETRYABLE_TOOLS
@@ -125,12 +143,7 @@ async def test_non_whitelisted_tool_is_never_retried():
 
 @pytest.mark.anyio
 async def test_validation_error_does_not_retry():
-    """参数错误重试无意义 —— 单轮下模型也没有第二次改参数的机会。
-
-    计次在 ainvoke 这一层,不在工具体里:langchain 的参数校验由
-    pydantic validate_arguments 包在工具体外层,参数不合法时工具体
-    根本不会进入 —— 按工具体计数永远是 0,"重试没重试"就区分不出来。
-    """
+    """参数错误重试无意义 —— 单轮下模型也没有第二次改参数的机会。"""
     calls = {"n": 0}
 
     @tool
@@ -138,22 +151,36 @@ async def test_validation_error_does_not_retry():
         """替身。"""
         return "ok"
 
-    class _CountingTool:
-        """计次壳,只透传 ainvoke。"""
-
-        def __init__(self, inner):
-            self._inner = inner
-
-        async def ainvoke(self, tool_call):
-            calls["n"] += 1
-            return await self._inner.ainvoke(tool_call)
-
     await execute_tool(
         tool_call=_tc("query_order", {}),
-        registry={"query_order": _CountingTool(query_order)},
+        registry={"query_order": _CountingTool(query_order, calls)},
         settings=_settings(tool_retry_attempts=3),
     )
     assert calls["n"] == 1      # 首次即校验失败,不再重放
+
+
+@pytest.mark.anyio
+async def test_tool_not_found_does_not_retry():
+    """业务性未找到是决定性结果 —— 重放同样的参数只会同样落空。
+
+    FAQ 查不到是本章最常见的落空路径,重试白搭一次 DB 往返加
+    tool_retry_delay_seconds 的等待,可恢复路径本该是最便宜的那条。
+    """
+    calls = {"n": 0}
+
+    @tool
+    async def query_faq(keyword: str) -> str:
+        """替身。"""
+        raise ToolNotFound("没有匹配的条目")
+
+    outcome = await execute_tool(
+        tool_call=_tc("query_faq", {"keyword": "邮费"}),
+        registry={"query_faq": _CountingTool(query_faq, calls)},
+        settings=_settings(tool_retry_attempts=3, tool_retry_delay_seconds=0.01),
+    )
+    assert outcome.ok is False
+    assert "没有匹配的条目" in outcome.content
+    assert calls["n"] == 1      # 确定性落空,不重放
 
 
 @pytest.mark.anyio
