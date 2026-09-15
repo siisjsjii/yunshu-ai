@@ -201,11 +201,18 @@ Expected: FAIL —— `test_database_url_is_required` 报 `DID NOT RAISE`,另外
 在「可选」组加入:
 
 ```python
-    # 工具执行
-    tool_timeout_seconds: float = 10.0
-    tool_retry_attempts: int = 1
-    tool_retry_delay_seconds: float = 0.3
+    # 工具执行。加界是**故意的**:负的 tool_retry_attempts 会让重试循环
+    # 一次都不执行,last_message 停在空串,执行器返回一个 content 为空的
+    # 结果给模型 —— 静默失败。本项目配置层的既定立场是让配错**启动即报**
+    # (OPENAI_MODEL / DATABASE_URL 都是必填而非给默认值)。
+    tool_timeout_seconds: float = Field(default=10.0, gt=0)
+    tool_retry_attempts: int = Field(default=1, ge=0)
+    tool_retry_delay_seconds: float = Field(default=0.3, ge=0)
 ```
+
+注意 pydantic **不校验 `default` 字面量本身**:`Field(default=-1, ge=0)` 仍能实例化出
+`-1`。所以这些界拦住的是 **env / 初始化入参**(即运维配错 `.env` 这条路径),而非代码里
+的字面量笔误 —— 后者由 `test_tool_defaults` 的断言兜住。
 
 `requirements.txt` 追加:
 
@@ -1430,6 +1437,24 @@ def _tc(name: str, args: dict) -> dict:
     return {"name": name, "args": args, "id": "call_1", "type": "tool_call"}
 
 
+class _CountingTool:
+    """计次壳,只透传 ainvoke,用来数"执行器尝试了几次"。
+
+    计次必须在 ainvoke 这一层,**不能数工具体调用**:langchain 的参数校验由
+    pydantic validate_arguments 包在工具体外层(StructuredTool.from_function
+    → create_schema_from_function),参数不合法时工具体根本不进入 ——
+    按工具体计数恒为 0,重试与否就区分不出来了。
+    """
+
+    def __init__(self, inner, counter: dict):
+        self._inner = inner
+        self._counter = counter
+
+    async def ainvoke(self, tool_call):
+        self._counter["n"] += 1
+        return await self._inner.ainvoke(tool_call)
+
+
 def test_retry_whitelist_excludes_create_ticket():
     """create_ticket 是写操作,重试会建出两张工单 —— 必须在白名单之外。"""
     assert "create_ticket" not in RETRYABLE_TOOLS
@@ -1534,15 +1559,38 @@ async def test_validation_error_does_not_retry():
     @tool
     async def query_order(order_id: str) -> str:
         """替身。"""
-        calls["n"] += 1
         return "ok"
 
     await execute_tool(
         tool_call=_tc("query_order", {}),
-        registry={"query_order": query_order},
+        registry={"query_order": _CountingTool(query_order, calls)},
         settings=_settings(tool_retry_attempts=3),
     )
-    assert calls["n"] == 1
+    assert calls["n"] == 1      # 首次即校验失败,不再重放
+
+
+@pytest.mark.anyio
+async def test_tool_not_found_does_not_retry():
+    """业务性未找到是决定性结果 —— 重放同样的参数只会同样落空。
+
+    FAQ 查不到是本章最常见的落空路径,重试白搭一次 DB 往返加
+    tool_retry_delay_seconds 的等待,可恢复路径本该是最便宜的那条。
+    """
+    calls = {"n": 0}
+
+    @tool
+    async def query_faq(keyword: str) -> str:
+        """替身。"""
+        raise ToolNotFound("没有匹配的条目")
+
+    outcome = await execute_tool(
+        tool_call=_tc("query_faq", {"keyword": "邮费"}),
+        registry={"query_faq": _CountingTool(query_faq, calls)},
+        settings=_settings(tool_retry_attempts=3, tool_retry_delay_seconds=0.01),
+    )
+    assert outcome.ok is False
+    assert "没有匹配的条目" in outcome.content
+    assert calls["n"] == 1      # 确定性落空,不重放
 
 
 @pytest.mark.anyio
@@ -1686,7 +1734,12 @@ async def execute_tool(*, tool_call: dict, registry: dict, settings) -> ToolOutc
             logger.warning("工具 %s 参数校验失败:%s", name, exc)
             break
         except ToolNotFound as exc:
+            # 业务性未找到是决定性结果:重放同一个 tool_call 送的是同样的参数,
+            # 只会同样落空。而且这是本章最常见的落空路径(FAQ 查不到),重试
+            # 白搭一次 DB 往返加 tool_retry_delay_seconds 的等待 —— 可恢复路径
+            # 本该是最便宜的那条。
             last_message = str(exc)
+            break
         except SQLAlchemyError as exc:
             logger.exception("工具 %s 命中数据库故障", name)
             raise ToolInfrastructureError("数据服务暂时不可用") from exc
@@ -1702,14 +1755,23 @@ async def execute_tool(*, tool_call: dict, registry: dict, settings) -> ToolOutc
 Run: `.venv/Scripts/python.exe -m pytest tests/test_executor.py -q`
 Expected: PASS(10 passed)
 
-- [ ] **Step 5: 验证两条关键断言真的能区分错误实现**
+- [ ] **Step 5: 验证三条关键断言真的能区分错误实现**
 
 1. 把 `RETRYABLE_TOOLS` 改成包含 `"create_ticket"`,重跑
    `test_non_whitelisted_tool_is_never_retried` → 必须 **FAIL**。
 2. 改回后,把 `except ValidationError` 分支里的 `break` 去掉,重跑
    `test_validation_error_does_not_retry` → 必须 **FAIL**。
+3. 改回后,把 `except ToolNotFound` 分支里的 `break` 去掉,重跑
+   `test_tool_not_found_does_not_retry` → 必须 **FAIL**
+   (计次壳在 `ainvoke` 边界,`tool_retry_attempts=3` 故应报 `assert 4 == 1`)。
 
-两次都确认后改回正确实现,把输出记进任务报告。
+三次都确认后改回正确实现,把输出记进任务报告。
+
+**为什么计次不能写在工具体里**:`@tool` 把函数体包在 pydantic `validate_arguments`
+之下(`StructuredTool.from_function` → `create_schema_from_function`),参数不合法时
+**工具体根本不进入** —— 按工具体计数在正确实现与错误实现下**都是 0**,
+`assert calls["n"] == 1` 对任何实现都是红的。计次必须落在 `ainvoke` 边界。
+(这条是本章实现过程中实测得出的,见 `dev-notes/ch02.md`。)
 
 - [ ] **Step 6: 提交**
 
