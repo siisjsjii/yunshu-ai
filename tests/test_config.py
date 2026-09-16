@@ -115,3 +115,35 @@ def test_zero_bounds_are_allowed():
     )
     assert settings.tool_retry_attempts == 0
     assert settings.tool_retry_delay_seconds == 0
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_max_sessions_is_rejected(bad):
+    """max_sessions <= 0 → `_enforce_capacity` 会把 `lock_for` 刚建的那把锁
+    自己淘汰掉(它在 LRU 末尾、且尚未被 acquire),下一次请求遂铸出一把
+    **新锁** —— 同一会话的两个请求并行跑,每会话互斥静默消失,全程无报错。
+    ch01 里 0 只是"不留历史",ch02 把它提成了并发正确性开关,启动即拒。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, max_sessions=bad)
+    assert "max_sessions" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_session_ttl_is_rejected(bad):
+    """session_ttl_seconds <= 0 → `_purge` 每次调用都把全部未持锁条目判为
+    "已过期"并立刻回收,锁条目活不过一次调用 —— 同一类静默故障。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, session_ttl_seconds=bad)
+    assert "session_ttl_seconds" in str(exc.value)
+
+
+def test_positive_store_bounds_are_accepted():
+    """反面:收界不能把默认值或最小的合法值误伤。"""
+    defaults = Settings(_env_file=None, **REQUIRED)
+    assert defaults.max_sessions == 1000
+    assert defaults.session_ttl_seconds == 1800
+
+    tight = Settings(
+        _env_file=None, **REQUIRED, max_sessions=1, session_ttl_seconds=1
+    )
+    assert (tight.max_sessions, tight.session_ttl_seconds) == (1, 1)

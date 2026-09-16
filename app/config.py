@@ -25,8 +25,12 @@ class Settings(BaseSettings):
     context_budget_tokens: int = 8192
     reserved_output_tokens: int = 1024
     safety_margin_tokens: int = 512
-    session_ttl_seconds: int = 1800
-    max_sessions: int = 1000
+    # 会话存储的两个数都必须为正,否则 `SessionStore` 会**静默**失去互斥:
+    # max_sessions<=0 时 lock_for 刚建的锁会在同一次调用里被容量淘汰掉,
+    # session_ttl_seconds<=0 时 _purge 每次都把所有未持锁条目判为过期,
+    # 两者都让"同一会话两次 lock_for 拿到同一把锁"不成立。
+    session_ttl_seconds: int = Field(default=1800, gt=0)
+    max_sessions: int = Field(default=1000, gt=0)
     session_lock_timeout_seconds: float = 60.0
     brand_name: str = "本店"
 
