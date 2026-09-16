@@ -4,7 +4,14 @@ import pytest
 from sqlalchemy import select, text
 
 from app.db.base import get_engine, get_sessionmaker
-from app.db.models import Conversation, Faq, MessageRecord, Ticket
+from app.db.models import (
+    Conversation,
+    Faq,
+    KnowledgeChunk,
+    MessageRecord,
+    QaExtractionStaging,
+    Ticket,
+)
 
 pytestmark = pytest.mark.db
 
@@ -133,3 +140,141 @@ async def test_faq_like_matches_chinese_substring():
             {"q": SCRATCH_FAQ_QUESTION},
         )
         await session.commit()
+
+
+# ---- ch03:knowledge_chunks / qa_extraction_staging(DDL: db/ch03.sql)----
+
+SCRATCH_KB_CATEGORY = "ch03-probe-分类"
+SCRATCH_KB_BATCH = "ch03-probe-batch"
+
+
+@pytest.mark.anyio
+async def test_knowledge_chunk_defaults_and_roundtrip():
+    """最小插入 → 服务器默认值生效:pending / 非关键条款 / 指针与 vector_id 为空。
+    中文三字段(向量化文本的组成)必须真插真读。"""
+    engine = get_engine()
+    async with get_sessionmaker()() as session:
+        chunk = KnowledgeChunk(
+            category=SCRATCH_KB_CATEGORY,
+            questions="运费怎么算\n下单时显示的邮费是多少",
+            answer="单笔订单满 99 元包邮,否则收取 8 元运费。",
+            content_type="policy",
+        )
+        session.add(chunk)
+        await session.commit()
+        chunk_id = chunk.id
+        assert chunk_id is not None
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(KnowledgeChunk).where(KnowledgeChunk.id == chunk_id)
+            )
+        ).scalars().one()
+        assert row.category == SCRATCH_KB_CATEGORY
+        assert row.questions.startswith("运费怎么算")          # 中文与换行往返
+        assert row.vectorize_status == "pending"               # ENUM 服务器默认
+        assert row.is_key_clause is False                      # TINYINT(1) → bool
+        assert row.vector_id is None
+        assert row.prev_chunk_id is None and row.next_chunk_id is None
+        assert row.section_path is None
+
+    await _cleanup_kb_rows(engine)
+
+
+@pytest.mark.anyio
+async def test_knowledge_chunk_flags_and_self_reference():
+    """is_key_clause 可置真、vectorize_status 可置 done、vector_id 回填语义、
+    prev/next 自引用 FK 双向往返 —— 四件都是双写流程要写的东西。"""
+    engine = get_engine()
+    async with get_sessionmaker()() as session:
+        first = KnowledgeChunk(
+            category=SCRATCH_KB_CATEGORY, questions="q1", answer="a1"
+        )
+        second = KnowledgeChunk(
+            category=SCRATCH_KB_CATEGORY,
+            questions="q2",
+            answer="a2",
+            is_key_clause=True,
+        )
+        session.add_all([first, second])
+        await session.flush()
+        second.prev_chunk_id = first.id
+        first.next_chunk_id = second.id
+        second.vectorize_status = "done"
+        second.vector_id = str(second.id)
+        await session.commit()
+        first_id, second_id = first.id, second.id
+
+    async with get_sessionmaker()() as session:
+        a = (
+            await session.execute(
+                select(KnowledgeChunk).where(KnowledgeChunk.id == first_id)
+            )
+        ).scalars().one()
+        b = (
+            await session.execute(
+                select(KnowledgeChunk).where(KnowledgeChunk.id == second_id)
+            )
+        ).scalars().one()
+        assert a.next_chunk_id == second_id and b.prev_chunk_id == first_id
+        assert b.is_key_clause is True and a.is_key_clause is False
+        assert b.vectorize_status == "done"
+        assert b.vector_id == str(second_id)
+
+    await _cleanup_kb_rows(engine)
+
+
+@pytest.mark.anyio
+async def test_qa_staging_defaults_and_three_states():
+    """staging 三态 ENUM:默认 extracted,kept/discarded 可写;source_ref 可空;
+    批次号与中文问答对往返。"""
+    engine = get_engine()
+    async with get_sessionmaker()() as session:
+        rows = [
+            QaExtractionStaging(
+                batch_no=SCRATCH_KB_BATCH,
+                source_ref="seed0000000000000000000000000000",
+                question="发什么快递",
+                answer="默认发中通/圆通。",
+            ),
+            QaExtractionStaging(
+                batch_no=SCRATCH_KB_BATCH, question="q", answer="a", status="kept"
+            ),
+            QaExtractionStaging(
+                batch_no=SCRATCH_KB_BATCH, question="q", answer="a", status="discarded"
+            ),
+        ]
+        session.add_all(rows)
+        await session.commit()
+
+    async with get_sessionmaker()() as session:
+        got = (
+            await session.execute(
+                select(QaExtractionStaging)
+                .where(QaExtractionStaging.batch_no == SCRATCH_KB_BATCH)
+                .order_by(QaExtractionStaging.id)
+            )
+        ).scalars().all()
+        assert [r.status for r in got] == ["extracted", "kept", "discarded"]
+        assert got[0].question == "发什么快递"
+        assert got[0].source_ref == "seed0000000000000000000000000000"
+
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            text("DELETE FROM qa_extraction_staging WHERE batch_no = :b"),
+            {"b": SCRATCH_KB_BATCH},
+        )
+        await session.commit()
+    await engine.dispose()
+
+
+async def _cleanup_kb_rows(engine) -> None:
+    from sqlalchemy import delete
+
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            delete(KnowledgeChunk).where(KnowledgeChunk.category == SCRATCH_KB_CATEGORY)
+        )
+        await session.commit()
+    await engine.dispose()

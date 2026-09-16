@@ -1,6 +1,16 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    JSON,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -59,6 +69,67 @@ class Ticket(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     ticket_type: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+
+class KnowledgeChunk(Base):
+    """知识库 chunk 原文权威源(DDL: db/ch03.sql,表已由用户建好,ORM 只映射)。
+
+    category / questions / answer 三字段拼成一段文本进向量;其余列都是
+    「只存不进向量」的元数据。vectorize_status 是双写幂等的状态机:
+    pending(待向量化)→ done(已向量化,/vector/ 已回填)。
+    """
+
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    category: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    questions: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    section_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_key_clause: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    prev_chunk_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("knowledge_chunks.id"), nullable=True
+    )
+    next_chunk_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("knowledge_chunks.id"), nullable=True
+    )
+    vector_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    vectorize_status: Mapped[str] = mapped_column(
+        Enum("pending", "done", name="vectorize_status"),
+        nullable=False,
+        default="pending",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class QaExtractionStaging(Base):
+    """历史对话抽 QA 的离线中转暂存表(DDL: db/ch03.sql)。
+
+    分批抽取按 batch_no 追溯;整体去重后 kept 行进 knowledge_chunks,
+    discarded 行留痕;表本身不做自动清空(DDL 注释「建库完成可清空」留给人工)。
+    """
+
+    __tablename__ = "qa_extraction_staging"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    batch_no: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Enum("extracted", "kept", "discarded", name="qa_staging_status"),
+        nullable=False,
+        default="extracted",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )

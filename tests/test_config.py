@@ -147,3 +147,83 @@ def test_positive_store_bounds_are_accepted():
         _env_file=None, **REQUIRED, max_sessions=1, session_ttl_seconds=1
     )
     assert (tight.max_sessions, tight.session_ttl_seconds) == (1, 1)
+
+
+# ---- ch03:知识库与向量检索的配置 ----
+
+
+def test_ch03_fields_have_defaults():
+    """13 个新字段全部可选带默认值 —— 环境里没有 Milvus 的机器仍能起服务、
+    跑与检索无关的单测(检索组件懒初始化,配置有值不等于启动就连接)。"""
+    s = Settings(_env_file=None, **REQUIRED)
+    assert s.embedding_model_path == "models/bge-m3"
+    assert s.embedding_max_length == 1024
+    assert s.embedding_batch_size == 16
+    assert s.milvus_uri == "http://127.0.0.1:19530"
+    assert s.milvus_collection == "knowledge"
+    assert s.retrieval_top_k == 3
+    assert s.retrieval_score_threshold == 0.5
+    assert s.dedupe_threshold == 0.95
+    assert s.chunk_max_chars == 800
+    assert s.chunk_overlap_chars == 100
+    assert s.mine_batch_conversations == 5
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+@pytest.mark.parametrize("field", ["embedding_max_length", "embedding_batch_size", "chunk_max_chars"])
+def test_non_positive_encoding_and_chunking_params_are_rejected(field, bad):
+    """tokenizer 的 max_length/batch_size 为 0 会直接抛进 encode 深处;
+    chunk_max_chars <= 0 让递归切分产不出合法块。都是配置期该抓住的错。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, **{field: bad})
+    assert field in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_top_k_is_rejected(bad):
+    """top_k <= 0 → Milvus 搜索永远返回空,query_faq 永远走「未收录」——
+    检索功能静默失效且无报错。必须启动即拒。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, retrieval_top_k=bad)
+    assert "retrieval_top_k" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.1])
+@pytest.mark.parametrize("field", ["retrieval_score_threshold", "dedupe_threshold"])
+def test_out_of_range_thresholds_are_rejected(field, bad):
+    """两个阈值都是 [0,1] 上的相似度:越界一个方向等于永远全滤空(检索
+    静默失效),另一个方向等于没有阈值(不相关也硬凑答案)。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, **{field: bad})
+    assert field in str(exc.value)
+
+
+def test_threshold_bounds_are_accepted():
+    """0 与 1 本身合法(1 只在归一化向量的完全重复上达得到)。"""
+    s = Settings(_env_file=None, **REQUIRED,
+                 retrieval_score_threshold=0.0, dedupe_threshold=1.0)
+    assert s.retrieval_score_threshold == 0.0
+    assert s.dedupe_threshold == 1.0
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_mine_batch_is_rejected(bad):
+    """挖知识批次 <= 0 → range() 空转,脚本「成功」但一行没抽 —— 假成功比
+    报错更糟。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, mine_batch_conversations=bad)
+    assert "mine_batch_conversations" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [-1, 800, 900])
+def test_overlap_not_smaller_than_max_chars_is_rejected(bad):
+    """overlap >= chunk_max_chars 时递归切分永不收敛(每块重叠就吃掉了
+    配额)—— 跨字段约束,在模型层统一拒绝,不让 chunker 运行时死循环。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            _env_file=None,
+            **REQUIRED,
+            chunk_max_chars=800,
+            chunk_overlap_chars=bad,
+        )
+    assert "chunk_overlap_chars" in str(exc.value)

@@ -16,3 +16,4 @@ __pycache__/
 
 # 评估集运行产物
 evals/results/
+models/
