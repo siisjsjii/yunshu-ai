@@ -6,6 +6,7 @@
 
 - **ch01(纯对话)**:SSE 流式对话 + 结构化抽取,已并入 main。
 - **ch02(单轮 Function Calling 查数据)**:已交付 —— 四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
+- **ch03(知识库 + 向量检索)**:**进行中,分支 `ch03-kb`**(main 上无 ch03 代码)。已完成 T0–T5(配置/两表 ORM/切分器/语料导入/BGE-M3 嵌入封装);待做 T6–T13(Milvus 封装/双写幂等/建库脚本/query_faq 换实现/挖知识/评估/验收/收尾)。续作入口:`dev-notes/ch03.md` 的「进度快照与交接说明」+ spec §12 订正(DEPLOY_MODE / flush / count(*) 三条命门)。
 - **明确不做**:多轮 Agent Loop、向量检索/RAG、认证。ch03 入口:物流号间接查询(见 ch02 spec §10)。
 - 技术栈:Python 3.13 + FastAPI + LangChain 1.4(`langchain-openai`)+ DeepSeek(OpenAI 兼容网关)+ MySQL(`asyncmy`)。`.venv` 已建好,一律用 `.venv/Scripts/python.exe`。
 

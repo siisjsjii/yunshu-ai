@@ -260,4 +260,10 @@ MINE_BATCH_CONVERSATIONS=5
 
 ## 12. 实现订正
 
-(实现过程中与本文的偏离,连同原因记录于此;暂无。)
+(实现过程中与本文的偏离,连同原因记录于此。)
+
+### §8.4 / §7.2 之订正:Milvus 行数核对必须用 `query(count(*))`,不能用 `get_collection_stats`(2026-09-16,T0 实测)
+
+同 pk 三遍 upsert 后:`get_collection_stats` 的 `row_count` 报 9(它数的是 insert 操作,未扣 delete,compaction 前不真实),`query(output_fields=["count(*)"])` 报 3(真值),search 也只返回 3 个唯一 id。**upsert 按 pk 覆盖的幂等语义成立**;验收 6 的「Milvus 数 == MySQL done 数」一律用 `count(*)`。
+
+另两处 T0 实测事实:①upsert 后**必须 `flush`** 才能立查(默认 Bounded 一致性下 search 返回空)——离线写入路径每批 flush;在线检索读的是久远数据,不受影响。②Milvus 容器(2.6.24,embed etcd 单容器)必须显式 `-e DEPLOY_MODE=STANDALONE`,否则启动即 panic「embedded etcd can not be used under distributed mode」(v2.6.24 源码 service_param.go:145 判据即此环境变量;milvus.io 文档上的新版启动脚本默认有入口脚本代设,本镜像入口只有 tini)。
