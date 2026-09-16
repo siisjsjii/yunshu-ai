@@ -203,7 +203,9 @@ Expected: FAIL —— `test_database_url_is_required` 报 `DID NOT RAISE`,另外
 ```python
     # 工具执行。加界是**故意的**:负的 tool_retry_attempts 会让重试循环
     # 一次都不执行,last_message 停在空串,执行器返回一个 content 为空的
-    # 结果给模型 —— 静默失败。本项目配置层的既定立场是让配错**启动即报**
+    # 结果给模型 —— 静默失败。本项目配置层的既定立场是让配错**响亮地早失败**
+    #(注意:不是"进程启动即报" —— get_settings 是 lru_cache 的、经 FastAPI Depends
+    #  解析,所以实际在**第一次解析它的请求**上抛错。但那次失败早于任何建锁,目标达成)
     # (OPENAI_MODEL / DATABASE_URL 都是必填而非给默认值)。
     tool_timeout_seconds: float = Field(default=10.0, gt=0)
     tool_retry_attempts: int = Field(default=1, ge=0)
@@ -2106,8 +2108,12 @@ async def test_capacity_never_evicts_a_held_lock():
     for i in range(5):
         store.lock_for(f"new{i}")
 
-    assert store.lock_for("oldest") is held          # 持锁条目仍在
+    # 顺序**不能反**。`lock_for("oldest")` 自身有副作用:它把 oldest 移到 LRU 末尾,
+    # 于是它不再是队首、不再挡住淘汰,后续淘汰会一路删到容量上限,count 掉回 2。
+    # 先断言身份再断言数量,在正确实现下必然失败 —— 而插入序(无 move_to_end)的
+    # 错误实现反而通过。实测两个方向都验过。
     assert store.active_lock_count() > 2             # 宁可短暂超容量
+    assert store.lock_for("oldest") is held          # 持锁条目仍在
 ```
 
 - [ ] **Step 3: 运行测试,确认失败**
