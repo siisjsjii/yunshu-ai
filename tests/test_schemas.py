@@ -14,6 +14,27 @@ def test_message_rejects_unknown_role():
         Message(role="system", content="x")
 
 
+def test_tool_message_requires_a_non_empty_tool_call_id():
+    """`role="tool"` 不带 tool_call_id 必须在**构造时**被拒。
+
+    放过去的话,app/prompts.py 会把它转成
+    `ToolMessage(content=..., tool_call_id="")`,而实测该形态经
+    `convert_to_openai_messages` 真的会发出去:
+    `{'role': 'tool', 'tool_call_id': '', 'content': 'x'}` —— 上游一个
+    无从解释的 400。空串与 None 都要拒:前者正是 `or ""` 那一步的产物。
+    """
+    with pytest.raises(ValidationError):
+        Message(role="tool", content="已揽件")
+    with pytest.raises(ValidationError):
+        Message(role="tool", content="已揽件", tool_call_id="")
+
+    assert Message(role="tool", content="已揽件", tool_call_id="c1").tool_call_id == "c1"
+
+    # 其余两个角色不受这条约束(它们的 tool_call_id 本就该是 None)。
+    assert Message(role="user", content="你好").tool_call_id is None
+    assert Message(role="assistant", content="您好").tool_call_id is None
+
+
 def test_chat_request_session_id_is_optional():
     assert ChatRequest(message="你好").session_id is None
     assert ChatRequest(session_id="s1", message="你好").session_id == "s1"

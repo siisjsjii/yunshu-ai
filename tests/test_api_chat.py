@@ -354,6 +354,37 @@ def test_oversized_input_returns_400_before_streaming(client_factory):
     assert client.model.calls == []
 
 
+def test_overflow_400_releases_lock_so_the_session_stays_usable(client_factory):
+    """`ContextOverflowError` 这条退出路径也要放锁 —— 它**不是**兜底那条例外。
+
+    端点里 `except ContextOverflowError` 与 `except BaseException` 是两个
+    并列子句,前者的 `lock.release()` 删掉后,后者**不会**兜住这个异常。
+    后果不是"报错",而是该 session 从此永久 409:持锁的锁既不被 TTL 也不被
+    LRU 回收,症状与"锁泄漏"毫无相似之处。另外两条非流式退出路径都有具名
+    测试(test_validation_failure_releases_lock / test_tool_build_failure_releases_lock),
+    唯独这条没有。
+
+    断言取"第二个超大请求仍然拿到 400 而不是 409"(会话仍可用)—— 这才是
+    真正要守的性质;等锁超时调成 0.15s,漏放锁时第二次请求会在 0.15s 内变红,
+    而不是用默认 60s 把测试挂死。顺带断一次锁对象本身,便于定位。
+    """
+    client, _ = client_factory(
+        batches=[],
+        context_budget_tokens=200,
+        reserved_output_tokens=0,
+        safety_margin_tokens=0,
+        session_lock_timeout_seconds=0.15,
+    )
+    body = {"session_id": "s1", "message": "退" * 5000}
+
+    with client as c:
+        first = c.post("/api/chat/stream", json=body)
+        second = c.post("/api/chat/stream", json=body)
+
+    assert [first.status_code, second.status_code] == [400, 400]
+    assert client.store.lock_for("s1").locked() is False
+
+
 def test_upstream_error_becomes_sse_error_event(client_factory):
     class ExplodingModel:
         def bind_tools(self, tools):

@@ -88,6 +88,18 @@ async def query_logistics(order_id: str) -> str:
     return '{"status": "已揽件"}'
 
 
+@tool
+async def query_order(order_id: str) -> str:
+    """替身:查订单。
+
+    与 query_logistics 成对,供「一轮两个 tool_call」的用例使用(见
+    test_two_tool_calls_in_one_round_are_both_executed_and_paired)。
+    本文件里另有两个函数内局部定义的 `query_order`(总是失败 / DB 挂了
+    那两条),它们是各自独立的替身对象,通过显式注册表传入,与此处无冲突。
+    """
+    return '{"status": "已发货"}'
+
+
 class RecordingSession:
     """替身 DB 会话:`add` 记下落库行,`commit` 默认成功。
 
@@ -302,6 +314,99 @@ def test_successful_turn_appends_user_tool_and_answer():
     assert session.added[1].tool_calls[0]["id"] == "c1"
     assert session.added[2].tool_call_id == "c1"
     assert session.added[3].content == "已揽件。"
+
+
+def test_two_tool_calls_in_one_round_are_both_executed_and_paired():
+    """一轮里模型发**两个** tool_call 时:两个都执行、都配对回灌、都落库。
+
+    这不是假想 —— dev-notes/ch02.md 阶段 6 ④ 记着真实模型在物流提问上同轮发了
+    两个 tool_call。而在此之前,**整个套件从没执行过 `for tool_call in tool_calls`
+    的第二次迭代**:两个变异都能让既有 45 条编排测试全绿 ——
+    ①循环体末尾 `break`(第二个工具根本不执行,事件序列少一对、回灌少一条);
+    ②落库时写 `tool_calls[:1]`(assistant 行带两个申请、history 里只有一条 tool
+    回复 —— 正是 spec §6.3 要防的、上游直接 400 的形态)。
+
+    所以这里三层都断:事件层(顺序与配对)、发给模型的第二轮消息层、落库层。
+    只断其中一层时,上面两个变异各有一个能从缝里溜过去。
+    """
+    from langchain.messages import AIMessage, ToolMessage
+
+    session = RecordingSession()
+    model = ScriptedModel(
+        [
+            [
+                FakeChunk(
+                    tool_calls=[
+                        {
+                            "name": "query_logistics",
+                            "args": {"order_id": "1001"},
+                            "id": "c1",
+                        },
+                        {
+                            "name": "query_order",
+                            "args": {"order_id": "1001"},
+                            "id": "c2",
+                        },
+                    ]
+                )
+            ],
+            [FakeChunk("包裹已揽件,订单正常。")],
+        ]
+    )
+    events = _collect(
+        model,
+        session,
+        {"query_logistics": query_logistics, "query_order": query_order},
+    )
+
+    # ---- 事件层:每个申请各自紧跟自己的结果,不是"先两个申请再两个结果"
+    assert [kind for kind, _ in events] == [
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "token",
+        "done",
+    ]
+    assert [p["tool_call_id"] for k, p in events if k == "tool_call"] == ["c1", "c2"]
+    assert [p["tool_call_id"] for k, p in events if k == "tool_result"] == ["c1", "c2"]
+    assert [p["name"] for k, p in events if k == "tool_call"] == [
+        "query_logistics",
+        "query_order",
+    ]
+    assert all(p["ok"] for k, p in events if k == "tool_result")
+
+    # ---- 发给模型的第二轮消息层:一条 assistant(带两个申请)+ 紧邻的两条 tool
+    second_round = model.calls[1][1]
+    parent_index = next(
+        i
+        for i, m in enumerate(second_round)
+        if isinstance(m, AIMessage) and m.tool_calls
+    )
+    assert [tc["id"] for tc in second_round[parent_index].tool_calls] == ["c1", "c2"]
+    tool_messages = [m for m in second_round if isinstance(m, ToolMessage)]
+    assert [m.tool_call_id for m in tool_messages] == ["c1", "c2"]
+    assert [second_round.index(m) for m in tool_messages] == [
+        parent_index + 1,
+        parent_index + 2,
+    ]
+    # 每条回灌的是**它自己那次调用**的结果,不是同一个工具跑两遍
+    assert "已揽件" in tool_messages[0].content
+    assert "已发货" in tool_messages[1].content
+
+    # ---- 落库层:五条,且 assistant 行的 tool_calls 不能只剩头一个
+    assert [obj.role for obj in session.added] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+    assert [obj.tool_call_id for obj in session.added if obj.role == "tool"] == [
+        "c1",
+        "c2",
+    ]
+    assert [tc["id"] for tc in session.added[1].tool_calls] == ["c1", "c2"]
 
 
 # ---------- 只做单轮:第二轮消息的合法性 ----------
