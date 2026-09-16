@@ -3057,7 +3057,27 @@ def test_infrastructure_failure_emits_error_frame(client_factory):
     assert "sk-test" not in payload["message"]   # 脱敏生效
 ```
 
-`client_factory` 夹具需替换 `get_session` 与模型依赖。因 `get_store` / `get_chat_model` / `get_session` 都走 `Depends`,用 `app.dependency_overrides` 覆盖:
+**但上面这条断言本身是假的,必须让替身真的把密钥吐出来。** 本计划的原文写
+`assert "sk-test" not in payload["message"]`,而假模型抛的是 `RuntimeError("上游炸了")`
+—— 文案里根本没有 `sk-test`,这条断言**恒真**。它守护的 spec §6 要求(「不回显 key 内容」)
+**根本没被验证**。
+
+这正是 ch01 最终审查抓到的那条假绿(`assert "sk-test" not in resp.text`),原文一字不差地
+复现在这里。**让替身把密钥写进异常文本**,断言才有承重:
+
+```python
+    class LeakyModel(ScriptedModel):
+        async def astream(self, messages):
+            # 假模型把配置里的密钥写进异常文本 —— 不脱敏就会原样进入 error 帧
+            raise RuntimeError("Incorrect API key provided: sk-test")
+```
+
+判据与前几处一致:**如果脱敏被删掉,这条断言必须变红。**
+
+`client_factory` 夹具需替换 `get_settings` / `get_session` 与模型依赖。因 `get_store` /
+`get_chat_model` / `get_session` / `get_settings` 都走 `Depends`,用
+`app.dependency_overrides` 覆盖。**`get_settings` 必须一起覆盖** —— 不覆盖的话测试会去读仓库根
+的真实 `.env`(里面有真实密钥),而脱敏类断言正是拿配置里的密钥做比对的,读到什么就不再可控:
 
 ```python
 @pytest.fixture
