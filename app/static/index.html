@@ -281,7 +281,8 @@
     const el = document.createElement("span");
     el.className = "badge";
     el.dataset.tool = name;
-    el.innerHTML = '<span class="dot"></span>';
+    // 圆点承载状态(进行中脉动 / 返回后停),🔧 是原型里的工具图标
+    el.innerHTML = '<span class="dot"></span><span aria-hidden="true">🔧</span>';
     el.appendChild(document.createTextNode(`调用了 ${name}`));
     badges.appendChild(el);
     scrollToEnd();
