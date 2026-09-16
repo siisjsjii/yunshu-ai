@@ -655,6 +655,12 @@ def test_user_id_defaults_to_demo_user(client_factory):
 
 # ---------- 工具事件(ch02 新增) ----------
 
+#: 一个「已发货」的订单号 —— `ok=True` 要求工具**真的执行成功**。
+#: 多数订单号(含 1001)是「未发货」,对它们查物流会正确地返回 ToolNotFound。
+#: 「哪些号码有物流」由 tests/test_tools_random.py 的自洽断言守护;种子函数
+#: 若变动,这里会以 `assert False is True` 硬失败,而不是被悄悄放宽。
+_SHIPPED_ORDER = "1003"
+
 
 def test_chat_stream_emits_tool_call_event(client_factory):
     """验收 1 的后端一半:必须推出 tool_call 帧,且 name / args 正确。
@@ -669,7 +675,7 @@ def test_chat_stream_emits_tool_call_event(client_factory):
                     tool_calls=[
                         {
                             "name": "query_logistics",
-                            "args": {"order_id": "1001"},
+                            "args": {"order_id": _SHIPPED_ORDER},
                             "id": "c1",
                         }
                     ]
@@ -679,7 +685,9 @@ def test_chat_stream_emits_tool_call_event(client_factory):
         ]
     )
     with client as c:
-        resp = c.post("/api/chat/stream", json={"message": "订单 1001 的物流到哪了"})
+        resp = c.post(
+            "/api/chat/stream", json={"message": f"订单 {_SHIPPED_ORDER} 的物流到哪了"}
+        )
         events = _parse_sse(resp.text)
 
     kinds = [name for name, _ in events]
@@ -687,7 +695,7 @@ def test_chat_stream_emits_tool_call_event(client_factory):
     assert "tool_result" in kinds
     payload = next(p for name, p in events if name == "tool_call")
     assert payload["name"] == "query_logistics"
-    assert payload["args"] == {"order_id": "1001"}
+    assert payload["args"] == {"order_id": _SHIPPED_ORDER}
     assert payload["tool_call_id"] == "c1"
     assert kinds[-1] == "done"
 

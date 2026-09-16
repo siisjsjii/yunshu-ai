@@ -124,18 +124,41 @@ print(",".join(states))
 '
 }
 
-# 从工具实现里取订单 1001 的确定性物流状态。
+# 取一个**已发货**的订单号。
+#
+# 订单状态由种子派生,多数号码是「待付款 / 已付款 / 已取消」—— 那些单子**没有**
+# 物流记录,对它们查物流会(正确地)返回 ToolNotFound,拿来做验收只会得到 ok=false。
+# 号码不写死:写死会在种子函数变动时静默失效,表现为"验收标准没达成",
+# 而不是"号码选错了"。
+shipped_order() {
+  "$PYTHON" -c '
+import asyncio, json, sys
+
+from app.tools.business import _LOGISTICS_BY_STATUS, query_order
+
+def status(oid):
+    call = {"name": "query_order", "args": {"order_id": oid}, "id": "p", "type": "tool_call"}
+    return json.loads(asyncio.run(query_order.ainvoke(call)).content)["status"]
+
+for i in range(1000, 1040):
+    if status(str(i)) in _LOGISTICS_BY_STATUS:
+        sys.stdout.buffer.write(str(i).encode("ascii"))
+        break
+'
+}
+
+# 从工具实现里取该订单的确定性物流状态。
 # 动态取值而非写死 —— 工具改了种子函数也不必改脚本;
 # 而"工具到底返回什么"由 Tier 1 的跨进程确定性测试守护。
 expected_logistics_status() {
-  "$PYTHON" -c '
-import asyncio, json, sys
+  ORDER="$1" "$PYTHON" -c '
+import asyncio, json, os, sys
 
 from app.tools.business import query_logistics
 
 tool_call = {
     "name": "query_logistics",
-    "args": {"order_id": "1001"},
+    "args": {"order_id": os.environ["ORDER"]},
     "id": "probe",
     "type": "tool_call",
 }
@@ -256,21 +279,25 @@ fi
 
 echo
 echo "=== 验收 4:工具调用链路(需求 4) ==="
-EXPECTED_STATUS=$(expected_logistics_status)
-echo "  订单 1001 的确定性物流状态:$EXPECTED_STATUS"
+SHIPPED_ORDER=$(shipped_order)
+if [ -z "$SHIPPED_ORDER" ]; then
+  fail "1000-1039 里找不到已发货的订单 —— 种子函数改坏了,验收 4 无法进行"
+fi
+EXPECTED_STATUS=$(expected_logistics_status "$SHIPPED_ORDER")
+echo "  订单 $SHIPPED_ORDER 的确定性物流状态:$EXPECTED_STATUS"
 
 # 工具取不到值时上面那条命令会**静默返回空**。空串会让 `grep -qF ""` 匹配
 # 任何文本 —— 于是"回复复述了工具结果"这条断言永远通过,而它恰恰是本章
 # 唯一证明"模型真的读到了工具返回"的证据。宁可在此处硬失败。
 if [ -z "$EXPECTED_STATUS" ]; then
-  fail "取不到订单 1001 的确定性物流状态 —— 下面的复述断言会退化成恒真,不再可信"
+  fail "取不到订单 $SHIPPED_ORDER 的确定性物流状态 —— 下面的复述断言会退化成恒真,不再可信"
 fi
 
 SID_TOOL="acceptance-tool-$$"
 OUT4=$(curl -sN -X POST "$BASE/api/chat/stream" \
   -H 'Content-Type: application/json' \
   --data-binary @- <<JSON
-{"session_id":"$SID_TOOL","message":"订单 1001 的物流到哪了"}
+{"session_id":"$SID_TOOL","message":"订单 $SHIPPED_ORDER 的物流到哪了"}
 JSON
 )
 

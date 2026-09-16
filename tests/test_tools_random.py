@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -19,23 +20,59 @@ def _call(tool, args: dict) -> str:
     return asyncio.run(tool.ainvoke(tool_call)).content
 
 
+#: 订单状态 → 该状态下**可能**出现的物流状态。
+#:
+#: 期望值在测试里**独立声明**,不 import 实现里的同名常量 —— import 的话
+#: 实现把表改错时期望值跟着一起改,断言就退化成同义反复。
+_ALLOWED_LOGISTICS = {
+    "已发货": {"已揽件", "运输中", "派送中"},
+    "已完成": {"已签收"},
+}
+
+#: 派生演示订单号用的扫描区间。必须同时存在「已发货/已完成」与「未发货」
+#: 两种订单,否则下面两个 helper 会硬失败。
+_SCAN = range(1000, 1040)
+
+
+def _status_of(order_id: str) -> str:
+    return json.loads(_call(query_order, {"order_id": order_id}))["status"]
+
+
+def _order_ids(*, shipped: bool) -> list[str]:
+    """按「有没有物流」筛订单号。
+
+    物流类断言**不能**写死 1001:它是「已取消」,对它查物流会抛
+    ToolNotFound —— 那是**正确行为**,不是"正常订单"。写死别的号码同样不行:
+    种子函数一变它就静默失效,而失败信息会指向"工具抛错了"而不是"号码选错了"。
+    """
+    ids = [str(i) for i in _SCAN if (_status_of(str(i)) in _ALLOWED_LOGISTICS) is shipped]
+    if not ids:
+        kind = "有" if shipped else "没有"
+        raise AssertionError(
+            f"{_SCAN.start}-{_SCAN.stop - 1} 里找不到{kind}物流的订单 —— 种子函数改坏了"
+        )
+    return ids
+
+
 def test_same_order_id_gives_same_result():
     """同一订单号永远返回同样数据。"""
-    assert _call(query_logistics, {"order_id": "1001"}) == _call(
-        query_logistics, {"order_id": "1001"}
+    oid = _order_ids(shipped=True)[0]
+    assert _call(query_logistics, {"order_id": oid}) == _call(
+        query_logistics, {"order_id": oid}
     )
 
 
 def test_different_order_ids_differ():
     """不同订单号应有不同数据,否则工具等于常量。"""
-    assert _call(query_logistics, {"order_id": "1001"}) != _call(
-        query_logistics, {"order_id": "1002"}
+    first, second = _order_ids(shipped=True)[:2]
+    assert _call(query_logistics, {"order_id": first}) != _call(
+        query_logistics, {"order_id": second}
     )
 
 
 def test_result_is_json_with_chinese_not_escaped():
     """返回 JSON 字符串,且中文不被转义成 \\uXXXX(白烧 token)。"""
-    raw = _call(query_logistics, {"order_id": "1001"})
+    raw = _call(query_logistics, {"order_id": _order_ids(shipped=True)[0]})
     payload = json.loads(raw)
     assert set(payload) >= {"order_id", "status", "location"}
     assert "\\u" not in raw
@@ -49,11 +86,14 @@ def test_seed_is_stable_across_processes():
     (PYTHONHASHSEED),用它会让同一订单号在重启后返回不同数据,
     而同进程内的任何测试都测不出来。故必须另起两个进程比对。
     """
+    oid = _order_ids(shipped=True)[0]
+    # 拼字符串而不是 f-string:下面这段代码里全是花括号,用 f-string 得逐个
+    # 翻倍转义,读起来全是 `{{`。
     code = (
         "import asyncio, sys; sys.path.insert(0, '.'); "
         "from app.tools.business import query_logistics; "
         "print(asyncio.run(query_logistics.ainvoke("
-        "{'name': 'query_logistics', 'args': {'order_id': '1001'}, "
+        "{'name': 'query_logistics', 'args': {'order_id': '" + oid + "'}, "
         "'id': 'c', 'type': 'tool_call'})).content)"
     )
     # 子进程的输出编码必须显式钉成 UTF-8。本机 locale 是 cp936,Python 会把管道
@@ -126,3 +166,98 @@ def test_error_message_does_not_echo_unbounded_input():
         _call(query_order, {"order_id": huge})
     assert huge not in str(exc.value)
     assert len(str(exc.value)) < 200
+
+
+# ---- 订单与物流的数据自洽 ----
+
+
+def test_unshipped_order_has_no_logistics():
+    """未发货的订单查物流必须查**不到**,而不是编一条出来。
+
+    这条钉的是耦合的反向那半:只把物流状态限制在订单状态的候选集里还不够 ——
+    「待付款」的候选集是空的,实现要么抛错,要么就得凭空造一条物流记录,
+    而凭空造的那条必然与订单状态矛盾。
+    """
+    with pytest.raises(ToolNotFound):
+        _call(query_logistics, {"order_id": _order_ids(shipped=False)[0]})
+
+
+def test_order_and_logistics_status_never_contradict():
+    """同一订单号下,订单状态与物流状态必须自洽。
+
+    两个工具各自 `_rng(不同前缀, 同一订单号)` 时是**两条独立随机流**,
+    于是同一个订单可以同时是「已取消」和「已签收」。实测 1000 个订单里
+    807 个自相矛盾(80.7%),连当时演示用的 1001 都落在里面。
+
+    扫一段区间而不是抽查:80.7% 的矛盾率下,抽查两三个也大概率全中,
+    那条断言区分不出实现。
+    """
+    contradictions = []
+    for i in range(1000, 1400):
+        oid = str(i)
+        order = json.loads(_call(query_order, {"order_id": oid}))
+        try:
+            logistics = json.loads(_call(query_logistics, {"order_id": oid}))
+        except ToolNotFound:
+            # 未发货的订单**必须**查不到物流。走得到这个分支本身就是耦合的
+            # 证据:两条独立随机流下,任何合法订单号都查得到物流,永远不会抛。
+            if order["status"] in _ALLOWED_LOGISTICS:
+                contradictions.append((oid, order["status"], "查不到物流"))
+            continue
+        allowed = _ALLOWED_LOGISTICS.get(order["status"], set())
+        if logistics["status"] not in allowed:
+            contradictions.append((oid, order["status"], logistics["status"]))
+
+    assert contradictions == [], (
+        f"订单与物流自相矛盾 (订单号, 订单状态, 物流状态):{contradictions[:5]}"
+    )
+
+
+def test_logistics_trace_never_predates_the_order():
+    """物流轨迹时间必须晚于下单时间。
+
+    同一个根因的另一面:轨迹时间原本也从 `_rng("logistics", ...)` 独立抽,
+    于是能出现「9 月 5 日已发出」而订单「9 月 20 日下单」的包裹先于订单存在。
+
+    这条的矛盾率远低于状态那条(量级 1%),故扫描区间要够宽 —— 区间窄了
+    在旧实现下可能一个都撞不上,断言就成了恒真。
+    """
+    bad = []
+    for i in range(1000, 3000):
+        oid = str(i)
+        order = json.loads(_call(query_order, {"order_id": oid}))
+        try:
+            logistics = json.loads(_call(query_logistics, {"order_id": oid}))
+        except ToolNotFound:
+            continue
+        created = datetime.strptime(order["created_at"], "%Y-%m-%d %H:%M")
+        trace = datetime.strptime(logistics["traces"][0]["time"], "%Y-%m-%d %H:%M")
+        if trace < created:
+            bad.append((oid, order["created_at"], logistics["traces"][0]["time"]))
+
+    assert bad == [], f"轨迹早于下单 (订单号, 下单时间, 轨迹时间):{bad[:5]}"
+
+
+def test_logistics_traces_are_a_coherent_timeline():
+    """轨迹必须是**时间递增**的事件序列,且末条描述当前状态。
+
+    原先末条写死 `"time": "当前"` —— 不是时间戳,整条轨迹因此无法排序。
+    模型读到的是"最后一次扫描停在『已发出』",于是 status 为「已签收」时它
+    会当场指出"两者信息不太一致"并追问用户是否收到货:验收 4 的真实回复
+    就是这么写的。断言按"能不能排序 + 末条是否描述当前状态"来钉。
+    """
+    fmt = "%Y-%m-%d %H:%M"
+    for oid in _order_ids(shipped=True)[:5]:
+        payload = json.loads(_call(query_logistics, {"order_id": oid}))
+
+        times = []
+        for entry in payload["traces"]:
+            try:
+                times.append(datetime.strptime(entry["time"], fmt))
+            except ValueError:
+                pytest.fail(f"{oid} 的轨迹条目 time 不是时间戳,轨迹无法排序:{entry!r}")
+
+        assert times == sorted(times), f"{oid} 轨迹时间未递增:{times}"
+        assert payload["status"] in payload["traces"][-1]["desc"], (
+            f"{oid} 末条轨迹没有描述当前状态 {payload['status']}:{payload['traces'][-1]!r}"
+        )

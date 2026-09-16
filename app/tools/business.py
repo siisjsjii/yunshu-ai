@@ -11,6 +11,7 @@ make_create_ticket。
 import hashlib
 import json
 import random
+from datetime import datetime, timedelta
 
 from langchain.tools import tool
 
@@ -50,25 +51,44 @@ def _require_order_no(order_id: str) -> str:
 _ORDER_STATUS = ["待付款", "已付款", "已发货", "已完成", "已取消"]
 _PRODUCT_NAMES = ["无线耳机", "运动鞋", "双肩包", "保温杯", "机械键盘"]
 
+#: 订单状态 → 该状态下**可能**出现的物流状态。
+#:
+#: 这是本模块唯一的「状态耦合」定义:物流状态不是自己抽的,而是从订单状态
+#: 派生出的候选里抽。反向的那半同样重要 ——「待付款 / 已付款 / 已取消」不在
+#: 表里,没发货的单子就是**没有**物流记录,查物流应当查不到,而不是编一条出来。
+_LOGISTICS_BY_STATUS = {
+    "已发货": ("已揽件", "运输中", "派送中"),
+    "已完成": ("已签收",),
+}
+
+
+def _order_record(order_no: str) -> dict:
+    """订单的唯一真相源 —— query_order 与 query_logistics 都必须经它取值。
+
+    两个工具各自 `_rng(不同前缀, 同一订单号)` 是本模块最容易犯的错:那是
+    **两条相互独立**的随机流,于是同一个订单可以同时是「已取消」和「已签收」。
+    实测 1000 个订单里 807 个状态矛盾、2000 个里 217 个轨迹早于下单时间。
+    共用同一条记录之后,这类矛盾在结构上不可能出现。
+
+    **抽取顺序不可改动** —— 改动会改变每个订单号的具体取值。
+    """
+    r = _rng("order", order_no)
+    return {
+        "order_id": order_no,
+        "status": r.choice(_ORDER_STATUS),
+        "product": r.choice(_PRODUCT_NAMES),
+        "amount": f"{r.randint(49, 999)}.{r.randint(0, 99):02d}",
+        "created_at": (
+            f"2026-{r.randint(1, 9):02d}-{r.randint(10, 28):02d} "
+            f"{r.randint(9, 21):02d}:{r.randint(0, 59):02d}"
+        ),
+    }
+
 
 @tool
 async def query_order(order_id: str) -> str:
     """查询订单详情:状态、商品、金额、下单时间。仅当用户给出订单号时使用。"""
-    order_no = _require_order_no(order_id)
-    r = _rng("order", order_no)
-    return json.dumps(
-        {
-            "order_id": order_no,
-            "status": r.choice(_ORDER_STATUS),
-            "product": r.choice(_PRODUCT_NAMES),
-            "amount": f"{r.randint(49, 999)}.{r.randint(0, 99):02d}",
-            "created_at": (
-                f"2026-{r.randint(1, 9):02d}-{r.randint(10, 28):02d} "
-                f"{r.randint(9, 21):02d}:{r.randint(0, 59):02d}"
-            ),
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps(_order_record(_require_order_no(order_id)), ensure_ascii=False)
 
 
 _PRODUCT_SPECS = ["标准版", "Pro 版", "家用款", "经典款"]
@@ -97,7 +117,6 @@ async def query_product(keyword: str) -> str:
     )
 
 
-_LOGISTICS_STATUS = ["已揽件", "运输中", "派送中", "已签收"]
 _CITIES = ["广州分拨中心", "上海分拨中心", "北京分拨中心", "成都分拨中心"]
 
 
@@ -105,21 +124,39 @@ _CITIES = ["广州分拨中心", "上海分拨中心", "北京分拨中心", "�
 async def query_logistics(order_id: str) -> str:
     """查询订单的物流状态、当前位置与轨迹。用户问"到哪了""发货没"时使用。"""
     order_no = _require_order_no(order_id)
+    order = _order_record(order_no)
+    candidates = _LOGISTICS_BY_STATUS.get(order["status"])
+    if candidates is None:
+        # 未发货的单子**没有**物流记录 —— 这是"查无此物",不是上游故障,
+        # 所以走 ToolNotFound(可恢复),不是 ToolInfrastructureError。
+        raise ToolNotFound(
+            f"订单 {order_no} 当前状态是「{order['status']}」,尚未发货、没有物流记录,"
+            f"请如实告知用户,不要自行编造物流信息"
+        )
+
     r = _rng("logistics", order_no)
-    status = r.choice(_LOGISTICS_STATUS)
+    status = r.choice(candidates)
     city = r.choice(_CITIES)
-    day = r.randint(1, 15)
+    # 轨迹时间必须**从下单时间往后推**。另起一条随机流去抽 2026-09-xx 会得到
+    # 早于下单的「已发出」时间 —— 那是与状态矛盾同一类的自相矛盾,实测 2000 个
+    # 订单里 217 个中招。
+    shipped = datetime.strptime(order["created_at"], "%Y-%m-%d %H:%M") + timedelta(
+        days=r.randint(1, 3), hours=r.randint(1, 20)
+    )
+    # 末条轨迹必须带**真实时间戳**并描述当前状态,不能写成 {"time": "当前"}:
+    # 那样整条轨迹无法排序,模型读到的是"最后一次扫描停在『已发出』",于是
+    # status 为「已签收」时它会当场指出"两者信息不太一致"并追问用户是否收到货
+    # —— 验收 4 的真实回复就是这么写的,演示看起来像坏了。
+    latest = shipped + timedelta(days=r.randint(1, 4), hours=r.randint(1, 12))
+    fmt = "%Y-%m-%d %H:%M"
     return json.dumps(
         {
             "order_id": order_no,
             "status": status,
             "location": city,
             "traces": [
-                {
-                    "time": f"2026-09-{day:02d} {r.randint(9, 21):02d}:{r.randint(0, 59):02d}",
-                    "desc": f"{city} 已发出",
-                },
-                {"time": "当前", "desc": f"当前状态:{status}"},
+                {"time": shipped.strftime(fmt), "desc": f"{city} 已发出"},
+                {"time": latest.strftime(fmt), "desc": f"{city} {status}"},
             ],
         },
         ensure_ascii=False,
