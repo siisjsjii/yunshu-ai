@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from app.kb.ingest import faq_migration, parse_corpus_dir
+from app.kb.ingest import faq_migration, parse_corpus_dir, parse_corpus_file
 
 MAX, OVERLAP = 100, 40
 
@@ -61,6 +61,15 @@ def test_dedup_only_on_full_triple(tmp_path):
     _write(tmp_path, "b.md", "<!--type: policy-->\n\n# 政策\n\n内容二。\n")
     chunks = parse_corpus_dir(tmp_path, max_chars=MAX, overlap_chars=OVERLAP)
     assert len(chunks) == 2
+
+
+def test_parse_corpus_file_reads_exactly_one_file(tmp_path):
+    """`build_kb --source` 用的入口:只读指定文件,不扫同目录的其它语料。"""
+    _write(tmp_path, "a.md", "<!--type: policy-->\n\n# 政策\n\n内容一。\n")
+    _write(tmp_path, "b.md", "<!--type: manual-->\n\n# 手册\n\n内容二。\n")
+    chunks = parse_corpus_file(tmp_path / "b.md", max_chars=MAX, overlap_chars=OVERLAP)
+    assert [c.content_type for c in chunks] == ["manual"]
+    assert [c.answer for c in chunks] == ["内容二。"]
 
 
 def test_faq_migration_maps_fields():

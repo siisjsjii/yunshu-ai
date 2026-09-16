@@ -14,21 +14,27 @@ from app.kb.chunker import Chunk, chunk_markdown
 _TYPE_RE = re.compile(r"^<!--\s*type:\s*(\S+)\s*-->\s*$")
 
 
+def parse_corpus_file(path, *, max_chars: int, overlap_chars: int) -> list[Chunk]:
+    """单个 .md → Chunk 列表(不查重,查重归目录入口与 writer)。"""
+    md = Path(path)
+    text = md.read_text(encoding="utf-8")
+    content_type, body = _split_type_marker(text, md.name)
+    return chunk_markdown(
+        body,
+        content_type=content_type,
+        max_chars=max_chars,
+        overlap_chars=overlap_chars,
+    )
+
+
 def parse_corpus_dir(
     dirpath, *, max_chars: int, overlap_chars: int
 ) -> list[Chunk]:
     """目录下全部 .md → Chunk 列表(批内三元组去重,稳定保序)。"""
     chunks: list[Chunk] = []
     for md in sorted(Path(dirpath).glob("*.md")):
-        text = md.read_text(encoding="utf-8")
-        content_type, body = _split_type_marker(text, md.name)
         chunks.extend(
-            chunk_markdown(
-                body,
-                content_type=content_type,
-                max_chars=max_chars,
-                overlap_chars=overlap_chars,
-            )
+            parse_corpus_file(md, max_chars=max_chars, overlap_chars=overlap_chars)
         )
     return _dedupe_by_triple(chunks)
 
