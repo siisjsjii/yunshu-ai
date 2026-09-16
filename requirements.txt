@@ -11,3 +11,5 @@ anyio==4.15.1
 sqlalchemy==2.0.53
 asyncmy==0.2.14
 cryptography==50.0.1
+pymilvus==2.6.17
+FlagEmbedding==1.4.2
