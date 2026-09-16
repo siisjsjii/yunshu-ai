@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **ch01(纯对话)** 已合并到 `main`:SSE 流式对话 + 结构化抽取。
 - **ch02(Function Calling 查数据)** 交付:模型单轮选工具 → 后端执行 → 回灌 → 作答。含四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
+- **ch03(知识库 + 向量检索)** 交付(分支 `ch03-kb`):`query_faq` 内部实现从关键词查 `faq` 表换成 **BGE-M3 + Milvus 的语义检索**(工具契约一字未改)。含结构感知切分、语料导入、双写幂等、对话挖知识、检索评估集、端到端验收 7 项。设计源见 ch03 spec(§12 订正最多的一章)。
 
-**本章不做**:多轮 Agent Loop、向量检索/RAG、认证。
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -23,7 +24,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务;浏览器开 http://localhost:8000
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py       # 工具选择评估集,需真实 key + MySQL
-bash scripts/acceptance.sh                                      # 端到端验收,需服务已启动 + 真实 key
+bash scripts/acceptance.sh                                      # 端到端验收 1–7,需服务已启动 + 真实 key
+
+# ch03(前置:docker start milvus-standalone)
+.venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)
+.venv/Scripts/python.exe scripts/build_kb.py --reindex          # 全表打回 pending + 删集合 + 重算
+.venv/Scripts/python.exe scripts/mine_qa.py                     # 对话挖知识(独立脚本 + 外部调度)
+.venv/Scripts/python.exe evals/run_retrieval_eval.py            # 检索评估,需 Milvus + BGE-M3
+.venv/Scripts/python.exe evals/run_retrieval_eval.py --dist     # 打印相似度分布,用于定阈值
 ```
 
 `pytest.ini` 已设 `testpaths = tests`、`addopts = -q`。异步测试用 `@pytest.mark.anyio`(backend 由 `tests/conftest.py` 固定为 asyncio),不用 pytest-asyncio。
@@ -45,12 +53,32 @@ app/memory/       store.py(锁注册表)、trim.py(token 预算与按整轮裁�
 app/services/     chat.py(单轮编排)、extract.py(抽取)、history.py(会话历史读写)
 app/api/          chat.py、extract.py
 app/static/       聊天页(单页,无构建工具链)
+app/retrieval/    ch03 在线检索:embedder.py(BGE-M3 懒加载)、milvus.py、search.py(KnowledgeRetriever)
+app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining
+knowledge/        知识语料(3 份 Markdown,首行带 <!--type: ...--> 类型标记)
+scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)
 ```
+
+ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm, retrieval}`,仍是单向。
 
 两条贯穿性的结构约定:
 
 - **`memory/` 与 `services/history.py` 不依赖 LangChain**,只碰 `app.schemas.Message` 纯数据类。转 `BaseMessage` 是 `prompts.py:to_lc_messages` 一处的职责。
 - **`services/` 的函数接收 llm 实例作为参数**,不在模块层建全局单例;FastAPI 侧靠 `Depends` 注入,测试用 `dependency_overrides` 替换。
+
+### ch03 的检索链路
+
+```
+离线:knowledge/*.md ──chunker──┐
+      faq 表 12 条 ──迁移─────┴→ write_chunks(MySQL,pending)
+                                    ↓ vectorize_pending(嵌入 + Milvus upsert)
+                                MySQL: vector_id + status=done
+在线:query_faq(keyword) → KnowledgeRetriever.search
+        = 嵌入 → Milvus Top-K → 阈值过滤 → 按 id 回查 MySQL → 按相似度序组装
+```
+
+- **Milvus 只当索引,不存文本**:集合只有 `id`(= `str(MySQL id)`)与 `vector`;原文一律回 MySQL 取,所以集合可随时 drop 重建(`build_kb --reindex`)。
+- **`retrieval/search.py` 是错误语义的翻译边界**:Milvus/嵌入故障 → `ToolInfrastructureError`(502),绝不降级成「没搜到」。`tools/errors.py` 是零依赖的错误词汇表,retrieval 反向引用它已记账(ch03 spec §12)。
 
 ### 两条链路
 
@@ -101,6 +129,22 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 
 **预算校验必须在流开始前完成**。SSE 一旦 yield 过第一帧,响应头就发出了,状态码再也改不了 —— 所以端点是普通 `async def` 手工构造 `EventSourceResponse`。
 
+**ch03 · Milvus/嵌入的七条命门**(每条都对应一次实测故障,细节见 ch03 spec §12 与 `dev-notes/ch03.md`):
+
+**VARCHAR 主键必须显式传 `max_length`**。pymilvus 的快捷建法不会替你补,漏了直接 `1101 type param(max_length) should be specified` 拒建。**单测用假 client 测不出这条**(假 client 只验证"我按我以为的形状调用了"),所以凡是对外部系统的调用,单测绿了还要真机冒烟一次。
+
+**`upsert` 后必须 `flush` 才立查**(默认 Bounded 一致性下 search 返回空);**行数一律用 `query(count(*))`**,`get_collection_stats` 的 `row_count` 数的是 insert 操作、未扣 delete,同 pk 三遍 upsert 会报 9 而真值是 3。
+
+**写 Milvus 成功之后才改 MySQL 状态并提交**。顺序反了,写 Milvus 失败的行会被记成 done、重跑永不补齐 —— 静默的永久缺失,不报错,只让某些知识永远检索不到。
+
+**挖知识的 prompt 必须写明「什么不算知识」**(非答案、个案数据、客套、对话状态)。首版没写,把客服「抱歉查不到运费」这种**非答案**挖成了知识,直接把验收 1 的正确答案挤下 top-1 —— 模型的失败被挖进知识库,再教它下次继续失败。
+
+**去重基准必须在抽取之前取快照**。之后取的话,本轮刚写进 staging 的产物会把自己全判成"已存在",结果是 **0 条保留** —— 而这个错误看起来就像"这轮确实没抽出新东西",没有任何报错。
+
+**冷启动的模型加载不在请求路径上**:2.2GB 权重首次加载十几秒 > `tool_timeout_seconds`(10s),冷进程第一个检索请求必然超时;超时取消协程后会话停在未收尾的事务上,而 `query_faq` **在重试白名单里**,重试复用同一 session 直接撞 `PendingRollbackError` → 用户看到 502。两处保障:`app/main.py` lifespan 起后台线程预热(**pytest 下跳过**,单测不加载模型是硬规矩);retriever 在取消路径 `rollback()` 再抛(`except BaseException` —— `CancelledError` 是 BaseException,只抓 `Exception` 正好漏掉)。
+
+**`_ensure_model` 必须有 `threading.Lock`**:没锁时预热线程与首请求并发会加载**两份 2.2GB** 且两边都成功、不报任何错。
+
 **裁剪按 `user` 边界切轮,不按 `assistant`**(`memory/trim.py`)。OpenAI 兼容 API 要求 `tool` 消息前面紧跟着带对应 `tool_call_id` 的 `assistant` 消息;按 `assistant` 收轮会把这对切开,而那**只在历史长到触发裁剪时偶发 400**。
 
 **`mount("/")` 必须在 `include_router` 之后**(`app/main.py`),否则静态目录会抢走 `/api/*`。
@@ -126,6 +170,8 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - `evals/tool_selection_cases.jsonl` —— 15 条工具选用例,`expected` 是工具名(闭式精确匹配)或 `null`(不该调工具)。
 - **工具选择准确率 13/15 = 86.7% 可引用**(闭式枚举,与 ch01 那个被样本拟合的 `expected_solution` 关键词口径不同)。但引用时须一并说明:**该数字是在没有生产 system prompt 的条件下测得的**,且**用例集偏弱**(非 null 的 13 条里 11 条从不失误,信息量主要来自 2 条诱饵)。
 - `evals/extract_cases.jsonl`(ch01)的 `expected_solution` 分数**不可引用** —— 关键词是看到输出措辞后才放宽的。
+- `evals/retrieval_cases.jsonl`(ch03)—— 23 条(19 换说法正例 + 4 干扰项),**23/23 可引用,但必须一并给出口径限制**:期望片段取自语料**逐字原文**且须在**同一块**里全部出现(闭式,不掺主观判断),然而可用阈值区间只有 **0.049 宽**(正例最低 0.609 / 干扰最高 0.560),且用例自造、4 条干扰项里有 3 条离阈值很远、不构成压力。**其中「卖手机」那一条是唯一有信息量的近域硬负例。**
+- 阈值 `retrieval_score_threshold` = 0.58 由上述评估集实测得出(spec §9 预授权);`dedupe_threshold` = 0.95 **仍是未实测值** —— 真实数据上从未被触发过,不要当成已验证的。
 - `evals/results/` 被 gitignore,是历史运行产物。
 
 ## 平台陷阱(Windows + Git Bash)

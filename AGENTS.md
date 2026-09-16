@@ -6,9 +6,9 @@
 
 - **ch01(纯对话)**:SSE 流式对话 + 结构化抽取,已并入 main。
 - **ch02(单轮 Function Calling 查数据)**:已交付 —— 四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
-- **ch03(知识库 + 向量检索)**:**进行中,分支 `ch03-kb`**(main 上无 ch03 代码)。已完成 T0–T5(配置/两表 ORM/切分器/语料导入/BGE-M3 嵌入封装);待做 T6–T13(Milvus 封装/双写幂等/建库脚本/query_faq 换实现/挖知识/评估/验收/收尾)。续作入口:`dev-notes/ch03.md` 的「进度快照与交接说明」+ spec §12 订正(DEPLOY_MODE / flush / count(*) 三条命门)。
-- **明确不做**:多轮 Agent Loop、向量检索/RAG、认证。ch03 入口:物流号间接查询(见 ch02 spec §10)。
-- 技术栈:Python 3.13 + FastAPI + LangChain 1.4(`langchain-openai`)+ DeepSeek(OpenAI 兼容网关)+ MySQL(`asyncmy`)。`.venv` 已建好,一律用 `.venv/Scripts/python.exe`。
+- **ch03(知识库 + 向量检索)**:已交付(T0–T13)—— 结构感知切分、语料导入、BGE-M3 嵌入、Milvus 双写幂等、`query_faq` 换向量语义检索、对话挖知识、检索评估集、端到端验收 7 项。分支 `ch03-kb`。设计源:ch03 spec(含 §12 订正)+ `dev-notes/ch03.md`。
+- **明确不做**:多轮 Agent Loop、认证;ch03 不做关键词召回/混合检索/重排(spec §10 定死只跑 dense 单路)。ch03 入口:物流号间接查询(见 ch02 spec §10)。
+- 技术栈:Python 3.13 + FastAPI + LangChain 1.4(`langchain-openai`)+ DeepSeek(OpenAI 兼容网关)+ MySQL(`asyncmy`)+ ch03 新增 **BGE-M3 本地权重**(`models/bge-m3/`,2.2GB,已 gitignore)+ **Milvus 2.6 standalone**。`.venv` 已建好,一律用 `.venv/Scripts/python.exe`。
 
 ## 高频命令
 
@@ -18,8 +18,15 @@
 .venv/Scripts/python.exe -m pytest tests/test_trim.py::test_xxx   # 单条
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000      # 起服务
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py         # 需真实 key + MySQL
-bash scripts/acceptance.sh                        # 端到端验收,需服务已启动 + 真实 key
+.venv/Scripts/python.exe scripts/build_kb.py                      # ch03 建库(幂等可重跑)
+.venv/Scripts/python.exe scripts/build_kb.py --reindex            # 重建向量索引
+.venv/Scripts/python.exe scripts/mine_qa.py                       # ch03 对话挖知识
+.venv/Scripts/python.exe evals/run_retrieval_eval.py              # 检索评估(需 Milvus)
+.venv/Scripts/python.exe evals/run_retrieval_eval.py --dist       # 看相似度分布定阈值
+bash scripts/acceptance.sh                        # 端到端验收 1–7,需服务已启动 + 真实 key
 ```
+
+ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 `-e DEPLOY_MODE=STANDALONE`,完整命令见 ch03 spec §12)。
 
 - `pytest.ini` 已有 `addopts = -q`,**别再手动加 `-q`**(`-qq` 会隐藏 `N passed`,抹掉验证证据);过滤用 `-m "not db"`。
 - 异步测试用 `@pytest.mark.anyio`(backend 由 `tests/conftest.py` 固定为 asyncio),不用 pytest-asyncio。
@@ -27,7 +34,12 @@ bash scripts/acceptance.sh                        # 端到端验收,需服务已
 
 ## 架构边界
 
-依赖方向严格单向:`api → services → {tools, db, memory, prompts, llm}`。
+依赖方向严格单向:`api → services → {tools, db, memory, prompts, llm}`;ch03 扩展为
+`tools → retrieval → db` 与 `kb(离线管线) → {db, llm, retrieval}`。
+
+- `app/retrieval/`(在线):`embedder.py`(BGE-M3 懒加载单例)、`milvus.py`(`MilvusVectorStore`)、`search.py`(`KnowledgeRetriever`,**错误语义的翻译边界**:Milvus/嵌入故障 → `ToolInfrastructureError`)。
+- `app/kb/`(离线,不在请求路径上):`chunker.py`(纯函数)、`ingest.py`、`writer.py`(双写幂等)、`mining.py`(挖知识)。
+- **Milvus 只当索引**:集合 `knowledge` 只有 `id VARCHAR(= str(MySQL id))` + `vector`;原文一律回 MySQL 查,故集合可随时 drop 重建。
 
 - `app/memory/`(锁注册表、token 裁剪)与 `app/services/history.py` **不依赖 LangChain**,只碰 `app.schemas.Message` 纯数据类;转 `BaseMessage` 只在 `prompts.py:to_lc_messages` 一处。
 - `services/` 的函数**接收 llm 实例作为参数**,不建模块级单例;FastAPI 侧 `Depends` 注入,测试用 `dependency_overrides`。
@@ -63,6 +75,16 @@ bash scripts/acceptance.sh                        # 端到端验收,需服务已
 - 预算校验必须在流开始前完成(SSE 首帧 yield 后状态码就改不了了),所以端点是普通 `async def` 手工构造 `EventSourceResponse`。
 - 历史裁剪按 `user` 边界切轮(`memory/trim.py`),按 `assistant` 切会拆开 `assistant(tool_calls)`+`tool` 消息对,只在历史变长后偶发 400。
 
+**ch03 新增(每条都对应一次实测故障)**:
+
+- Milvus **VARCHAR 主键必须显式传 `max_length`**,否则报 1101 拒建 —— pymilvus 的快捷建法不会替你补(spec §12)。
+- **upsert 后必须 flush 才立查**(默认 Bounded 一致性);**行数一律用 `query(count(*))`**,`get_collection_stats` 的 row_count 未扣 delete、不可信。
+- 写 Milvus **成功之后**才改 MySQL 状态并提交;顺序反了,写失败的行会被记成 done、重跑永不补(静默永久缺失)。
+- 挖知识的 prompt 必须写明**什么不算知识**(非答案/个案数据/客套/对话状态)。首版没写,把客服「查不到运费」这种非答案挖成了知识,直接把验收 1 的正确答案挤下 top-1。
+- 去重基准必须在抽取**之前**取快照 —— 之后取的话本轮产物会把自己全判重(表现为「0 条保留」,像"真没抽出东西")。
+- 冷启动:2.2GB 权重首次加载 > 工具超时(10s),故 `app/main.py` lifespan 起后台线程预热(**pytest 下跳过**);retriever 在取消路径上必须 `rollback()` 再抛,否则重试撞 `PendingRollbackError` 被升级成 502。
+- `_ensure_model` 有 `threading.Lock`:没锁时预热与首请求并发会**加载两份 2.2GB 且不报错**。
+
 ## 测试规矩(头号风险是「假绿测试」)
 
 写断言前先反问:**实现改错了,这条断言的输出会不会不同?**
@@ -78,6 +100,7 @@ bash scripts/acceptance.sh                        # 端到端验收,需服务已
 
 - `evals/tool_selection_cases.jsonl`:15 条,**13/15 = 86.7% 可引用**,但引用时须说明:无生产 system prompt 条件下测得、用例集偏弱。
 - `evals/extract_cases.jsonl` 的 `expected_solution` 分数**不可引用**(关键词是看到输出后才放宽的)。
+- `evals/retrieval_cases.jsonl`(ch03):23 条,**23/23 可引用但须一并说明口径** —— 阈值可用区间只有 0.049 宽、用例自造、干扰项 4 条中 3 条离阈值很远。**闭式口径**(期望片段取自语料逐字原文且须同块命中),不掺主观判断。
 - `evals/results/` 已 gitignore,是历史运行产物。
 
 ## Windows + Git Bash 平台陷阱(本机 locale cp936,复发型)
