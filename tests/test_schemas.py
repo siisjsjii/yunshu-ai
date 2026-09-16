@@ -50,9 +50,26 @@ def test_chat_request_rejects_empty_session_id():
 
 
 def test_chat_request_rejects_oversized_session_id():
+    """上限 32 = conversations.id 的列宽(ch02 由 128 收窄)。
+
+    本用例原先钉的是 128。收窄的理由见 app/schemas.ChatRequest 的
+    docstring:33–128 字符的 id 会在 INSERT 处抛 DataError,被错误分类
+    判成不可恢复 → 502,把参数问题报成服务端故障。
+    """
     with pytest.raises(ValidationError):
-        ChatRequest(session_id="s" * 129, message="你好")
-    assert ChatRequest(session_id="s" * 128, message="你好").session_id == "s" * 128
+        ChatRequest(session_id="s" * 33, message="你好")
+    assert ChatRequest(session_id="s" * 32, message="你好").session_id == "s" * 32
+
+
+def test_chat_request_user_id_is_optional_and_bounded():
+    """user_id 上限 128 = conversations.user 的列宽,宽度不一致会复现同一个 DataError。"""
+    assert ChatRequest(message="你好").user_id is None
+    assert ChatRequest(message="你好", user_id="alice").user_id == "alice"
+    with pytest.raises(ValidationError):
+        ChatRequest(message="你好", user_id="")
+    with pytest.raises(ValidationError):
+        ChatRequest(message="你好", user_id="u" * 129)
+    assert ChatRequest(message="你好", user_id="u" * 128).user_id == "u" * 128
 
 
 def test_extract_result_allows_null_order_id():

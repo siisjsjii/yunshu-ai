@@ -4,14 +4,18 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, format_sse_event
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
+from app.db.session import get_session
 from app.llm import create_chat_model
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
 from app.sanitize import redact_api_key
 from app.schemas import ChatRequest
 from app.services.chat import prepare_turn, stream_turn
+from app.services.history import ensure_conversation, load_history
+from app.tools.registry import build_tools, registry_for
 
 router = APIRouter()
 
@@ -46,9 +50,14 @@ async def chat_stream(
     settings: Settings = Depends(get_settings),
     store: SessionStore = Depends(get_store),
     model=Depends(get_chat_model),
+    session: AsyncSession = Depends(get_session),
 ) -> EventSourceResponse:
     session_id = request.session_id or uuid.uuid4().hex
+    user_id = request.user_id or "demo-user"
 
+    # `lock_for` 与 `acquire` 之间**不得插入 await**:lock_for 返回的锁可能
+    # 被紧随其后的容量淘汰摘掉,而这中间一旦让出控制权,那个窗口就可达了
+    # (window 眼下靠"这两个调用之间没有 await"关着)。
     lock = store.lock_for(session_id)
     try:
         await asyncio.wait_for(
@@ -60,12 +69,17 @@ async def chat_stream(
         ) from exc
 
     # 预算校验必须在响应开始前完成 —— 一旦开始流式就改不了状态码。
+    # 会话读取与历史加载也在锁内:同会话并发时不会读到半轮历史。
     try:
+        # ensure_conversation 必须在**持锁之后**。它在锁外有个建会话竞态:
+        # 两个并发的首请求都看不到行,其中一个 INSERT 撞主键抛 IntegrityError。
+        # 持锁跨过"检查 + 插入"把窗口关掉 —— 这看着像偶然细节,不是。
+        await ensure_conversation(
+            session=session, session_id=session_id, user_id=user_id
+        )
+        history = await load_history(session=session, conversation_id=session_id)
         messages = prepare_turn(
-            settings=settings,
-            store=store,
-            session_id=session_id,
-            user_input=request.message,
+            settings=settings, history=history, user_input=request.message
         )
     except ContextOverflowError as exc:
         lock.release()
@@ -79,6 +93,12 @@ async def chat_stream(
         lock.release()
         raise
 
+    # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
+    # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
+    # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
+    tools = build_tools(session=session, conversation_id=session_id)
+    registry = registry_for(tools)
+
     async def generate():
         try:
             yield _frame(
@@ -87,12 +107,24 @@ async def chat_stream(
             )
             async for event, payload in stream_turn(
                 settings=settings,
-                store=store,
                 model=model,
-                session_id=session_id,
+                session=session,
+                conversation_id=session_id,
                 user_input=request.message,
                 messages=messages,
+                tools=tools,
+                registry=registry,
             ):
+                if event == "tool_result" and not payload["ok"]:
+                    # 失败原因是**出站**文本(spec §5.2:同样脱敏后),
+                    # 这里补上工具路径的脱敏 —— 模型错误那条路径的脱敏
+                    # 在下面的 except 里。
+                    payload = {
+                        **payload,
+                        "summary": redact_api_key(
+                            payload["summary"], settings.openai_api_key
+                        ),
+                    }
                 yield _frame(event, payload)
         except Exception as exc:
             # 上游异常文本可能带着密钥(见 app/sanitize.py),出站前抹掉。

@@ -21,8 +21,21 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    """对话请求。
+
+    `session_id` 的上限是 32,不是 ch01 的 128:`session_id` 在本章成了
+    `conversations.id`(**varchar(32) 主键**),系统自己生成的 id 恒为
+    uuid4().hex 的 32 位。留在 128 的话,33–128 字符的 id 会一路走到
+    INSERT 才抛 DataError,按错误分类算**不可恢复 → 502** —— 一个参数
+    问题被报成服务端故障。收窄后它以 422 被拒,语义诚实。
+
+    `user_id` 的上限 128 与 `conversations.user` 的列宽一致,同理 ——
+    否则宽度不一致会以同一个 DataError 形态复现。
+    """
+
+    session_id: str | None = Field(default=None, min_length=1, max_length=32)
     message: str = Field(min_length=1)
+    user_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ExtractRequest(BaseModel):
