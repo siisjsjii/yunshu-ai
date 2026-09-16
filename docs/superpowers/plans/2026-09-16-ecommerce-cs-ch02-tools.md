@@ -2261,7 +2261,7 @@ from app.services.history import append_turn, ensure_conversation, load_history
 
 pytestmark = pytest.mark.db
 
-SCRATCH = "histtest0000000000000000000000000"
+SCRATCH = "histtest000000000000000000000000"
 
 
 def asyncio_run(coro):
@@ -2343,7 +2343,39 @@ def test_load_history_returns_chronological_order():
 
     contents = [m.content for m in asyncio_run(run())]
     assert contents == ["第一句", "第二句"]
+
+
+def test_load_history_orders_by_id_when_created_at_disagrees():
+    """id 序 ≠ created_at 序时,必须按 id(插入序)返回。
+
+    上一条顺序用例**区分不出两种实现**:两条消息在同一秒内写入,created_at
+    打平,MySQL 恰好按插入序返回 —— 把 order_by(MessageRecord.id) 换成
+    created_at 它依然全绿(已实测,7 个变异里它是唯一活下来的那个)。
+    这里把 created_at 人为倒挂,让「按 id」与「按时间戳」给出相反结果,
+    那条不变式才真正被钉住。
+    """
+
+    async def run():
+        async with get_sessionmaker()() as session:
+            await ensure_conversation(session=session, session_id=SCRATCH, user_id="u")
+            # 同一批写入,但先写的那条 created_at 更晚:id 序与时间戳序相反。
+            await session.execute(
+                text(
+                    "INSERT INTO messages (conversation_id, role, content, created_at) "
+                    "VALUES (:c, 'user', '先写的', '2999-01-01 00:00:00'),"
+                    "       (:c, 'user', '后写的', '2000-01-01 00:00:00')"
+                ),
+                {"c": SCRATCH},
+            )
+            await session.commit()
+            return await load_history(session=session, conversation_id=SCRATCH)
+
+    assert [m.content for m in asyncio_run(run())] == ["先写的", "后写的"]
 ```
+
+**注**:`SCRATCH` 必须恰好 **32 字符** —— `conversations.id` 是 `varchar(32)`,
+在 MySQL 严格模式下超长会抛 `DataError 1406`,断言根本到不了。
+(本章此前的计划文本在这里写成 33 字符,是错的。)
 
 - [ ] **Step 2: 运行测试,确认失败**
 
