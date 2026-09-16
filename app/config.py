@@ -50,7 +50,11 @@ class Settings(BaseSettings):
     # top_k <= 0 → 搜索永远空,检索静默失效;阈值越界一个方向等于永远全滤空、
     # 另一个方向等于没有阈值(不相关也硬凑答案)。都在启动时拒。
     retrieval_top_k: int = Field(default=3, ge=1)
-    retrieval_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # 0.58 由检索评估集实测定夺(spec §9 预授权,记账见 §12):
+    # 正例 top-1 最低 0.609、干扰项 top-1 最高 0.560,0.5 落在干扰项区间里
+    # (实测确有一条超纲问题被召回)。可用区间 (0.560, 0.609],取 0.58 两边
+    # 余量相当。
+    retrieval_score_threshold: float = Field(default=0.58, ge=0.0, le=1.0)
     dedupe_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
     chunk_max_chars: int = Field(default=800, gt=0)
     chunk_overlap_chars: int = Field(default=100, ge=0)

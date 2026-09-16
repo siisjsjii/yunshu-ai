@@ -162,7 +162,9 @@ def test_ch03_fields_have_defaults():
     assert s.milvus_uri == "http://127.0.0.1:19530"
     assert s.milvus_collection == "knowledge"
     assert s.retrieval_top_k == 3
-    assert s.retrieval_score_threshold == 0.5
+    # 0.58 是评估集实测值(§12),不是随手取的数:正例最低 0.609 / 干扰最高
+    # 0.560,0.5 会把超纲问题放进召回结果
+    assert s.retrieval_score_threshold == 0.58
     assert s.dedupe_threshold == 0.95
     assert s.chunk_max_chars == 800
     assert s.chunk_overlap_chars == 100

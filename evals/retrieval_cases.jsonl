@@ -1,0 +1,23 @@
+{"query": "邮费是多少", "expect_contains": ["99 元包邮"], "note": "换说法:直接问运费(验收 1 的原句)"}
+{"query": "买东西要运费吗", "expect_contains": ["基础运费 8 元"], "note": "换说法:把『邮费』说成『运费』"}
+{"query": "寄到新疆要不要加钱", "expect_contains": ["偏远地区附加费"], "note": "换说法:问偏远地区加收,要落到具体条款而不是泛泛的运费说明"}
+{"query": "退货的话运费谁出", "expect_contains": ["由买家自行承担"], "note": "换说法:问退货运费归属"}
+{"query": "质量有问题退回去的邮费谁付", "expect_contains": ["由商家承担"], "note": "换说法:同一节的另一面(质量问题商家承担),与上一条互为正负样本"}
+{"query": "不想要了怎么退", "expect_contains": ["申请退款"], "note": "换说法:问退货流程"}
+{"query": "买回来发现不喜欢,能退吗", "expect_contains": ["七天"], "note": "换说法:问无理由退货时限"}
+{"query": "收到货之后多少天内可以退货", "expect_contains": ["七天内可申请无理由退货"], "note": "换说法:时限的直接问法"}
+{"query": "退款什么时候能到账", "expect_contains": ["1-3 个工作日"], "note": "换说法:问退款时效"}
+{"query": "钱什么时候退回给我", "expect_contains": ["原路退回"], "note": "换说法:更口语,同上一条同节"}
+{"query": "保修多久", "expect_contains": ["保修一年"], "note": "换说法:问保修期限"}
+{"query": "主要零件保修几年", "expect_contains": ["主要部件保修两年"], "note": "换说法:问主要部件期限"}
+{"query": "东西坏了去哪修", "expect_contains": ["维修周期"], "note": "换说法:问维修流程"}
+{"query": "能开增值税发票吗", "expect_contains": ["增值税专用发票"], "note": "换说法:问发票类型"}
+{"query": "支持哪些付款方式", "expect_contains": ["花呗分期"], "note": "换说法:把『支付』说成『付款』"}
+{"query": "刚买就降价了怎么办", "expect_contains": ["差价补偿"], "note": "换说法:问价保"}
+{"query": "下单多久发货", "expect_contains": ["48 小时内发货"], "note": "换说法:问发货时效"}
+{"query": "换货运费谁掏", "expect_contains": ["规格选错"], "note": "换说法:问换货运费归属"}
+{"query": "怎么找人工客服", "expect_contains": ["400-000-0000"], "note": "换说法:问人工入口"}
+{"query": "你们卖不卖手机", "expect_empty": true, "note": "干扰项:商品目录里没有手机这一类,知识库不该硬凑答案"}
+{"query": "今天天气怎么样", "expect_empty": true, "note": "干扰项:完全超纲"}
+{"query": "帮我写一首诗", "expect_empty": true, "note": "干扰项:完全超纲"}
+{"query": "股票怎么开户", "expect_empty": true, "note": "干扰项:完全超纲"}
