@@ -1,0 +1,49 @@
+"""BGE-M3 嵌入封装(离线在线共用)。
+
+懒加载两段式:**构造不 import FlagEmbedding、首次 encode 才加载权重** ——
+单测与不碰检索的服务启动都不能背上 torch 的导入开销。离线在线必须走同一
+配置(max_length/batch_size),保证两头的向量在同一空间。
+"""
+
+import os
+from functools import lru_cache
+
+
+class BgeM3Embedder:
+    """BGEM3FlagModel 的薄封装,只出 dense。"""
+
+    def __init__(self, model_path: str, max_length: int = 1024, batch_size: int = 16):
+        self._model_path = model_path
+        self._max_length = max_length
+        self._batch_size = batch_size
+        self._model = None
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """文本列表 → 1024 维已归一化稠密向量(顺序对应)。空列表直接返回。"""
+        if not texts:
+            return []
+        return [list(v) for v in self._ensure_model().encode(
+            texts,
+            batch_size=self._batch_size,
+            max_length=self._max_length,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )["dense_vecs"]]
+
+    def _ensure_model(self):
+        if self._model is None:
+            # 权重由 models/ 目录本地提供(T0 裁决),钉死离线模式,
+            # 防止加载时去连被墙的 huggingface.co。
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            from FlagEmbedding import BGEM3FlagModel
+
+            self._model = BGEM3FlagModel(self._model_path, use_fp16=False)
+        return self._model
+
+
+@lru_cache(maxsize=1)
+def get_embedder(model_path: str, max_length: int, batch_size: int) -> BgeM3Embedder:
+    """进程内单例:2.2GB 权重只加载一次(同 get_settings 模式)。"""
+    return BgeM3Embedder(model_path, max_length, batch_size)
