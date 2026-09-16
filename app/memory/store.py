@@ -1,120 +1,89 @@
 import asyncio
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
-
-from app.schemas import Message
 
 
 class SessionStore:
-    """进程内会话存储:惰性 TTL + LRU 上限 + 每会话一把互斥锁。
+    """每会话互斥锁的注册表。
 
-    内存上界的确切构成(见设计文档 5.3):
-      - `_sessions`(会话历史)有硬上界 `max_sessions` 条,由 LRU 淘汰;
-      - `_locks` / `_touched` **没有硬数量上限**,规模约为「TTL 时间窗内
-        到达的不同 session_id 数」。`lock_for` 会为任何 session_id 建
-        条目,而校验失败(如超长输入返回 400)的会话不会进历史表,条目
-        遂成孤儿,只在超过 TTL 且锁未被持有时才被清扫;
-      - 被持锁的孤儿条目永不清扫,受并发在途流数量约束。
-    端点本身没有认证,内存耗尽只是诸多 DoS 向量之一,本章接受此风险
-    (ch02 若引入认证,应同时给这两个 dict 加数量上限)。
+    ch01 里它还管进程内会话历史(TTL + LRU 淘汰);ch02 历史迁到 MySQL 后
+    那部分退役,只剩锁与清扫。
 
-    不做后台清理任务 —— 后台任务只改变"何时释放",不改变"是否释放",
-    它不是内存上界的来源。
+    `max_sessions` 因此**改为限制锁表大小** —— 它当初唯一的作用是限制
+    历史条数,历史一走就成了死配置(读 .env.example 的人会以为它在管事)。
+    这也顺带关闭了 ch01 spec §9 记录的「_locks/_touched 无硬数量上限」风险。
 
-    被持锁的会话不会被淘汰(无论 TTL 还是 LRU)。否则正在流式的会话
-    被淘汰后,新请求会拿到另一把锁,两个流并发写同一会话。
+    锁仍然必要:同会话的并发请求会各自读到同一份历史、各自追加,
+    不串行化就会后写覆盖先写。锁在进程内,历史在 MySQL —— 两者正交。
+
+    多进程 / 多 worker 部署下本锁失效,本章不在范围内。
     """
 
     def __init__(self, *, ttl_seconds: float, max_sessions: int) -> None:
         self._ttl = ttl_seconds
         self._max = max_sessions
-        self._sessions: OrderedDict[str, list[Message]] = OrderedDict()
-        self._touched: dict[str, float] = {}
+        # OrderedDict 而非普通 dict:淘汰要按 LRU 序,不能按插入序。
+        self._touched: OrderedDict[str, float] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
 
-    # ---- 查询 ----
-
-    def history(self, session_id: str) -> list[Message]:
-        self._purge()
-        if session_id in self._sessions:
-            self._sessions.move_to_end(session_id)
-            self._touched[session_id] = time.monotonic()
-        return list(self._sessions.get(session_id, []))
-
-    def active_session_count(self) -> int:
-        self._purge()
-        return len(self._sessions)
-
-    # ---- 写入 ----
-
-    def append(self, session_id: str, messages: Sequence[Message]) -> None:
-        self._purge()
-        history = list(self._sessions.get(session_id, []))
-        history.extend(messages)
-        self._sessions[session_id] = history
-        self._sessions.move_to_end(session_id)
-        self._touched[session_id] = time.monotonic()
-        self._enforce_capacity()
-
-    # ---- 锁 ----
+    # ---- 公开 ----
 
     def lock_for(self, session_id: str) -> asyncio.Lock:
         """取该会话的锁,按需创建。
 
-        同时刷新活跃时间 —— 这是"持锁会话不被 TTL 淘汰"的实现方式:
-        请求一开始就会调 lock_for,等它被淘汰时锁已被持有。
+        同时刷新使用时间并移到 LRU 末尾 —— 刚建的锁因此不会被紧接着的
+        容量淘汰选中,幂等性得以保持。
         """
         self._purge()
         lock = self._locks.get(session_id)
         if lock is None:
             lock = asyncio.Lock()
             self._locks[session_id] = lock
-        self._touched[session_id] = time.monotonic()
+        self._touch(session_id)
+        self._enforce_capacity()
         return lock
 
+    def active_lock_count(self) -> int:
+        self._purge()
+        return len(self._locks)
+
     # ---- 内部 ----
+
+    def _touch(self, session_id: str) -> None:
+        self._touched[session_id] = time.monotonic()
+        self._touched.move_to_end(session_id)
 
     def _is_locked(self, session_id: str) -> bool:
         lock = self._locks.get(session_id)
         return lock is not None and lock.locked()
 
     def _drop(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
         self._touched.pop(session_id, None)
         self._locks.pop(session_id, None)
 
     def _purge(self) -> None:
-        """淘汰超时会话。被持锁的不动 —— 它正在流式。"""
+        """清扫超过 TTL 且未被持有的条目。持锁的不动 —— 它正在流式。"""
         now = time.monotonic()
-        for session_id in list(self._sessions.keys()):
-            if now - self._touched.get(session_id, now) > self._ttl:
-                if not self._is_locked(session_id):
-                    self._drop(session_id)
-        # 清理孤儿条目:lock_for 建过锁/时间戳、但从未 append 的会话。
-        # 否则 _touched/_locks 不受 max_sessions 约束,长期运行会无界增长。
-        # 同样按 TTL 判惰性 —— 立刻扫掉刚建的锁会破坏"同一 session 两次
-        # lock_for 返回同一把锁"的幂等性;持锁的不动,否则请求刚拿锁就 400
-        # 时,并发请求会拿到第二把锁,破坏互斥。
         for session_id in list(self._touched.keys()):
-            if (
-                session_id not in self._sessions
-                and not self._is_locked(session_id)
-                and now - self._touched[session_id] > self._ttl
-            ):
-                self._touched.pop(session_id, None)
-                self._locks.pop(session_id, None)
+            if now - self._touched[session_id] <= self._ttl:
+                continue
+            if self._is_locked(session_id):
+                continue
+            self._drop(session_id)
 
     def _enforce_capacity(self) -> None:
-        """超容量时从最老的开始淘汰。
+        """超容量时淘汰最久未使用的条目。
 
-        遇到被持锁的就**整个停下**,而不是跳过它去淘汰更新的 ——
-        跳过会删掉比它更新的会话,把 LRU 语义彻底弄反。
-        代价:极端情况下会短暂超出 max_sessions,这是有意的取舍,
-        上界仍由"同时进行中的流数量"兜住。
+        遇到被持锁的**整个停下**,而不是跳过它去淘汰更新的 ——
+        跳过会删掉比它更新的条目,把 LRU 语义彻底弄反。
+        代价:极端情况下会短暂超出 max_sessions,上界仍由"同时进行中的
+        流数量"兜住。
+
+        淘汰一个**未被持有**的锁是安全的:没有持锁者就不存在被破坏的
+        互斥,后续请求会拿到一把全新的、未锁定的锁。
         """
-        while len(self._sessions) > self._max:
-            oldest = next(iter(self._sessions))
+        while len(self._touched) > self._max:
+            oldest = next(iter(self._touched))
             if self._is_locked(oldest):
                 return
             self._drop(oldest)
