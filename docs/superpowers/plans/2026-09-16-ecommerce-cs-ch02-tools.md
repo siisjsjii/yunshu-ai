@@ -183,7 +183,7 @@ REQUIRED = {
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_config.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_config.py`
 Expected: FAIL —— `test_database_url_is_required` 报 `DID NOT RAISE`,另外两个报 `Settings` 无该属性
 
 - [ ] **Step 3: 实现**
@@ -252,7 +252,7 @@ markers =
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_config.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_config.py`
 Expected: PASS
 
 - [ ] **Step 5: 运行全量,确认没有打破既有测试**
@@ -407,7 +407,7 @@ async def test_faq_like_matches_chinese_substring():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_db_models.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_db_models.py`
 Expected: FAIL —— `ModuleNotFoundError: No module named 'app.db'`
 
 - [ ] **Step 3: 实现 `app/db/base.py`**
@@ -561,7 +561,7 @@ if __name__ == "__main__":
 Run:
 ```bash
 .venv/Scripts/python.exe scripts/init_db.py
-.venv/Scripts/python.exe -m pytest tests/test_db_models.py -q
+.venv/Scripts/python.exe -m pytest tests/test_db_models.py
 ```
 Expected: 建表输出四个表名;测试 PASS
 
@@ -619,7 +619,7 @@ def test_seed_contains_no_shipping_fee_entry():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_seed_db.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_seed_db.py`
 Expected: FAIL —— `ModuleNotFoundError: No module named 'scripts.seed_db'`
 
 - [ ] **Step 3: 实现**
@@ -717,7 +717,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_seed_db.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_seed_db.py`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -840,7 +840,7 @@ def test_query_product_uses_keyword():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py`
 Expected: FAIL —— `ModuleNotFoundError: No module named 'app.tools'`
 
 - [ ] **Step 3: 实现 `app/tools/errors.py`**
@@ -997,14 +997,14 @@ async def query_logistics(order_id: str) -> str:
 
 - [ ] **Step 5: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py`
 Expected: PASS(6 passed)
 
 - [ ] **Step 6: 验证「跨进程」那条断言真的能区分错误实现**
 
 把 `_rng` 里的 `hashlib.sha256(...)` 临时换成 `hash(...)`,重跑:
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py::test_seed_is_stable_across_processes -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_tools_random.py::test_seed_is_stable_across_processes`
 Expected: **FAIL**
 
 确认失败后**改回 sha256**,再跑一次确认 PASS。把两次输出都记进任务报告 —— 这是「断言能区分正确与错误实现」的证据。
@@ -1204,8 +1204,8 @@ def test_create_ticket_writes_row():
 
 Run:
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_registry.py -q
-.venv/Scripts/python.exe -m pytest tests/test_tools_db.py -q
+.venv/Scripts/python.exe -m pytest tests/test_registry.py
+.venv/Scripts/python.exe -m pytest tests/test_tools_db.py
 ```
 Expected: FAIL —— `make_query_faq` 不存在、`app.tools.registry` 不存在
 
@@ -1381,8 +1381,8 @@ def registry_for(tools: list[BaseTool]) -> dict[str, BaseTool]:
 
 Run:
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_registry.py -q
-.venv/Scripts/python.exe -m pytest tests/test_tools_db.py -q
+.venv/Scripts/python.exe -m pytest tests/test_registry.py
+.venv/Scripts/python.exe -m pytest tests/test_tools_db.py
 ```
 Expected: PASS
 
@@ -1646,7 +1646,7 @@ async def test_summary_is_truncated_to_200_chars():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_executor.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_executor.py`
 Expected: FAIL —— `ModuleNotFoundError: No module named 'app.tools.executor'`
 
 - [ ] **Step 3: 实现**
@@ -1754,7 +1754,7 @@ async def execute_tool(*, tool_call: dict, registry: dict, settings) -> ToolOutc
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_executor.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_executor.py`
 Expected: PASS(10 passed)
 
 - [ ] **Step 5: 验证三条关键断言真的能区分错误实现**
@@ -1916,7 +1916,7 @@ def test_to_lc_messages_handles_tool_role():
 
 Run:
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_trim.py tests/test_prompts.py -q
+.venv/Scripts/python.exe -m pytest tests/test_trim.py tests/test_prompts.py
 ```
 Expected: FAIL —— `Message` 不接受 `role="tool"` / `to_lc_messages` 不存在 / `_to_rounds` 行为不符
 
@@ -2004,7 +2004,7 @@ def to_lc_messages(history: Sequence[Message]) -> list:
 
 - [ ] **Step 6: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_trim.py tests/test_prompts.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_trim.py tests/test_prompts.py`
 Expected: PASS
 
 - [ ] **Step 7: 验证「tool 配对」那条断言真能区分错误实现**
@@ -2118,7 +2118,7 @@ async def test_capacity_never_evicts_a_held_lock():
 
 - [ ] **Step 3: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_store.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_store.py`
 Expected: FAIL —— `active_lock_count` 不存在;容量测试不通过(旧实现不限制锁表)
 
 - [ ] **Step 4: 重写 `app/memory/store.py`**
@@ -2217,7 +2217,7 @@ class SessionStore:
 
 - [ ] **Step 5: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_store.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_store.py`
 Expected: PASS
 
 - [ ] **Step 6: 提交**
@@ -2322,7 +2322,7 @@ def test_append_turn_then_load_history_roundtrips_tool_messages():
 
     history = asyncio_run(run())
     assert [m.role for m in history] == ["user", "assistant", "tool", "assistant"]
-    assert history[1].tool_calls[0]["id"] == "c1"     # JSON 列往返
+    assert history[1].tool_calls == tool_calls        # JSON 列往返:整个嵌套结构
     assert history[2].tool_call_id == "c1"
     assert history[2].content == "已揽件"              # 中文往返
 
@@ -2379,7 +2379,7 @@ def test_load_history_orders_by_id_when_created_at_disagrees():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_history.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_history.py`
 Expected: FAIL —— `ModuleNotFoundError: No module named 'app.services.history'`
 
 - [ ] **Step 3: 实现**
@@ -2460,7 +2460,7 @@ async def append_turn(
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_history.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_history.py`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -2765,7 +2765,7 @@ def test_successful_turn_appends_user_tool_and_answer():
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py`
 Expected: FAIL —— `prepare_turn` 签名不符、`stream_turn` 不存在
 
 - [ ] **Step 3: 改写 `app/services/chat.py`**
@@ -2935,7 +2935,7 @@ async def stream_turn(
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py`
 Expected: PASS
 
 - [ ] **Step 5: 验证结构断言真能区分错误实现**
@@ -2943,7 +2943,7 @@ Expected: PASS
 把第二轮那行 `async for chunk in model.astream(round_two)` 临时改成
 `async for chunk in model_with_tools.astream(round_two)`,重跑:
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py::test_second_round_uses_unbound_model -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_chat_service.py::test_second_round_uses_unbound_model`
 Expected: **FAIL**
 
 确认后改回。把两次输出记进任务报告。
@@ -3079,7 +3079,7 @@ app.dependency_overrides[get_session] = _session_override
 
 - [ ] **Step 2: 运行测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_api_chat.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_api_chat.py`
 Expected: FAIL —— 没有 `tool_call` 事件
 
 - [ ] **Step 3: 改写 `app/api/chat.py`**
@@ -3175,7 +3175,7 @@ class ChatRequest(BaseModel):
 
 - [ ] **Step 4: 运行测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_api_chat.py -q`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_api_chat.py`
 Expected: PASS
 
 - [ ] **Step 5: 全量回归**
