@@ -2602,20 +2602,24 @@ async def query_logistics(order_id: str) -> str:
     return '{"status": "已揽件"}'
 
 
-@tool
-async def create_ticket(description: str, ticket_type: str) -> str:
-    """替身:建工单。"""
-    return '{"ticket_no": "T-1"}'
-
-
 class RecordingSession:
-    """记录落库内容的替身 DB 会话。"""
+    """替身 DB 会话:`add` 记下落库行,`commit` 默认成功。
+
+    **`add` 必须一律记账。** 落库是本文件要断言的产出之一(见
+    test_successful_turn_appends_user_tool_and_answer 与
+    test_tool_free_turn_appends_user_and_answer)—— 一个不记账的变体等于让
+    "这一轮到底写没写库"无从观测。本章曾因此漏掉整整一条落库路径:
+    无工具路径的 append_turn 被删掉后,20 条测试依然全绿。
+
+    不要为了某个用例再搞一个"不记账"的 session 变体;需要区分时,在断言里
+    看 added 的内容,而不是换一个看不见的替身。
+    """
 
     def __init__(self):
-        self.appended = []
+        self.added = []
 
-    def add(self, obj):        # 供 MessageRecord 构造期调用,此处不关心
-        pass
+    def add(self, obj):
+        self.added.append(obj)
 
     async def commit(self):
         pass
@@ -2748,12 +2752,7 @@ def test_infrastructure_failure_propagates():
 
 def test_history_is_not_written_when_second_round_breaks():
     """第二轮炸了 → 整轮不落库,不留孤儿行(沿用 ch01 语义)。"""
-    recorded = []
-
-    class ExplodingSession:
-        def add(self, obj):
-            recorded.append(obj)
-
+    class ExplodingSession(RecordingSession):
         async def commit(self):
             raise AssertionError("不应提交")
 
@@ -2763,39 +2762,32 @@ def test_history_is_not_written_when_second_round_breaks():
             yield FakeChunk("前半句")
             raise RuntimeError("上游炸了")
 
+    session = ExplodingSession()
     model = ExplodingModel(
         [[FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])]]
     )
     with pytest.raises(RuntimeError):
-        _collect(model, ExplodingSession(), {"query_logistics": query_logistics})
+        _collect(model, session, {"query_logistics": query_logistics})
 
-    assert recorded == []
+    assert session.added == []
 
 
 def test_successful_turn_appends_user_tool_and_answer():
     """成功一轮落库四条:user / assistant(带 tool_calls) / tool / assistant。"""
-    captured = []
-
-    class CapturingSession:
-        def add(self, obj):
-            captured.append(obj)
-
-        async def commit(self):
-            pass
-
+    session = RecordingSession()
     model = ScriptedModel(
         [
             [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
             [FakeChunk("已揽件。")],
         ]
     )
-    _collect(model, CapturingSession(), {"query_logistics": query_logistics})
+    _collect(model, session, {"query_logistics": query_logistics})
 
-    roles = [obj.role for obj in captured]
+    roles = [obj.role for obj in session.added]
     assert roles == ["user", "assistant", "tool", "assistant"]
-    assert captured[1].tool_calls[0]["id"] == "c1"
-    assert captured[2].tool_call_id == "c1"
-    assert captured[3].content == "已揽件。"
+    assert session.added[1].tool_calls[0]["id"] == "c1"
+    assert session.added[2].tool_call_id == "c1"
+    assert session.added[3].content == "已揽件。"
 ```
 
 - [ ] **Step 2: 运行测试,确认失败**
