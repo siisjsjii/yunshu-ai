@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.config import get_settings
 from app.db.base import get_engine, get_sessionmaker
@@ -75,9 +75,29 @@ async def _status_counts() -> tuple[int, int, int]:
     return total, done, total - done
 
 
+async def _reindex(session) -> None:
+    """全表打回待向量化。
+
+    配合下面 drop 集合同用 —— 两者缺一不可:只 drop 集合的话,MySQL 里
+    全是 done 的行,重跑时一条都不会被捡起,结果是**空集合配全 done**。
+    """
+    result = await session.execute(
+        update(KnowledgeChunk).values(vectorize_status="pending", vector_id=None)
+    )
+    await session.commit()
+    return result.rowcount
+
+
 async def _run(args) -> None:
     settings = get_settings()
     started = time.perf_counter()
+
+    store = get_vector_store(settings.milvus_uri, settings.milvus_collection)
+    if args.reindex:
+        async with get_sessionmaker()() as session:
+            reset = await _reindex(session)
+        store.drop_collection()
+        _out(f"--reindex:{reset} 行打回 pending,Milvus 集合已删除,开始重建")
 
     corpus, with_faq = _corpus_chunks(args, settings)
     _out(f"语料切块:{len(corpus)} 块" + (f"(仅 {args.source})" if args.source else ""))
@@ -93,7 +113,6 @@ async def _run(args) -> None:
         new_rows = await write_chunks(session, chunks)
     _out(f"新增入库:{new_rows} 行(其余 {len(chunks) - new_rows} 块已存在,跳过)")
 
-    store = get_vector_store(settings.milvus_uri, settings.milvus_collection)
     embedder = get_embedder(
         settings.embedding_model_path,
         settings.embedding_max_length,
@@ -127,6 +146,11 @@ def main() -> None:
     parser.add_argument(
         "--source",
         help="只导入 knowledge/ 下的某一个 .md(可给相对名或绝对路径);不给则全量",
+    )
+    parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="重建向量索引:全表打回 pending + 删掉 Milvus 集合,再全量重算",
     )
     asyncio.run(_run(parser.parse_args()))
 

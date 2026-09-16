@@ -78,6 +78,27 @@ class RequestType(str, Enum):
     OTHER = "其他"
 
 
+class MinedQaItem(BaseModel):
+    """从历史对话里挖出的一条问答对(ch03 挖知识管线)。"""
+
+    question: str = Field(description="用户在对话中提出的问法,尽量用用户原话。")
+    answer: str = Field(description="客服在对话中给出的答案,必须来自对话原文。")
+    category: str = Field(description="这条知识所属的分类,如 退换货 / 物流异常。")
+
+
+class MinedQaBatch(BaseModel):
+    """一次抽取的返回体。
+
+    **外层必须是对象、数组放在 `items` 里**:json_mode 下模型被要求输出一个
+    JSON 对象,根直接给数组时解析行为不稳定(而且要跨供应商)。多包一层
+    没有代价,却把返回形状钉死了。
+    """
+
+    items: list[MinedQaItem] = Field(
+        default_factory=list, description="本批对话中挖出的问答对,没有就给空数组。"
+    )
+
+
 class ExtractResult(BaseModel):
     """从用户售后描述中抽取的结构化信息。"""
 

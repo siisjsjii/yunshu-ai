@@ -66,6 +66,16 @@ class MilvusVectorStore:
             auto_id=False,
         )
 
+    def drop_collection(self) -> None:
+        """删掉整个集合(重建索引用)。集合不存在时是空操作。
+
+        「Milvus 只是索引、MySQL 才是原文权威源」的兑现处:删库不丢原文,
+        把全表打回 pending 重跑即可重建(spec §6.1)。
+        """
+        client = self._ensure_client()
+        if client.has_collection(self._collection):
+            client.drop_collection(self._collection)
+
     def upsert(self, ids: list, vectors: list) -> None:
         """按 pk 覆盖写入。同 pk 重复 upsert 是幂等的(T0 实证)。
 

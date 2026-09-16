@@ -34,6 +34,10 @@ class _FakeClient:
     def flush(self, collection_name, **kw):
         self.calls.append(("flush", collection_name))
 
+    def drop_collection(self, collection_name, **kw):
+        self.calls.append(("drop_collection", collection_name))
+        self._exists = False
+
     def search(self, collection_name, data, limit, output_fields, **kw):
         self.calls.append(("search", collection_name, data, limit, output_fields))
         if self._raw is not None:
@@ -98,6 +102,21 @@ def test_ensure_collection_is_idempotent():
     store2.ensure_collection()
     kinds = [c[0] for c in fake2.calls]
     assert kinds == ["has_collection", "create_collection", "has_collection"]
+
+
+def test_drop_collection_is_noop_when_absent():
+    fake = _FakeClient(exists=False)
+    _store(fake).drop_collection()
+    assert fake.calls == [("has_collection", "knowledge")]
+
+
+def test_drop_collection_drops_when_present():
+    fake = _FakeClient(exists=True)
+    _store(fake).drop_collection()
+    assert fake.calls == [("has_collection", "knowledge"), ("drop_collection", "knowledge")]
+    # drop 之后 ensure 会重新建 —— 这正是「重建索引」的两步
+    _store(fake).ensure_collection()
+    assert [c[0] for c in fake.calls][-2:] == ["has_collection", "create_collection"]
 
 
 def test_upsert_sends_id_vector_rows_then_flushes():
