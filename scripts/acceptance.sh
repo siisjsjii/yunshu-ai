@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# ch01 端到端验收。前置:另开一个终端启动服务
-#   .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+# ch01–ch03 端到端验收。前置:
+#   1) .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+#   2) MySQL 在跑(见 .env 的 DATABASE_URL)
+#   3) ch03 的验收 7 还需要 Milvus 容器在跑:
+#      docker start milvus-standalone
 # 需要真实 API key(.env)。
+#
+# **起服务之前先查 8000 端口**:残留的僵尸进程会让你 curl 到**旧代码**,
+# 于是得到"新代码坏了"的假红(ch02 的最终验证差点栽在这上面)。本脚本开头
+# 会探一次服务可达性,但探不出"在跑的是哪一版" —— 若下面验收 6 的
+# query_faq 报 ok=false,第一件该查的就是 8000 上跑的是不是 ch02 的旧进程。
 set -uo pipefail
 
 # ── 本仓库运行在 Windows + Git Bash 下,有两处平台陷阱,已在脚本内规避 ──
@@ -167,10 +175,84 @@ sys.stdout.buffer.write(payload["status"].encode("utf-8"))
 '
 }
 
+# 知识库一致性:MySQL 的 pending/done 与 Milvus 条数一次性取出。
+# 用 ORM 而非裸 SQL —— 裸 SQL 得在里面写单引号,而这段是套在 bash 的
+# 单引号串里的,'done' 会把字符串提前截断。
+kb_consistency() {
+  "$PYTHON" -c '
+import asyncio, sys
+
+from sqlalchemy import func, select
+
+from app.config import get_settings
+from app.db.base import get_engine, get_sessionmaker
+from app.db.models import KnowledgeChunk
+from app.retrieval.milvus import get_vector_store
+
+
+async def main():
+    async with get_sessionmaker()() as session:
+        total = (await session.execute(select(func.count(KnowledgeChunk.id)))).scalar_one()
+        pending = (await session.execute(
+            select(func.count(KnowledgeChunk.id)).where(
+                KnowledgeChunk.vectorize_status == "pending"))).scalar_one()
+    settings = get_settings()
+    store = get_vector_store(settings.milvus_uri, settings.milvus_collection)
+    milestones = store.count()
+    sys.stdout.buffer.write(
+        f"总行数={total} 已向量化={total - pending} 待向量化={pending} Milvus条数={milestones}".encode("utf-8"))
+    await get_engine().dispose()
+
+
+asyncio.run(main())
+'
+}
+
+# 把 id 最小的 N 行打回待向量化,返回实际改动的行数。
+# 用途见验收 7:先造出"建库没跑完"的确定性状态,再让重跑去证明它能补齐。
+kb_reset_pending() {
+  COUNT="$1" "$PYTHON" -c '
+import asyncio, os, sys
+
+from sqlalchemy import select, update
+
+from app.db.base import get_engine, get_sessionmaker
+from app.db.models import KnowledgeChunk
+
+
+async def main():
+    want = int(os.environ["COUNT"])
+    async with get_sessionmaker()() as session:
+        ids = list((await session.execute(
+            select(KnowledgeChunk.id).order_by(KnowledgeChunk.id).limit(want))).scalars().all())
+        if ids:
+            await session.execute(
+                update(KnowledgeChunk)
+                .where(KnowledgeChunk.id.in_(ids))
+                .values(vectorize_status="pending", vector_id=None))
+            await session.commit()
+    sys.stdout.buffer.write(str(len(ids)).encode("ascii"))
+    await get_engine().dispose()
+
+
+asyncio.run(main())
+'
+}
+
 if [ ! -x "$PYTHON" ]; then
   echo "找不到 $PYTHON —— 请在项目根目录运行本脚本。" >&2
   exit 2
 fi
+
+echo "=== 前置:服务可达性 ==="
+if ! curl -s -m 5 -o /dev/null "$BASE/"; then
+  echo "  ❌ $BASE 没有响应。先起服务:" >&2
+  echo "     $PYTHON -m uvicorn app.main:app --port 8000" >&2
+  echo "     (并确认 8000 上没有**别的**旧进程占着 —— 那会让你验到旧代码)" >&2
+  exit 2
+fi
+pass "$BASE 可达"
+echo
 
 echo "=== 验收 1:流式回复 ==="
 OUT1=$(curl -sN -X POST "$BASE/api/chat/stream" \
@@ -361,7 +443,11 @@ else
 fi
 
 echo
-echo "=== 验收 6:邮费漏召回(验收标准 3,预期失败) ==="
+echo "=== 验收 6:邮费换说法召回(ch03 验收标准 1) ==="
+# 这一条在 ch02 里是**反向**断言:「邮费」预期查不到(ch02 验收标准 3 的漏召回
+# 是刻意设计的,faq 种子不含邮费条目)。ch03 把这个洞补上了 —— 运费说明进了
+# 语料、query_faq 换成向量语义检索,**同一个问题现在必须答得上来**。
+# 断言方向随本章反转:查不到才是失败。
 OUT6=$(curl -sN -X POST "$BASE/api/chat/stream" \
   -H 'Content-Type: application/json' \
   --data-binary @- <<'JSON'
@@ -375,12 +461,74 @@ REPLY6=$(echo "$OUT6" | join_tokens)
 echo "  调用的工具:[$TOOLS6]  结果:[$STATES6]"
 echo "  回复:$REPLY6"
 
-# 反向断言:这一条**期望查不到**。若它竟然查到了,说明 faq 种子里混进了
-# 「邮费」条目,验收标准 3 的前提被破坏 —— 那才是失败。
 if [ "$TOOLS6" = "query_faq" ] && [ "$STATES6" = "ok" ]; then
-  fail "「邮费」竟然从 faq 查到了 —— 种子数据污染了,验收标准 3 失去意义"
+  pass "query_faq 通过语义检索召回了知识(不是关键词命中)"
 else
-  pass "「邮费」未能查到(预期漏召回),工具=[$TOOLS6] 结果=[$STATES6]"
+  fail "期望 query_faq 命中,实际工具=[$TOOLS6] 结果=[$STATES6]"
+  echo "     ↳ 若结果是 ok=false:先确认 8000 上跑的不是 ch02 的旧进程,再确认 build_kb 跑过"
+  echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)"
+fi
+
+# 回复里必须出现运费条款的**要点**。比的是语料原文里的数字与措辞:
+# 没召回就不可能说对,所以这条同时证明了"召回的内容真的被模型用上了"。
+# 逐 token 推送会把 "99" 切成独立帧,必须先 join_tokens(脚本头注 2)。
+if echo "$REPLY6" | grep -qE "99|包邮|8 元"; then
+  pass "回复里含运费要点(包邮门槛 / 基础运费)"
+else
+  fail "回复里没有任何运费要点 —— 召回了但没用上,或者答的是别的"
+fi
+
+if REASON=$(echo "$REPLY6" | has_cjk); then
+  pass "回复非空且含 $REASON"
+else
+  fail "回复$REASON"
+fi
+
+echo
+echo "=== 验收 7:中断建库后重跑补齐(ch03 验收标准 2) ==="
+# 两步造出"半途而废"的现场,缺一不可:
+#   ① 把一部分行打回待向量化 —— 否则库里全是 done,**没有任何活可干**,
+#      后面的 timeout 杀与不杀是同一件事,这条验收会变成恒真;
+#   ② timeout 杀 build_kb —— 真的打断一次,而不是假装。
+# 断言只认**终态**:重跑后没有待向量化行,且 Milvus 条数 == 已向量化行数。
+# 不假设"被杀的那次一定提交了前几批"(那取决于机器速度,会引入 flaky)。
+BEFORE=$(kb_consistency)
+echo "  起始:$BEFORE"
+RESET=$(kb_reset_pending 10)
+echo "  打回待向量化:$RESET 行"
+
+if timeout 25 "$PYTHON" scripts/build_kb.py > /tmp/kb_interrupted.log 2>&1; then
+  echo "  (build_kb 在 25 秒内自己跑完了,没被杀死 —— 幂等补齐仍会被下面的重跑验证)"
+else
+  echo "  build_kb 已在 25 秒处被打断(退出码 $?)"
+fi
+echo "  中断后:$(kb_consistency)"
+
+if ! "$PYTHON" scripts/build_kb.py > /tmp/kb_rerun.log 2>&1; then
+  fail "重跑 build_kb 失败,详见 /tmp/kb_rerun.log"
+  tail -3 /tmp/kb_rerun.log
+fi
+
+AFTER=$(kb_consistency)
+echo "  重跑后:$AFTER"
+
+if echo "$AFTER" | grep -q "待向量化=0"; then
+  pass "重跑后没有待向量化的行(漏掉的块被捡起补齐)"
+else
+  fail "重跑后仍有待向量化行 —— 补齐路径没兜住:$AFTER"
+fi
+
+# Milvus 条数 == 已向量化行数。两者不等说明双写没对齐:
+# Milvus 少了是漏写,多了是残留了已删 MySQL 行的陈旧向量。
+# 注意行数一律由 MilvusVectorStore.count() 走 query(count(*)) 取 ——
+# get_collection_stats 的 row_count 未扣 delete,不可信(spec §12)。
+MILVUS_N=$(echo "$AFTER" | sed -n 's/.*Milvus条数=\([0-9]*\).*/\1/p')
+DONE_N=$(echo "$AFTER" | sed -n 's/.*已向量化=\([0-9]*\).*/\1/p')
+if [ -n "$MILVUS_N" ] && [ "$MILVUS_N" = "$DONE_N" ]; then
+  pass "Milvus 条数($MILVUS_N)== 已向量化行数($DONE_N),双写对齐"
+else
+  fail "Milvus 条数($MILVUS_N)!= 已向量化行数($DONE_N) —— 双写没对齐"
+  echo "     ↳ 若 Milvus 更多:集合里残留了已删行的陈旧向量,跑 build_kb --reindex 重建"
 fi
 
 echo

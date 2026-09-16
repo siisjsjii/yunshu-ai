@@ -63,6 +63,57 @@ def test_encode_empty_list_skips_model(monkeypatch):
     assert _FakeModel.calls == []
 
 
+def test_warmup_loads_model_without_encoding(monkeypatch):
+    """预热:把权重读进来但不跑推理 —— 启动时就是这么用的。"""
+    _install_fake(monkeypatch)
+    e = BgeM3Embedder("fake-path")
+    e.warmup()
+    assert [c[0] for c in _FakeModel.calls] == ["init"]
+    e.encode(["x"])
+    assert [c[0] for c in _FakeModel.calls] == ["init", "encode"]
+
+
+def test_concurrent_first_use_loads_model_exactly_once(monkeypatch):
+    """并发首用只能加载一次。
+
+    预热线程与首请求(或两个并发首请求)会同时进 `_ensure_model`;没有锁
+    就是**两份 2.2GB 权重**常驻,而且两边都"成功",不会有任何报错。
+    这个窗口靠 __init__ 里的 sleep 撑开,再用 Barrier 让线程同时出发 ——
+    去掉锁时四个线程都会读到 `self._model is None`,计数变 4。
+    """
+    import threading
+    import time
+
+    class _SlowFakeModel:
+        inits = 0
+
+        def __init__(self, path, **kw):
+            time.sleep(0.05)  # 撑开竞态窗口
+            _SlowFakeModel.inits += 1
+
+        def encode(self, texts, **kw):
+            return {"dense_vecs": [[0.0] for _ in texts]}
+
+    mod = types.ModuleType("FlagEmbedding")
+    mod.BGEM3FlagModel = _SlowFakeModel
+    monkeypatch.setitem(sys.modules, "FlagEmbedding", mod)
+
+    embedder = BgeM3Embedder("fake-path")
+    barrier = threading.Barrier(4)
+
+    def worker():
+        barrier.wait()
+        embedder.encode(["x"])
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert _SlowFakeModel.inits == 1
+
+
 def test_get_embedder_is_singleton():
     a = get_embedder("p", 8, 2)
     b = get_embedder("p", 8, 2)

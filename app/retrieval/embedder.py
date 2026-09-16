@@ -6,6 +6,7 @@
 """
 
 import os
+import threading
 from functools import lru_cache
 
 
@@ -17,6 +18,10 @@ class BgeM3Embedder:
         self._max_length = max_length
         self._batch_size = batch_size
         self._model = None
+        # 加载要十几秒,期间必须挡住第二个加载者。预热线程与首请求、
+        # 或两个并发首请求,都会同时进 _ensure_model —— 没有锁就是**两份**
+        # 2.2GB 权重(4.4GB 常驻),而且两边都"成功",不会有任何报错。
+        self._load_lock = threading.Lock()
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         """文本列表 → 1024 维已归一化稠密向量(顺序对应)。空列表直接返回。"""
@@ -32,15 +37,28 @@ class BgeM3Embedder:
         )["dense_vecs"]]
 
     def _ensure_model(self):
-        if self._model is None:
-            # 权重由 models/ 目录本地提供(T0 裁决),钉死离线模式,
-            # 防止加载时去连被墙的 huggingface.co。
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-            from FlagEmbedding import BGEM3FlagModel
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            # 双重检查:等锁期间可能已经被别人加载好了。
+            if self._model is None:
+                # 权重由 models/ 目录本地提供(T0 裁决),钉死离线模式,
+                # 防止加载时去连被墙的 huggingface.co。
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                from FlagEmbedding import BGEM3FlagModel
 
-            self._model = BGEM3FlagModel(self._model_path, use_fp16=False)
+                self._model = BGEM3FlagModel(self._model_path, use_fp16=False)
         return self._model
+
+    def warmup(self) -> None:
+        """把权重读进内存,供启动时预热调用(阻塞,十几秒)。
+
+        存在的理由:首次加载远超工具超时(`tool_timeout_seconds` 默认 10 秒),
+        冷进程的第一个检索请求必然超时。预热让它不在请求路径上发生。
+        见 app/main.py 的 lifespan。
+        """
+        self._ensure_model()
 
 
 @lru_cache(maxsize=1)

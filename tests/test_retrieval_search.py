@@ -4,6 +4,8 @@
 「Milvus 有而 MySQL 没有」这几件必须真读库,打 @pytest.mark.db。
 """
 
+import asyncio
+
 import pytest
 from sqlalchemy import delete, select
 
@@ -88,6 +90,30 @@ async def test_embedder_failure_becomes_infrastructure_error():
     embedder = _FakeEmbedder(error=RuntimeError("模型加载失败"))
     with pytest.raises(ToolInfrastructureError):
         await _retriever(_FakeStore(), embedder).search("邮费")
+
+
+@pytest.mark.anyio
+async def test_cancellation_rolls_back_the_session():
+    """工具超时是用 `asyncio.wait_for` **取消协程**实现的 —— 取消后必须回滚。
+
+    不回滚的话,executor 对 query_faq 的重试会复用这条会话,直接撞
+    `PendingRollbackError`(SQLAlchemy 明确要求先 rollback 才能继续),
+    于是一次"超时重试"被升级成用户可见的 502。实测:冷启动那一次就是
+    这个形态 —— 首次 encode 要加载 2.2GB 权重,十几秒都回不来。
+    """
+
+    class _RollbackRecorder:
+        def __init__(self):
+            self.rollbacks = 0
+
+        async def rollback(self):
+            self.rollbacks += 1
+
+    session = _RollbackRecorder()
+    store = _FakeStore(error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _retriever(store, session=session).search("邮费")
+    assert session.rollbacks == 1  # 取消路径上也把事务收干净了
 
 
 # ---- 真 MySQL ----

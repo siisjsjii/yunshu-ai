@@ -45,6 +45,27 @@ class KnowledgeRetriever:
         self._score_threshold = score_threshold
 
     async def search(self, query: str) -> list[RetrievedChunk]:
+        try:
+            return await self._search(query)
+        except BaseException:
+            # 工具超时是靠 `asyncio.wait_for` **取消协程**实现的,取消点是随机的
+            # (冷启动时第一次 encode 要加载 2.2GB 权重,十几秒都回不来,极容易
+            # 落在那里)。被取消之后这条会话会停在一个没有收尾的事务上,而
+            # executor 对 query_faq 是**会重试**的 —— 重试复用同一个 session,
+            # 于是撞上 `PendingRollbackError`,把一次"超时重试"升级成用户可见的
+            # 502(实测:验收 1 冷启动那一次就是这个形态)。
+            #
+            # 这里把事务收干净再往上抛。用 BaseException 而不是 Exception:
+            # CancelledError 是 BaseException,只抓 Exception 正好漏掉这个场景。
+            #
+            # session 判空:单测里"全被阈值滤掉"这类用例根本不碰库,传的就是
+            # None。不判空的话,真正的故障会被 `None.rollback()` 的
+            # AttributeError 顶掉 —— 报错指向本行,而根因是上游的 Milvus 故障。
+            if self._session is not None:
+                await self._session.rollback()
+            raise
+
+    async def _search(self, query: str) -> list[RetrievedChunk]:
         kept = [
             (chunk_id, score)
             for chunk_id, score in self._top_hits(query)
