@@ -1,11 +1,16 @@
+"""对话编排测试。全部用替身,不联网、不碰 DB。"""
+
+import asyncio
+
 import pytest
+from langchain.tools import tool
 from langchain_core.messages import SystemMessage
 
 from app.config import Settings
-from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
 from app.schemas import Message
 from app.services.chat import prepare_turn, stream_turn
+from app.tools.errors import ToolInfrastructureError
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -19,36 +24,418 @@ def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **REQUIRED, **overrides)
 
 
-def _store() -> SessionStore:
-    return SessionStore(ttl_seconds=60, max_sessions=10)
-
-
 class FakeChunk:
-    def __init__(self, text: str, usage=None):
+    """模拟 AIMessageChunk:支持 + 累加,累加后携带 tool_calls。
+
+    替身**必须补上 `"type": "tool_call"`**:真实链路上模型流出的
+    tool_call chunk 经 `langchain_core.messages.tool.default_tool_parser`
+    解析后,每个 tool_call 都带这个键(已在 langchain 1.4.0 / core 1.6.3
+    上实测确认)。而 `BaseTool.ainvoke` 判"这是不是工具调用"靠的正是
+    `_is_tool_call(x) = x.get("type") == "tool_call"` 这一个条件 ——
+    缺键时它会把这个 dict **整个当成参数**去校验,于是每次调用都返回
+    "参数不合法"的可恢复失败。那样的替身会让整组编排测试看似全绿,
+    实际却一条都没走到真实路径上。
+    """
+
+    def __init__(self, text="", tool_calls=None, usage=None):
         self.text = text
+        self.tool_calls = [{"type": "tool_call", **tc} for tc in (tool_calls or [])]
         self.usage_metadata = usage
 
+    def __add__(self, other):
+        return FakeChunk(
+            text=self.text + other.text,
+            tool_calls=self.tool_calls + other.tool_calls,
+            usage=other.usage_metadata or self.usage_metadata,
+        )
 
-class FakeModel:
-    """替身模型:按脚本产出 chunk,不联网。"""
 
-    def __init__(self, chunks):
-        self._chunks = chunks
-        self.received = None
+class _BoundModel:
+    def __init__(self, inner):
+        self._inner = inner
 
     async def astream(self, messages):
-        self.received = messages
-        for chunk in self._chunks:
+        self._inner.calls.append(("bound", list(messages)))
+        for chunk in self._inner.batches.pop(0):
             yield chunk
 
 
-def test_prepare_turn_returns_system_plus_input_for_new_session():
-    messages = prepare_turn(
-        settings=_settings(),
-        store=_store(),
-        session_id="s1",
-        user_input="你好",
+class ScriptedModel:
+    """按顺序回放预置 chunk 批次的替身。
+
+    记录每次 astream 走的是**绑了工具**还是**未绑工具**的入口 ——
+    这正是"只做单轮"的结构保证所在,必须有断言钉住。
+    """
+
+    def __init__(self, batches):
+        self.batches = list(batches)
+        self.calls = []
+        self.bound_tools = None
+
+    def bind_tools(self, tools):
+        self.bound_tools = list(tools)
+        return _BoundModel(self)
+
+    async def astream(self, messages):
+        self.calls.append(("unbound", list(messages)))
+        for chunk in self.batches.pop(0):
+            yield chunk
+
+
+@tool
+async def query_logistics(order_id: str) -> str:
+    """替身:查物流。"""
+    return '{"status": "已揽件"}'
+
+
+@tool
+async def create_ticket(description: str, ticket_type: str) -> str:
+    """替身:建工单。"""
+    return '{"ticket_no": "T-1"}'
+
+
+class RecordingSession:
+    """记录落库内容的替身 DB 会话。"""
+
+    def __init__(self):
+        self.appended = []
+
+    def add(self, obj):        # 供 MessageRecord 构造期调用,此处不关心
+        pass
+
+    async def commit(self):
+        pass
+
+
+def _collect(model, session, registry, tools=None):
+    async def run():
+        return [
+            event
+            async for event in stream_turn(
+                settings=_settings(),
+                model=model,
+                session=session,
+                conversation_id="s1",
+                user_input="订单 1001 的物流到哪了",
+                messages=[Message(role="user", content="订单 1001 的物流到哪了")],
+                tools=tools if tools is not None else list(registry.values()),
+                registry=registry,
+            )
+        ]
+
+    return asyncio.run(run())
+
+
+# ---------- 单轮结构保证 ----------
+
+def test_second_round_uses_unbound_model():
+    """**本章最关键的一条结构断言。**
+
+    「只做单轮」不能靠提示词求模型自觉,必须靠第二轮不绑 tools。
+    谁把第二轮改成 model_with_tools,这条就挂。
+    """
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已揽件。")],
+        ]
     )
+    _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    assert [kind for kind, _ in model.calls] == ["bound", "unbound"]
+
+
+def test_no_tool_call_means_single_api_call():
+    """不调工具时只发一次请求,且文本已经流式推出。"""
+    model = ScriptedModel([[FakeChunk("您"), FakeChunk("好")]])
+    events = _collect(model, RecordingSession(), {})
+
+    assert len(model.calls) == 1
+    assert events[0] == ("token", {"text": "您"})
+    assert events[-1][0] == "done"
+
+
+def test_tool_event_order_is_call_then_result_then_answer():
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("包裹"), FakeChunk("已揽件。")],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+    kinds = [kind for kind, _ in events]
+
+    assert kinds == ["tool_call", "tool_result", "token", "token", "done"]
+    assert events[0][1]["name"] == "query_logistics"
+    assert events[0][1]["tool_call_id"] == "c1"
+    assert events[1][1]["ok"] is True
+
+
+def test_tool_result_is_fed_back_as_tool_message():
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已揽件。")],
+        ]
+    )
+    _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    second_round_messages = model.calls[1][1]
+    from langchain.messages import ToolMessage
+
+    tool_messages = [m for m in second_round_messages if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_call_id == "c1"
+    assert "已揽件" in tool_messages[0].content
+
+
+# ---------- 错误分类 ----------
+
+def test_recoverable_tool_failure_still_converges():
+    """可恢复失败(查无此单)要回灌给模型,流正常 done,不是 error 帧。"""
+
+    @tool
+    async def query_order(order_id: str) -> str:
+        """替身:总是找不到订单。"""
+        from app.tools.errors import ToolNotFound
+        raise ToolNotFound("未找到订单 9999")
+
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_order", "args": {"order_id": "9999"}, "id": "c1"}])],
+            [FakeChunk("没查到该订单,请核对单号。")],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_order": query_order})
+    kinds = [kind for kind, _ in events]
+
+    assert "tool_result" in kinds
+    assert kinds[-1] == "done"
+    assert "error" not in kinds
+    result_payload = next(payload for kind, payload in events if kind == "tool_result")
+    assert result_payload["ok"] is False
+
+
+def test_infrastructure_failure_propagates():
+    """基础设施故障必须向上抛,由 API 层推 error 帧 —— 不能伪装成"查不到"。"""
+
+    @tool
+    async def query_order(order_id: str) -> str:
+        """替身:DB 挂了。"""
+        from sqlalchemy.exc import OperationalError
+        raise OperationalError("SELECT 1", {}, Exception("连接断开"))
+
+    model = ScriptedModel(
+        [[FakeChunk(tool_calls=[{"name": "query_order", "args": {"order_id": "1001"}, "id": "c1"}])]]
+    )
+    with pytest.raises(ToolInfrastructureError):
+        _collect(model, RecordingSession(), {"query_order": query_order})
+
+
+def test_history_is_not_written_when_second_round_breaks():
+    """第二轮炸了 → 整轮不落库,不留孤儿行(沿用 ch01 语义)。"""
+    recorded = []
+
+    class ExplodingSession:
+        def add(self, obj):
+            recorded.append(obj)
+
+        async def commit(self):
+            raise AssertionError("不应提交")
+
+    class ExplodingModel(ScriptedModel):
+        async def astream(self, messages):
+            self.calls.append(("unbound", list(messages)))
+            yield FakeChunk("前半句")
+            raise RuntimeError("上游炸了")
+
+    model = ExplodingModel(
+        [[FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])]]
+    )
+    with pytest.raises(RuntimeError):
+        _collect(model, ExplodingSession(), {"query_logistics": query_logistics})
+
+    assert recorded == []
+
+
+def test_successful_turn_appends_user_tool_and_answer():
+    """成功一轮落库四条:user / assistant(带 tool_calls) / tool / assistant。"""
+    captured = []
+
+    class CapturingSession:
+        def add(self, obj):
+            captured.append(obj)
+
+        async def commit(self):
+            pass
+
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已揽件。")],
+        ]
+    )
+    _collect(model, CapturingSession(), {"query_logistics": query_logistics})
+
+    roles = [obj.role for obj in captured]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert captured[1].tool_calls[0]["id"] == "c1"
+    assert captured[2].tool_call_id == "c1"
+    assert captured[3].content == "已揽件。"
+
+
+# ---------- 只做单轮:第二轮消息的合法性 ----------
+#
+# 上面那组测试钉的是事件序列;下面这组钉的是**发给模型的第二条请求
+# 本身长什么样**。两者缺一不可:事件对了而消息不成对,线上就是 400,
+# 而且只在真的触发工具调用时才复现。
+
+
+def test_second_round_assistant_message_precedes_its_tool_message():
+    """tool 消息前面必须紧跟带同名 tool_call_id 的 assistant 消息。
+
+    OpenAI 兼容端点对此是硬校验:tool 消息的父 assistant 缺失或不相邻
+    直接 400。上面那条 `test_tool_result_is_fed_back_as_tool_message`
+    只数了 tool 消息的条数 —— 把配对的 assistant 消息整条删掉,它依然
+    全绿。这条补上那个缺口。
+    """
+    from langchain.messages import AIMessage, ToolMessage
+
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已揽件。")],
+        ]
+    )
+    _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    second_round_messages = model.calls[1][1]
+    tool_index = next(
+        i for i, m in enumerate(second_round_messages) if isinstance(m, ToolMessage)
+    )
+    parent = second_round_messages[tool_index - 1]
+
+    assert isinstance(parent, AIMessage)
+    assert [tc["id"] for tc in parent.tool_calls] == ["c1"]
+    assert parent.tool_calls[0]["name"] == "query_logistics"
+    assert parent.tool_calls[0]["args"] == {"order_id": "1001"}
+
+
+def test_tool_message_carries_full_content_not_truncated_summary():
+    """回灌给模型的是**完整**结果,tool_result 事件里的才是截断摘要。
+
+    两条都短的输出下 summary == content,所以上面所有编排测试都区分不出
+    "拿 summary 回灌"这个 bug —— 模型会拿到被砍掉尾巴的数据,而且看不出来。
+    """
+
+    @tool
+    async def query_order(order_id: str) -> str:
+        """替身:返回超长结果。"""
+        return "中" * 500
+
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_order", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已为您查到。")],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_order": query_order})
+
+    from langchain.messages import ToolMessage
+
+    payload = next(p for kind, p in events if kind == "tool_result")
+    assert len(payload["summary"]) == 201          # 200 字符 + 省略号
+    tool_message = next(
+        m for m in model.calls[1][1] if isinstance(m, ToolMessage)
+    )
+    assert len(tool_message.content) == 500        # 未被摘要截断
+
+
+def test_tool_call_event_carries_the_model_supplied_args():
+    """前端要靠 args 展示"正在查什么";退化成空 dict 时事件序列本身看不出来。"""
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已查询到。")],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    assert events[0][1]["args"] == {"order_id": "1001"}
+
+
+def test_tool_call_chunks_do_not_leak_into_tokens():
+    """调工具的那一轮不发 token 帧 —— 模型还没说话,别把空串推给用户。"""
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}])],
+            [FakeChunk("已揽件。")],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    assert [p["text"] for k, p in events if k == "token"] == ["已揽件。"]
+
+
+# ---------- usage 与空 chunk ----------
+
+
+def test_done_keeps_earlier_usage_when_a_later_chunk_has_none():
+    """后一个 chunk 的 usage_metadata 为 None 时,不能把先前的 usage 冲掉。
+
+    真实上游只有最后一帧带 usage;若实现写成 `usage = chunk.usage_metadata`
+    (丢掉 `or usage`),这一条会退化成 None。
+    """
+    model = ScriptedModel(
+        [
+            [
+                FakeChunk("您", usage={"input_tokens": 10, "output_tokens": 1}),
+                FakeChunk("好", usage=None),
+            ]
+        ]
+    )
+    events = _collect(model, RecordingSession(), {})
+
+    assert events[-1][1]["usage"] == {"input_tokens": 10, "output_tokens": 1}
+
+
+def test_done_reports_second_round_usage():
+    """第二轮才是产出答复的那一轮,usage 得取它的,不能继续用第一轮的。
+
+    第一轮带 usage、第二轮也带,且两者不同 —— 只带其中一个的实现会露馅。
+    """
+    model = ScriptedModel(
+        [
+            [FakeChunk(tool_calls=[{"name": "query_logistics", "args": {"order_id": "1001"}, "id": "c1"}],
+                       usage={"input_tokens": 5, "output_tokens": 1})],
+            [FakeChunk("已揽件。", usage={"input_tokens": 20, "output_tokens": 3})],
+        ]
+    )
+    events = _collect(model, RecordingSession(), {"query_logistics": query_logistics})
+
+    assert events[-1][1]["usage"] == {"input_tokens": 20, "output_tokens": 3}
+
+
+def test_stream_turn_skips_empty_token_chunks():
+    model = ScriptedModel([[FakeChunk(""), FakeChunk("好")]])
+    events = _collect(model, RecordingSession(), {})
+
+    assert [e for e in events if e[0] == "token"] == [("token", {"text": "好"})]
+
+
+def test_done_usage_is_none_when_absent():
+    model = ScriptedModel([[FakeChunk("好")]])
+    events = _collect(model, RecordingSession(), {})
+
+    assert events[-1][1]["usage"] is None
+
+
+# ---------- 消息组装与预算 ----------
+
+
+def test_prepare_turn_returns_system_plus_input_for_empty_history():
+    messages = prepare_turn(settings=_settings(), history=[], user_input="你好")
+
     assert len(messages) == 2
     assert messages[0].content  # 非空 system prompt
     assert messages[-1].content == "你好"
@@ -57,25 +444,38 @@ def test_prepare_turn_returns_system_plus_input_for_new_session():
 
 
 def test_prepare_turn_includes_existing_history():
-    store = _store()
-    store.append(
-        "s1",
-        [
+    messages = prepare_turn(
+        settings=_settings(),
+        history=[
             Message(role="user", content="我的订单是 20240915"),
             Message(role="assistant", content="好的,我为您查询"),
         ],
-    )
-
-    messages = prepare_turn(
-        settings=_settings(),
-        store=store,
-        session_id="s1",
         user_input="我刚才说的订单号是多少？",
     )
 
     assert len(messages) == 4
     assert messages[1].content == "我的订单是 20240915"
     assert messages[-1].content == "我刚才说的订单号是多少？"
+
+
+def test_prepare_turn_drops_history_that_does_not_fit_the_budget():
+    """预算放不下历史时把它裁掉,但本轮输入照常发出。"""
+    history = [
+        Message(role="user", content="退" * 2000),
+        Message(role="assistant", content="好" * 2000),
+    ]
+    messages = prepare_turn(
+        settings=_settings(
+            context_budget_tokens=1000,
+            reserved_output_tokens=0,
+            safety_margin_tokens=0,
+        ),
+        history=history,
+        user_input="在吗",
+    )
+
+    assert len(messages) == 2
+    assert messages[-1].content == "在吗"
 
 
 def test_prepare_turn_raises_when_input_alone_exceeds_budget():
@@ -86,191 +486,6 @@ def test_prepare_turn_raises_when_input_alone_exceeds_budget():
                 reserved_output_tokens=0,
                 safety_margin_tokens=0,
             ),
-            store=_store(),
-            session_id="s1",
+            history=[],
             user_input="退" * 5000,
         )
-
-
-@pytest.mark.anyio
-async def test_stream_turn_yields_tokens_then_done():
-    store = _store()
-    model = FakeModel([FakeChunk("您"), FakeChunk("好")])
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    events = [
-        ev
-        async for ev in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=model,
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        )
-    ]
-
-    assert events[0] == ("token", {"text": "您"})
-    assert events[1] == ("token", {"text": "好"})
-    assert events[-1][0] == "done"
-
-
-@pytest.mark.anyio
-async def test_stream_turn_persists_both_messages_on_success():
-    store = _store()
-    model = FakeModel([FakeChunk("好的")])
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    async for _ in stream_turn(
-        settings=_settings(),
-        store=store,
-        model=model,
-        session_id="s1",
-        user_input="你好",
-        messages=messages,
-    ):
-        pass
-
-    assert store.history("s1") == [
-        Message(role="user", content="你好"),
-        Message(role="assistant", content="好的"),
-    ]
-
-
-@pytest.mark.anyio
-async def test_stream_turn_discards_history_when_stream_breaks():
-    """流中途断掉时,半截回复不写入历史。"""
-    store = _store()
-
-    class ExplodingModel:
-        async def astream(self, messages):
-            yield FakeChunk("前半")
-            raise RuntimeError("上游炸了")
-
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    with pytest.raises(RuntimeError, match="上游炸了"):
-        async for _ in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=ExplodingModel(),
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        ):
-            pass
-
-    assert store.history("s1") == []
-
-
-@pytest.mark.anyio
-async def test_stream_turn_done_event_carries_usage_when_available():
-    store = _store()
-    model = FakeModel(
-        [
-            FakeChunk("好"),
-            FakeChunk("", usage={"input_tokens": 10, "output_tokens": 1}),
-        ]
-    )
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    events = [
-        ev
-        async for ev in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=model,
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        )
-    ]
-
-    assert events[-1][1]["usage"] == {"input_tokens": 10, "output_tokens": 1}
-
-
-@pytest.mark.anyio
-async def test_stream_turn_keeps_earlier_usage_when_a_later_chunk_has_none():
-    """后一个 chunk 的 usage_metadata 为 None 时,不能把先前的 usage 冲掉。
-
-    真实上游只有最后一帧带 usage;若实现写成 `usage = chunk.usage_metadata`
-    (丢掉 `or usage`),这一条会退化成 None。
-    """
-    store = _store()
-    model = FakeModel(
-        [
-            FakeChunk("好", usage={"input_tokens": 10, "output_tokens": 1}),
-            FakeChunk("", usage=None),
-        ]
-    )
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    events = [
-        ev
-        async for ev in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=model,
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        )
-    ]
-
-    assert events[-1][1]["usage"] == {"input_tokens": 10, "output_tokens": 1}
-
-
-@pytest.mark.anyio
-async def test_stream_turn_done_usage_is_none_when_absent():
-    store = _store()
-    model = FakeModel([FakeChunk("好")])
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    events = [
-        ev
-        async for ev in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=model,
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        )
-    ]
-
-    assert events[-1][1]["usage"] is None
-
-
-@pytest.mark.anyio
-async def test_stream_turn_skips_empty_token_chunks():
-    store = _store()
-    model = FakeModel([FakeChunk(""), FakeChunk("好")])
-    messages = prepare_turn(
-        settings=_settings(), store=store, session_id="s1", user_input="你好"
-    )
-
-    events = [
-        ev
-        async for ev in stream_turn(
-            settings=_settings(),
-            store=store,
-            model=model,
-            session_id="s1",
-            user_input="你好",
-            messages=messages,
-        )
-    ]
-
-    assert [e for e in events if e[0] == "token"] == [("token", {"text": "好"})]
