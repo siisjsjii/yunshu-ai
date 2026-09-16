@@ -78,6 +78,72 @@ sys.stdout.buffer.write(f"{n} 个 CJK 字符".encode("utf-8"))
 '
 }
 
+# 取出本轮实际调用了哪些工具(按出现顺序,逗号分隔)。
+# 直接对原始 SSE 流 grep 工具名是不行的 —— 事件名与 data 分处两行,
+# 且工具名只出现在 JSON 里。按 SSE 块解析才可靠。
+called_tools() {
+  "$PYTHON" -c '
+import json, sys
+
+names = []
+for block in sys.stdin.buffer.read().decode("utf-8", "replace").split("\n\n"):
+    event = data = None
+    for line in block.splitlines():
+        if line.startswith("event: "):
+            event = line[len("event: "):]
+        elif line.startswith("data: "):
+            data = line[len("data: "):]
+    if event == "tool_call" and data:
+        try:
+            names.append(json.loads(data)["name"])
+        except (json.JSONDecodeError, KeyError):
+            pass
+print(",".join(names))
+'
+}
+
+# 取出每个 tool_result 的成败(ok/fail,逗号分隔)。
+tool_result_states() {
+  "$PYTHON" -c '
+import json, sys
+
+states = []
+for block in sys.stdin.buffer.read().decode("utf-8", "replace").split("\n\n"):
+    event = data = None
+    for line in block.splitlines():
+        if line.startswith("event: "):
+            event = line[len("event: "):]
+        elif line.startswith("data: "):
+            data = line[len("data: "):]
+    if event == "tool_result" and data:
+        try:
+            states.append("ok" if json.loads(data).get("ok") else "fail")
+        except json.JSONDecodeError:
+            pass
+print(",".join(states))
+'
+}
+
+# 从工具实现里取订单 1001 的确定性物流状态。
+# 动态取值而非写死 —— 工具改了种子函数也不必改脚本;
+# 而"工具到底返回什么"由 Tier 1 的跨进程确定性测试守护。
+expected_logistics_status() {
+  "$PYTHON" -c '
+import asyncio, json, sys
+
+from app.tools.business import query_logistics
+
+tool_call = {
+    "name": "query_logistics",
+    "args": {"order_id": "1001"},
+    "id": "probe",
+    "type": "tool_call",
+}
+payload = json.loads(asyncio.run(query_logistics.ainvoke(tool_call)).content)
+sys.stdout.buffer.write(payload["status"].encode("utf-8"))
+'
+}
+
 if [ ! -x "$PYTHON" ]; then
   echo "找不到 $PYTHON —— 请在项目根目录运行本脚本。" >&2
   exit 2
@@ -186,6 +252,108 @@ if echo "$OUT3" | grep -q '"expected_solution"'; then
   pass "抽出 expected_solution"
 else
   fail "expected_solution 没抽出来"
+fi
+
+echo
+echo "=== 验收 4:工具调用链路(需求 4) ==="
+EXPECTED_STATUS=$(expected_logistics_status)
+echo "  订单 1001 的确定性物流状态:$EXPECTED_STATUS"
+
+# 工具取不到值时上面那条命令会**静默返回空**。空串会让 `grep -qF ""` 匹配
+# 任何文本 —— 于是"回复复述了工具结果"这条断言永远通过,而它恰恰是本章
+# 唯一证明"模型真的读到了工具返回"的证据。宁可在此处硬失败。
+if [ -z "$EXPECTED_STATUS" ]; then
+  fail "取不到订单 1001 的确定性物流状态 —— 下面的复述断言会退化成恒真,不再可信"
+fi
+
+SID_TOOL="acceptance-tool-$$"
+OUT4=$(curl -sN -X POST "$BASE/api/chat/stream" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+{"session_id":"$SID_TOOL","message":"订单 1001 的物流到哪了"}
+JSON
+)
+
+TOOLS4=$(echo "$OUT4" | called_tools)
+STATES4=$(echo "$OUT4" | tool_result_states)
+REPLY4=$(echo "$OUT4" | join_tokens)
+echo "  调用的工具:[$TOOLS4]  结果:[$STATES4]"
+echo "  回复:$REPLY4"
+
+if [ "$TOOLS4" = "query_logistics" ]; then
+  pass "模型选中 query_logistics(验收标准 1 的后端一半)"
+else
+  fail "期望选中 query_logistics,实际调用了 [$TOOLS4]"
+fi
+
+if [ "$STATES4" = "ok" ]; then
+  pass "工具执行成功"
+else
+  fail "工具执行未成功,结果状态为 [$STATES4]"
+fi
+
+# 断言模型真的**读懂了工具结果**而不是自己编。
+# 比的是工具返回的确定性状态词 —— 模型没拿到结果就不可能说对。
+# -F:状态词是数据不是正则(虽然当前取值全是 CJK、不含任何 ASCII 元字符,
+# 但"当前取值恰好安全"不该是这条断言成立的前提)。
+#
+# 前半句 `[ -n ... ]` 是防"恒真":空模式会让 grep 匹配任何文本(上面已单独
+# 记一次失败),但若不在这里挡住,这条断言还会**额外**刷出一个通过 —— 一条
+# 永远不会失败的断言正是本章要防的东西。取不到值时必须走 else。
+if [ -n "$EXPECTED_STATUS" ] && echo "$REPLY4" | grep -qF "$EXPECTED_STATUS"; then
+  pass "回复中复述了工具返回的状态「$EXPECTED_STATUS」(工具结果真的被用上了)"
+else
+  fail "回复中没有「$EXPECTED_STATUS」—— 模型没有用上工具结果"
+fi
+
+echo
+echo "=== 验收 5:FAQ 查表(验收标准 2) ==="
+OUT5=$(curl -sN -X POST "$BASE/api/chat/stream" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{"message":"退货政策是什么"}
+JSON
+)
+
+TOOLS5=$(echo "$OUT5" | called_tools)
+STATES5=$(echo "$OUT5" | tool_result_states)
+REPLY5=$(echo "$OUT5" | join_tokens)
+echo "  调用的工具:[$TOOLS5]  结果:[$STATES5]"
+echo "  回复:$REPLY5"
+
+if [ "$TOOLS5" = "query_faq" ] && [ "$STATES5" = "ok" ]; then
+  pass "query_faq 查到了退货政策"
+else
+  fail "期望 query_faq 命中,实际工具=[$TOOLS5] 结果=[$STATES5]"
+fi
+
+if REASON=$(echo "$REPLY5" | has_cjk); then
+  pass "回复非空且含 $REASON"
+else
+  fail "回复$REASON"
+fi
+
+echo
+echo "=== 验收 6:邮费漏召回(验收标准 3,预期失败) ==="
+OUT6=$(curl -sN -X POST "$BASE/api/chat/stream" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{"message":"邮费是多少"}
+JSON
+)
+
+TOOLS6=$(echo "$OUT6" | called_tools)
+STATES6=$(echo "$OUT6" | tool_result_states)
+REPLY6=$(echo "$OUT6" | join_tokens)
+echo "  调用的工具:[$TOOLS6]  结果:[$STATES6]"
+echo "  回复:$REPLY6"
+
+# 反向断言:这一条**期望查不到**。若它竟然查到了,说明 faq 种子里混进了
+# 「邮费」条目,验收标准 3 的前提被破坏 —— 那才是失败。
+if [ "$TOOLS6" = "query_faq" ] && [ "$STATES6" = "ok" ]; then
+  fail "「邮费」竟然从 faq 查到了 —— 种子数据污染了,验收标准 3 失去意义"
+else
+  pass "「邮费」未能查到(预期漏召回),工具=[$TOOLS6] 结果=[$STATES6]"
 fi
 
 echo
