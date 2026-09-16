@@ -526,7 +526,10 @@ def test_tool_build_failure_releases_lock(client_factory, monkeypatch):
     把工具组装挪到守卫之外(见本条的变异记录),下面两条断言都会变红。
     """
 
-    def boom(session):
+    # 签名必须与 make_query_faq 一致(它现在多收一个 retriever)—— 桩函数
+    # 少收一个参数时抛的是 TypeError,而下面 pytest.raises 等的是 RuntimeError,
+    # 这条用例会以「没抛 RuntimeError」的样子假红。
+    def boom(session, retriever):
         raise RuntimeError("工具组装失败")
 
     monkeypatch.setattr(tools_registry, "make_query_faq", boom)

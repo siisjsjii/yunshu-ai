@@ -262,6 +262,40 @@ MINE_BATCH_CONVERSATIONS=5
 
 (实现过程中与本文的偏离,连同原因记录于此。)
 
+### §4 之订正:retrieval 反向引用 `app/tools/errors.py`(2026-09-16,T9)
+
+§4 写的依赖方向是 `tools → retrieval → {db}`,但 T9 要让 retriever 把
+Milvus/嵌入故障翻成 `ToolInfrastructureError`,这个类落在 `app/tools/errors.py`。
+
+权衡后**接受这条反向引用**,理由:`tools/errors.py` 是零依赖的**错误词汇表**,
+不是工具层逻辑 —— `executor`、`api`、`services` 都在对着它分类,把它当成
+「工具层」才是不准确的。反向引用不产生环(pymilvus/Milvus 的导入仍在函数内)。
+若要彻底消掉这条边,做法是把两个异常类挪到 `app/errors.py` 再由
+`tools/errors.py` 转出(既有 import 全不用改)—— 已列为可选重构,未做。
+
+### §8.2 之订正:三条 LIKE 通配符用例随关键词查表一起删除(2026-09-16,T9)
+
+`test_tools_db.py` 里 `test_query_faq_wildcard_keyword_cannot_match_everything`
+/ `test_query_faq_matches_literal_percent_not_everything` /
+`test_query_faq_matches_literal_underscore_not_single_char` 三条,钉的是
+`make_query_faq` 里 `LIKE ... ESCAPE` 的转义正确性。T9 换实现后该 SQL 路径
+**不再存在**,断言失去对象,故删除。
+
+**它们原本防的风险没有消失,而是换了防线**:那三条守的是「工具返回一堆与
+问题无关的答案却报 ok=true,模型照着自己编」;现在由 **相似度阈值**
+(spec §6.6)承担,由 `test_retrieval_search.py` 的阈值用例与 T11 的检索评估集
+继续守。同批搬走的是契约类断言(种子命中/漏召回/文案有界),它们进了
+`tests/test_tools_query_faq.py` —— 用替身检索器,不依赖 MySQL,因此能在
+`-m "not db"` 的快路径里跑到(留在 db 文件里会被默认跳过,最容易破的接口
+反而最少被验)。
+
+### §5.2 之订正:`make_query_faq(session, retriever)` 的 `session` 已无用途(2026-09-16,T9)
+
+`session` 在本工具里已不再被使用(原文回查由 retriever 承担)。按 plan
+「工厂签名扩参」的要求保留该形参,以维持与 `make_create_ticket(session, ...)`
+一致的工厂形态;若认为冗余,可一句话改成 `make_query_faq(retriever)`
+(同时改 `registry.build_tools` 与 `tests/test_api_chat.py` 的 `boom` 桩签名)。
+
 ### §8.4 / §7.2 之订正:Milvus 行数核对必须用 `query(count(*))`,不能用 `get_collection_stats`(2026-09-16,T0 实测)
 
 同 pk 三遍 upsert 后:`get_collection_stats` 的 `row_count` 报 9(它数的是 insert 操作,未扣 delete,compaction 前不真实),`query(output_fields=["count(*)"])` 报 3(真值),search 也只返回 3 个唯一 id。**upsert 按 pk 覆盖的幂等语义成立**;验收 6 的「Milvus 数 == MySQL done 数」一律用 `count(*)`。

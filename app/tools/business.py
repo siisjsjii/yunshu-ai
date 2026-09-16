@@ -174,52 +174,33 @@ async def query_logistics(order_id: str) -> str:
 FAQ_LIMIT = 3
 
 
-def make_query_faq(session):
-    """构造 FAQ 查询工具。会话绑在闭包里,模型看不到。"""
+def make_query_faq(session, retriever):
+    """构造 FAQ 查询工具。会话与检索器绑在闭包里,模型看不到。
+
+    **ch03 换的是内部实现**:关键词查 `faq` 表 → 向量语义检索
+    `knowledge_chunks`。对模型的入参出参契约一字未动(spec §5.1):
+    入参仍是 `keyword: str`,出参仍是
+    `{"keyword", "count", "items": [{"question", "answer", "category"}]}`。
+
+    `session` 参数已不再被本工具使用(原文回查由 retriever 承担),保留是为了
+    与 `make_create_ticket` 的工厂形态一致、给后续可能的分页/过滤留位置。
+    """
 
     @tool
     async def query_faq(keyword: str) -> str:
         """查询常见问题库:退货政策、发票、物流规则等。用户问政策或规则类问题时使用。"""
-        from sqlalchemy import or_, select
-
-        from app.db.models import Faq
-
         cleaned = keyword.strip()
         if not cleaned:
             raise ToolNotFound("请提供要查询的关键词")
 
-        # 关键词里的 % 与 _ 必须按字面匹配,否则 LIKE 会把它们当通配符:
-        # "%" 能命中表里任意一行,于是这条查询**永远查得到**,返回 ok=true
-        # 加三条与用户问题无关的答案,模型会照着它们自信作答 —— 漏召回这条
-        # 防线(见下面的 ToolNotFound)就被从另一头绕过了。关键词由模型从
-        # 用户原话里摘("100% 纯棉"这类),% 与 _ 会原样传进来。
-        #
-        # 反斜杠必须**第一个**替换:放后面会把它自己刚加进去的转义符再翻一倍。
-        # 不用 contains(autoescape=True):它在 MySQL 上的渲染没实测过,而显式
-        # 写法的语义毫无歧义。
-        escaped = (
-            cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
-        pattern = f"%{escaped}%"
-        rows = (
-            (
-                await session.execute(
-                    select(Faq)
-                    .where(
-                        or_(
-                            Faq.question.like(pattern, escape="\\"),
-                            Faq.answer.like(pattern, escape="\\"),
-                        )
-                    )
-                    .limit(FAQ_LIMIT)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if not rows:
-            # 回显同样截断:这段文本会回灌进模型上下文(可恢复路径),而关键词
-            # 是模型给的。理由与 _require_order_no 那处一致。
+        # 基础设施故障(向量库/嵌入)必须原样抛上去走 502,**不能**落进下面的
+        # ToolNotFound —— 那会把「检索服务挂了」伪装成「这条知识没收录」。
+        chunks = await retriever.search(cleaned)
+
+        if not chunks:
+            # 全部命中都被相似度阈值滤掉 = 库里的确没有相关内容。回显截断:
+            # 这段文本会回灌进模型上下文(可恢复路径),而关键词是模型给的,
+            # 长度不受我们控制。理由与 _require_order_no 那处一致。
             raise ToolNotFound(
                 f"常见问题库里没有与「{cleaned[:_ECHO_LIMIT]}」相关的内容,"
                 f"请如实告知用户暂未收录,不要自行编造答案"
@@ -227,10 +208,10 @@ def make_query_faq(session):
         return json.dumps(
             {
                 "keyword": cleaned,
-                "count": len(rows),
+                "count": len(chunks),
                 "items": [
-                    {"question": r.question, "answer": r.answer, "category": r.category}
-                    for r in rows
+                    {"question": c.question, "answer": c.answer, "category": c.category}
+                    for c in chunks
                 ],
             },
             ensure_ascii=False,

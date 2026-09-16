@@ -86,9 +86,11 @@ async def chat_stream(
         # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
         #
         # 这两行也必须在守卫之内。make_query_faq / make_create_ticket 会做
-        # 导入、建闭包,是本章新加进"拿到锁之后"这段的代码;它们抛异常时
-        # 漏放锁的后果不是"慢"—— 持锁的锁既不被 TTL 也不被 LRU 回收,
-        # 该会话从此永久 409,症状与"泄漏"毫无相似之处。
+        # 导入、建闭包,ch03 起 build_tools 还在里面组装检索器
+        # (build_retriever:读配置 + 取懒加载的 embedder/Milvus 客户端单例),
+        # 都是"拿到锁之后"这段里的新代码;它们抛异常时漏放锁的后果不是"慢"
+        # —— 持锁的锁既不被 TTL 也不被 LRU 回收,该会话从此永久 409,
+        # 症状与"泄漏"毫无相似之处。
         tools = build_tools(session=session, conversation_id=session_id)
         registry = registry_for(tools)
     except ContextOverflowError as exc:

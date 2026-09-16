@@ -7,29 +7,18 @@ import pytest
 from sqlalchemy import select, text
 
 from app.db.base import get_sessionmaker
-from app.db.models import Conversation, Faq, Ticket
-from app.tools.business import make_create_ticket, make_query_faq
-from app.tools.errors import ToolNotFound
+from app.db.models import Conversation, Ticket
+from app.tools.business import make_create_ticket
 
 pytestmark = pytest.mark.db
 
 SCRATCH_CONVERSATION = "tooltest000000000000000000000000"
 
-#: 钉字面 % / _ 用的临时 FAQ,用例跑完由 _cleanup 抹掉。
-#:
-#: 每对里第二行的存在都是刻意的:它含关键词的前缀却**不含**字面通配符,
-#: 不转义时 pattern 会把它一并捞出,`count == 1` 随即挂 —— 少了这行陪衬,
-#: 那条测试对"到底转义没转义"完全无感(即假绿)。
-SCRATCH_FAQ_PERCENT = ("100% 纯棉 T 恤怎么洗", "满 100 元有赠品吗")
-#: "_" 在 LIKE 里是**单字符**通配符:"A1_" 不转义时匹配 "A1" + 任意一个字符,
-#: 于是第二行(空格)也会命中。
-SCRATCH_FAQ_UNDERSCORE = ("订单号 A1_B2 怎么查", "A1 型号有货吗")
-SCRATCH_FAQ_QUESTIONS = SCRATCH_FAQ_PERCENT + SCRATCH_FAQ_UNDERSCORE
-
-
-def _call(tool, args: dict) -> str:
-    tool_call = {"name": tool.name, "args": args, "id": "call_1", "type": "tool_call"}
-    return asyncio.run(tool.ainvoke(tool_call)).content
+# 本文件原先还有 6 条 query_faq 用例(种子命中、漏召回、% / _ 字面匹配、
+# 错误文案有界)。ch03 把 query_faq 的内部实现换成向量检索后,它们钉的
+# `Faq` 表 LIKE 查询路径已不存在 —— 契约类断言整体搬到
+# `tests/test_tools_query_faq.py`(替身检索器,不依赖 MySQL,快路径也能跑),
+# 「% / _ 按字面匹配」那三条随 LIKE 一并删除。删除理由与防线去向见该文件头注。
 
 
 @pytest.fixture(autouse=True)
@@ -45,128 +34,8 @@ def _cleanup():
                 text("DELETE FROM conversations WHERE id = :c"),
                 {"c": SCRATCH_CONVERSATION},
             )
-            for question in SCRATCH_FAQ_QUESTIONS:
-                await s.execute(
-                    text("DELETE FROM faq WHERE question = :q"), {"q": question}
-                )
             await s.commit()
     asyncio.run(_drop())
-
-
-def test_query_faq_finds_seeded_row():
-    from scripts.seed_db import seed
-
-    asyncio.run(seed())
-
-    async def run():
-        async with get_sessionmaker()() as session:
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": "退货"}, "id": "c", "type": "tool_call"}
-            )
-
-    hits = json.loads(asyncio.run(run()).content)
-    assert hits["count"] >= 1
-    assert any("退货" in item["question"] for item in hits["items"])
-
-
-def test_query_faq_raises_not_found_for_unmatched_keyword():
-    """验收 3 的漏召回路径:查不到要走 ToolNotFound,不是返回空列表假装成功。"""
-    async def run():
-        async with get_sessionmaker()() as session:
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": "邮费"}, "id": "c", "type": "tool_call"}
-            )
-
-    with pytest.raises(ToolNotFound):
-        asyncio.run(run())
-
-
-def test_query_faq_wildcard_keyword_cannot_match_everything():
-    """纯通配符关键词必须落空,而不是把任意三条 FAQ 当结果递回去。
-
-    不转义时 pattern 是 "%%%",对表里任何一行都成立 —— 工具于是返回
-    ok=true 加三条与问题无关的答案,模型会照着它们自信作答。这是 Ruling 2
-    要堵的洞的另一半:漏召回不是"查不到才发生",通配符能让它**永远查得到**。
-    关键词由模型从用户原话里摘("100% 纯棉"这类),% 与 _ 会原样传进来。
-    """
-    async def run():
-        async with get_sessionmaker()() as session:
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": "%"}, "id": "c", "type": "tool_call"}
-            )
-
-    with pytest.raises(ToolNotFound):
-        asyncio.run(run())
-
-
-def test_query_faq_matches_literal_percent_not_everything():
-    """关键词里的 % 按字面匹配:命中那一行,且只命中那一行。"""
-    async def run():
-        async with get_sessionmaker()() as session:
-            session.add_all(
-                [
-                    Faq(question=q, answer="临时行", category="测试")
-                    for q in SCRATCH_FAQ_PERCENT
-                ]
-            )
-            await session.commit()
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": "100%"}, "id": "c", "type": "tool_call"}
-            )
-
-    hits = json.loads(asyncio.run(run()).content)
-    assert hits["count"] == 1
-    assert hits["items"][0]["question"] == SCRATCH_FAQ_PERCENT[0]
-
-
-def test_query_faq_matches_literal_underscore_not_single_char():
-    """关键词里的 _ 按字面匹配,不是"任意一个字符"。
-
-    与上一条同形,但钉的是另一个分支 —— `_` 的通配符语义比 `%` 更隐蔽:
-    它只吃一个字符,所以 pattern 看起来"没那么贪",照样能把不相干的行捞进来。
-    """
-    async def run():
-        async with get_sessionmaker()() as session:
-            session.add_all(
-                [
-                    Faq(question=q, answer="临时行", category="测试")
-                    for q in SCRATCH_FAQ_UNDERSCORE
-                ]
-            )
-            await session.commit()
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": "A1_"}, "id": "c", "type": "tool_call"}
-            )
-
-    hits = json.loads(asyncio.run(run()).content)
-    assert hits["count"] == 1
-    assert hits["items"][0]["question"] == SCRATCH_FAQ_UNDERSCORE[0]
-
-
-def test_query_faq_error_message_does_not_echo_unbounded_input():
-    """漏召回的错误文本也必须有界 —— 它同样回灌进模型上下文。
-
-    关键词是模型从用户原话里摘的,长度不受我们控制;原样回灌等于把上下文
-    预算交给它。这条路径(查不到 → ToolNotFound)在验收 3 里会被真的走到。
-    """
-    huge = "查无此项" * 1000
-
-    async def run():
-        async with get_sessionmaker()() as session:
-            tool = make_query_faq(session)
-            return await tool.ainvoke(
-                {"name": "query_faq", "args": {"keyword": huge}, "id": "c", "type": "tool_call"}
-            )
-
-    with pytest.raises(ToolNotFound) as exc:
-        asyncio.run(run())
-    assert huge not in str(exc.value)
-    assert len(str(exc.value)) < 200
 
 
 def test_create_ticket_does_not_expose_conversation_id_to_model():
