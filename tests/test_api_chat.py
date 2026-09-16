@@ -21,6 +21,7 @@ from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
 from app.main import app
 from app.memory.store import SessionStore
+from app.tools import registry as tools_registry
 from app.tools.errors import ToolNotFound
 
 REQUIRED = {
@@ -480,6 +481,42 @@ def test_validation_failure_releases_lock(client_factory, monkeypatch):
             )
 
     assert client.store.lock_for("s1").locked() is False
+
+
+def test_tool_build_failure_releases_lock(client_factory, monkeypatch):
+    """工具组装必须在放锁守卫**之内**。
+
+    `make_query_faq` / `make_create_ticket` 会做导入并建闭包 —— 本章新加进
+    "拿到锁之后"这段区域的代码。它们抛异常时漏放锁的后果不是"慢":持锁的
+    锁既不被 TTL 也不被 LRU 回收,该 session_id 从此**永远 409**,症状看
+    起来和"锁泄漏"毫无相似之处。
+
+    所以这里不只断言"这次报错了",而是断言**这个会话之后还能用** ——
+    把工具组装挪到守卫之外(见本条的变异记录),下面两条断言都会变红。
+    """
+
+    def boom(session):
+        raise RuntimeError("工具组装失败")
+
+    monkeypatch.setattr(tools_registry, "make_query_faq", boom)
+    client, _ = client_factory(
+        batches=[[FakeChunk("您好")]], session_lock_timeout_seconds=0.15
+    )
+
+    with client as c:
+        with pytest.raises(RuntimeError):
+            c.post(
+                "/api/chat/stream", json={"session_id": "s1", "message": "你好"}
+            )
+
+        # 工具组装恢复正常。锁若没被放掉,下面这次请求会等锁超时 → 409。
+        monkeypatch.undo()
+        follow_up = c.post(
+            "/api/chat/stream", json={"session_id": "s1", "message": "在吗"}
+        )
+
+    assert client.store.lock_for("s1").locked() is False
+    assert follow_up.status_code == 200
 
 
 def test_lock_is_released_after_a_successful_stream(client_factory):

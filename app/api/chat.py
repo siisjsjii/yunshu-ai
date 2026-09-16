@@ -81,6 +81,16 @@ async def chat_stream(
         messages = prepare_turn(
             settings=settings, history=history, user_input=request.message
         )
+        # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
+        # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
+        # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
+        #
+        # 这两行也必须在守卫之内。make_query_faq / make_create_ticket 会做
+        # 导入、建闭包,是本章新加进"拿到锁之后"这段的代码;它们抛异常时
+        # 漏放锁的后果不是"慢"—— 持锁的锁既不被 TTL 也不被 LRU 回收,
+        # 该会话从此永久 409,症状与"泄漏"毫无相似之处。
+        tools = build_tools(session=session, conversation_id=session_id)
+        registry = registry_for(tools)
     except ContextOverflowError as exc:
         lock.release()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -92,12 +102,6 @@ async def chat_stream(
         # 是 BaseException 的子类,不是 Exception。
         lock.release()
         raise
-
-    # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
-    # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
-    # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
-    tools = build_tools(session=session, conversation_id=session_id)
-    registry = registry_for(tools)
 
     async def generate():
         try:
@@ -135,6 +139,10 @@ async def chat_stream(
         finally:
             lock.release()
 
+    # 这一句刻意留在守卫之外:`EventSourceResponse(...)` 只是构造一个对象,
+    # 不做 IO,也不启动生成器(generate 的第一个 yield 发生在响应发送时,
+    # 那时锁的释放由它自己的 finally 负责)。为它把 `return` 包进 try 换不到
+    # 什么,只会让"哪些退出路径必须放锁"这条规则变得含糊。
     return EventSourceResponse(
         generate(),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
