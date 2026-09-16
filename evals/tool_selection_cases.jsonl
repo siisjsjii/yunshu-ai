@@ -1,0 +1,15 @@
+{"text": "订单 1001 的物流到哪了", "expected": "query_logistics", "note": "诱饵:句里有『订单』二字,容易误选 query_order,但问的是物流"}
+{"text": "帮我查下物流,单号 1002", "expected": "query_logistics", "note": ""}
+{"text": "订单 1002 为什么还没发货", "expected": "query_logistics", "note": ""}
+{"text": "订单 1001 现在是什么状态", "expected": "query_order", "note": ""}
+{"text": "查一下订单 1003 的金额", "expected": "query_order", "note": ""}
+{"text": "无线耳机多少钱", "expected": "query_product", "note": ""}
+{"text": "运动鞋还有货吗", "expected": "query_product", "note": ""}
+{"text": "保温杯有什么规格", "expected": "query_product", "note": ""}
+{"text": "退货政策是什么", "expected": "query_faq", "note": "验收标准 2 的用例"}
+{"text": "发票怎么开", "expected": "query_faq", "note": ""}
+{"text": "退款多久到账", "expected": "query_faq", "note": ""}
+{"text": "我要投诉,给我转人工", "expected": "create_ticket", "note": ""}
+{"text": "你们客服态度太差了,我要投诉", "expected": "create_ticket", "note": ""}
+{"text": "你好", "expected": null, "note": "诱饵:闲聊不该调工具。防的是『模型见谁都调工具』"}
+{"text": "你们几点下班", "expected": null, "note": "诱饵:没有工具能回答,不该硬调"}
