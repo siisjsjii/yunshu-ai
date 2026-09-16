@@ -2536,11 +2536,24 @@ def _settings(**overrides) -> Settings:
 
 
 class FakeChunk:
-    """模拟 AIMessageChunk:支持 + 累加,累加后携带 tool_calls。"""
+    """模拟 AIMessageChunk:支持 + 累加,累加后携带 tool_calls。
+
+    替身**必须补上 `"type": "tool_call"`**:真实链路上模型流出的 tool_call chunk
+    经 `langchain_core.messages.tool.default_tool_parser` 解析后,每个 tool_call
+    都带这个键(已在 langchain 1.4.0 / core 1.6.3 上实测确认)。
+    而 `BaseTool.ainvoke` 判"这是不是工具调用"靠的正是
+    `_is_tool_call(x) = x.get("type") == "tool_call"` 这**一个**条件 ——
+    缺键时它会把这个 dict **整个当成参数**去校验,于是每次调用都返回
+    "参数不合法"的可恢复失败(`order_id` Field required)。
+
+    后果不是"全绿",而是**红在一个语义误导的位置**:断言 `ok is True` 的用例
+    会因为"编排里工具失败了"而红,看起来像编排有 bug;而不检查 `ok` 的用例
+    照常通过、一次都没走到真实调用路径。修的时候很容易去改编排而不是改替身。
+    """
 
     def __init__(self, text="", tool_calls=None, usage=None):
         self.text = text
-        self.tool_calls = list(tool_calls or [])
+        self.tool_calls = [{"type": "tool_call", **tc} for tc in (tool_calls or [])]
         self.usage_metadata = usage
 
     def __add__(self, other):
