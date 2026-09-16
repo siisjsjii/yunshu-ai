@@ -28,7 +28,7 @@ async def ensure_conversation(*, session, session_id: str, user_id: str) -> Conv
 
 
 async def load_history(*, session, conversation_id: str) -> list[Message]:
-    """按时间正序读出该会话的全部消息。"""
+    """按插入序(id)正序读出该会话的全部消息。"""
     rows = (
         await session.execute(
             select(MessageRecord)

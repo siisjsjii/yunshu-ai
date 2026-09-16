@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select, text
 
 from app.db.base import get_sessionmaker
-from app.db.models import Conversation, MessageRecord
+from app.db.models import Conversation
 from app.schemas import Message
 from app.services.history import append_turn, ensure_conversation, load_history
 
@@ -52,7 +52,20 @@ def test_ensure_conversation_creates_then_reuses():
             again = await ensure_conversation(
                 session=session, session_id=SCRATCH, user_id="mallory"
             )
-            return again.user
+            assert again.user == "alice"
+
+        # 换一个**全新 session** 重查,断的是行里存的值。
+        # 同一个 session 里读会被身份映射兜住(expire_on_commit=False,二次
+        # select 不会用行覆盖已加载的属性),那样只证明"内存对象没被改过",
+        # 证明不了"库里还是 alice" —— 回写若用 UPDATE 实现,照样全绿。
+        # Ruling 1 是安全裁决,必须钉在行上。
+        async with get_sessionmaker()() as session:
+            stored = (
+                await session.execute(
+                    select(Conversation).where(Conversation.id == SCRATCH)
+                )
+            ).scalars().one()
+            return stored.user
 
     assert asyncio_run(run()) == "alice"
 
@@ -73,6 +86,13 @@ def test_append_turn_then_load_history_roundtrips_tool_messages():
                     Message(role="assistant", content="您的包裹已揽件。"),
                 ],
             )
+
+        # 另开 session 读回。同一 session 里读到的值**未必**来自 MySQL:身份映射
+        # 持弱引用,只要还有东西引用那几个 ORM 实例,select 就命中缓存、直接把
+        # 原来那个 Python list 交回来 —— 实测把行改成坏值时断言照样通过。
+        # 这条往返是 Ruling 6 明令要钉的,不能建立在"恰好没人引用"上;换成空身份
+        # 映射的新 session,值才必然由 JSON 列反序列化而来。
+        async with get_sessionmaker()() as session:
             return await load_history(session=session, conversation_id=SCRATCH)
 
     history = asyncio_run(run())
