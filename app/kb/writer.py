@@ -105,13 +105,16 @@ async def vectorize_rows(session, store, embedder, rows: list[KnowledgeChunk]) -
     await session.commit()
 
 
-async def vectorize_pending(session, store, embedder, *, batch_size: int = 16) -> int:
+async def vectorize_pending(session, store, embedder, *, batch_size: int = 16,
+                            progress=None) -> int:
     """把所有 pending 行补齐,返回处理行数。**重跑 = 再跑一次这个函数。**
 
     每批一次 encode + 一次批量 upsert + 一次提交。批内中断的话这批仍是
     pending,重跑按同 pk 重写(Milvus upsert 幂等)后照常回填。
 
     batch_size 只管「一次处理多少行」,与 embedder 内部的 batch_size 无关。
+    `progress` 是可选的 async callable(message: str),每批后回调(供 web 任务
+    报告进度);默认 None,离线脚本与既有测试不受影响。
     """
     store.ensure_collection()
     total = 0
@@ -132,3 +135,5 @@ async def vectorize_pending(session, store, embedder, *, batch_size: int = 16) -
             return total
         await vectorize_rows(session, store, embedder, rows)
         total += len(rows)
+        if progress is not None:
+            await progress(f"已向量化 {total} 行")
