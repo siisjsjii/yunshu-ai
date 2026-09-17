@@ -463,3 +463,74 @@ async def test_staging_fingerprints_covers_all_statuses():
     finally:
         await _cleanup()
         await get_engine().dispose()
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_mine_knowledge_end_to_end_result_shape():
+    """编排级:抽取→去重→入库→结果字典,全程 fake 模型/向量库。
+
+    造 1 个会话,模型固定吐 2 条问答对(1 条与已入库重复)。断言结果字典
+    key 齐全、计数自洽、kept 那条真进了 knowledge_chunks(pending)。
+    """
+    from app.kb.mining import mine_knowledge
+
+    class _Store:
+        def search(self, vector, top_k):
+            return []          # 无向量近重复
+
+    class _Embedder:
+        def encode(self, texts):
+            return [[0.5, 0.5] for _ in texts]
+
+    await _cleanup()
+    try:
+        async with get_sessionmaker()() as session:
+            session.add(Conversation(id=SCRATCH_CONVERSATION, user="t", status="active"))
+            session.add_all([
+                MessageRecord(conversation_id=SCRATCH_CONVERSATION, role="user", content="怎么退货"),
+                MessageRecord(conversation_id=SCRATCH_CONVERSATION, role="assistant", content="七天无理由。"),
+            ])
+            await session.commit()
+
+        # 预置一条已入库知识,让第二条问答对与它重复 → 去重后只入 1 条
+        async with get_sessionmaker()() as session:
+            session.add(KnowledgeChunk(category=SCRATCH_CATEGORY, questions="怎么换货", answer="能换。"))
+            await session.commit()
+
+        model = _FakeModel(_batch(
+            ("怎么退货", "七天无理由。", SCRATCH_CATEGORY),
+            ("怎么换货", "能换。", SCRATCH_CATEGORY),
+        ))
+        progress_messages = []
+
+        async def progress(msg):
+            progress_messages.append(msg)
+
+        result = await mine_knowledge(
+            session_factory=get_sessionmaker(),
+            batch_size=5, dedupe_threshold=0.95,
+            model=model, store=_Store(), embedder=_Embedder(),
+            batch_no=SCRATCH_BATCH, dry_run=False, progress=progress,
+        )
+
+        assert set(result) == {"extracted", "kept", "discarded", "near_dup_dropped", "inserted", "kept_qa"}
+        # `extracted` 依赖库里既有会话数(fake 模型每批都吐同一对),不做精确断言;
+        # 有意义的是去重后的不变量:两条里「怎么换货」与已入库重复、「怎么退货」保留 1 条。
+        assert result["extracted"] >= 2
+        assert result["inserted"] == 1            # 与已入库重复的那条被去重
+        assert result["kept"] == 1
+        assert result["near_dup_dropped"] == 0
+        assert result["kept"] + result["discarded"] == result["extracted"]   # 计数自洽
+        assert result["kept_qa"] == [{"question": "怎么退货", "answer": "七天无理由。", "category": SCRATCH_CATEGORY}]
+        assert progress_messages                 # 分批时至少报过一次进度
+
+        async with get_sessionmaker()() as session:
+            rows = (await session.execute(
+                select(KnowledgeChunk).where(
+                    KnowledgeChunk.category == SCRATCH_CATEGORY,
+                    KnowledgeChunk.questions == "怎么退货"))).scalars().all()
+            assert len(rows) == 1 and rows[0].vectorize_status == "pending"
+    finally:
+        await _cleanup()
+        await get_engine().dispose()

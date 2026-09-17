@@ -337,3 +337,88 @@ async def keep_pairs(session, pairs: list[QaPair]) -> int:
         for pair in pairs
     ]
     return await write_chunks(session, chunks)
+
+
+async def mine_knowledge(*, session_factory, batch_size, dedupe_threshold, model,
+                         store, embedder, batch_no=None, dry_run=False,
+                         progress=None) -> dict:
+    """从会话挖知识的完整编排。脚本(`scripts/mine_qa.py`)与 web 后台任务共用这一份。
+
+    `session_factory` 是 `async_sessionmaker` —— 脚本传 `get_sessionmaker()`,
+    web 后台任务传自建 engine 的 maker(避免跨线程复用主循环的 engine)。
+
+    计数含义与 ch03 一致:`kept` = 最终保留并入库的问答对数;`discarded` =
+    字面去重 + 向量近重复总共丢掉的。**去重快照必须在抽取循环之前取** ——
+    否则本轮刚写进 staging 的产物会把自己全判重(ch03 命门,实测踩过
+    「44 条全部丢弃」)。
+    """
+    import secrets
+    import time as _time
+
+    batch_no = batch_no or f"mine-{_time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+
+    async def _report(msg: str) -> None:
+        if progress is not None:
+            await progress(msg)
+
+    async with session_factory() as session:
+        turns = await load_turns(session)
+
+    # 去重基准快照(抽取**之前**,见 docstring)
+    async with session_factory() as session:
+        seen = await existing_fingerprints(session)
+        seen |= await staging_fingerprints(session)
+
+    all_pairs: list[QaPair] = []
+    failed_batches = 0
+    batch_index = 0
+    for group in batch_conversations(turns, batch_size):
+        batch_index += 1
+        text = render_conversations(group)
+        try:
+            pairs = await mine_batch(model=model, conversation_text=text)
+        except MineParseError:
+            # 一批没抽好不该拖垮整跑 —— 记数继续。上游故障(401/超时)不是
+            # MineParseError,会照常把脚本崩掉,那才是要人介入的。
+            failed_batches += 1
+            await _report(f"第 {batch_index} 批解析失败,跳过")
+            continue
+        all_pairs.extend(pairs)
+        if not dry_run:
+            async with session_factory() as session:
+                await write_staging(session, batch_no=batch_no,
+                                    source_ref=group[0].conversation_id if group else None,
+                                    pairs=pairs)
+        await _report(f"第 {batch_index} 批:{len(group)} 轮 → {len(pairs)} 条")
+
+    kept, dropped = dedupe_pairs(all_pairs, seen)
+    near_duplicates = []
+    for pair in kept:
+        if await find_near_duplicate(store=store, embedder=embedder,
+                                     question=pair.question, threshold=dedupe_threshold):
+            near_duplicates.append(pair)
+    if near_duplicates:
+        # 按指纹剔除,不用 id()/身份比较 —— 那依赖对象身份,同一批里两个
+        # 内容相同的 QaPair 会被当成不同对象漏掉。
+        near_prints = {question_fingerprint(p.question) for p in near_duplicates}
+        kept = [p for p in kept if question_fingerprint(p.question) not in near_prints]
+        dropped = dropped + near_duplicates
+
+    inserted = 0
+    if not dry_run:
+        async with session_factory() as session:
+            inserted = await keep_pairs(session, kept)
+        async with session_factory() as session:
+            await finalize_staging(session, batch_no=batch_no, kept=kept)
+        if inserted:
+            await _report(f"入库 {inserted} 条,待向量化")
+
+    return {
+        "extracted": len(all_pairs),
+        "kept": len(kept),
+        "discarded": len(dropped),
+        "near_dup_dropped": len(near_duplicates),
+        "inserted": inserted,
+        "kept_qa": [{"question": p.question, "answer": p.answer, "category": p.category}
+                    for p in kept],
+    }
