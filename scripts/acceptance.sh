@@ -244,6 +244,52 @@ if [ ! -x "$PYTHON" ]; then
   exit 2
 fi
 
+# 轮询后台任务直到终态,输出最终任务 JSON;超时(600s)输出 running 并返回 1。
+poll_job() {
+  BASE="$BASE" JOBID="$1" "$PYTHON" -c '
+import json, os, sys, time, urllib.request
+
+base = os.environ["BASE"]
+jid = os.environ["JOBID"]
+for _ in range(600):
+    with urllib.request.urlopen(f"{base}/api/kb/jobs/{jid}") as r:
+        j = json.loads(r.read().decode("utf-8"))
+    if j["status"] != "running":
+        sys.stdout.buffer.write(json.dumps(j, ensure_ascii=False).encode("utf-8"))
+        sys.exit(0)
+    time.sleep(1)
+sys.stdout.buffer.write(b"{\"status\":\"running\"}")
+sys.exit(1)
+'
+}
+
+# knowledge_chunks 里重复的 (category, questions, answer) 三元组数。
+# 挖知识幂等 = 重复触发不重复入库,即这张表永远不出现重复三元组 ——
+# 这是确定性的断言,不像「第二次 inserted==0」那样依赖 LLM 每次都抽同一批
+# (deepseek 在 temperature=0 下依然非确定,CLAUDE.md 记过)。
+kb_duplicate_triples() {
+  "$PYTHON" -c '
+import asyncio, sys
+
+from sqlalchemy import text
+
+from app.db.base import get_engine, get_sessionmaker
+
+
+async def main():
+    async with get_sessionmaker()() as s:
+        n = (await s.execute(text(
+            "SELECT COUNT(*) FROM (SELECT category, questions, answer FROM "
+            "knowledge_chunks GROUP BY category, questions, answer HAVING COUNT(*) > 1) t"
+        ))).scalar()
+    sys.stdout.buffer.write(str(n).encode("ascii"))
+    await get_engine().dispose()
+
+
+asyncio.run(main())
+'
+}
+
 echo "=== 前置:服务可达性 ==="
 if ! curl -s -m 5 -o /dev/null "$BASE/"; then
   echo "  ❌ $BASE 没有响应。先起服务:" >&2
@@ -529,6 +575,92 @@ if [ -n "$MILVUS_N" ] && [ "$MILVUS_N" = "$DONE_N" ]; then
 else
   fail "Milvus 条数($MILVUS_N)!= 已向量化行数($DONE_N) —— 双写没对齐"
   echo "     ↳ 若 Milvus 更多:集合里残留了已删行的陈旧向量,跑 build_kb --reindex 重建"
+fi
+
+echo
+echo "=== 验收 8:上传 → 向量化 → 改说法召回(ch04 验收标准 1) ==="
+# 上传一份带运费说明的新文档(文件名带 $$,避免重复跑撞 409),随后向量化,
+# 再问一个改说法的问题,断言 query_faq 的工具结果里出现了新文档的独有短语
+# (工具结果是单帧完整 JSON,不会像回复那样被逐 token 切开,可安全 grep)。
+UP_NAME="超大件运费-$$.md"
+UP_PHRASE="超大件商品运费单独计费"
+UP_UPLOAD=$(curl -s -X POST "$BASE/api/kb/documents" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+{"filename":"$UP_NAME","type":"policy","content":"# 超大件运费\n\n$UP_PHRASE,每公斤加收 3 元。\n"}
+JSON
+)
+echo "  上传返回:$UP_UPLOAD"
+
+if echo "$UP_UPLOAD" | grep -q '"chunks_added"'; then
+  pass "上传成功,已切分入库"
+else
+  fail "上传失败:$UP_UPLOAD"
+fi
+
+VJOB=$(curl -s -X POST "$BASE/api/kb/jobs/vectorize")
+VJOBID=$(echo "$VJOB" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("job_id",""))')
+if [ -n "$VJOBID" ]; then
+  VJOBJSON=$(poll_job "$VJOBID") || fail "向量化任务超时"
+  VSTATUS=$(echo "$VJOBJSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  if [ "$VSTATUS" = "done" ]; then
+    pass "向量化任务完成"
+  else
+    fail "向量化任务未完成:$VJOBJSON"
+  fi
+else
+  fail "向量化任务未启动(可能忙):$VJOB"
+fi
+
+OUT8=$(curl -sN -X POST "$BASE/api/chat/stream" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{"message":"超大件商品运费单独计费吗"}
+JSON
+)
+if echo "$OUT8" | grep -qF "$UP_PHRASE"; then
+  pass "query_faq 召回了新上传文档的运费内容(语义检索)"
+else
+  fail "未召回「$UP_PHRASE」—— 上传或向量化链路没生效"
+fi
+
+echo
+echo "=== 验收 9:挖知识幂等(ch04 验收标准 2) ==="
+MINE1=$(curl -s -X POST "$BASE/api/kb/jobs/mine")
+MINE1ID=$(echo "$MINE1" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("job_id",""))')
+if [ -n "$MINE1ID" ]; then
+  MINE1JSON=$(poll_job "$MINE1ID") || fail "第一次挖知识超时"
+  MINE1_STATUS=$(echo "$MINE1JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  if [ "$MINE1_STATUS" = "done" ]; then
+    MINE1_INSERTED=$(echo "$MINE1JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["inserted"])')
+    echo "  第一次挖知识入库:$MINE1_INSERTED 条"
+    pass "第一次挖知识完成"
+
+    MINE2=$(curl -s -X POST "$BASE/api/kb/jobs/mine")
+    MINE2ID=$(echo "$MINE2" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("job_id",""))')
+    if [ -n "$MINE2ID" ]; then
+      MINE2JSON=$(poll_job "$MINE2ID") || fail "第二次挖知识超时"
+      MINE2_STATUS=$(echo "$MINE2JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+      if [ "$MINE2_STATUS" = "done" ]; then
+        MINE2_INSERTED=$(echo "$MINE2JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["inserted"])')
+        echo "  第二次挖知识入库:$MINE2_INSERTED 条"
+        DUP=$(kb_duplicate_triples)
+        if [ "$DUP" = "0" ]; then
+          pass "重复触发无重复入库(知识库无重复三元组)"
+        else
+          fail "知识库存在 $DUP 组重复三元组 —— 幂等失效"
+        fi
+      else
+        fail "第二次挖知识失败:$(echo "$MINE2JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("message",""))')"
+      fi
+    else
+      fail "第二次挖知识未启动(可能忙):$MINE2"
+    fi
+  else
+    fail "第一次挖知识失败:$(echo "$MINE1JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("message",""))')"
+  fi
+else
+  fail "挖知识任务未启动(可能忙):$MINE1"
 fi
 
 echo
