@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知识库管理 · 小喵</title>
+<style>
+  :root {
+    --bg:        #e8f2fb;
+    --bg-line:   #d3e6f7;
+    --brand:     #2f6fb0;
+    --brand-dim: #245a90;
+    --ink:       #1c2b39;
+    --bubble:    #ffffff;
+    --badge:     #4a7fb5;
+    --warn:      #c2570f;
+    --ok:        #2e7d32;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    padding: 24px 16px 40px;
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    color: var(--ink);
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--bg-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--bg-line) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px; background: var(--brand); color: #fff;
+    border: 3px solid var(--brand-dim); border-radius: 4px;
+    box-shadow: 6px 6px 0 rgba(47,111,176,.18);
+  }
+  header .avatar { width: 40px; height: 40px; display: grid; place-items: center;
+    font-size: 22px; background: #fff; border-radius: 4px; }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .5px; }
+  header .spacer { flex: 1; }
+  header a { font-size: 13px; color: #fff; text-decoration: none;
+    border: 2px solid #fff; border-radius: 3px; padding: 7px 14px; }
+  header a:hover { background: #dcebf9; color: var(--brand); }
+
+  .stats { display: flex; gap: 10px; margin: 16px 0; }
+  .stat { flex: 1; background: var(--bubble); border: 2px solid var(--ink);
+    border-radius: 4px; padding: 10px 12px; }
+  .stat .n { font-size: 22px; font-weight: 700; }
+  .stat .l { font-size: 12px; color: #5b7186; }
+
+  .card { background: var(--bubble); border: 2px solid var(--ink); border-radius: 4px;
+    padding: 14px 16px; margin: 16px 0; box-shadow: 4px 4px 0 rgba(28,43,57,.10); }
+  .card h2 { margin: 0 0 10px; font-size: 15px; }
+
+  .doc-list { list-style: none; margin: 0; padding: 0; }
+  .doc-list li { display: flex; align-items: center; gap: 10px;
+    padding: 8px 6px; border-bottom: 1px dashed #cdd9e4; cursor: pointer; }
+  .doc-list li:hover { background: #f0f7fd; }
+  .doc-list li .name { font-weight: 600; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    color: var(--badge); border: 1.5px dashed var(--badge); }
+  .muted { color: #5b7186; font-size: 12px; }
+
+  .pre { white-space: pre-wrap; word-break: break-word; background: #f5f9fd;
+    border: 1px solid #d3e6f7; border-radius: 3px; padding: 12px; max-height: 420px;
+    overflow: auto; font-size: 13.5px; line-height: 1.65; }
+
+  .form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .form-row label { font-size: 13px; color: #5b7186; display: flex; align-items: center; gap: 6px; }
+  input[type=text], select, textarea {
+    font: inherit; font-size: 14px; padding: 8px 10px; color: var(--ink);
+    background: #fff; border: 2px solid var(--ink); border-radius: 3px; }
+  input[type=text] { flex: 1; min-width: 160px; }
+  textarea { width: 100%; min-height: 120px; resize: vertical; }
+  button { font: inherit; font-size: 14px; padding: 9px 16px; color: #fff;
+    background: var(--brand); border: 2px solid var(--brand-dim); border-radius: 3px;
+    cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--brand-dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.secondary { background: #fff; color: var(--brand); }
+
+  .job-status { margin-top: 10px; padding: 10px 12px; border: 1.5px dashed var(--badge);
+    border-radius: 3px; font-size: 13.5px; }
+  .job-status.done { border-color: var(--ok); color: var(--ok); }
+  .job-status.failed { border-color: var(--warn); color: var(--warn); }
+  .qa-item { padding: 8px 0; border-bottom: 1px dashed #cdd9e4; }
+  .qa-item .q { font-weight: 600; }
+  .qa-item .a { color: #40586e; font-size: 13px; margin-top: 2px; }
+  .qa-item .c { color: var(--badge); font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="avatar">📚</div>
+    <h1>知识库管理</h1>
+    <div class="spacer"></div>
+    <a href="/">← 回聊天</a>
+  </header>
+
+  <div class="stats" id="stats">
+    <div class="stat"><div class="n" id="st-total">–</div><div class="l">总块数</div></div>
+    <div class="stat"><div class="n" id="st-done">–</div><div class="l">已向量化</div></div>
+    <div class="stat"><div class="n" id="st-pending">–</div><div class="l">待向量化</div></div>
+    <div class="stat"><div class="n" id="st-milvus">–</div><div class="l">Milvus 条数</div></div>
+  </div>
+
+  <div class="card">
+    <h2>文档</h2>
+    <ul class="doc-list" id="doc-list"></ul>
+    <div class="pre" id="doc-view" style="display:none;margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>上传文档(Markdown)</h2>
+    <div class="form-row">
+      <label>文件名 <input type="text" id="up-name" placeholder="例如 退换货补充.md"></label>
+      <label>类型
+        <select id="up-type">
+          <option value="policy">policy · 政策</option>
+          <option value="faq">faq · 常见问题</option>
+          <option value="manual">manual · 手册</option>
+        </select>
+      </label>
+      <label>从文件读取 <input type="file" id="up-file" accept=".md"></label>
+    </div>
+    <textarea id="up-content" placeholder="粘贴 Markdown 内容(首行无需写类型标记,系统自动注入)"></textarea>
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+      <button id="up-submit">上传</button>
+      <span class="muted" id="up-msg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>任务</h2>
+    <div style="display:flex;gap:10px">
+      <button id="job-vectorize">向量化</button>
+      <button id="job-mine" class="secondary">从会话挖知识</button>
+    </div>
+    <div class="job-status" id="job-status" style="display:none"></div>
+    <div id="job-result"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+
+  async function api(path, opts) {
+    const resp = await fetch(path, opts);
+    if (resp.status === 409) throw new Error("已有任务在跑,或同名文档已存在");
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try { msg = (await resp.json()).detail || msg; } catch {}
+      throw new Error(msg);
+    }
+    return resp.json();
+  }
+
+  // ── 统计与文档列表 ──
+  async function refreshStats() {
+    try {
+      const s = await api("/api/kb/stats");
+      $("st-total").textContent = s.total;
+      $("st-done").textContent = s.done;
+      $("st-pending").textContent = s.pending;
+      $("st-milvus").textContent = s.milvus_count == null ? "不可用" : s.milvus_count;
+    } catch (e) { /* 静默:管理页不因 stats 失败崩掉 */ }
+  }
+
+  async function refreshDocs() {
+    const list = await api("/api/kb/documents");
+    const ul = $("doc-list");
+    ul.replaceChildren();
+    for (const d of list) {
+      const li = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "name"; name.textContent = d.name;
+      const tag = document.createElement("span");
+      tag.className = "tag"; tag.textContent = d.type;
+      const meta = document.createElement("span");
+      meta.className = "muted"; meta.textContent = `${d.title} · ${d.chunk_count} 块`;
+      li.append(name, tag, meta);
+      li.onclick = () => viewDoc(d.name);
+      ul.appendChild(li);
+    }
+    if (!list.length) {
+      const li = document.createElement("li");
+      li.className = "muted"; li.textContent = "(暂无文档)";
+      ul.appendChild(li);
+    }
+  }
+
+  async function viewDoc(name) {
+    const d = await api(`/api/kb/documents/${encodeURIComponent(name)}`);
+    const v = $("doc-view");
+    v.style.display = "block";
+    v.textContent = d.content;
+  }
+
+  // ── 上传 ──
+  $("up-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (!$("up-name").value) $("up-name").value = f.name;
+    $("up-content").value = await f.text();
+  });
+
+  $("up-submit").addEventListener("click", async () => {
+    const filename = $("up-name").value.trim();
+    const type = $("up-type").value;
+    const content = $("up-content").value;
+    if (!filename || !content) { $("up-msg").textContent = "文件名与内容不能为空"; return; }
+    $("up-submit").disabled = true;
+    $("up-msg").textContent = "上传中…";
+    try {
+      const r = await api("/api/kb/documents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename, type, content }),
+      });
+      $("up-msg").textContent = `✓ 入库 ${r.chunks_added} 块(跳过 ${r.chunks_skipped}),记得点「向量化」`;
+      $("up-content").value = ""; $("up-name").value = "";
+      await refreshDocs(); await refreshStats();
+    } catch (e) {
+      $("up-msg").textContent = `⚠ ${e.message}`;
+    } finally {
+      $("up-submit").disabled = false;
+    }
+  });
+
+  // ── 任务 ──
+  let pollTimer = null;
+
+  function renderJobResult(result) {
+    const box = $("job-result");
+    box.replaceChildren();
+    if (!result || !result.kept_qa) return;
+    const h = document.createElement("div");
+    h.className = "muted";
+    h.textContent = `抽 ${result.extracted} 条 · 保留 ${result.kept} · 丢弃 ${result.discarded} · 入库 ${result.inserted}`;
+    box.appendChild(h);
+    for (const qa of result.kept_qa) {
+      const item = document.createElement("div");
+      item.className = "qa-item";
+      const q = document.createElement("div"); q.className = "q"; q.textContent = qa.question;
+      const a = document.createElement("div"); a.className = "a"; a.textContent = qa.answer;
+      const c = document.createElement("div"); c.className = "c"; c.textContent = qa.category;
+      item.append(q, a, c);
+      box.appendChild(item);
+    }
+  }
+
+  function pollJob(jobId) {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const j = await api(`/api/kb/jobs/${jobId}`);
+        const st = $("job-status");
+        st.style.display = "block";
+        st.className = "job-status " + j.status;
+        st.textContent = `[${j.status}] ${j.message || ""}`;
+        if (j.status !== "running") {
+          clearInterval(pollTimer);
+          renderJobResult(j.result);
+          await refreshStats();
+        }
+      } catch (e) {
+        clearInterval(pollTimer);
+        $("job-status").textContent = `⚠ ${e.message}`;
+      }
+    }, 1000);
+  }
+
+  async function startJob(type) {
+    try {
+      $("job-status").style.display = "block";
+      $("job-status").className = "job-status";
+      $("job-status").textContent = "提交中…";
+      const r = await api(`/api/kb/jobs/${type}`, { method: "POST" });
+      pollJob(r.job_id);
+    } catch (e) {
+      $("job-status").className = "job-status failed";
+      $("job-status").textContent = `⚠ ${e.message}`;
+    }
+  }
+
+  $("job-vectorize").addEventListener("click", () => startJob("vectorize"));
+  $("job-mine").addEventListener("click", () => startJob("mine"));
+
+  // ── 初始 ──
+  refreshStats();
+  refreshDocs();
+})();
+</script>
+</body>
+</html>
