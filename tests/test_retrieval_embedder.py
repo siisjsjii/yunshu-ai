@@ -114,6 +114,51 @@ def test_concurrent_first_use_loads_model_exactly_once(monkeypatch):
     assert _SlowFakeModel.inits == 1
 
 
+def test_encode_is_serialized_across_threads(monkeypatch):
+    """并发 encode 必须串行 —— 后台任务与聊天共用同一 torch 模型实例。
+
+    去掉锁时,4 个线程会同时进入 encode(峰值并发 4);加锁后串行(峰值 1)。
+    """
+    import threading
+    import time
+
+    class _SerialProbe:
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def __init__(self, path, **kw):
+            pass
+
+        def encode(self, texts, **kw):
+            with _SerialProbe.lock:
+                _SerialProbe.active += 1
+                _SerialProbe.peak = max(_SerialProbe.peak, _SerialProbe.active)
+            time.sleep(0.02)          # 撑开窗口,让并发若存在则重叠
+            with _SerialProbe.lock:
+                _SerialProbe.active -= 1
+            return {"dense_vecs": [[0.0] for _ in texts]}
+
+    mod = types.ModuleType("FlagEmbedding")
+    mod.BGEM3FlagModel = _SerialProbe
+    monkeypatch.setitem(sys.modules, "FlagEmbedding", mod)
+
+    e = BgeM3Embedder("p")
+    barrier = threading.Barrier(4)
+
+    def worker():
+        barrier.wait()
+        e.encode(["x"])
+
+    ts = [threading.Thread(target=worker) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert _SerialProbe.peak == 1, f"并发 encode 峰值应=1,实际 {_SerialProbe.peak}"
+
+
 def test_get_embedder_is_singleton():
     a = get_embedder("p", 8, 2)
     b = get_embedder("p", 8, 2)

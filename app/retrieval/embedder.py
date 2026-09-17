@@ -22,19 +22,24 @@ class BgeM3Embedder:
         # 或两个并发首请求,都会同时进 _ensure_model —— 没有锁就是**两份**
         # 2.2GB 权重(4.4GB 常驻),而且两边都"成功",不会有任何报错。
         self._load_lock = threading.Lock()
+        # encode 也要串行:ch04 的后台任务与聊天检索共享同一个 torch 模型
+        # 实例,并发调同一模型的前向(跨线程)不保证安全。锁的代价是任务
+        # 批量 encode 时聊天查询可能等当前一批(约数秒,spec §9)。
+        self._encode_lock = threading.Lock()
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         """文本列表 → 1024 维已归一化稠密向量(顺序对应)。空列表直接返回。"""
         if not texts:
             return []
-        return [list(v) for v in self._ensure_model().encode(
-            texts,
-            batch_size=self._batch_size,
-            max_length=self._max_length,
-            return_dense=True,
-            return_sparse=False,
-            return_colbert_vecs=False,
-        )["dense_vecs"]]
+        with self._encode_lock:
+            return [list(v) for v in self._ensure_model().encode(
+                texts,
+                batch_size=self._batch_size,
+                max_length=self._max_length,
+                return_dense=True,
+                return_sparse=False,
+                return_colbert_vecs=False,
+            )["dense_vecs"]]
 
     def _ensure_model(self):
         if self._model is not None:
