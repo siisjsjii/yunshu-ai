@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.chat import router as chat_router
 from app.api.extract import router as extract_router
+from app.api.kb import router as kb_router
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="电商智能客服 ch02", lifespan=lifespan)
 app.include_router(chat_router)
 app.include_router(extract_router)
+app.include_router(kb_router)
 
 # 静态页必须**最后**挂:mount("/") 会接管根路径,先挂会抢走 /api/*。
 _static_dir = Path(__file__).parent / "static"

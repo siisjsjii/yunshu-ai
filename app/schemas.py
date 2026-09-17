@@ -1,7 +1,8 @@
+import re
 from enum import Enum
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Message(BaseModel):
@@ -97,6 +98,22 @@ class MinedQaBatch(BaseModel):
     items: list[MinedQaItem] = Field(
         default_factory=list, description="本批对话中挖出的问答对,没有就给空数组。"
     )
+
+
+class UploadDocumentRequest(BaseModel):
+    """上传知识文档请求(ch04 管理台)。文件名只收安全 Markdown;type 限 ch03 三类。"""
+
+    filename: str
+    type: Literal["policy", "faq", "manual"]
+    content: str
+
+    @field_validator("filename")
+    @classmethod
+    def _safe_md_name(cls, v: str) -> str:
+        # 只收 \w 与 - 组成的 .md,拒绝路径分隔符与 `..`(防写越出 knowledge/ 目录)。
+        if not re.fullmatch(r"[\w\-]+\.md", v):
+            raise ValueError("文件名须为 [字母数字_-] 组成的 .md,不含路径分隔符")
+        return v
 
 
 class ExtractResult(BaseModel):
