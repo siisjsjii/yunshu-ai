@@ -160,6 +160,11 @@
   @keyframes pulse { 50% { opacity: .25; } }
 
   .error { color: #b00020; }
+  .feedback { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .fb { font: inherit; font-size: 13px; padding: 3px 8px; background: #fff;
+    border: 1.5px solid #cdd9e4; border-radius: 999px; cursor: pointer; }
+  .fb.active { background: var(--brand); border-color: var(--brand-dim); }
+  .fb-state { font-size: 11.5px; color: #5b7186; }
 
   /* ── 底栏 ── */
   footer {
@@ -276,6 +281,24 @@
     badges.className = "badges";
     const body = document.createElement("div");
     bubble.append(badges, body);
+    // 满意度反馈(纯前端采集,一次性锁定)
+    const fb = document.createElement("div");
+    fb.className = "feedback";
+    fb.innerHTML =
+      '<button class="fb" data-v="up" type="button">👍</button>' +
+      '<button class="fb" data-v="down" type="button">👎</button>' +
+      '<span class="fb-state"></span>';
+    bubble.appendChild(fb);
+    let locked = false;
+    fb.querySelectorAll(".fb").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (locked) return;
+        locked = true;
+        fb.querySelectorAll(".fb").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        fb.querySelector(".fb-state").textContent = "已反馈";
+      });
+    });
     return { badges, body };
   }
 

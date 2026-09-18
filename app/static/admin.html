@@ -94,6 +94,15 @@
     border-bottom: 1px dashed var(--brand); cursor: pointer; }
   .src-link:hover { color: var(--brand-dim); }
   .src-none { font-size: 11.5px; color: #9aa7b4; }
+  .tabs { display: flex; gap: 8px; margin: 16px 0; }
+  .tab { font: inherit; font-size: 14px; padding: 8px 18px; color: var(--brand);
+    background: #fff; border: 2px solid var(--ink); border-radius: 3px; cursor: pointer; }
+  .tab.active { background: var(--brand); color: #fff; border-color: var(--brand-dim); }
+  table.eval { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.eval th, table.eval td { border: 1px solid #cdd9e4; padding: 6px 8px; text-align: center; }
+  table.eval th { background: #f0f7fd; }
+  .eval-bucket { margin: 12px 0; }
+  .eval-bucket h3 { font-size: 14px; margin: 0 0 6px; }
 </style>
 </head>
 <body>
@@ -105,6 +114,12 @@
     <a href="/">← 回聊天</a>
   </header>
 
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="入库" type="button">入库</button>
+    <button class="tab" data-tab="评测" type="button">评测</button>
+  </nav>
+
+  <div id="tab-入库">
   <div class="stats" id="stats">
     <div class="stat"><div class="n" id="st-total">–</div><div class="l">总块数</div></div>
     <div class="stat"><div class="n" id="st-done">–</div><div class="l">已向量化</div></div>
@@ -155,6 +170,18 @@
     </div>
     <div class="job-status" id="job-status" style="display:none"></div>
     <div id="job-result"></div>
+  </div>
+  </div>
+
+  <div id="tab-评测" style="display:none">
+    <div class="card">
+      <h2>检索评测(四策略对比)</h2>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button id="eval-refresh">刷新结果</button>
+        <span class="muted">评测由 <code>scripts/run_eval.py</code> 跑出,这里读取最近一次结果</span>
+      </div>
+      <div id="eval-results" style="margin-top:10px"></div>
+    </div>
   </div>
 </div>
 
@@ -369,6 +396,64 @@
 
   $("job-vectorize").addEventListener("click", () => startJob("vectorize"));
   $("job-mine").addEventListener("click", () => startJob("mine"));
+
+  // ── 标签页切换 ──
+  function switchTab(name) {
+    for (const b of document.querySelectorAll(".tab")) {
+      b.classList.toggle("active", b.dataset.tab === name);
+    }
+    $("tab-入库").style.display = (name === "入库") ? "block" : "none";
+    $("tab-评测").style.display = (name === "评测") ? "block" : "none";
+  }
+  for (const b of document.querySelectorAll(".tab")) {
+    b.addEventListener("click", () => switchTab(b.dataset.tab));
+  }
+
+  // ── 评测结果 ──
+  const BUCKET_LABELS = {
+    A_policy: "政策", B_model: "型号", C_colloquial: "口语",
+    D_absent: "应拒答", E_multi: "多跳",
+  };
+  function renderEval(data) {
+    const box = $("eval-results");
+    box.replaceChildren();
+    const strategies = Object.keys(data.strategies || {});
+    if (!strategies.length) {
+      box.innerHTML = '<div class="muted">暂无结果,请先运行 scripts/run_eval.py</div>';
+      return;
+    }
+    const buckets = [...new Set(
+      strategies.flatMap((s) => Object.keys(data.strategies[s])))];
+    for (const bucket of buckets) {
+      const wrap = document.createElement("div");
+      wrap.className = "eval-bucket";
+      const h = document.createElement("h3");
+      h.textContent = BUCKET_LABELS[bucket] || bucket;
+      wrap.appendChild(h);
+      const table = document.createElement("table");
+      table.className = "eval";
+      table.innerHTML =
+        "<tr><th>策略</th><th>Recall@10</th><th>MRR</th><th>置信度</th><th>应答正确</th></tr>";
+      for (const s of strategies) {
+        const r = (data.strategies[s] || {})[bucket];
+        if (!r) continue;
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${s}</td><td>${r["recall@10"]}</td><td>${r["mrr"]}</td>` +
+          `<td>${r["conf"]}</td><td>${r["answer_ok"]}</td>`;
+        table.appendChild(tr);
+      }
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    }
+  }
+  async function refreshEval() {
+    try {
+      renderEval(await api("/api/kb/eval"));
+    } catch (e) {
+      $("eval-results").innerHTML = `<div class="muted">⚠ ${e.message}</div>`;
+    }
+  }
+  $("eval-refresh").addEventListener("click", refreshEval);
 
   // ── 初始 ──
   refreshStats();

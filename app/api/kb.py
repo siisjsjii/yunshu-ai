@@ -183,6 +183,17 @@ async def search_kb(q: str, session=Depends(get_session),
     return [annotate_chunk(c, index) for c in chunks]
 
 
+@router.get("/api/kb/eval")
+async def eval_results():
+    """返回最近一次四策略评估结果(scripts/run_eval.py 产出的 latest.json)。"""
+    import json
+
+    path = Path(__file__).resolve().parents[2] / "evals" / "results" / "latest.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="尚未运行评估,请先跑 scripts/run_eval.py")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 @router.post("/api/kb/jobs/vectorize", status_code=201)
 async def start_vectorize(settings: Settings = Depends(get_settings)):
     job = start_job(get_job_store(), "vectorize", settings)
