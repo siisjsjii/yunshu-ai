@@ -42,7 +42,7 @@ class RetrievedChunk:
 
 class KnowledgeRetriever:
     def __init__(self, session, store, embedder, reranker, *, top_k: int,
-                 score_threshold: float, hybrid_top_k: int = 20):
+                 score_threshold: float, hybrid_top_k: int = 10):
         self._session = session
         self._store = store
         self._embedder = embedder
