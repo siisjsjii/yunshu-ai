@@ -211,3 +211,11 @@ GET  /api/kb/jobs/{id}         → 200 {id, type, status, message, result, creat
 ### 测试之订正:orchestrate 测试不绑定全局 pending 数(2026-09-18)
 
 `test_kb_orchestrate.py` 后台任务的 `vectorize_pending` 扫**全表** pending,而断言 `processed == 1` / `milvus_count == 1` 假设干净库 —— 库里残留上一轮验收挖矿留下的 pending 行时,全套跑会 flaky 红。改成只断言「至少处理了本测试插入的那行」+ 该行确实 done + vector_id 正确,不绑全局计数。
+
+### 增补之订正:在线检索端点(2026-09-18)
+
+用户追加需求「在线检索,命中知识块附源文档链接,点击回原文」。这是对 §1 的**功能增补**,未在原 spec §1 里列出,故记于此:
+
+- **`GET /api/kb/search?q=...`**:复用 ch03 的 `KnowledgeRetriever.search`,返回 top-K 知识块,每块带 `document`(源 `.md` 文件名)与 `section_path`(章节路径)。
+- **chunk → 源文档的反查**:`knowledge_chunks` 没有 source 列(ch03 DDL 冻死,不改表),故用 `chunk_source_index` 纯函数**重新切分每个源 .md、按 `(category, questions, answer)` 三元组匹配**。faq 迁移/挖矿块不在此索引里 → `document=null`,前端不附链接。
+- **已知边界(不修,YAGNI)**:同一内容在多个文件重复出现时,映射取 `sorted()` 靠后的文件;链接仍有效(内容确实在该文件里)。
