@@ -8,8 +8,50 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.kb import list_documents, read_document
+from app.api.kb import annotate_chunk, chunk_source_index, list_documents, read_document
+from app.retrieval.search import RetrievedChunk
 from app.schemas import UploadDocumentRequest
+
+
+# ---- 检索:chunk → 源文档映射 ----
+
+def _chunk(q="怎么退货", a="七天无理由。", c="退换货") -> RetrievedChunk:
+    return RetrievedChunk(question=q, answer=a, category=c)
+
+
+def test_chunk_source_index_maps_triple_to_file_and_section(tmp_path):
+    (tmp_path / "a.md").write_text(
+        "<!--type: policy-->\n\n# 退货政策\n\n## 运费说明\n\n满 99 包邮。\n", encoding="utf-8")
+    index = chunk_source_index(tmp_path, max_chars=100, overlap_chars=10)
+    assert index
+    # 索引键是三元组,值带文件名与章节路径
+    key, source = next(iter(index.items()))
+    assert source["name"] == "a.md"
+    assert "运费说明" in source["section_path"]
+
+
+def test_chunk_source_index_skips_file_without_marker(tmp_path):
+    (tmp_path / "stray.md").write_text("# 无标记\n\n正文。\n", encoding="utf-8")
+    assert chunk_source_index(tmp_path, max_chars=100, overlap_chars=10) == {}
+
+
+def test_annotate_chunk_links_to_source_document(tmp_path):
+    (tmp_path / "a.md").write_text(
+        "<!--type: policy-->\n\n# 退货政策\n\n满 99 包邮。\n", encoding="utf-8")
+    index = chunk_source_index(tmp_path, max_chars=100, overlap_chars=10)
+    source = next(iter(index.values()))
+    chunk = _chunk(q=next(iter(index))[1], a=next(iter(index))[2], c=next(iter(index))[0])
+    result = annotate_chunk(chunk, index)
+    assert result["document"] == "a.md"
+    assert result["section_path"] == source["section_path"]
+
+
+def test_annotate_chunk_without_source_has_null_document():
+    """faq 迁移/挖矿来的块不在任何文件里 → 不附原文链接。"""
+    result = annotate_chunk(_chunk(q="挖矿来的问题"), {})
+    assert result["document"] is None
+    assert result["section_path"] is None
+    assert result["question"] == "挖矿来的问题"
 
 
 def test_list_documents_parses_type_title_and_chunk_count(tmp_path):

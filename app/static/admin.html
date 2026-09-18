@@ -89,6 +89,11 @@
   .qa-item .q { font-weight: 600; }
   .qa-item .a { color: #40586e; font-size: 13px; margin-top: 2px; }
   .qa-item .c { color: var(--badge); font-size: 11.5px; }
+  .qa-item .meta { display: flex; gap: 10px; align-items: center; margin-top: 2px; }
+  .src-link { font-size: 12.5px; color: var(--brand); text-decoration: none;
+    border-bottom: 1px dashed var(--brand); cursor: pointer; }
+  .src-link:hover { color: var(--brand-dim); }
+  .src-none { font-size: 11.5px; color: #9aa7b4; }
 </style>
 </head>
 <body>
@@ -111,6 +116,15 @@
     <h2>文档</h2>
     <ul class="doc-list" id="doc-list"></ul>
     <div class="pre" id="doc-view" style="display:none;margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>在线检索</h2>
+    <div style="display:flex;gap:10px">
+      <input type="text" id="search-input" placeholder="输入问题,检索相关知识…" style="flex:1">
+      <button id="search-btn">检索</button>
+    </div>
+    <div id="search-results" style="margin-top:10px"></div>
   </div>
 
   <div class="card">
@@ -201,6 +215,70 @@
     v.style.display = "block";
     v.textContent = d.content;
   }
+
+  // ── 检索 ──
+  function renderSearchResults(results) {
+    const box = $("search-results");
+    box.replaceChildren();
+    if (!results.length) {
+      const p = document.createElement("div");
+      p.className = "muted";
+      p.textContent = "(没有召回到相关内容)";
+      box.appendChild(p);
+      return;
+    }
+    for (const r of results) {
+      const item = document.createElement("div");
+      item.className = "qa-item";
+      const q = document.createElement("div"); q.className = "q"; q.textContent = r.question;
+      const a = document.createElement("div"); a.className = "a"; a.textContent = r.answer;
+      const meta = document.createElement("div"); meta.className = "meta";
+      const c = document.createElement("span"); c.className = "c"; c.textContent = r.category;
+      meta.appendChild(c);
+      if (r.section_path) {
+        const sp = document.createElement("span"); sp.className = "muted"; sp.textContent = r.section_path;
+        meta.appendChild(sp);
+      }
+      if (r.document) {
+        const link = document.createElement("a");
+        link.className = "src-link";
+        link.textContent = `查看原文:${r.document}`;
+        link.onclick = () => viewDoc(r.document);
+        meta.appendChild(link);
+      } else {
+        const none = document.createElement("span");
+        none.className = "src-none";
+        none.textContent = "(对话挖矿 / FAQ 迁移来源,无原文)";
+        meta.appendChild(none);
+      }
+      item.append(q, a, meta);
+      box.appendChild(item);
+    }
+  }
+
+  async function doSearch() {
+    const q = $("search-input").value.trim();
+    if (!q) return;
+    $("search-btn").disabled = true;
+    try {
+      const results = await api(`/api/kb/search?q=${encodeURIComponent(q)}`);
+      renderSearchResults(results);
+    } catch (e) {
+      const box = $("search-results");
+      box.replaceChildren();
+      const p = document.createElement("div");
+      p.className = "muted";
+      p.textContent = `⚠ ${e.message}`;
+      box.appendChild(p);
+    } finally {
+      $("search-btn").disabled = false;
+    }
+  }
+
+  $("search-btn").addEventListener("click", doSearch);
+  $("search-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doSearch();
+  });
 
   // ── 上传 ──
   $("up-file").addEventListener("change", async (e) => {

@@ -19,7 +19,9 @@ from app.kb.jobs import Job, get_job_store
 from app.kb.orchestrate import start_job
 from app.kb.writer import write_chunks
 from app.retrieval.milvus import get_vector_store
+from app.retrieval.search import RetrievedChunk
 from app.schemas import UploadDocumentRequest
+from app.tools.registry import build_retriever
 
 router = APIRouter()
 
@@ -70,6 +72,39 @@ def read_document(dirpath, name: str) -> dict | None:
         return None
     text = path.read_text(encoding="utf-8")
     return {"name": name, "type": _doc_type(text), "content": text}
+
+
+def chunk_source_index(dirpath, *, max_chars: int, overlap_chars: int) -> dict:
+    """(category, questions, answer) 三元组 → {name, section_path} 的源文档索引。
+
+    `knowledge_chunks` 没有 source 列(ch03 DDL 冻死,不改表),要反查某个
+    知识块来自哪个源 `.md`,唯一干净的做法是**重新切分每个文件**、按三元组
+    匹配 —— chunker 是纯函数、语料只有几份,每次检索现算毫秒级。
+    faq 迁移/挖矿来的块不在此索引里(它们没有源文件)。
+    """
+    index: dict = {}
+    for md in sorted(Path(dirpath).glob("*.md")):
+        try:
+            chunks = parse_corpus_file(md, max_chars=max_chars, overlap_chars=overlap_chars)
+        except ValueError:
+            continue  # 无类型标记的散文件跳过
+        for c in chunks:
+            index[(c.category, c.questions, c.answer)] = {
+                "name": md.name, "section_path": c.section_path,
+            }
+    return index
+
+
+def annotate_chunk(chunk: RetrievedChunk, source_index: dict) -> dict:
+    """检索结果 + 源文档索引 → 带 document/section_path 的返回体。"""
+    source = source_index.get((chunk.category, chunk.question, chunk.answer))
+    return {
+        "question": chunk.question,
+        "answer": chunk.answer,
+        "category": chunk.category,
+        "document": source["name"] if source else None,
+        "section_path": source["section_path"] if source else None,
+    }
 
 
 # ---- 端点 ----
@@ -132,6 +167,20 @@ async def upload_document(payload: UploadDocumentRequest,
         "chunks_added": added,
         "chunks_skipped": len(chunks) - added,
     }
+
+
+@router.get("/api/kb/search")
+async def search_kb(q: str, session=Depends(get_session),
+                    settings: Settings = Depends(get_settings)):
+    """在线检索:语义检索知识库,返回带源文档链接的知识块列表。"""
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="查询词不能为空")
+    chunks = await build_retriever(session).search(query)
+    index = chunk_source_index(
+        KNOWLEDGE_DIR, max_chars=settings.chunk_max_chars,
+        overlap_chars=settings.chunk_overlap_chars)
+    return [annotate_chunk(c, index) for c in chunks]
 
 
 @router.post("/api/kb/jobs/vectorize", status_code=201)
