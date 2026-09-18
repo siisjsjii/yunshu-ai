@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **ch01(纯对话)** 已合并到 `main`:SSE 流式对话 + 结构化抽取。
 - **ch02(Function Calling 查数据)** 交付:模型单轮选工具 → 后端执行 → 回灌 → 作答。含四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
 - **ch03(知识库 + 向量检索)** 交付(分支 `ch03-kb`):`query_faq` 内部实现从关键词查 `faq` 表换成 **BGE-M3 + Milvus 的语义检索**(工具契约一字未改)。含结构感知切分、语料导入、双写幂等、对话挖知识、检索评估集、端到端验收 7 项。设计源见 ch03 spec(§12 订正最多的一章)。
+- **ch04(知识库管理台)** 交付(分支 `ch04-kb-console`):文档查看/在线上传、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。核心是 `app/kb/jobs.py`(JobStore)+ `app/kb/orchestrate.py`(后台任务:专用线程 + **自建独立 engine**)+ `app/api/kb.py`(7 端点)。
 
-**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**全程不做**:多轮 Agent Loop、认证。
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -24,7 +25,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务;浏览器开 http://localhost:8000
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py       # 工具选择评估集,需真实 key + MySQL
-bash scripts/acceptance.sh                                      # 端到端验收 1–7,需服务已启动 + 真实 key
+bash scripts/acceptance.sh                                      # 端到端验收 1–9,需服务已启动 + 真实 key
+# ch04 管理台:浏览器开 http://localhost:8000/admin.html(文档查看/上传、向量化/挖知识按钮)
 
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)
@@ -144,6 +146,14 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 **冷启动的模型加载不在请求路径上**:2.2GB 权重首次加载十几秒 > `tool_timeout_seconds`(10s),冷进程第一个检索请求必然超时;超时取消协程后会话停在未收尾的事务上,而 `query_faq` **在重试白名单里**,重试复用同一 session 直接撞 `PendingRollbackError` → 用户看到 502。两处保障:`app/main.py` lifespan 起后台线程预热(**pytest 下跳过**,单测不加载模型是硬规矩);retriever 在取消路径 `rollback()` 再抛(`except BaseException` —— `CancelledError` 是 BaseException,只抓 `Exception` 正好漏掉)。
 
 **`_ensure_model` 必须有 `threading.Lock`**:没锁时预热线程与首请求并发会加载**两份 2.2GB** 且两边都成功、不报任何错。
+
+**ch04 · 后台任务的三个命门**(细节见 ch04 spec §12 与 `dev-notes/ch04.md`):
+
+**后台任务必须自建 engine,不能用 `get_engine()` 的 lru_cache 单例** —— 那单例绑在首次使用它的主事件循环上,后台线程 `asyncio.run` 里复用会出跨循环的异步连接问题。`orchestrate.py` 每任务 `create_async_engine` + 任务结束 `dispose()`。
+
+**encode 也要锁(`_encode_lock`)**:后台任务与聊天检索共享同一个 torch 模型实例,并发前向跨线程不保证安全。与 `_load_lock` 分开,串行 encode 的代价是任务批量编码时聊天查询可能等当前一批(数秒)。
+
+**验收/测试的确定性**:聊天里的工具选择与关键词抽取非确定(deepseek 在 temperature=0 下亦然),凡是「召回」「挖知识幂等」这类断言**不要经过 LLM 聊天** —— 召回直接查 retriever、幂等直接查「知识库有无重复三元组」。
 
 **裁剪按 `user` 边界切轮,不按 `assistant`**(`memory/trim.py`)。OpenAI 兼容 API 要求 `tool` 消息前面紧跟着带对应 `tool_call_id` 的 `assistant` 消息;按 `assistant` 收轮会把这对切开,而那**只在历史长到触发裁剪时偶发 400**。
 

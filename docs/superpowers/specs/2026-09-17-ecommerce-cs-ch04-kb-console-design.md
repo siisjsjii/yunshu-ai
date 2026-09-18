@@ -190,3 +190,24 @@ GET  /api/kb/jobs/{id}         → 200 {id, type, status, message, result, creat
 ## 12. 实现订正
 
 (实现过程中与本文的偏离,连同原因记录于此。)
+
+### §9 之订正:embedder 加了 `_encode_lock`,encode 全程串行(2026-09-18)
+
+§9 预告「给 embedder 加 encode 锁串行化」。实现时确认:**后台任务与聊天检索共享同一个 torch 模型实例**,并发调同一模型前向(跨线程)不保证安全。故 `encode` 主体包进 `_encode_lock`(与 `_load_lock` 分开),可证伪测试:去锁后 4 线程并发峰值 4,加锁后峰值 1。代价:任务批量 encode 时聊天查询可能等当前一批(约数秒),实测可接受。
+
+### §3.3 之订正:后台任务「独立 engine」落地的形态(2026-09-18)
+
+§3.3 写「任务线程自建 `create_async_engine`,不用 `get_engine()` 的 lru_cache 单例」。实现:`app/kb/orchestrate.py` 里 `_fresh_factory(settings)` 每次任务新建 engine + `async_sessionmaker(expire_on_commit=False)`,任务结束 `dispose()`;`start_job` 的 `store`/`embedder`/`model` 缺省用真实单例、测试注入 fake。db 测试(`test_kb_orchestrate.py`)真 MySQL + fake 三件套验证线程+engine 胶水。
+
+### §4.3 之订正:挖知识结果计数「kept=最终入库数」(2026-09-18)
+
+`mine_knowledge` 返回的 `kept` 定义为**最终保留并入库**的问答对数(不是「活过字面去重」的数),与 `inserted` 一致;`discarded` = 字面去重 + 向量近重复总共丢掉的。`kept_qa` 是 kept 的 `{question,answer,category}` 列表。
+
+### §8 之订正:验收 8/9 的断言都改成了确定性写法(2026-09-18)
+
+- **验收 8(召回)**:初版走「聊天 → grep 工具结果」,但**聊天里的工具选择/关键词抽取非确定**(deepseek 在 temperature=0 下依然非确定,CLAUDE.md 记过),会偶发假红。改成 `kb_recall_hit` 直接用查询原文喂 retriever,确定性验证「新内容进索引且能召回」。
+- **验收 9(幂等)**:初版断言「第二次 inserted==0」,但 LLM 每次抽的问答对**不同**(非确定),第二次会抽出第一次没抽到的新对 → inserted>0,这不是重复入库、是新内容。幂等的真实含义是「重复触发不重复入库」= 知识库不产生重复三元组。改成确定性的 `kb_duplicate_triples == 0`(查 `knowledge_chunks` 有无重复 `(category, questions, answer)`)。
+
+### 测试之订正:orchestrate 测试不绑定全局 pending 数(2026-09-18)
+
+`test_kb_orchestrate.py` 后台任务的 `vectorize_pending` 扫**全表** pending,而断言 `processed == 1` / `milvus_count == 1` 假设干净库 —— 库里残留上一轮验收挖矿留下的 pending 行时,全套跑会 flaky 红。改成只断言「至少处理了本测试插入的那行」+ 该行确实 done + vector_id 正确,不绑全局计数。

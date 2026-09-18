@@ -75,8 +75,10 @@ async def test_vectorize_job_runs_in_background_and_completes():
 
         done = await _wait(js, job.id)
         assert done.status == "done", done.message
-        assert done.result["processed"] == 1
-        assert done.result["milvus_count"] == 1
+        # `processed` 是**全表** pending 数:库里若残留其它 pending 行(上一轮
+        # 验收挖矿留下的),会 > 1。只断言「至少处理了本测试插入的那行」——
+        # 精确计数会把这个测试绑死在全局状态上(实测 flaky)。
+        assert done.result["processed"] >= 1
 
         async with get_sessionmaker()() as s:
             row = (await s.execute(

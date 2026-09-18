@@ -6,8 +6,9 @@
 
 - **ch01(纯对话)**:SSE 流式对话 + 结构化抽取,已并入 main。
 - **ch02(单轮 Function Calling 查数据)**:已交付 —— 四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
-- **ch03(知识库 + 向量检索)**:已交付(T0–T13)—— 结构感知切分、语料导入、BGE-M3 嵌入、Milvus 双写幂等、`query_faq` 换向量语义检索、对话挖知识、检索评估集、端到端验收 7 项。分支 `ch03-kb`。设计源:ch03 spec(含 §12 订正)+ `dev-notes/ch03.md`。
-- **明确不做**:多轮 Agent Loop、认证;ch03 不做关键词召回/混合检索/重排(spec §10 定死只跑 dense 单路)。ch03 入口:物流号间接查询(见 ch02 spec §10)。
+- **ch03(知识库 + 向量检索)**:已交付(T0–T13)—— 结构感知切分、语料导入、BGE-M3 嵌入、Milvus 双写幂等、`query_faq` 换向量语义检索、对话挖知识、检索评估集、端到端验收 7 项。设计源:ch03 spec(含 §12 订正)+ `dev-notes/ch03.md`。
+- **ch04(知识库管理台)**:已交付(T1–T8)—— 文档查看/在线上传、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。分支 `ch04-kb-console`。设计源:ch04 spec(含 §12 订正)+ `dev-notes/ch04.md`。
+- **明确不做**:多轮 Agent Loop、认证;ch03 不做关键词召回/混合检索/重排(spec §10 定死只跑 dense 单路);ch04 不做文档删除/编辑、任务持久化、并发任务队列。
 - 技术栈:Python 3.13 + FastAPI + LangChain 1.4(`langchain-openai`)+ DeepSeek(OpenAI 兼容网关)+ MySQL(`asyncmy`)+ ch03 新增 **BGE-M3 本地权重**(`models/bge-m3/`,2.2GB,已 gitignore)+ **Milvus 2.6 standalone**。`.venv` 已建好,一律用 `.venv/Scripts/python.exe`。
 
 ## 高频命令
@@ -23,8 +24,11 @@
 .venv/Scripts/python.exe scripts/mine_qa.py                       # ch03 对话挖知识
 .venv/Scripts/python.exe evals/run_retrieval_eval.py              # 检索评估(需 Milvus)
 .venv/Scripts/python.exe evals/run_retrieval_eval.py --dist       # 看相似度分布定阈值
-bash scripts/acceptance.sh                        # 端到端验收 1–7,需服务已启动 + 真实 key
+bash scripts/acceptance.sh                        # 端到端验收 1–9,需服务已启动 + 真实 key
 ```
+
+ch04 管理台:浏览器开 `http://localhost:8000/admin.html`(文档查看/上传、向量化与挖知识按钮)。
+ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 `-e DEPLOY_MODE=STANDALONE`,完整命令见 ch03 spec §12)。
 
 ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 `-e DEPLOY_MODE=STANDALONE`,完整命令见 ch03 spec §12)。
 
@@ -38,7 +42,8 @@ ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 
 `tools → retrieval → db` 与 `kb(离线管线) → {db, llm, retrieval}`。
 
 - `app/retrieval/`(在线):`embedder.py`(BGE-M3 懒加载单例)、`milvus.py`(`MilvusVectorStore`)、`search.py`(`KnowledgeRetriever`,**错误语义的翻译边界**:Milvus/嵌入故障 → `ToolInfrastructureError`)。
-- `app/kb/`(离线,不在请求路径上):`chunker.py`(纯函数)、`ingest.py`、`writer.py`(双写幂等)、`mining.py`(挖知识)。
+- `app/kb/`(离线,不在请求路径上):`chunker.py`(纯函数)、`ingest.py`、`writer.py`(双写幂等)、`mining.py`(挖知识 + `mine_knowledge` 编排)。
+- ch04 新增:`app/kb/jobs.py`(JobStore 内存任务注册表)、`app/kb/orchestrate.py`(后台任务:专用线程 + **自建独立 engine**,不用 `get_engine()` 单例)、`app/api/kb.py`(7 端点)。
 - **Milvus 只当索引**:集合 `knowledge` 只有 `id VARCHAR(= str(MySQL id))` + `vector`;原文一律回 MySQL 查,故集合可随时 drop 重建。
 
 - `app/memory/`(锁注册表、token 裁剪)与 `app/services/history.py` **不依赖 LangChain**,只碰 `app.schemas.Message` 纯数据类;转 `BaseMessage` 只在 `prompts.py:to_lc_messages` 一处。
