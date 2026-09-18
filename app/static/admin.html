@@ -103,6 +103,13 @@
   table.eval th { background: #f0f7fd; }
   .eval-bucket { margin: 12px 0; }
   .eval-bucket h3 { font-size: 14px; margin: 0 0 6px; }
+  .eval-bars { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+  .eval-bar-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .eval-bar-label { width: 110px; text-align: right; flex-shrink: 0; color: #40586e; }
+  .eval-bar-track { flex: 1; height: 18px; background: #eef4fa; border-radius: 3px; overflow: hidden; }
+  .eval-bar-fill { height: 100%; background: var(--brand); border-radius: 3px; }
+  .eval-bar-val { width: 48px; font-weight: 700; flex-shrink: 0; }
+  .eval-chart-note { font-size: 11px; color: #9aa7b4; margin-bottom: 4px; }
 </style>
 </head>
 <body>
@@ -430,6 +437,39 @@
       const h = document.createElement("h3");
       h.textContent = BUCKET_LABELS[bucket] || bucket;
       wrap.appendChild(h);
+
+      // ── MRR 柱状图(横向条,长度 ∝ MRR)──
+      const note = document.createElement("div");
+      note.className = "eval-chart-note";
+      note.textContent = "MRR(平均倒数排名,越高越好)";
+      wrap.appendChild(note);
+      const bars = document.createElement("div");
+      bars.className = "eval-bars";
+      const mrrVals = strategies.map((s) => ((data.strategies[s] || {})[bucket] || {}).mrr || 0);
+      const maxMrr = Math.max(...mrrVals, 0.0001);
+      for (const s of strategies) {
+        const r = (data.strategies[s] || {})[bucket];
+        if (!r) continue;
+        const row = document.createElement("div");
+        row.className = "eval-bar-row";
+        const label = document.createElement("span");
+        label.className = "eval-bar-label";
+        label.textContent = s;
+        const track = document.createElement("div");
+        track.className = "eval-bar-track";
+        const fill = document.createElement("div");
+        fill.className = "eval-bar-fill";
+        fill.style.width = `${((r.mrr / maxMrr) * 100).toFixed(1)}%`;
+        track.appendChild(fill);
+        const val = document.createElement("span");
+        val.className = "eval-bar-val";
+        val.textContent = r.mrr.toFixed(3);
+        row.append(label, track, val);
+        bars.appendChild(row);
+      }
+      wrap.appendChild(bars);
+
+      // ── 数值表(强化)──
       const table = document.createElement("table");
       table.className = "eval";
       table.innerHTML =
