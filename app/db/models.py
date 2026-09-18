@@ -111,6 +111,26 @@ class KnowledgeChunk(Base):
     )
 
 
+class LowConfidenceQuestion(Base):
+    """低置信度问题池(ch04,DDL: db/ch04.sql)。
+
+    检索为空 / 自评不足时,问题落此池留痕,供数据飞轮消费(本章只落不消费)。
+    """
+
+    __tablename__ = "low_confidence_questions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    source_conversation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    entry_point: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    reject_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+
 class QaExtractionStaging(Base):
     """历史对话抽 QA 的离线中转暂存表(DDL: db/ch03.sql)。
 

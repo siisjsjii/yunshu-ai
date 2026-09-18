@@ -8,6 +8,7 @@ from app.db.models import (
     Conversation,
     Faq,
     KnowledgeChunk,
+    LowConfidenceQuestion,
     MessageRecord,
     QaExtractionStaging,
     Ticket,
@@ -275,6 +276,43 @@ async def _cleanup_kb_rows(engine) -> None:
     async with get_sessionmaker()() as session:
         await session.execute(
             delete(KnowledgeChunk).where(KnowledgeChunk.category == SCRATCH_KB_CATEGORY)
+        )
+        await session.commit()
+    await engine.dispose()
+
+
+SCRATCH_LQ_QUESTION = "ch04-probe-低置信度问题"
+
+
+@pytest.mark.anyio
+async def test_low_confidence_question_roundtrip():
+    """落池行往返:原话/入池入口/原因 + source_conversation_id 可空。"""
+    engine = get_engine()
+    async with get_sessionmaker()() as session:
+        row = LowConfidenceQuestion(
+            question=SCRATCH_LQ_QUESTION,
+            source_conversation_id=None,
+            entry_point="检索为空",
+            reject_reason="知识库没有相关内容",
+        )
+        session.add(row)
+        await session.commit()
+        row_id = row.id
+
+    async with get_sessionmaker()() as session:
+        got = (
+            await session.execute(
+                select(LowConfidenceQuestion).where(
+                    LowConfidenceQuestion.id == row_id
+                )
+            )
+        ).scalars().one()
+        assert got.question == SCRATCH_LQ_QUESTION
+        assert got.entry_point == "检索为空"
+        assert got.reject_reason == "知识库没有相关内容"
+        assert got.source_conversation_id is None
+        await session.execute(
+            text("DELETE FROM low_confidence_questions WHERE id = :i"), {"i": row_id}
         )
         await session.commit()
     await engine.dispose()
