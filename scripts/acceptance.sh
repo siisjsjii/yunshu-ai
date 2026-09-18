@@ -290,6 +290,30 @@ asyncio.run(main())
 '
 }
 
+# 直接查检索器,判断某短语是否被语义召回。输出 hit / miss。
+# 不经过 LLM 聊天 —— 聊天里的工具选择/关键词抽取是非确定的(deepseek 在
+# temperature=0 下依然非确定),会让「上传→向量化→召回」这条断言偶发假红。
+# 这里用查询原文直接喂 retriever,确定性验证「新内容进了索引且能召回」。
+kb_recall_hit() {
+  QUERY="$1" PHRASE="$2" "$PYTHON" -c '
+import asyncio, os, sys
+
+from app.db.base import get_engine, get_sessionmaker
+from app.tools.registry import build_retriever
+
+
+async def main():
+    async with get_sessionmaker()() as session:
+        chunks = await build_retriever(session).search(os.environ["QUERY"])
+    text = " ".join(c.question + " " + c.answer for c in chunks)
+    sys.stdout.buffer.write(b"hit" if os.environ["PHRASE"] in text else b"miss")
+    await get_engine().dispose()
+
+
+asyncio.run(main())
+'
+}
+
 echo "=== 前置:服务可达性 ==="
 if ! curl -s -m 5 -o /dev/null "$BASE/"; then
   echo "  ❌ $BASE 没有响应。先起服务:" >&2
@@ -612,14 +636,8 @@ else
   fail "向量化任务未启动(可能忙):$VJOB"
 fi
 
-OUT8=$(curl -sN -X POST "$BASE/api/chat/stream" \
-  -H 'Content-Type: application/json' \
-  --data-binary @- <<'JSON'
-{"message":"超大件商品运费单独计费吗"}
-JSON
-)
-if echo "$OUT8" | grep -qF "$UP_PHRASE"; then
-  pass "query_faq 召回了新上传文档的运费内容(语义检索)"
+if [ "$(kb_recall_hit '超大件商品运费单独计费吗' "$UP_PHRASE")" = "hit" ]; then
+  pass "新上传文档的运费内容被语义召回"
 else
   fail "未召回「$UP_PHRASE」—— 上传或向量化链路没生效"
 fi
