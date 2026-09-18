@@ -181,7 +181,9 @@ async def stream_turn(
             {
                 "items": [
                     {"n": i + 1, "chunk_id": item["chunk_id"],
-                     "section_path": item["section_path"]}
+                     "section_path": item["section_path"],
+                     "question": item["question"], "answer": item["answer"],
+                     "category": item["category"]}
                     for i, item in enumerate(faq_items)
                 ]
             },
