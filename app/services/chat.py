@@ -1,8 +1,10 @@
+import json
 from collections.abc import AsyncIterator, Sequence
 
 from langchain.messages import AIMessage, ToolMessage
 
 from app.config import Settings
+from app.kb.assess import assess_sufficiency, record_low_confidence
 from app.memory import trim
 from app.prompts import build_messages, render_system_prompt
 from app.schemas import Message
@@ -60,6 +62,7 @@ async def stream_turn(
     messages: Sequence,
     tools: Sequence,
     registry: dict,
+    assess_model=None,
 ) -> AsyncIterator[tuple[str, dict]]:
     """单轮工具调用编排。
 
@@ -106,6 +109,8 @@ async def stream_turn(
     # ---- 执行工具 ----
     round_two = list(messages) + [AIMessage(content=first_text, tool_calls=tool_calls)]
     tool_messages: list[Message] = []
+    faq_items: list[dict] = []   # query_faq 命中的知识块(ch04 引用/自评用)
+    faq_failed = False           # query_faq 检索为空(ToolNotFound)
 
     for tool_call in tool_calls:
         yield (
@@ -132,6 +137,62 @@ async def stream_turn(
         )
         tool_messages.append(
             Message(role="tool", content=outcome.content, tool_call_id=tool_call["id"])
+        )
+        if tool_call["name"] == "query_faq":
+            if outcome.ok:
+                try:
+                    faq_items = json.loads(outcome.content).get("items", [])
+                except (json.JSONDecodeError, AttributeError):
+                    faq_items = []
+            else:
+                faq_failed = True
+
+    # ---- 生成 QC(ch04):检索为空落池 / 自评不足拒答落池 / 引用帧 ----
+    if faq_items:
+        assess = await assess_sufficiency(
+            user_input,
+            [type("_C", (), {"answer": item["answer"]}) for item in faq_items],
+            assess_model or model,
+        )
+        if not assess["sufficient"]:
+            await record_low_confidence(
+                session,
+                question=user_input,
+                source_conversation_id=conversation_id,
+                entry_point="自评不足",
+                reject_reason=assess["reason"] or "召回知识不足以回答",
+            )
+            refusal = "抱歉,我目前掌握的信息不足以准确回答这个问题,建议联系人工客服进一步确认。"
+            await append_turn(
+                session=session,
+                conversation_id=conversation_id,
+                messages=[
+                    Message(role="user", content=user_input),
+                    Message(role="assistant", content=first_text, tool_calls=tool_calls),
+                    *tool_messages,
+                    Message(role="assistant", content=refusal),
+                ],
+            )
+            yield ("token", {"text": refusal})
+            yield ("done", {"finish_reason": "stop", "usage": None})
+            return
+        yield (
+            "citations",
+            {
+                "items": [
+                    {"n": i + 1, "chunk_id": item["chunk_id"],
+                     "section_path": item["section_path"]}
+                    for i, item in enumerate(faq_items)
+                ]
+            },
+        )
+    elif faq_failed:
+        await record_low_confidence(
+            session,
+            question=user_input,
+            source_conversation_id=conversation_id,
+            entry_point="检索为空",
+            reject_reason="知识库没有相关内容",
         )
 
     # ---- 第二轮:不绑 tools,强制收敛为文本 ----

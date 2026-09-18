@@ -210,7 +210,15 @@ def make_query_faq(session, retriever):
                 "keyword": cleaned,
                 "count": len(chunks),
                 "items": [
-                    {"question": c.question, "answer": c.answer, "category": c.category}
+                    {
+                        "question": c.question,
+                        "answer": c.answer,
+                        "category": c.category,
+                        # ch04 增补(引用定位用,spec §13):chunk_id 映射原文、
+                        # section_path 展示章节路径。模型侧旧三字段不变。
+                        "chunk_id": c.chunk_id,
+                        "section_path": c.section_path,
+                    }
                     for c in chunks
                 ],
             },

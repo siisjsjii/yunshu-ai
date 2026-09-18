@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.db.session import get_session
-from app.llm import create_chat_model
+from app.llm import create_chat_model, create_extract_model
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
 from app.sanitize import redact_api_key
@@ -120,6 +120,7 @@ async def chat_stream(
                 messages=messages,
                 tools=tools,
                 registry=registry,
+                assess_model=create_extract_model(settings),
             ):
                 if event == "tool_result" and not payload["ok"]:
                     # 失败原因是**出站**文本(spec §5.2:同样脱敏后),

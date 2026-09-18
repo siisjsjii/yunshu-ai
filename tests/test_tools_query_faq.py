@@ -63,8 +63,13 @@ def test_output_keys_and_types_are_unchanged():
     assert isinstance(payload["count"], int)
     assert payload["count"] == len(payload["items"]) == 1
     item = payload["items"][0]
-    assert set(item) == {"question", "answer", "category"}
-    assert all(isinstance(v, str) for v in item.values())
+    # 旧三字段 + ch04 增补的引用元数据(chunk_id 是 int,section_path 是 str/None)
+    assert {"question", "answer", "category"} <= set(item)
+    assert isinstance(item["question"], str)
+    assert isinstance(item["answer"], str)
+    assert isinstance(item["category"], str)
+    assert isinstance(item["chunk_id"], int)
+    assert item["section_path"] is None or isinstance(item["section_path"], str)
 
 
 def test_question_keeps_full_text_with_newlines():
