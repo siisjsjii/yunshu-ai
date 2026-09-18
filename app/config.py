@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     embedding_model_path: str = "models/bge-m3"
     embedding_max_length: int = Field(default=1024, gt=0)
     embedding_batch_size: int = Field(default=16, gt=0)
+    # ch04 重排(懒加载,权重由用户放 models/ 下)
+    reranker_model_path: str = "models/bge-reranker-v2-m3"
+    reranker_use_fp16: bool = False
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_collection: str = "knowledge"
     # top_k <= 0 → 搜索永远空,检索静默失效;阈值越界一个方向等于永远全滤空、
