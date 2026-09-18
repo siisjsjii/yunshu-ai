@@ -125,7 +125,7 @@ async def main() -> None:
         yield "混合(RRF)", lambda q, qv: store.hybrid_search(qv, q, top_k)
 
         def hybrid_rerank(q, qv):
-            hits = store.hybrid_search(qv, q, max(50, top_k))
+            hits = store.hybrid_search(qv, q, max(20, top_k))
             if not hits:
                 return []
             texts = [(i, chunks.get(str(i), {}).get("answer", "")) for i, _ in hits]
