@@ -1,18 +1,15 @@
-"""在线检索:问题向量化 → Milvus Top-K → 阈值过滤 → MySQL 回查原文。
+"""在线检索:问题向量化 → 混合检索(dense+BM25,RRF)→ 回查 → 重排 → 阈值过滤。
 
-Milvus 只当索引(spec §6.1),命中的 id 一律回 MySQL 取原文,所以在返回
-之前有两件事必须做对:
+ch04 起检索换成混合 + 重排:
 
-- **顺序跟 Milvus 的相似度**,不跟 MySQL 的返回顺序 —— 综合结果按分数
-  排序才对用户/模型有意义,而 SQL 的 `IN` 不保证任何顺序。
-- **阈值以下的命中直接丢**,全丢光就返回空 —— dense 单路没有重排兜底,
-  阈值是「不相关也硬凑答案」的唯一闸门(spec §6.6)。返回空由调用方
-  (query_faq)翻成 ToolNotFound。
+1. 嵌入 query → dense 向量;
+2. `hybrid_search`(dense 腿 + BM25 腿,RRF 融合)→ 候选 Top-N;
+3. 回 MySQL 取原文(拿 text 供重排);
+4. bge-reranker-v2-m3 精排 → Top-K(0-1 sigmoid 分数);
+5. 阈值过滤 → 返回带 chunk_id / section_path / score 的块。
 
-本模块是错误语义的**翻译边界**:Milvus 连不上、嵌入失败都是基础设施故障,
-一律翻成 `ToolInfrastructureError`(502),绝不降级成「没搜到」——
-那会把「向量库挂了」伪装成「这条知识没收录」,模型会如实转告用户「暂未
-收录」,而我们永远不知道检索其实一直在失败。
+本模块是错误语义的**翻译边界**:Milvus 连不上、嵌入失败、重排失败都是基础设施
+故障,一律翻成 `ToolInfrastructureError`(502),绝不降级成「没搜到」。
 """
 
 from dataclasses import dataclass
@@ -29,73 +26,74 @@ _INFRA_MESSAGE = "知识检索服务暂时不可用"
 
 @dataclass(frozen=True)
 class RetrievedChunk:
-    """一条召回结果 —— 字段与 query_faq 出参的 items 一一对应(spec §5.1)。"""
+    """一条召回结果。chunk_id / section_path 供引用定位回原文(ch04)。
+
+    question/answer/category 在前保持旧位置构造兼容;chunk_id/section_path/score
+    是 ch04 新增、带默认值(检索器用关键字构造,不受字段序影响)。
+    """
 
     question: str
     answer: str
     category: str
+    chunk_id: int = 0
+    section_path: str | None = None
+    score: float = 0.0
 
 
 class KnowledgeRetriever:
-    def __init__(self, session, store, embedder, *, top_k: int, score_threshold: float):
+    def __init__(self, session, store, embedder, reranker, *, top_k: int,
+                 score_threshold: float, hybrid_top_k: int = 50):
         self._session = session
         self._store = store
         self._embedder = embedder
+        self._reranker = reranker
         self._top_k = top_k
         self._score_threshold = score_threshold
+        self._hybrid_top_k = hybrid_top_k
 
     async def search(self, query: str) -> list[RetrievedChunk]:
         try:
             return await self._search(query)
         except BaseException:
-            # 工具超时是靠 `asyncio.wait_for` **取消协程**实现的,取消点是随机的
-            # (冷启动时第一次 encode 要加载 2.2GB 权重,十几秒都回不来,极容易
-            # 落在那里)。被取消之后这条会话会停在一个没有收尾的事务上,而
-            # executor 对 query_faq 是**会重试**的 —— 重试复用同一个 session,
-            # 于是撞上 `PendingRollbackError`,把一次"超时重试"升级成用户可见的
-            # 502(实测:验收 1 冷启动那一次就是这个形态)。
-            #
-            # 这里把事务收干净再往上抛。用 BaseException 而不是 Exception:
-            # CancelledError 是 BaseException,只抓 Exception 正好漏掉这个场景。
-            #
-            # session 判空:单测里"全被阈值滤掉"这类用例根本不碰库,传的就是
-            # None。不判空的话,真正的故障会被 `None.rollback()` 的
-            # AttributeError 顶掉 —— 报错指向本行,而根因是上游的 Milvus 故障。
+            # 工具超时靠 `asyncio.wait_for` 取消协程,取消点随机。取消后会话停在
+            # 未收尾事务上,而 query_faq 会重试复用同一 session → PendingRollbackError
+            # 把「超时」升级成 502。这里回滚再抛。BaseException 覆盖 CancelledError。
             if self._session is not None:
                 await self._session.rollback()
             raise
 
     async def _search(self, query: str) -> list[RetrievedChunk]:
-        kept = [
-            (chunk_id, score)
-            for chunk_id, score in self._top_hits(query)
-            if score >= self._score_threshold
-        ]
+        hits = self._hybrid_hits(query)  # [(chunk_id, rrf_score)]
+        if not hits:
+            return []
+
+        rows = await self._load_rows([chunk_id for chunk_id, _ in hits])
+        ranked = self._rerank(query, hits, rows)  # [(chunk_id, sigmoid_score)]
+        kept = [(cid, score) for cid, score in ranked if score >= self._score_threshold]
         if not kept:
             return []
 
-        rows = await self._load_rows([chunk_id for chunk_id, _ in kept])
         out: list[RetrievedChunk] = []
-        for chunk_id, _score in kept:  # 保持 Milvus 给的降序
+        for chunk_id, score in kept:
             row = rows.get(chunk_id)
             if row is None:
-                # Milvus 里残留的陈旧向量(对应行已从 MySQL 删掉)。跳过即可
-                # —— 这正是「Milvus 只是索引」的代价,两边可能短暂不一致。
+                # Milvus 里残留的陈旧向量(对应行已从 MySQL 删掉)。跳过。
                 continue
             out.append(
                 RetrievedChunk(
+                    chunk_id=int(chunk_id),
                     question=row.questions,  # 全文,多个问法含换行,不截断
                     answer=row.answer,
                     category=row.category,
+                    section_path=row.section_path,
+                    score=score,
                 )
             )
         return out
 
-    def _top_hits(self, query: str) -> list[tuple[str, float]]:
-        """嵌入 + 向量检索。两处失败都是基础设施故障,统一翻译。"""
+    def _hybrid_hits(self, query: str) -> list[tuple[str, float]]:
+        """嵌入 + 混合检索。两处失败都是基础设施故障,统一翻译。"""
         try:
-            # 查询侧**不拼** category/questions/answer:那是入库时对 chunk 做的
-            # 事(见 writer.vector_text)。查询就是问题原文。
             vector = self._embedder.encode([query])[0]
         except ToolInfrastructureError:
             raise
@@ -103,19 +101,32 @@ class KnowledgeRetriever:
             raise ToolInfrastructureError(_INFRA_MESSAGE) from exc
 
         try:
-            return self._store.search(vector, self._top_k)
+            return self._store.hybrid_search(vector, query, self._hybrid_top_k)
         except ToolInfrastructureError:
             raise
         except Exception as exc:
             raise ToolInfrastructureError(_INFRA_MESSAGE) from exc
 
-    async def _load_rows(self, chunk_ids: list[str]) -> dict[str, KnowledgeChunk]:
-        """按 id 回查原文。
+    def _rerank(self, query: str, hits: list[tuple[str, float]],
+                rows: dict[str, KnowledgeChunk]) -> list[tuple[str, float]]:
+        """对候选块用 bge-reranker-v2-m3 精排,返回 Top-K 的 [(chunk_id, score)]。
 
-        返回 {str(id): row} —— 键是**字符串**,与 Milvus 的主键类型一致,
-        免得调用方在 int/str 之间来回转。非数字 id 直接丢掉(理论上不会出现,
-        真出现也不能变成 500)。
+        排序依据是重排分数(0-1 sigmoid);分数同时当置信度供阈值过滤。
         """
+        candidates = [(cid, rows[cid].answer) for cid, _ in hits if cid in rows]
+        if not candidates:
+            return []
+        try:
+            scores = self._reranker.rerank(query, candidates)
+        except ToolInfrastructureError:
+            raise
+        except Exception as exc:
+            raise ToolInfrastructureError(_INFRA_MESSAGE) from exc
+        ranked = sorted(zip(candidates, scores), key=lambda x: -x[1])
+        return [(cid, score) for (cid, _), score in ranked[: self._top_k]]
+
+    async def _load_rows(self, chunk_ids: list[str]) -> dict[str, KnowledgeChunk]:
+        """按 id 回查原文,返回 {str(id): row}。非数字 id 直接丢掉。"""
         numeric_ids = []
         for chunk_id in chunk_ids:
             try:

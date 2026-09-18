@@ -10,6 +10,7 @@ from langchain_core.tools import BaseTool
 from app.config import get_settings
 from app.retrieval.embedder import get_embedder
 from app.retrieval.milvus import get_vector_store
+from app.retrieval.reranker import get_reranker
 from app.retrieval.search import KnowledgeRetriever
 from app.tools.business import (
     make_create_ticket,
@@ -35,6 +36,7 @@ def build_retriever(session) -> KnowledgeRetriever:
             settings.embedding_max_length,
             settings.embedding_batch_size,
         ),
+        get_reranker(settings.reranker_model_path, settings.reranker_use_fp16),
         top_k=settings.retrieval_top_k,
         score_threshold=settings.retrieval_score_threshold,
     )
