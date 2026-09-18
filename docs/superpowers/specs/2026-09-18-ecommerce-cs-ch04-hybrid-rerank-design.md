@@ -200,3 +200,28 @@ CREATE TABLE low_confidence_questions (
 ## 13. 实现订正
 
 (实现过程中与本文的偏离,连同原因记录于此。)
+
+### §5.2 之订正:重排候选池 50 → 20(性能,2026-09-18)
+
+实测 bge-reranker-v2-m3 在 CPU 上重排 50 对 ≈ 5.2s,300 条评估要 ~26 分钟,且
+在线 query_faq 的 50 对重排 + 其它开销会超 `tool_timeout_seconds`(10s)。故把
+`hybrid_top_k` 从 spec 的 50 降到 **20**(重排 top-20 足够精排出 top-10)。性能
+驱动,不换模型、不动方案。
+
+### §5.1 之订正:query_faq 出参 items 增补 `chunk_id`/`section_path`(2026-09-18)
+
+§5.5 的引用定位需要 chunk_id 与 section_path,但 query_faq 的 JSON(§5.1)只有
+`{question, answer, category}`。增补两个字段到 items(模型侧旧三字段不变),供
+`citations` 帧与「点引用回原文」使用。契约测试相应放宽(旧三字段仍是超集断言)。
+
+### §5.5 之订正:拒答落池的两条入口(2026-09-18)
+
+- **检索为空**:query_faq 命中空(阈值全滤) → ToolNotFound,落池 `entry_point="检索为空"`。
+- **自评不足**:召回非空但自评 `sufficient=false` → 拒答 + 落池 `entry_point="自评不足"`。
+自评用 temperature=0 的 extract 模型(json_mode);解析失败退化为「够」(不误拒)。
+
+### 环境之订正:重排权重经 hf-mirror + curl 下载(2026-09-18)
+
+`huggingface_hub` 的 httpx 对 hf-mirror.com 报 SSL 证书校验失败(certifi 不含其
+CA),而 curl 能连。故改 curl 直下 6 个文件(config/safetensors/tokenizer 等)到
+`models/bge-reranker-v2-m3/`。权重 2.0G,加载 ~25s(同 bge-m3)。

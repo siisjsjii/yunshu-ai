@@ -8,6 +8,7 @@
 - **ch02(单轮 Function Calling 查数据)**:已交付 —— 四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
 - **ch03(知识库 + 向量检索)**:已交付(T0–T13)—— 结构感知切分、语料导入、BGE-M3 嵌入、Milvus 双写幂等、`query_faq` 换向量语义检索、对话挖知识、检索评估集、端到端验收 7 项。设计源:ch03 spec(含 §12 订正)+ `dev-notes/ch03.md`。
 - **ch04(知识库管理台)**:已交付(T1–T8 + 在线检索增补)—— 文档查看/在线上传、在线检索(知识块 + 源文档链接)、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。分支 `ch04-kb-console`。设计源:ch04 spec(含 §12 订正)+ `dev-notes/ch04.md`。
+- **ch04 增补(混合检索 + 重排 + 评估)**:已交付 —— Milvus BM25(chinese analyzer)+ hybrid_search RRF + bge-reranker-v2-m3 重排;生成 QC(自评拒答落 `low_confidence_questions` 池 + 引用帧 + 负面知识 prompt);四策略评估 `scripts/run_eval.py` 读 `evals/测试集.md` 出 Recall@K/MRR/置信度;前端菜单分入库/评测 + 聊天页引用可点 + 👍/👎。设计源:ch04 增补 spec(含 §13 订正)。
 - **明确不做**:多轮 Agent Loop、认证;ch03 不做关键词召回/混合检索/重排(spec §10 定死只跑 dense 单路);ch04 不做文档删除/编辑、任务持久化、并发任务队列。
 - 技术栈:Python 3.13 + FastAPI + LangChain 1.4(`langchain-openai`)+ DeepSeek(OpenAI 兼容网关)+ MySQL(`asyncmy`)+ ch03 新增 **BGE-M3 本地权重**(`models/bge-m3/`,2.2GB,已 gitignore)+ **Milvus 2.6 standalone**。`.venv` 已建好,一律用 `.venv/Scripts/python.exe`。
 

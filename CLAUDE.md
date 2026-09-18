@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **ch02(Function Calling 查数据)** 交付:模型单轮选工具 → 后端执行 → 回灌 → 作答。含四张 MySQL 表、五个 `@tool`、工具执行器、评估集、端到端验收、聊天页。
 - **ch03(知识库 + 向量检索)** 交付(分支 `ch03-kb`):`query_faq` 内部实现从关键词查 `faq` 表换成 **BGE-M3 + Milvus 的语义检索**(工具契约一字未改)。含结构感知切分、语料导入、双写幂等、对话挖知识、检索评估集、端到端验收 7 项。设计源见 ch03 spec(§12 订正最多的一章)。
 - **ch04(知识库管理台)** 交付(分支 `ch04-kb-console`):文档查看/在线上传、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。核心是 `app/kb/jobs.py`(JobStore)+ `app/kb/orchestrate.py`(后台任务:专用线程 + **自建独立 engine**)+ `app/api/kb.py`(7 端点)。
+- **ch04 增补(混合检索 + 重排 + 评估)** 交付:Milvus BM25(`text` 字段 jieba analyzer + BM25 Function)+ `hybrid_search` RRF + bge-reranker-v2-m3 重排(候选池 20,CPU 性能约束);生成 QC(自评 json_mode → 拒答落 `low_confidence_questions` 池 + `citations` 帧 + 负面知识 prompt);四策略评估 `scripts/run_eval.py`。设计源见 ch04 增补 spec §13。
 
 **ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**全程不做**:多轮 Agent Loop、认证。
 
