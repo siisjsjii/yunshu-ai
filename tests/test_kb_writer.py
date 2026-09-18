@@ -38,12 +38,12 @@ class _FakeStore:
     def ensure_collection(self):
         self.calls.append(("ensure_collection",))
 
-    def upsert(self, ids, vectors):
+    def upsert(self, ids, texts, categories, vectors):
         if self.fail_at is not None and len(self.calls) + 1 >= self.fail_at:
             # 抛在记录**之前**:模拟「这次写根本没落地」(进程被打断),
             # 重跑必须原样重写这一批。
             raise RuntimeError("模拟中断")
-        self.calls.append(("upsert", list(ids), list(vectors)))
+        self.calls.append(("upsert", list(ids), list(texts), list(categories), list(vectors)))
 
 
 class _FakeSession:
@@ -78,7 +78,8 @@ async def test_vectorize_rows_marks_done_and_backfills_vector_id():
     ]
     assert store.calls[0][0] == "upsert"
     assert store.calls[0][1] == ["11", "12"]        # pk = str(MySQL id)
-    assert len(store.calls[0][2]) == 2              # 一行一个向量,顺序对应
+    assert len(store.calls[0][2]) == 2              # text(category+questions+answer)
+    assert len(store.calls[0][4]) == 2              # 一行一个向量,顺序对应
     assert session.commits == 1
 
 

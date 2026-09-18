@@ -95,10 +95,12 @@ async def vectorize_rows(session, store, embedder, rows: list[KnowledgeChunk]) -
     """
     if not rows:
         return
-    vectors = embedder.encode(
-        [vector_text(r.category, r.questions, r.answer) for r in rows]
+    texts = [vector_text(r.category, r.questions, r.answer) for r in rows]
+    vectors = embedder.encode(texts)
+    # ch04:写入 text(供 BM25)与 category(供过滤)。dense 与 BM25 用同一份 text。
+    store.upsert(
+        [str(r.id) for r in rows], texts, [r.category for r in rows], vectors
     )
-    store.upsert([str(r.id) for r in rows], vectors)
     for r in rows:
         r.vector_id = str(r.id)  # 与 Milvus 主键对齐(spec §6.2)
         r.vectorize_status = "done"

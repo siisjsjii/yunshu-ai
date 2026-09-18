@@ -34,7 +34,7 @@ class _FakeStore:
     def ensure_collection(self):
         pass
 
-    def upsert(self, ids, vectors):
+    def upsert(self, ids, texts, categories, vectors):
         self.upserted.extend(ids)
 
     def flush(self):

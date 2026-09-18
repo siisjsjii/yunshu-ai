@@ -46,7 +46,7 @@ class _FakeStore:
     def ensure_collection(self):
         pass
 
-    def upsert(self, ids, vectors):
+    def upsert(self, ids, texts, categories, vectors):
         if self.fail_on_id is not None and self.fail_on_id in ids:
             # 抛在记录之前:这次写没落地,重跑必须重写这一批。
             # 只炸一次 —— 中断是**一次性事故**,重跑时那条 Milvus 已经好了,
