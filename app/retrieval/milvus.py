@@ -1,30 +1,26 @@
 """Milvus 向量库封装(离线写入与在线检索共用)。
 
-**Milvus 只当索引,不存文本**(spec §6.1):集合里只有两个字段 ——
-`id`(VARCHAR,值 = `str(MySQL knowledge_chunks.id)`)和 `vector`
-(FLOAT_VECTOR 1024)。命中后拿 id 回 MySQL 查原文,所以 Milvus 可以随时
-drop 重建(全表回到 pending → 重跑补齐),不存在双份真相漂移。
+ch04 起集合多存两列:**text**(BM25 全文检索的原文,`category+questions+answer`
+拼接)与 **category**(元数据过滤)。原文仍以 MySQL 为权威源,Milvus 的 text 只
+服务 BM25 分词,检索命中后仍回 MySQL 取原文。
 
-懒连接两段式(同 embedder):**构造不 import pymilvus、不建连接**,
-首次真正调用才连。单测与不碰检索的服务启动路径不该背上 pymilvus 的
-导入与网络开销。
+懒连接两段式:**构造不 import pymilvus、不建连接**,首次调用才连。
 
-这里**不做**错误翻译:Milvus 抛什么就抛什么,由 retrieval/search.py 这个
-边界统一翻成 `ToolInfrastructureError`(spec §6.7),离线脚本则直接崩
-—— 三处的处置不同,翻译留在各自的那一层。
+这里**不做**错误翻译:Milvus 抛什么就抛什么,由 retrieval/search.py 统一翻成
+`ToolInfrastructureError`。
 """
 
 from functools import lru_cache
 
 VECTOR_DIM = 1024
 _ID_FIELD = "id"
+_TEXT_FIELD = "text"
+_CATEGORY_FIELD = "category"
 _VECTOR_FIELD = "vector"
-#: VARCHAR 主键的长度上限。Milvus **强制要求** VARCHAR 字段声明 max_length,
-#: 不传直接报 1101「type param(max_length) should be specified」—— 而 pymilvus
-#: 的快捷建法(get_collection_stats 那套 create_collection 不带 schema)默认
-#: 不给主键补这个参数,必须自己传。pk 值 = str(MySQL id),BIGINT UNSIGNED 的
-#: 十进制上限是 20 位,64 留足余量。
+_BM25_FIELD = "text_bm25"
 _PK_MAX_LENGTH = 64
+_TEXT_MAX_LENGTH = 4096
+_CATEGORY_MAX_LENGTH = 255
 
 
 class MilvusVectorStore:
@@ -44,48 +40,69 @@ class MilvusVectorStore:
         return self._client
 
     def ensure_collection(self) -> None:
-        """幂等建集合:存在即跳过,不存在则建(VARCHAR 主键 + 1024 维 + IP)。
+        """幂等建集合:存在即跳过,不存在则建 schema(text/category/vector + BM25 函数)。
 
-        用 pymilvus 的快捷建法(不给 schema)会自动带 AUTOINDEX 并 load。
+        建 schema 时不会自动 load(T0 实测),故建完手动 load。
         """
         client = self._ensure_client()
         if client.has_collection(self._collection):
             return
-        client.create_collection(
-            collection_name=self._collection,
-            dimension=self._dim,
-            primary_field_name=_ID_FIELD,
-            # pk 是 str(MySQL id):用整数 pk 会在 id 一旦超过 int64 或需要
-            # 前缀化时逼着改 schema,而字符串 pk 与「Milvus 是纯索引、
-            # MySQL 才是权威源」的定位一致。
-            id_type="string",
-            max_length=_PK_MAX_LENGTH,
-            vector_field_name=_VECTOR_FIELD,
-            # dense 向量已 L2 归一化(BGE-M3 输出),IP 与余弦在此等价。
-            metric_type="IP",
-            auto_id=False,
+        from pymilvus import (
+            CollectionSchema,
+            DataType,
+            FieldSchema,
+            Function,
+            FunctionType,
         )
 
-    def drop_collection(self) -> None:
-        """删掉整个集合(重建索引用)。集合不存在时是空操作。
+        schema = CollectionSchema(
+            fields=[
+                FieldSchema(name=_ID_FIELD, dtype=DataType.VARCHAR,
+                            is_primary=True, max_length=_PK_MAX_LENGTH),
+                FieldSchema(name=_TEXT_FIELD, dtype=DataType.VARCHAR,
+                            max_length=_TEXT_MAX_LENGTH, enable_analyzer=True,
+                            analyzer_params={"tokenizer": "jieba"}),
+                FieldSchema(name=_CATEGORY_FIELD, dtype=DataType.VARCHAR,
+                            max_length=_CATEGORY_MAX_LENGTH),
+                FieldSchema(name=_VECTOR_FIELD, dtype=DataType.FLOAT_VECTOR,
+                            dim=self._dim),
+                # BM25 输出字段必须显式声明为 SPARSE_FLOAT_VECTOR(T0 实测),
+                # 否则报「Function output field not found in collection schema」。
+                FieldSchema(name=_BM25_FIELD, dtype=DataType.SPARSE_FLOAT_VECTOR),
+            ],
+            enable_dynamic_field=True,
+        )
+        schema.add_function(Function(
+            name=_BM25_FIELD, function_type=FunctionType.BM25,
+            input_field_names=[_TEXT_FIELD], output_field_names=[_BM25_FIELD],
+        ))
+        client.create_collection(self._collection, schema=schema)
+        # dense 索引(IP)+ BM25 稀疏索引(metric 必须是 BM25,T0 实测)。
+        client.create_index(
+            self._collection,
+            index_params=client.prepare_index_params(
+                field_name=_VECTOR_FIELD, index_type="AUTOINDEX", metric_type="IP"),
+        )
+        client.create_index(
+            self._collection,
+            index_params=client.prepare_index_params(
+                field_name=_BM25_FIELD, index_type="SPARSE_INVERTED_INDEX",
+                metric_type="BM25"),
+        )
+        client.load_collection(self._collection)
 
-        「Milvus 只是索引、MySQL 才是原文权威源」的兑现处:删库不丢原文,
-        把全表打回 pending 重跑即可重建(spec §6.1)。
-        """
+    def drop_collection(self) -> None:
         client = self._ensure_client()
         if client.has_collection(self._collection):
             client.drop_collection(self._collection)
 
-    def upsert(self, ids: list, vectors: list) -> None:
-        """按 pk 覆盖写入。同 pk 重复 upsert 是幂等的(T0 实证)。
-
-        写完**必须 flush** 才能立查 —— 默认 Bounded 一致性下,不 flush 的
-        新数据搜不到(T0 实测,spec §12);离线路径每批都写,索性每批都 flush。
-        """
+    def upsert(self, ids: list, texts: list, categories: list, vectors: list) -> None:
+        """按 pk 覆盖写入(text/category/vector)。写完必须 flush 才立查(T0 实测)。"""
         if not ids:
             return
         rows = [
-            {"id": str(i), "vector": list(v)} for i, v in zip(ids, vectors)
+            {"id": str(i), "text": t, "category": c, "vector": list(v)}
+            for i, t, c, v in zip(ids, texts, categories, vectors)
         ]
         self._ensure_client().upsert(collection_name=self._collection, data=rows)
         self.flush()
@@ -93,31 +110,70 @@ class MilvusVectorStore:
     def flush(self) -> None:
         self._ensure_client().flush(self._collection)
 
-    def search(self, vector: list, top_k: int) -> list[tuple[str, float]]:
-        """单条查询向量 → [(id, score)],按 score 降序(由 Milvus 保证)。
+    @staticmethod
+    def _category_expr(category: str | None) -> str | None:
+        return f'{_CATEGORY_FIELD} == "{category}"' if category else None
 
-        返回的是 `res[0]`:pymilvus 的返回形状是「每条查询向量一个命中列表」,
-        我们一次只查一条。无命中时是空列表,不是异常 —— 集合不存在才是异常,
-        那条路径必须让它抛出去(search.py 翻成 502),不能在这里兜成空结果,
-        否则「Milvus 挂了」会被伪装成「这条知识没收录」。
-        """
+    def search(self, vector: list, top_k: int, category: str | None = None) -> list[tuple[str, float]]:
+        """dense 单路(纯向量策略)。"""
         res = self._ensure_client().search(
             collection_name=self._collection,
             data=[list(vector)],
+            filter=self._category_expr(category) or "",
             limit=top_k,
             output_fields=[_ID_FIELD],
+            search_params={"metric_type": "IP"},
+            # 集合里现有 dense + sparse 两个向量字段,必须显式指 anns_field(T0 实测)。
+            anns_field=_VECTOR_FIELD,
         )
+        return self._flatten(res)
+
+    @staticmethod
+    def _flatten(res) -> list[tuple[str, float]]:
         if not res:
             return []
         return [(str(hit[_ID_FIELD]), float(hit["distance"])) for hit in res[0]]
 
-    def count(self) -> int:
-        """集合真实行数。
+    def bm25_search(self, text: str, top_k: int, category: str | None = None) -> list[tuple[str, float]]:
+        """BM25 单路(纯关键词策略)。BM25 腿 data 是原始文本(T0 实测)。"""
+        from pymilvus import AnnSearchRequest, RRFRanker
 
-        **不能用 get_collection_stats**:它的 row_count 数的是 insert 操作、
-        未扣 delete(同 pk upsert 三遍报 9 而真值 3),compaction 前不可信
-        —— 验收 6 的「Milvus 数 == MySQL done 数」必须走 count(*)。
-        """
+        return self._hybrid(
+            [AnnSearchRequest(
+                data=[text], anns_field=_BM25_FIELD, param={}, limit=top_k,
+                expr=self._category_expr(category))],
+            top_k,
+        )
+
+    def hybrid_search(self, vector: list, text: str, top_k: int,
+                      category: str | None = None) -> list[tuple[str, float]]:
+        """dense + BM25 双路,RRF(k=60) 融合。"""
+        from pymilvus import AnnSearchRequest, RRFRanker
+
+        return self._hybrid(
+            [
+                AnnSearchRequest(
+                    data=[list(vector)], anns_field=_VECTOR_FIELD,
+                    param={"metric_type": "IP"}, limit=top_k,
+                    expr=self._category_expr(category)),
+                AnnSearchRequest(
+                    data=[text], anns_field=_BM25_FIELD, param={}, limit=top_k,
+                    expr=self._category_expr(category)),
+            ],
+            top_k,
+        )
+
+    def _hybrid(self, reqs, top_k: int) -> list[tuple[str, float]]:
+        from pymilvus import RRFRanker
+
+        res = self._ensure_client().hybrid_search(
+            collection_name=self._collection, reqs=reqs,
+            ranker=RRFRanker(k=60), limit=top_k, output_fields=[_ID_FIELD],
+        )
+        return self._flatten(res)
+
+    def count(self) -> int:
+        """集合真实行数(用 count(*),stats 的 row_count 未扣 delete 不可信)。"""
         res = self._ensure_client().query(
             collection_name=self._collection, filter="", output_fields=["count(*)"]
         )
@@ -126,9 +182,5 @@ class MilvusVectorStore:
 
 @lru_cache(maxsize=1)
 def get_vector_store(uri: str, collection_name: str) -> MilvusVectorStore:
-    """进程内单例(同 get_embedder 模式)。
-
-    单例在这里不只是省内存:MilvusClient 每次构造都是一条新的 gRPC 通道,
-    每请求一条会把连接数打在 Milvus 上 —— 在线检索每个请求都要走这条路。
-    """
+    """进程内单例(同 get_embedder 模式)。"""
     return MilvusVectorStore(uri, collection_name)
