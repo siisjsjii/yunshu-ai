@@ -857,7 +857,7 @@ git commit -m "feat: ch05 意图识别节点 + 七类 Prompt + 标注样例评�
 - Create: `tests/test_agent_fixed_replies.py`
 
 **Interfaces:**
-- Produces: `make_chitchat_reply_node()`、`make_fallback_reply_node()`、`make_complaint_reply_node(*, emit)`;常量 `CHITCHAT_REPLY`、`FALLBACK_REPLY`、`COMPLAINT_REPLY`、`CHOICE_HANDOFF`、`CHOICE_TICKET`
+- Produces: `make_chitchat_reply_node(*, emit)`、`make_fallback_reply_node(*, emit)`、`make_complaint_reply_node(*, emit)`(三个都收 `emit` —— 每个出口都必须自己发 `token` 帧,否则前端气泡是空的);常量 `CHITCHAT_REPLY`、`FALLBACK_REPLY`、`COMPLAINT_REPLY`、`CHOICE_HANDOFF`、`CHOICE_TICKET`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -878,13 +878,6 @@ from app.agent.nodes import (
     make_complaint_reply_node,
     make_fallback_reply_node,
 )
-
-
-class ExplodingModel:
-    """任何属性访问都炸 —— 用「它一次都没被碰过」证明「不花模型调用」。"""
-
-    def __getattr__(self, name):
-        raise AssertionError(f"固定话术出口不该碰模型,却访问了 model.{name}")
 
 
 @pytest.mark.anyio
@@ -952,7 +945,7 @@ def test_fixed_copy_factories_take_no_model_at_all():
 
 - [ ] **Step 3: 写实现**
 
-在 `app/agent/nodes.py` 追加(并删掉该文件里未使用的 `ExplodingModel` 引用风险 —— 实现里不引入任何模型):
+在 `app/agent/nodes.py` 追加(实现里不引入任何模型 —— 不 import、不接收):
 
 ```python
 # ---- 固定话术出口 ----
@@ -1044,7 +1037,7 @@ git commit -m "feat: ch05 闲聊/兜底/投诉三个固定话术出口(零模型
 
 **Interfaces:**
 - Consumes: `KnowledgeRetriever.search(query) -> list[RetrievedChunk]`;`record_low_confidence(session, ...)`
-- Produces: `make_retrieve_knowledge_node(*, retriever)`、`make_confidence_gate_node(*, settings, session, conversation_id)`
+- Produces: `make_retrieve_knowledge_node(*, retriever, emit)`(检索到证据时发 `citations` 帧 —— 见 Ruling 4)、`make_confidence_gate_node(*, settings, session, conversation_id)`
 
 **背景**:`RetrievedChunk` 的字段顺序是 `question, answer, category, chunk_id, section_path, score`。
 
