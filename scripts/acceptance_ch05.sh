@@ -18,7 +18,10 @@ bad() { echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
 # MSYS2 会按 CP936 重编码,服务端只回 error parsing the body。
 ask() {
   local sid="$1" msg="$2"
-  curl -s -N -X POST "$BASE/api/chat/stream" \
+  # --max-time:上游卡住时不加这个,脚本会**无限期阻塞且什么都不打印**,
+  # 收尾时表现为「挂住」而不是「红」—— 那是查不出来的失败。180s 足够:
+  # 最长的一条(验收 5)实测单次 10~30s。
+  curl -s -N --max-time 180 -X POST "$BASE/api/chat/stream" \
     -H "Content-Type: application/json" \
     --data-binary @- <<JSON
 {"session_id":"$sid","message":"$msg"}
@@ -78,6 +81,26 @@ for i, l in enumerate(lines):
 print(bad)'
 }
 
+# 取 choices 帧的 options(逐帧解析,不做子串匹配)。
+# 子串匹配只证明 '"handoff"' 与 '"ticket"' **在流里出现过** —— 不证明它们在
+# **同一个 choices 帧**里、更不证明在它的 options 数组里(比如某个工具返回的
+# JSON 里恰好也有这两个词就会假绿)。照 bad_tool_results 的范式逐帧解析。
+choices_opts() {
+  "$PYTHON" -c '
+import json, sys
+lines = sys.stdin.buffer.read().decode("utf-8", "replace").splitlines()
+for i, l in enumerate(lines):
+    if l.strip() == "event: choices" and i + 1 < len(lines) and lines[i+1].startswith("data: "):
+        print(",".join(o.get("key", "") for o in json.loads(lines[i+1][6:]).get("options", [])))
+        break'
+}
+
+# 有 error 帧。端点故障时(app/api/chat.py)只发 error、**不发 done**,
+# 此时 done_field 取到的是字面量 null —— 不特判就会把**基础设施故障**
+# 报成「trace 里没有强制检索节点」(路由问题),正是 CLAUDE.md 点名的
+# 「报错指向别处」。
+has_error() { grep -q "event: error" "$1"; }
+
 # ---- 预检:8000 上那个进程**是不是当前代码** ------------------------------------
 # 这条不是形式主义,是实测撞出来的:开发期起的 uvicorn **没有 --reload**,
 # ch05 的 T8/T9 改了端点之后它仍跑旧代码。2026-09-20 实测:旧进程上
@@ -85,8 +108,19 @@ print(bad)'
 # 而当前代码回 **422**(session_id 超过 32)。不预检的话五条验收**全部假红**,
 # 而且看起来像「新代码坏了」—— 本项目已栽过一次的类型。
 # 33 个 x 触发 TicketRequest 的 max_length=32 校验;422 只证明路由+校验层在,
-# **不会**建出任何工单(校验先于函数体,T9 有用例钉着)。
+# **不会**建出工单 —— 校验先于函数体(T9 有用例钉着)。
+# 注意这依赖「部署的代码确实在 32 处校验」;若某个中间版本放宽了上限,
+# 这一发会在预检判红的同时真的建出一张工单。
 PRE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/ticket"   -H 'Content-Type: application/json'   --data-binary '{"session_id":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}')
+# 服务**没起**时 curl 给的是 000,不是 405/404。先分这一支 —— 否则下面那段
+# 「多半是旧进程」会把「服务没起」误诊成「旧进程」,让人去 netstat 一个
+# 根本不存在的 PID。
+if [ "$PRE_CODE" = "000" ]; then
+  echo "预检失败:$BASE 上没有服务在监听(curl 返回 000)。先起服务:"
+  echo "  docker start mysql milvus-standalone"
+  echo "  .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000"
+  exit 1
+fi
 if [ "$PRE_CODE" != "422" ]; then
   echo "预检失败:$BASE 上的服务不是当前代码 —— POST /api/ticket 期望 422,实得 $PRE_CODE。"
   echo "8000 上多半是旧进程(无 --reload,不会自己更新)。按序执行:"
@@ -101,24 +135,46 @@ SID=$(new_sid)
 ask "$SID" "退货政策是怎么规定的" > /tmp/ch05_1.sse
 T=$(done_field trace < /tmp/ch05_1.sse)
 G=$(done_field gate_passed < /tmp/ch05_1.sse)
-case "$T" in
-  *"retrieve_knowledge"*) ok "trace 有强制检索节点:$T(gate_passed=$G)";;
-  *) bad "trace 里没有强制检索节点:$T";;
-esac
+if has_error /tmp/ch05_1.sse && [ "$T" = "null" ]; then
+  bad "端点发了 error 帧、没有 done 帧(基础设施故障,不是路由问题):$(grep -A1 'event: error' /tmp/ch05_1.sse | tail -1)"
+else
+  case "$T" in
+    *"retrieve_knowledge"*) ok "trace 有强制检索节点:$T(gate_passed=$G)";;
+    *) bad "trace 里没有强制检索节点:$T";;
+  esac
+fi
 
 echo "== 验收 2:Agent 自己调工具作答 =="
 SID=$(new_sid)
 ask "$SID" "订单 1001 的物流到哪了" > /tmp/ch05_2.sse
-if grep -q "event: tool_call" /tmp/ch05_2.sse; then
-  ok "Agent 自己调了工具(trace=$(done_field trace < /tmp/ch05_2.sse))"
-else bad "没有 tool_call 帧"; fi
+# 断「调用与结果**一一配对**」,而不是只 grep 到 tool_call 就算数。
+# 只看 tool_call 分不出「Agent 拿到了数据作答」与「每次调用都炸了」。
+# ⚠️ 这里**不能**断 ok=true:订单 1001 状态是**已取消**,`query_logistics("1001")`
+# 抛 ToolNotFound → 执行器转成 ok=false —— 那是**正确**行为,断 ok 会把对的判成红。
+# ok 的探针留在验收 5(BAD)。
+TC=$(grep -c "event: tool_call" /tmp/ch05_2.sse)
+TRC=$(grep -c "event: tool_result" /tmp/ch05_2.sse)
+if [ "$TC" -ge 1 ] && [ "$TC" -eq "$TRC" ]; then
+  ok "Agent 自己调了工具,且每个调用都有结果($TC 次)(trace=$(done_field trace < /tmp/ch05_2.sse))"
+else
+  bad "调了 $TC 次、只回了 $TRC 个结果(调用未被执行?)"
+fi
 
 echo "== 验收 3:投诉 → 两个独立选项 =="
 SID=$(new_sid)
 ask "$SID" "我要投诉" > /tmp/ch05_3.sse
-if grep -q '"handoff"' /tmp/ch05_3.sse && grep -q '"ticket"' /tmp/ch05_3.sse; then
-  ok "choices 帧含 handoff 与 ticket 两个独立选项"
-else bad "choices 帧缺失或不完整"; fi
+OPTS=$(choices_opts < /tmp/ch05_3.sse)
+case "$OPTS" in
+  *handoff*ticket*|*ticket*handoff*) ok "choices 帧的 options 同时含 handoff 与 ticket:$OPTS";;
+  *) bad "choices 帧 options 不完整:$OPTS";;
+esac
+# 投诉**不许**进 Agent(用户需求 3:投诉 → 安抚话术 + 两个选项,不走 Agent)。
+# 证据就在同一个 done 帧里:走 Agent 的路径 trace 里必有 `agent:step`。
+TR3=$(done_field trace < /tmp/ch05_3.sse)
+case "$TR3" in
+  *"agent:"*) bad "投诉路径进了 Agent(应只走 complaint_reply):$TR3";;
+  *) ok "投诉未进 Agent(agent_steps=$(done_field agent_steps < /tmp/ch05_3.sse))";;
+esac
 
 echo "== 验收 4:闲聊拿到固定话术 =="
 SID=$(new_sid)
@@ -154,9 +210,28 @@ ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > 
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
 BAD=$(bad_tool_results < /tmp/ch05_5.sse)
-if [ "$STEPS" -ge 2 ] && [ "$N" -ge 2 ] && [ "$BAD" -eq 0 ]; then
-  ok "ReAct 走了 $STEPS 步、$N 次工具调用、0 次工具失败(trace=$(done_field trace < /tmp/ch05_5.sse))"
-else bad "步数不足或工具失败:agent_steps=$STEPS tool_calls=$N 失败工具数=$BAD"; fi
+TR=$(done_field trace < /tmp/ch05_5.sse)
+# 「不止一步」必须断在 **agent:step2** 上,不能断 agent_steps>=2:
+# agent_steps 是**绑工具轮次的序号**(nodes.py:243-244 `steps = step`),
+# **把收敛那一轮也算了一步**,所以任何一次工具调用都会得到 2
+# (实测:验收 2 只调一次 query_logistics,done 帧照样 agent_steps=2)。
+# 于是 `agent_steps >= 2` 在 `N >= 2` 之外**一点判别力都没有** ——
+# 把循环改成单轮、让模型在一轮里并发发两个调用(商品名可以瞎猜),
+# N=2、BAD=0、STEPS=2,照样绿 —— 而那正是「ReAct 根本没有第二轮」。
+# `agent:step2` 由 nodes.py:265 在**第 2 轮真的发了工具调用**时才追加,
+# 所以它才真能区分「走了第二轮」与「一轮里并发发了两个」。
+case "$TR" in
+  *"agent:step2"*) MULTI=1;;
+  *) MULTI=0;;
+esac
+if [ "$MULTI" -eq 1 ] && [ "$N" -ge 2 ] && [ "$BAD" -eq 0 ]; then
+  ok "ReAct 走了 $STEPS 步、$N 次工具调用、0 次工具失败(trace=$TR)"
+else
+  # 红的时候必须打印 intent:这一条会因**意图摇摆**而红(问句被判成「商品咨询」
+  # 就绕开 Agent 走知识路),那与「ReAct 真坏了」在输出上必须能分开 ——
+  # 而意图摇摆是**已记账的概率性事实**(约 10/16),不是缺陷。
+  bad "非真正多轮或多/少调工具:agent_steps=$STEPS tool_calls=$N 失败工具数=$BAD intent=$(done_field intent < /tmp/ch05_5.sse) trace=$TR"
+fi
 
 # ⚠️ `BAD -eq 0` 这一条**不是补充,是唯一的探针**,别删。
 # `"type": "tool_call"` 键的丢失在**单测层捕获不到**:替身 `FakeTool` 不查这个键、
