@@ -2855,14 +2855,17 @@ git commit -m "feat: ch05 接入图骨架到 SSE 端点;删掉祛魅用的手写
 这条钉的是**端点真的把工具调起来了**。
 """
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.db.models import Ticket
-from app.main import app
-from app.api import chat as chat_api
 from app.db.session import get_session
-from tests.test_api_chat import FakeSession
+from app.main import app
+
+# 顶层 import(`tests/` 没有 `__init__.py`,pytest 默认的 prepend 导入模式会把
+# `tests/` 放进 sys.path)—— **不要**写成 `tests.test_api_chat`:那会让同一份
+# 替身以两个不同的模块名被加载两遍,`FakeSession` 变成两个类,
+# `isinstance` 判断会莫名其妙地为假。已实测 `import test_api_chat` 可用。
+from test_api_chat import FakeSession
 
 SID = "00000000000000000000000000000001"
 
