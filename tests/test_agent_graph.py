@@ -5,6 +5,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph, get_checkpointer
+from app.agent.nodes import make_resolve_references_node
 from app.config import Settings
 from app.retrieval.search import RetrievedChunk
 
@@ -292,6 +293,40 @@ async def test_second_turn_on_same_thread_reports_only_its_own_turn():
     assert "retrieve_knowledge" not in " ".join(payload["trace"])
     assert payload["gate_passed"] is None          # 第 1 轮过闸了;第 2 轮没进闸
     assert payload["agent_steps"] == 0             # 第 1 轮进过 Agent;第 2 轮没有
+
+
+@pytest.mark.anyio
+async def test_resolve_references_resets_every_per_turn_channel():
+    """每轮开头必须清掉上一轮的**全部**逐轮通道。
+
+    为什么值得单钉:**删除其中一个键不会有任何测试变红** —— 而后果按通道
+    不同而不等。`evidence` 尤其真实:它被 agent 节点读进 `build_messages`
+    (`app/agent/nodes.py:234` 附近),业务轮跟在知识轮后会把**上一轮的检索
+    结果**当本轮知识塞进 prompt —— 用户看到的是上一轮的知识,且完全静默。
+
+    两轮整图用例(闲聊轮)盖不住它:闲聊不读 `evidence`。
+    """
+    node = make_resolve_references_node()
+    out = await node({
+        "user_input": "在吗",
+        "evidence": [{"answer": "上一轮的旧知识"}],
+        "gate_passed": True,
+        "agent_steps": 3,
+        "reply": "上一轮的回复",
+        "choices": ["handoff"],
+        "citations": [{"n": 1}],
+        "tool_calls_made": [{"name": "query_order"}],
+    })
+
+    assert out["resolved_input"] == "在吗"
+    assert out["trace"] == ["resolve_references"]
+    assert out["evidence"] == []
+    assert out["gate_passed"] is None
+    assert out["agent_steps"] == 0
+    assert out["reply"] == ""
+    assert out["choices"] == []
+    assert out["citations"] == []
+    assert out["tool_calls_made"] == []
 
 
 @pytest.mark.anyio
