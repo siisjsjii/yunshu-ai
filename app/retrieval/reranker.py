@@ -3,6 +3,9 @@
 与 embedder 同一套懒加载 + 锁:构造不 import FlagEmbedding、首次 rerank 才加载
 权重。`compute_score(pairs, normalize=True)` 输出 0-1 分数(sigmoid),用于置信度
 与阈值判定。单测用假 FlagReranker 模块,不加载真模型。
+
+**设备与精度自动决定**:有 CUDA 就 `cuda:0` + fp16,否则 CPU + fp32。不做成
+配置项 —— 一个「改了没反应」的旋钮比没有旋钮更糟。见 `_ensure_model`。
 """
 
 import os
@@ -11,9 +14,8 @@ from functools import lru_cache
 
 
 class Reranker:
-    def __init__(self, model_path: str, use_fp16: bool = False):
+    def __init__(self, model_path: str):
         self._model_path = model_path
-        self._use_fp16 = use_fp16
         self._model = None
         self._load_lock = threading.Lock()
 
@@ -52,6 +54,6 @@ class Reranker:
 
 
 @lru_cache(maxsize=1)
-def get_reranker(model_path: str, use_fp16: bool = False) -> Reranker:
+def get_reranker(model_path: str) -> Reranker:
     """进程内单例(同 get_embedder)。"""
-    return Reranker(model_path, use_fp16)
+    return Reranker(model_path)

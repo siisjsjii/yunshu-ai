@@ -110,7 +110,7 @@ async def main() -> None:
         settings.embedding_model_path, settings.embedding_max_length,
         settings.embedding_batch_size)
     reranker_available = Path(settings.reranker_model_path).exists()
-    reranker = get_reranker(settings.reranker_model_path, settings.reranker_use_fp16)
+    reranker = get_reranker(settings.reranker_model_path)
     if not reranker_available:
         emit(f"⚠ 重排权重未就绪({settings.reranker_model_path} 不存在),混合+Rerank 策略将跳过")
 

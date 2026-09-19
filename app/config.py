@@ -46,8 +46,10 @@ class Settings(BaseSettings):
     embedding_max_length: int = Field(default=1024, gt=0)
     embedding_batch_size: int = Field(default=16, gt=0)
     # ch04 重排(懒加载,权重由用户放 models/ 下)
+    # 精度不再用配置项控制:`Reranker` 按 `torch.cuda.is_available()` 自己决定
+    # (有 CUDA 就 cuda:0 + fp16,否则 CPU + fp32)。原来的 `reranker_use_fp16`
+    # 在 GPU 分支落地后已无人读 —— 留着会让「改了没反应」的配置项存在。
     reranker_model_path: str = "models/bge-reranker-v2-m3"
-    reranker_use_fp16: bool = False
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_collection: str = "knowledge"
     # top_k <= 0 → 搜索永远空,检索静默失效;阈值越界一个方向等于永远全滤空、

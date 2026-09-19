@@ -36,7 +36,7 @@ def build_retriever(session) -> KnowledgeRetriever:
             settings.embedding_max_length,
             settings.embedding_batch_size,
         ),
-        get_reranker(settings.reranker_model_path, settings.reranker_use_fp16),
+        get_reranker(settings.reranker_model_path),
         top_k=settings.retrieval_top_k,
         score_threshold=settings.retrieval_score_threshold,
     )
