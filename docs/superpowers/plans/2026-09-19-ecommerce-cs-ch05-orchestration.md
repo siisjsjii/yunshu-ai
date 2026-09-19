@@ -1476,11 +1476,20 @@ class FakeChunk:
         self.usage_metadata = usage
 
     def __add__(self, other):
-        # 累积 chunk 时**原样**拼接 tool_calls(不带 "type" 会让下游判不出是调用)
+        # 累积 chunk 时**原样**拼接 tool_calls,**必须保留 `"type": "tool_call"`**。
+        # 它是 `BaseTool.ainvoke` 判定「这是一个工具调用」的**唯一**依据
+        # (CLAUDE.md 的硬约束);`execute_tool` 则原样把 dict 透传给
+        # `tool.ainvoke`(`app/tools/executor.py:65`)。丢了它,真实 `@tool` 会把
+        # 整个 dict 当**参数**去校验 schema,每次调用都退化成「参数不合法」的
+        # 可恢复失败 —— 而本文件的替身工具不查这个键,所以**测试照样全绿**。
+        #
+        # 说明:本替身**不模拟** LangChain 真实的按 index 合并 + 分片 args 拼接
+        # (真实模型会把一次工具调用拆成多个 chunk 流式吐出来),因为那些测试
+        # 里每次工具调用都写在**单个** chunk 里,`__add__` 的合并分支用不到。
+        # 真实多 chunk 的累积由 T11 的验收 5(真模型、要求 ReAct 不止一步)兜底。
         return FakeChunk(
             text=self.text + other.text,
-            tool_calls=[{k: v for k, v in tc.items() if k != "type"}
-                        for tc in self.tool_calls + other.tool_calls],
+            tool_calls=self.tool_calls + other.tool_calls,
             usage=other.usage_metadata or self.usage_metadata,
         )
 
@@ -2234,6 +2243,13 @@ def build_graph(
         "retrieve_knowledge",
         make_retrieve_knowledge_node(retriever=retriever, emit=emit),
     )
+    # ⚠️ 这个 `conversation_id` 必须与 state 里的 `conversation_id` 是**同一个值**。
+    # 闸用它写 `low_confidence_questions.source_conversation_id`(即「这问题是从哪段
+    # 对话里冒出来的」),而 state 里那个是 `thread_id`、是落库 `append_turn` 的依据。
+    # 两者不一致时,问题会被记到**别的会话**名下 —— 而**没有任何测试看得见**:
+    # 测试全程给闭包和 state 传同一个字面量,读的也是闭包传的那个。
+    # 传入方只有一个(T8 的端点,`conversation_id=session_id`,state 里也是
+    # `session_id`),所以今天是一致的;这行注释是给**以后**加调用点的人。
     graph.add_node(
         "confidence_gate",
         make_confidence_gate_node(
