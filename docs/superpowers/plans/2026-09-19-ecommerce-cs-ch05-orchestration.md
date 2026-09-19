@@ -1125,7 +1125,9 @@ async def test_citations_are_emitted_as_a_frame():
     node = make_retrieve_knowledge_node(retriever=FakeRetriever([_chunk(0.91)]),
                                         emit=frames.append)
     out = await node({"resolved_input": "怎么退货"})
-    assert frames == [{"frame": "citations", "citations": out["citations"]}]
+    # 载荷键是 `items` —— ch04 前端读的就是 `payload.items`(见 index.html:368)。
+    # 断言写成 `{"citations": ...}` 的话,把键改错也照样绿。
+    assert frames == [{"frame": "citations", "items": out["citations"]}]
 
 
 @pytest.mark.anyio
@@ -1252,7 +1254,11 @@ def make_retrieve_knowledge_node(*, retriever, emit):
             for i, e in enumerate(evidence)
         ]
         if citations:
-            emit({"frame": "citations", "citations": citations})
+            # 载荷键必须是 **`items`**,不是 `citations`:ch04 的
+            # `app/static/index.html` 里是 `ctx.citations = payload.items || []`。
+            # 换个键名 = 帧到了、前端仍渲染不出引用(静默失效),而且
+            # ch05 的单测只断言「发了一帧」,照样全绿。
+            emit({"frame": "citations", "items": citations})
         top = f" top={evidence[0]['score']:.2f}" if evidence else ""
         return {
             "evidence": evidence,
@@ -2284,7 +2290,10 @@ def test_prepare_turn_raises_when_budget_is_exhausted():
 .venv/Scripts/python.exe -m pytest tests/test_chat_service.py
 ```
 
-预期:两条新用例失败(返回值仍是消息列表,`m.content` 断言不成立)。
+预期:**只有第一条失败**(返回值仍是组装好的消息列表,`[m.content for m in kept]`
+拿到的是 system/human 两条而不是原历史)。**第二条本来就通过** —— 预算校验
+这一章不变,它是用来钉「别把它改坏」的回归,红不了才对。若第二条也红了,
+说明改动越界了。
 
 - [ ] **Step 3: 改 `services/chat.py`**
 
