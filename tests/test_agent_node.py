@@ -120,7 +120,11 @@ def _state(**over):
 @pytest.mark.anyio
 async def test_direct_text_answer_converges_without_tools():
     frames = []
-    model = ScriptedModel([[FakeChunk("你的"), FakeChunk("订单已发货。")]])
+    # 第二批(空)是**探针**:正确的实现根本不会去取它。若实现改成「无工具的一轮
+    # 之后再走一次收尾」,它会吃掉这批空的 —— 于是红在下面的
+    # `unbound_rounds == 0` 上(「多问了一次模型」);不摆它的话,红法会是
+    # `rounds.pop(0)` 的 IndexError,把「多调了一次」报成「测试写错了」。
+    model = ScriptedModel([[FakeChunk("你的"), FakeChunk("订单已发货。")], []])
     out = await _node(model, frames=frames).__call__(_state())
     assert out["reply"] == "你的订单已发货。"
     assert out["agent_steps"] == 1
@@ -129,6 +133,13 @@ async def test_direct_text_answer_converges_without_tools():
         {"frame": "token", "text": "你的"},
         {"frame": "token", "text": "订单已发货。"},
     ]
+    # **只问一次模型**:没调工具就不该再走收尾那一轮。ch02 的
+    # `test_no_tool_call_means_single_api_call`(`:163`,随 `stream_turn` 一起被
+    # T8 删掉)断的是同一件事。少了这两行,「无工具的一轮多问一次模型」只会
+    # 以**脚本耗尽**的样子红(`rounds.pop(0)` 抛 IndexError),而那个红指向的是
+    # 「测试写错了」,盖掉真问题 —— 与 `_run` 里给 `agent_steps` 初值同一条理由。
+    assert model.bound_rounds == 1
+    assert model.unbound_rounds == 0
 
 
 @pytest.mark.anyio
@@ -148,6 +159,14 @@ async def test_tool_call_round_emits_frames_and_feeds_result_back():
             "args": {"order_id": "1001"}, "tool_call_id": "c1"} in frames
     assert {"frame": "tool_result", "tool_call_id": "c1", "ok": True,
             "summary": '{"status": "已发货"}'} in frames
+    # **精确列表,不是 `in`**。调工具的那一轮模型还没说话,chunk.text 是空串 ——
+    # `if chunk.text:` 是"不发空 token 帧"的**唯一**屏障。上面两条 `in` 断言
+    # (以及 T8 删掉的 `test_tool_call_chunks_do_not_leak_into_tokens` /
+    # `test_stream_turn_skips_empty_token_chunks` 的新家)都拦不住它:把
+    # `if chunk.text:` 删掉(只留 `parts.append` / `emit`),空串 token 帧混进来,
+    # 这组 `in` 断言照样全绿 —— 而前端会先画出一个空气泡。
+    # 第二条空串来源:收尾那一轮也可能吐空 chunk。
+    assert [p["text"] for p in frames if p["frame"] == "token"] == ["已发货。"]
     # 回灌的 ToolMessage 必须与 tool_call_id 配对。
     # 注意记的是**绑工具**那个入口:agent 每一轮都绑着工具问,未绑工具的入口
     # 只在步数用尽收尾时走一次。
@@ -298,6 +317,19 @@ async def test_two_tool_calls_in_one_round_are_both_executed_and_paired():
          "args": {"order_id": "1001"}, "tool_call_id": "c1"},
         {"frame": "tool_call", "name": "query_logistics",
          "args": {"order_id": "1001"}, "tool_call_id": "c2"},
+    ]
+    # ④ **交错,不是"先两个申请再两个结果"**。T8 实测过:把 emit 拆成两个循环
+    # (先对所有 call 发 tool_call 帧,再执行并逐个发 tool_result 帧)—— 状态、
+    # 消息序列、落库结果全都不变,只有帧序变了,而上面①~③与全仓其余用例
+    # **一律照样全绿**(实测 `1 passed`)。前端是按帧渲染的:那会让"正在查订单"
+    # 与"正在查物流"两个转圈同时亮起、再同时收到两条结果,配错对子。
+    # ch02 的 `test_tool_event_order_is_call_then_result_then_answer`
+    # (`tests/test_chat_service.py:173`,被 T8 连同 `stream_turn` 删掉)守的正是这条,
+    # 本文件当时没有等价的**顺序**断言(③只钉了 tool_call 帧的内部顺序)。
+    assert [(p["frame"], p["tool_call_id"]) for p in frames
+            if p["frame"] in ("tool_call", "tool_result")] == [
+        ("tool_call", "c1"), ("tool_result", "c1"),
+        ("tool_call", "c2"), ("tool_result", "c2"),
     ]
     # 两者同属**同一次** ReAct 步 —— 步号都是 1
     assert out["trace"] == [

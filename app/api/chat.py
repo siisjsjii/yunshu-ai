@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, format_sse_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.emit import make_emitter
+from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
 from app.db.session import get_session
 from app.llm import create_chat_model, create_extract_model
@@ -13,9 +15,9 @@ from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
 from app.sanitize import redact_api_key
 from app.schemas import ChatRequest
-from app.services.chat import prepare_turn, stream_turn
+from app.services.chat import prepare_turn
 from app.services.history import ensure_conversation, load_history
-from app.tools.registry import build_tools, registry_for
+from app.tools.registry import build_retriever, build_tools, registry_for
 
 router = APIRouter()
 
@@ -37,6 +39,24 @@ def get_chat_model(settings: Settings = Depends(get_settings)):
     return create_chat_model(settings)
 
 
+def get_intent_model(settings: Settings = Depends(get_settings)):
+    """意图识别用的模型。与 `get_chat_model` **并排**做成依赖,不是为了让生产
+    代码多一层 —— 是为了给测试留一个 `dependency_overrides` 的注入点。
+
+    意图节点**每一个请求都会跑**,也就每一个请求都会真的 `.ainvoke` 一次。
+    若这里就地 `create_extract_model(settings)`(模块级导入的名字),测试想拦
+    它就只能去 monkeypatch `chat_api.create_extract_model` —— 而那是**导入进来的
+    名字**,patch 它等于 patch 整个模块的绑定,别的端点(抽取)同用一个名时会
+    连带被换掉。`Depends` 是本项目既有的注入缝(CLAUDE.md:services 收 llm 实例
+    作参数、FastAPI 侧靠 Depends 注入、测试用 dependency_overrides 替换),
+    `tests/test_api_chat.py` 的 `client_factory` 里已经有一行
+    `app.dependency_overrides[chat_api.get_chat_model] = lambda: model`,
+    加一行同形的即可。**不做这层,端点测试里 28 条都会朝
+    `https://example.invalid/v1` 发真实请求,而且不联网这一条是硬规矩。**
+    """
+    return create_extract_model(settings)
+
+
 def _frame(event: str, payload: dict) -> bytes:
     return format_sse_event(
         event=event,
@@ -50,6 +70,7 @@ async def chat_stream(
     settings: Settings = Depends(get_settings),
     store: SessionStore = Depends(get_store),
     model=Depends(get_chat_model),
+    intent_model=Depends(get_intent_model),
     session: AsyncSession = Depends(get_session),
 ) -> EventSourceResponse:
     session_id = request.session_id or uuid.uuid4().hex
@@ -78,7 +99,9 @@ async def chat_stream(
             session=session, session_id=session_id, user_id=user_id
         )
         history = await load_history(session=session, conversation_id=session_id)
-        messages = prepare_turn(
+        # 产出是**裁剪后的历史**(不是组装好的消息):消息组装搬进了
+        # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
+        history = prepare_turn(
             settings=settings, history=history, user_input=request.message
         )
         # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
@@ -107,32 +130,55 @@ async def chat_stream(
 
     async def generate():
         try:
-            yield _frame(
-                "meta",
-                {"session_id": session_id, "model": settings.openai_model},
-            )
-            async for event, payload in stream_turn(
-                settings=settings,
+            yield _frame("meta", {"session_id": session_id, "model": settings.openai_model})
+
+            # emit 必须在图**之外**创建、在节点里才被调用 —— make_emitter 返回的
+            # 是可重复调用的函数,每次发帧时现取 writer(见 app/agent/emit.py)。
+            emit = make_emitter()
+            graph = build_graph(
                 model=model,
-                session=session,
-                conversation_id=session_id,
-                user_input=request.message,
-                messages=messages,
+                intent_model=intent_model,
                 tools=tools,
                 registry=registry,
-                assess_model=create_extract_model(settings),
+                settings=settings,
+                retriever=build_retriever(session),
+                session=session,
+                conversation_id=session_id,
+                emit=emit,
+                checkpointer=get_checkpointer(),
+            )
+
+            final = {"trace": [], "intent": None, "gate_passed": None, "agent_steps": 0}
+            async for payload in graph.astream(
+                {
+                    "conversation_id": session_id,
+                    "user_input": request.message,
+                    "history": history,        # prepare_turn 返回的**裁剪后**历史
+                    "trace": [],
+                },
+                config={"configurable": {"thread_id": session_id}},
+                stream_mode="custom",
             ):
-                if event == "tool_result" and not payload["ok"]:
-                    # 失败原因是**出站**文本(spec §5.2:同样脱敏后),
-                    # 这里补上工具路径的脱敏 —— 模型错误那条路径的脱敏
-                    # 在下面的 except 里。
-                    payload = {
-                        **payload,
-                        "summary": redact_api_key(
-                            payload["summary"], settings.openai_api_key
-                        ),
-                    }
-                yield _frame(event, payload)
+                event = payload.get("frame")
+                if event == "trace":
+                    # 内部证据链:折进 done 帧,不外推 —— 前端不认识这个帧。
+                    final = payload
+                    continue
+                data = {k: v for k, v in payload.items() if k != "frame"}
+                if event == "tool_result" and not data.get("ok", True):
+                    data["summary"] = redact_api_key(
+                        data.get("summary", ""), settings.openai_api_key
+                    )
+                yield _frame(event, data)
+
+            yield _frame("done", {
+                "finish_reason": "stop",
+                "usage": None,
+                "trace": final.get("trace") or [],
+                "intent": final.get("intent"),
+                "gate_passed": final.get("gate_passed"),
+                "agent_steps": final.get("agent_steps") or 0,
+            })
         except Exception as exc:
             # 上游异常文本可能带着密钥(见 app/sanitize.py),出站前抹掉。
             yield _frame(

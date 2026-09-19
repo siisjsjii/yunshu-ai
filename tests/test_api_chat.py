@@ -100,6 +100,37 @@ class ScriptedModel:
         return self.calls[-1][1] if self.calls else None
 
 
+class _Intent:
+    def __init__(self, intent):
+        self.intent = intent
+
+
+class FakeIntentModel:
+    """意图识别节点的替身,形状对齐 `tests/test_agent_intent.py:FakeStructuredModel`。
+
+    **为什么必须有这个替身**:ch05 在模型**前面**插了意图识别节点,而它
+    **每一个请求都会跑**、每一个请求都会真的 `.ainvoke` 一次。不替换掉它,
+    本文件 28 条用例会各自朝 `https://example.invalid/v1` 发一次真实请求 ——
+    「单测全程不联网」是硬规矩,不是偏好。端点为它留了 `get_intent_model`
+    这个 `Depends` 缝(与 `get_chat_model` 并排),下面一行 override 就接上了。
+
+    `with_structured_output` 里断言 `method == "json_mode"`:`IntentResult` 是
+    出参结构,本项目的端点上 `function_calling` / `json_schema` 都返回 400
+    (CLAUDE.md 的硬约束,`app/services/extract.py` 同一条)。替身不看 schema
+    就看不出这件事,所以这一行必须留着。
+    """
+
+    def __init__(self, intent="订单"):
+        self.intent = intent
+
+    def with_structured_output(self, schema, method=None):
+        assert method == "json_mode", "结构化出参只能用 json_mode(本项目硬约束)"
+        return self
+
+    async def ainvoke(self, messages):
+        return _Intent(self.intent)
+
+
 class _Result:
     """`session.execute(...)` 的返回值:支持 .scalars().all() / .one_or_none()。"""
 
@@ -170,12 +201,20 @@ class FakeSession:
 def client_factory(monkeypatch):
     """造一个端点级测试客户端,替换掉模型、会话存储与 DB 会话。
 
-    返回 `(client, model)`;client 上另挂了 `.db` / `.store` / `.model`,
-    供测试在请求结束后观察落库内容与锁状态。
+    返回 `(client, model)`;client 上另挂了 `.db` / `.store` / `.model` /
+    `.intent_model`,供测试在请求结束后观察落库内容与锁状态。
+
+    `intent` 的**默认值必须是业务数据类(物流/订单/售后)**。本文件的用例把
+    `ScriptedModel(batches)` 的批次当作「Agent 节点一定会来消费」来写;意图若是
+    `其他`/`闲聊`/`投诉`,路由**根本不进 Agent 节点**,那些批次一个都消费不到 ——
+    红法会是 `pop from empty list` 之类**看不出因果**的样子。定在业务类,现有
+    批次脚本就仍由 Agent 节点照常消费;要单独覆盖路由行为的用例显式传
+    `intent="闲聊"` / `intent="投诉"`。
     """
 
-    def make(batches, session=None, registry=None, **settings_overrides):
+    def make(batches, session=None, registry=None, intent="订单", **settings_overrides):
         model = ScriptedModel(batches)
+        intent_model = FakeIntentModel(intent)
         db = session if session is not None else FakeSession()
         store = SessionStore(ttl_seconds=60, max_sessions=10)
 
@@ -198,12 +237,15 @@ def client_factory(monkeypatch):
         )
         app.dependency_overrides[chat_api.get_store] = lambda: store
         app.dependency_overrides[chat_api.get_chat_model] = lambda: model
+        # 意图识别是每请求都跑的一步 —— 这一行不做,28 条用例全部发真实请求。
+        app.dependency_overrides[chat_api.get_intent_model] = lambda: intent_model
         app.dependency_overrides[get_session] = _session_override
 
         client = TestClient(app)
         client.db = db
         client.store = store
         client.model = model
+        client.intent_model = intent_model
         return client, model
 
     yield make
@@ -386,6 +428,17 @@ def test_overflow_400_releases_lock_so_the_session_stays_usable(client_factory):
 
 
 def test_upstream_error_becomes_sse_error_event(client_factory):
+    """上游炸了 → error 帧终止**且整轮不落库**(不留孤儿行)。
+
+    两条断言缺一不可。只断 error 帧的话,把 `log_turn` 挪到 agent **之前**
+    (或让异常路径也调一次 `append_turn`),流照样以 error 帧收尾、这条用例
+    照样全绿 —— 而库里会躺着一条 user 消息(或者一条空回复的 assistant),
+    下一轮 `load_history` 把它读回来当历史,用户看到客服"提过半句就哑了"。
+    ch02 的 `test_history_is_not_written_when_second_round_breaks` 守的就是这条,
+    它连同 `stream_turn` 一起被 T8 删掉 —— 新架构里「失败不落库」是**结构上**
+    成立的(`log_turn` 是唯一写方且在下游),但零断言,所以在这里补上。
+    """
+
     class ExplodingModel:
         def bind_tools(self, tools):
             return self
@@ -403,6 +456,8 @@ def test_upstream_error_becomes_sse_error_event(client_factory):
     events = _parse_sse(resp.text)
     assert events[-1][0] == "error"
     assert "上游超时" in events[-1][1]["message"]
+    # 半截回复绝不能污染历史:一行都没有。
+    assert client.db.messages == []
 
 
 def test_error_event_does_not_echo_the_configured_key(client_factory):
@@ -717,6 +772,17 @@ def test_chat_stream_emits_tool_call_event(client_factory):
         "create_ticket",
     }
 
+    # **调过工具的一轮也要落库,且落的是最终答复**。ch05 起 `log_turn` 是唯一
+    # 写方,写的只有 user + assistant(reply)两条 —— ch02 那四条(user /
+    # assistant(tool_calls) / tool / assistant)按设计不再落库。剩下这条**残留
+    # 保证**没人钉:`reply` 是 agent 各轮 `parts` 的拼接,工具轮的 token 是空的,
+    # 所以落库的 assistant 内容必须来自**收尾那一轮**。把 `log_turn` 里那次
+    # `append_turn` 删掉、或让它写 `state["user_input"]` 当回复,下面两条变红
+    # (前者由 `test_successful_turn_is_persisted_to_mysql_history` 一并覆盖,
+    # 后者只有这里看得见)。
+    assert [m.role for m in client.db.messages] == ["user", "assistant"]
+    assert client.db.messages[1].content == "已揽件。"
+
 
 def test_recoverable_tool_failure_is_not_an_error_frame(client_factory):
     """可恢复失败(查无此单)回灌给模型,流正常 done —— 不是 error 帧。
@@ -828,3 +894,61 @@ def test_infrastructure_failure_emits_error_frame(client_factory):
     # 绑给模型的必须就是注册表里那批。端点若把 `tools` 与 `registry`
     # 取自两处(绑生产工具集、执行替身),这条会红。
     assert model.bound_tools == [query_order]
+
+
+# ---------- 意图路由(默认值之外的出口) ----------
+#
+# 上面 25 条全部走 `intent="订单"`(业务数据类 → Agent 节点)。下面两条**显式**
+# 传非默认意图,覆盖两件上面一条都看不见的事:
+#   ① 路由真的按意图分叉(闲聊 / 投诉**不进** Agent 节点);
+#   ② ch05 新增的 `choices` 帧真的走到了 SSE 线上 —— 前端的「转人工 / 建工单」
+#      两个按钮就靠它,帧丢了后端一句话都不报,只是按钮永远不出现。
+
+
+def test_chitchat_intent_returns_fixed_copy_without_calling_the_chat_model(client_factory):
+    """闲聊出口:固定话术 + **零模型调用**,并把 `intent` / `trace` 折进 done 帧。
+
+    `batches=[]` 是刻意的:脚本为空,Agent 节点一旦被走到就会 `pop from empty
+    list` —— 这条因此同时是「闲聊不进 Agent」的结构探针,而不只是内容断言。
+
+    done 帧那条断言钉的是**端点新增的折帧逻辑**:`trace` 帧在端点被折进 done、
+    不外推;折的逻辑写错(比如忘了 `final = payload`)时,验收脚本依赖的
+    「trace 里有 retrieve_knowledge / agent:converged」会**静默变空**,
+    而上面所有只断 `events[-1][0] == "done"` 的用例照样全绿。
+    """
+    from app.agent.nodes import CHITCHAT_REPLY
+
+    client, model = client_factory(batches=[], intent="闲聊")
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"session_id": "s1", "message": "你好"})
+
+    events = _parse_sse(resp.text)
+    assert resp.status_code == 200
+    assert [p["text"] for name, p in events if name == "token"] == [CHITCHAT_REPLY]
+    assert model.calls == []                       # 闲聊出口一次模型都不调
+
+    done = events[-1]
+    assert done[0] == "done"
+    assert done[1]["intent"] == "闲聊"
+    assert "chitchat_reply" in done[1]["trace"]
+    assert done[1]["agent_steps"] == 0
+
+
+def test_complaint_intent_emits_choices_frame(client_factory):
+    """投诉出口:安抚话术 + `choices` 帧(转人工 / 建工单两个选项)。
+
+    选项是**后端给、前端渲染**的:`options` 的键名或结构改了,后端零报错、
+    单测全绿,只有用户看不到按钮。
+    """
+    client, model = client_factory(batches=[], intent="投诉")
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"session_id": "s1", "message": "我要投诉"})
+
+    events = _parse_sse(resp.text)
+    assert model.calls == []
+    choices = next(p for name, p in events if name == "choices")
+    assert choices["options"] == [
+        {"key": "handoff", "label": "转人工"},
+        {"key": "ticket", "label": "建工单"},
+    ]
+    assert [name for name, _ in events][-1] == "done"
