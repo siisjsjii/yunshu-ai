@@ -2922,10 +2922,22 @@ def test_build_ticket_invokes_the_tool_and_returns_its_payload():
 
 
 def test_session_id_length_is_bounded_like_chat_request():
-    """上限必须与 conversations.id 的 varchar(32) 对齐 —— 否则 DataError 会被判成 502。"""
-    with TestClient(app) as client:
+    """上限必须与 conversations.id 的 varchar(32) 对齐 —— 否则 DataError 会被判成 502。
+
+    **同样要替换 `get_session`**,不要图省事写裸 `TestClient(app)`。FastAPI 在
+    **422 之前就会进入 yield 依赖** —— 已实测:body 校验失败时依赖的 `enter`/`exit`
+    都跑了。所以裸 `TestClient` 照样会把 `get_engine()` 的 lru_cache 单例建在
+    portal 循环上,正是文件头警告的那个组合(第一版计划这里就是裸的,已订正)。
+    """
+    session = _TicketSession()
+    client = _client(session)
+    try:
         resp = client.post("/api/ticket", json={"session_id": "x" * 33})
+    finally:
+        app.dependency_overrides.clear()
     assert resp.status_code == 422
+    # 请求**根本没进端点**(校验先于函数体):长 session_id 不该建出工单
+    assert session.tickets == []
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3029,10 +3041,69 @@ async def create_ticket_endpoint(
 `test_build_ticket_invokes_the_tool_and_returns_its_payload` 必须**恰好**打红
 (红在 `session.tickets == []` 那条),第二条不受影响。然后还原。
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 6: 随带的三处文字收口(T8 审查遗留的 1 Important + 2 Minor)**
+
+**不新增任何行为,只改注释与 docstring。** 这三处都不是本任务引入的,是 T8
+任务审查的遗留项;裁定由编排者做,并进本任务的提交(其中一处就在
+`app/api/chat.py`,而另两处各只有一两行 —— 不值得为纯注释单开一轮实现+审查)。
+
+**(a)`28 条` → `27 条`(三处)。** `app/api/chat.py:54` 的 docstring 写
+「端点测试里 28 条都会朝 `https://example.invalid/v1` 发真实请求」;
+`tests/test_api_chat.py:113` 与 `:240` 的注释里各有一处同形表述。
+**实测真值是 27**(`.venv/Scripts/python.exe -m pytest tests/test_api_chat.py
+--collect-only` 现数),三处一并改成 27。
+`tests/test_api_chat.py:901` 的「上面 25 条」指的是**该行以上**的 25 条
+(25 + 下面 2 条 = 27),它是对的,**不要动**。
+
+> 数字一律用 `--collect-only` 现数,不要从任何人的报告里抄 —— 本条的来源
+> (审查报告)自己就把 27 写成了 25。
+
+**(b)`app/kb/assess.py` 的 `assess_sufficiency` 标注「不在请求路径上」。**
+它是 ch04 spec §5.5 的交付物。T8 删掉 `services/chat.py:stream_turn` 之后,
+它的**唯一**调用方只剩 `tests/test_kb_assess.py` —— 而那个文件至今全绿,
+于是没有任何东西会提示「这条路已经没有任何请求能走到」。
+ch05 spec §50 用**事前置信度闸**取代了它的事后自评,但它本身没有坏,
+且在 ch05 里删它等于单方面改掉 ch04 已交付的接口面。
+**裁定:保留,但把「不在请求路径上」写进 docstring 与测试文件头**,让下一个
+读者一眼看到,而不是靠 grep 反推。
+
+在 `assess_sufficiency` 的 docstring 末尾(现有那段的后面)追加:
+
+```python
+    **当前不在请求路径上**(ch05 spec §50):ch05 起「召回够不够」改由
+    `app/agent/nodes.py` 的**置信度闸在事前**判定,ch04 这套「生成后再自评」
+    被整段替换。T8 删掉 `services/chat.py:stream_turn` 后,本函数的生产调用方
+    为零,只剩 `tests/test_kb_assess.py` 在跑它 —— 那个文件全绿**不代表**线上
+    有这条链路。函数本身没坏,也不删(删它等于在 ch05 里改掉 ch04 已交付的
+    接口面);留着是为了将来需要「生成后二次自评」时有现成的、有测试的实现。
+```
+
+并在 `tests/test_kb_assess.py` 的模块 docstring(第 1 行)末尾追加一句:
+
+```python
+注意:被测的 `assess_sufficiency` 当前**不在请求路径上**(ch05 spec §50 用事前
+置信度闸取代了它的事后自评),本文件全绿不代表线上有这条链路;理由见该函数 docstring。
+```
+
+**(c)`tests/test_api_chat.py:903-905` 的 `choices` 帧注释改成将来时。**
+现注释说前端的「转人工 / 建工单」两个按钮「就靠它」,但
+`app/static/index.html` 此刻**没有**任何 `choices` / `handoff` / `ticket` 处理
+—— 那要等 T10。用例本身没错(它钉的是 T10 将要消费的帧契约),错的是把
+「将来会依赖」写成了「现在就依赖」。把措辞改成「T10 的前端将消费这个帧」。
 
 ```bash
-git add app/schemas.py app/api/chat.py tests/test_api_ticket.py
+.venv/Scripts/python.exe -m pytest tests/test_api_chat.py
+.venv/Scripts/python.exe -m pytest tests/test_kb_assess.py
+```
+
+预期:两个文件全 passed,且**数字与本轮开始前一字不差**(纯注释改动:
+`test_api_chat.py` 仍是 27,`test_kb_assess.py` 不变)。有任何一个数字变了,
+说明改到了行为而不是注释,停下来报告。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add app/schemas.py app/api/chat.py tests/test_api_ticket.py         tests/test_api_chat.py app/kb/assess.py
 git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后端入口"
 ```
 
