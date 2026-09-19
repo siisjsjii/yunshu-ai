@@ -1022,10 +1022,44 @@ def make_complaint_reply_node(*, emit):
 
 预期:`4 passed`。
 
+- [ ] **Step 4b: 补一条意图标签的漂移守卫(控制器补充项,见 ledger Ruling 16)**
+
+> 这一条**不是**本任务范围内的自然延伸,是 T3 审查挖出来的缺口,**由控制器授权补做**。
+> 审查者已确认它便宜且堵的是静默失效,故不另开任务、并入本次提交。
+
+追加到 `tests/test_agent_intent.py`(文件已存在,T3 建的):
+
+```python
+def test_every_label_in_the_prompt_matches_the_routing_table():
+    """标签名在两处各写一份,必须自动对齐。
+
+    `INTENT_SYSTEM_PROMPT` 里的七个标签是**手写**的;`INTENT_TO_ROUTE` 是代码里的
+    权威表。谁改了 `app/agent/routing.py` 的键名,模型仍会吐**旧名**,
+    `nodes.py` 的越界检查把**整个桶**静默降级成「其他」—— 全部进兜底,零报错。
+
+    既有守卫 `tests/test_agent_routing.py:35`(`INTENT_LABELS == tuple(INTENT_TO_ROUTE)`)
+    是恒真式(定义即如此),**正好抓不到这个**;这条才是真的守卫。
+    """
+    from app.agent.routing import INTENT_LABELS
+    from app.prompts import INTENT_SYSTEM_PROMPT
+
+    missing = [label for label in INTENT_LABELS if label not in INTENT_SYSTEM_PROMPT]
+    assert not missing, f"Prompt 里缺这些标签名,对应整桶会静默降级成「其他」:{missing}"
+```
+
+跑一次确认通过(它**一开始就该是绿的** —— Prompt 里的标签名今天是对的,
+这是一条守卫,不是 TDD 的驱动测试):
+
+```bash
+.venv/Scripts/python.exe -m pytest tests/test_agent_intent.py
+```
+
+预期:`12 passed`。
+
 - [ ] **Step 5: 提交**
 
 ```bash
-git add app/agent/nodes.py tests/test_agent_fixed_replies.py
+git add app/agent/nodes.py tests/test_agent_fixed_replies.py tests/test_agent_intent.py
 git commit -m "feat: ch05 闲聊/兜底/投诉三个固定话术出口(零模型调用 + choices 帧)"
 ```
 
@@ -1312,6 +1346,18 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
 ```
 
 预期:`8 passed`。
+
+> ⚠️ **已知且已裁定,不要"顺手修"(ledger Ruling 15)**:检索器内部**已经**按
+> `settings.retrieval_score_threshold` 滤过一遍(`app/retrieval/search.py:72`),
+> 而 `build_retriever` 传的就是**闸用的同一个值**(`app/tools/registry.py:41`)。
+> 所以真实链路上走到闸的证据**分数必然已达标**,`test_gate_fails_below_threshold...`
+> 之所以能过,是因为它用**假检索器**塞了一条 0.31 —— 真实检索器造不出这个状态。
+> 也就是说:**生产上唯一会触发的失败是「检索为空」**,`reject_reason` 里那句
+> 「最高分 … 低于阈值 …」是死分支。
+>
+> **这是本章「最简版」的已知边界,不是 bug,不要改检索器、不要传低阈值。**
+> 用户要的走向(证据弱 → 直接兜底、不进 Agent)现在就是对的:弱证据被检索器
+> 滤成空 → 闸拦下 → 兜底。正式的置信度检查已明确推给「可观测」那章。
 
 - [ ] **Step 5: 提交**
 
