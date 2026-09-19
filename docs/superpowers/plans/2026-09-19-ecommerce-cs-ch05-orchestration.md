@@ -1864,6 +1864,7 @@ git commit -m "feat: ch05 主力 ReAct Agent 节点 + token 预算/步数停止�
 """整图行为:五条出口各走一遍,断言 trace(验收 1/5 的可检查性来源)。"""
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph, get_checkpointer
@@ -1943,14 +1944,29 @@ def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None):
         retriever=retriever or FakeRetriever(),
         session=session, conversation_id="conv-1",
         emit=(frames.append if frames is not None else (lambda p: None)),
-        checkpointer=get_checkpointer(),
+        # **每个测试一个全新的 checkpointer**,不用 `get_checkpointer()` 那个
+        # 进程级单例 —— 真机已验证:同一个 thread 上重复 ainvoke,带
+        # `operator.add` 的 `trace` 会**跨调用累积**(实测 `['a','b','a','b']`)。
+        # 而所有测试都用默认 thread "t",于是**测试之间互相污染**:
+        # `test_business_route_skips_retrieval_and_gate` 断言的
+        # `"confidence_gate:pass" not in out["trace"]` 会被前面那个知识类测试
+        # 留下的同一句打红 —— 而它红得毫无道理,指向的是测试脚手架而非实现。
+        # 单例本身由 `test_checkpointer_is_a_process_level_singleton` 单独覆盖,
+        # 生产路径由 T8 的端点测试覆盖。
+        checkpointer=InMemorySaver(),
     )
     return graph, session
 
 
 async def _run(graph, user_input, thread="t"):
+    # `agent_steps` 必须在入参里**显式给初值**:真机已验证,一个从未被写过的
+    # 通道在返回的 state 里**根本不存在**(实测 `"agent_steps" in out` 为 False),
+    # 于是 `assert out["agent_steps"] == 0` 抛的是 KeyError ——
+    # 那个红指向「测试写错了」,而不是「闸没拦住」,把真问题盖掉。
+    # 给了初值之后,这条断言才真的在问「Agent 到底有没有跑」。
     return await graph.ainvoke(
-        {"conversation_id": "conv-1", "user_input": user_input, "history": [], "trace": []},
+        {"conversation_id": "conv-1", "user_input": user_input, "history": [],
+         "agent_steps": 0, "trace": []},
         config={"configurable": {"thread_id": thread}},
     )
 
