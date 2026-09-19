@@ -5,8 +5,10 @@ from langchain_core.messages import ToolMessage
 
 from app.agent.nodes import make_agent_node
 from app.config import Settings
+from app.prompts import render_evidence
 from app.schemas import Message
 from app.tools.errors import ToolInfrastructureError
+from app.tools.executor import SUMMARY_MAX_CHARS
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -87,9 +89,8 @@ class ScriptedModel:
 
 
 class FakeTool:
-    name = "query_order"
-
-    def __init__(self, content='{"status": "已发货"}', error=None):
+    def __init__(self, name="query_order", content='{"status": "已发货"}', error=None):
+        self.name = name
         self.content = content
         self.error = error
         self.calls = []
@@ -240,3 +241,134 @@ async def test_no_evidence_means_no_evidence_block_in_the_prompt():
     await _node(model).__call__(_state(evidence=[]))
     assert "以下是知识库中" not in _text(model.bound_messages[-1])
     assert _text(model.bound_messages[-1]) == "订单 1001 发货了吗"
+
+
+@pytest.mark.anyio
+async def test_two_tool_calls_in_one_round_are_both_executed_and_paired():
+    """一轮里模型发**两个** tool_call:两个都执行、都按序配对回灌。
+
+    这不是假想 —— dev-notes/ch02.md 阶段 6 ④ 记着真实模型在物流提问上同轮发了
+    两个 tool_call。本文件其余用例**从没执行过 `for call in tool_calls` 的第二次
+    迭代**,于是 `tool_calls[:1]` 这种错误实现能全绿,而它产出的消息序列是
+    「assistant 申请两个、只回灌一个」—— 上游 OpenAI 兼容 API **直接 400**。
+    `tests/test_chat_service.py:319` 为 ch02 的链路立过同一条守卫,而那条链路
+    正是本节点替代掉的(Task 8 会连同 `stream_turn` 一起删掉它)。
+
+    本用例还走**两个 chunk 累积成一轮**的路径 —— 真实模型正是这么流的,
+    所以它同时覆盖 `FakeChunk.__add__` 的合并分支。
+    """
+    frames = []
+    order_tool = FakeTool(name="query_order")
+    logistics_tool = FakeTool(name="query_logistics", content='{"location": "杭州"}')
+    model = ScriptedModel([
+        [   # 同一轮,两个 chunk,各带一个 tool_call
+            FakeChunk(tool_calls=[{"name": "query_order",
+                                   "args": {"order_id": "1001"}, "id": "c1"}]),
+            FakeChunk(tool_calls=[{"name": "query_logistics",
+                                   "args": {"order_id": "1001"}, "id": "c2"}]),
+        ],
+        [FakeChunk("订单已发货,目前在杭州。")],
+    ])
+    out = await _node(
+        model,
+        [order_tool, logistics_tool],
+        {"query_order": order_tool, "query_logistics": logistics_tool},
+        frames=frames,
+    ).__call__(_state())
+
+    # ① 两个工具**都真的被调用**了(`tool_calls[:1]` 死在这里)
+    assert [c["id"] for c in order_tool.calls] == ["c1"]
+    assert [c["id"] for c in logistics_tool.calls] == ["c2"]
+    assert out["tool_calls_made"] == [
+        {"name": "query_order", "ok": True},
+        {"name": "query_logistics", "ok": True},
+    ]
+    # ② 两个 ToolMessage 都回灌,按序,且**紧邻**那条 assistant(tool_calls)
+    fed = [m for m in model.bound_messages if isinstance(m, ToolMessage)]
+    assert [m.tool_call_id for m in fed] == ["c1", "c2"]
+    calls_idx = [i for i, m in enumerate(model.bound_messages)
+                 if getattr(m, "tool_calls", None)]
+    tool_idx = [i for i, m in enumerate(model.bound_messages)
+                if isinstance(m, ToolMessage)]
+    assert calls_idx and len(tool_idx) == 2
+    assert tool_idx == [calls_idx[0] + 1, calls_idx[0] + 2]
+    # ③ 两对 tool_call / tool_result 帧都发了
+    assert [p for p in frames if p["frame"] == "tool_call"] == [
+        {"frame": "tool_call", "name": "query_order",
+         "args": {"order_id": "1001"}, "tool_call_id": "c1"},
+        {"frame": "tool_call", "name": "query_logistics",
+         "args": {"order_id": "1001"}, "tool_call_id": "c2"},
+    ]
+    # 两者同属**同一次** ReAct 步 —— 步号都是 1
+    assert out["trace"] == [
+        "agent:step1 tool=query_order",
+        "agent:step1 tool=query_logistics",
+        "agent:converged",
+    ]
+
+
+@pytest.mark.anyio
+async def test_full_tool_content_is_fed_back_not_the_truncated_summary():
+    """回灌给模型的必须是**完整内容** `outcome.content`,不是展示用的 `summary`。
+
+    `summary` 截断在 `SUMMARY_MAX_CHARS = 200`(`app/tools/executor.py:22`)。
+    回灌截断版的话:`query_faq` 常态返回 400+ 字符,模型手里只有半截 JSON,
+    读不出答案,只能回「暂未收录」—— 用户看到「知识库里明明有,客服却说没有」。
+    而本文件其它用例的工具载荷只有十几字符,`summary == content`,**永远看不出区别**。
+    """
+    long_answer = "七天无理由退货。" + "详情见退货政策第三条。" * 40   # 远超 200 字符
+    tool_obj = FakeTool(content=long_answer)
+    model = ScriptedModel([
+        [FakeChunk(tool_calls=[{"name": "query_order",
+                                "args": {"order_id": "1"}, "id": "c1"}])],
+        [FakeChunk("好的。")],
+    ])
+    frames = []
+    await _node(model, [tool_obj], {"query_order": tool_obj},
+                frames=frames).__call__(_state())
+
+    fed = [m for m in model.bound_messages if isinstance(m, ToolMessage)]
+    assert len(fed) == 1
+    assert fed[0].content == long_answer          # 完整,一字未截
+    assert len(fed[0].content) > SUMMARY_MAX_CHARS
+    # 帧上仍走**截断**版 —— 那是给前端/日志看的,两条路径不能共用一个变量
+    shown = [p for p in frames if p["frame"] == "tool_result"][0]["summary"]
+    assert shown.endswith("…")
+    assert len(shown) < len(fed[0].content)
+
+
+@pytest.mark.anyio
+async def test_evidence_block_numbering_is_one_based_and_matches_citations():
+    """证据块编号必须从 **[1]** 起 —— 它就是 `citations[].n` 的来源。
+
+    `make_retrieve_knowledge_node` 给 citations 编的是 `{"n": i + 1}`,
+    前端 `app/static/index.html` 用 `citations.find(x => x.n === n)`
+    把正文里的 `[n]` 变成可点开的来源。这里要是从 `[0]` 起,模型照着抄 `[0]`,
+    前端**永远匹配不到第一个来源** —— 引用 UI 静默失效,零报错。
+    """
+    text = render_evidence([
+        {"section_path": "退换货 > 退货政策", "category": "退换货", "answer": "七天无理由"},
+        {"section_path": None, "category": "物流", "answer": "48 小时内发货"},
+    ])
+    assert "[1] (退换货 > 退货政策) 七天无理由" in text
+    assert "[2] (物流) 48 小时内发货" in text     # section_path 为 None 时退回 category
+    assert "[0]" not in text
+    assert "[3]" not in text
+
+
+@pytest.mark.anyio
+async def test_agent_uses_the_resolved_input_not_the_raw_utterance():
+    """Agent 读的是 `resolved_input`,不是 `user_input`。
+
+    本章指代消解是**原样透传**,两个键今天恒等,所以这条断言今天不区分任何东西
+    —— 它的价值在**下一步**:指代消解落地后(「它」「那个」被补全成具体商品/订单),
+    读 `user_input` 的实现会让 Agent 看到**未消解的原话**,用户问「它还有货吗」,
+    模型把「它」当成商品名去查。那时这条断言是唯一会红的东西。
+    """
+    model = ScriptedModel([[FakeChunk("好")]])
+    await _node(model).__call__(
+        _state(user_input="它还有货吗", resolved_input="那件连衣裙还有货吗")
+    )
+    sent = _text(model.bound_messages[-1])
+    assert "那件连衣裙还有货吗" in sent
+    assert "它还有货吗" not in sent
