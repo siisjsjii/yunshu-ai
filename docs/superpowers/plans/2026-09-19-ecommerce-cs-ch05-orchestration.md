@@ -1732,6 +1732,24 @@ def build_messages(
 
 > 改完请跑 `.venv/Scripts/python.exe -m pytest tests/test_prompts.py` 确认那 4 条老用例
 > **一字不改仍然通过** —— 那正是「加了可选参数」而非「另起炉灶」的证据。
+> (已核实确实会通过:`messages[0]` 仍是 `SystemMessage`、`messages[-1]` 仍是以
+> `user_input` 为内容的 `HumanMessage`、空历史 2 条 / 两条历史 4 条 —— 重写前后
+> 逐条对得上。)
+
+**同时删掉因这次重写而变成死代码的两处**(评审一定会提,现在顺手做掉):
+
+- `app/prompts.py:60` 的 `CHAT_PROMPT = ChatPromptTemplate.from_messages([...])`
+  —— `build_messages` 是它**唯一**的使用者(`grep -rn "CHAT_PROMPT" app/ tests/
+  scripts/ evals/` 只剩它自己那一行)。重写后它不再被引用。
+  删它**不改变任何行为**:它的 system 段就是 `SYSTEM_PROMPT_TEMPLATE`,而
+  `render_system_prompt()` 走的是同一个模板(`_SYSTEM_PROMPT`)——
+  两条路径产出**同一个字符串**。
+- `app/prompts.py` 顶部 `from langchain_core.prompts import ... MessagesPlaceholder`
+  里,**只删 `MessagesPlaceholder`**(`CHAT_PROMPT` 的 `MessagesPlaceholder("history"
+  , optional=True)` 是它唯一用处)。`ChatPromptTemplate` **要留着** ——
+  `_SYSTEM_PROMPT` 与 `EXTRACT_PROMPT` 还在用。
+
+改完**再跑一次** `tests/test_prompts.py` 与 `tests/test_chat_service.py`,确认仍然全绿。
 
 - [ ] **Step 8: 写 Agent 节点实现**
 
