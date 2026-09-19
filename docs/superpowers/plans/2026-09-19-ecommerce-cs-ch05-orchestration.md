@@ -2453,7 +2453,29 @@ def prepare_turn(*, settings: Settings, history: Sequence[Message], user_input: 
 - 顶部 import 调整:删 `stream_turn`;加
   `from app.agent.emit import make_emitter`、
   `from app.agent.graph import build_graph, get_checkpointer`、
-  `from app.llm import create_extract_model`(若尚未引入)。
+  `from app.llm import create_extract_model`。
+- **加一个 `get_intent_model` 依赖,与既有的 `get_chat_model` 并排**:
+
+```python
+def get_intent_model(settings: Settings = Depends(get_settings)):
+    """意图识别用的模型。与 `get_chat_model` **并排**做成依赖,不是为了让生产
+    代码多一层 —— 是为了给测试留一个 `dependency_overrides` 的注入点。
+
+    意图节点**每一个请求都会跑**,也就每一个请求都会真的 `.ainvoke` 一次。
+    若这里就地 `create_extract_model(settings)`(模块级导入的名字),测试想拦
+    它就只能去 monkeypatch `chat_api.create_extract_model` —— 而那是**导入进来的
+    名字**,patch 它等于 patch 整个模块的绑定,别的端点(抽取)同用一个名时会
+    连带被换掉。`Depends` 是本项目既有的注入缝(CLAUDE.md:services 收 llm 实例
+    作参数、FastAPI 侧靠 Depends 注入、测试用 dependency_overrides 替换),
+    `tests/test_api_chat.py` 的 `client_factory` 里已经有一行
+    `app.dependency_overrides[chat_api.get_chat_model] = lambda: model`,
+    加一行同形的即可。**不做这层,端点测试里 28 条都会朝
+    `https://example.invalid/v1` 发真实请求,而且不联网这一条是硬规矩。**
+    """
+    return create_extract_model(settings)
+```
+
+  端点签名相应加 `intent_model=Depends(get_intent_model),`。
 - `prepare_turn(...)` 的返回值语义变了 —— 现在是**裁剪后的历史**,直接喂给图的
   `history` 字段:`history = prepare_turn(settings=settings, history=history, user_input=request.message)`。
 - 把 `stream_turn(...)` 那段 `async for (event, payload) in ...` 换成:
@@ -2468,7 +2490,7 @@ def prepare_turn(*, settings: Settings, history: Sequence[Message], user_input: 
             emit = make_emitter()
             graph = build_graph(
                 model=model,
-                intent_model=create_extract_model(settings),
+                intent_model=intent_model,
                 tools=tools,
                 registry=registry,
                 settings=settings,
@@ -2525,13 +2547,54 @@ def prepare_turn(*, settings: Settings, history: Sequence[Message], user_input: 
 > 它和 token 帧走**同一条** emit 通道,所以不需要 `stream_mode=["custom","values"]`
 > ——少一个流模式就少一处「帧会不会被缓冲住」的风险。
 
-- [ ] **Step 6: 删掉手写循环**
+- [ ] **Step 6: 改 `tests/test_api_chat.py`(28 条端点用例的接缝)**
+
+这批用例是**对着 ch02 那条直线流**写的:发消息 → 模型 → 工具 → 模型。ch05 在
+模型**前面**插了两个节点(指代消解、意图识别),路由又是**按意图分叉**的。
+不改这批文件,`tests/test_api_chat.py` 会**整片红**,而且红法与实现无关 ——
+所以这一步是**必须的**,不是"顺手清理"。
+
+改动只有两处:
+
+1. `client_factory.make(...)` 里加第二行 override(与既有那行同形):
+
+```python
+        app.dependency_overrides[chat_api.get_intent_model] = lambda: intent_model
+```
+
+   并让 `make(...)` 收一个新参数 `intent: str = "订单"`,默认值就是它 ——
+   替身用 `tests/test_agent_intent.py` 里那个 `FakeStructuredModel` 的形状
+   (`with_structured_output` 断言 `method == "json_mode"` 后返回自身、
+   `ainvoke` 回放一个带 `.intent` 的对象)。
+
+2. **默认值必须是 `BUSINESS` 那一类(物流/订单/售后),不能是 `其他`/`闲聊`。**
+   这批用例把 `ScriptedModel(batches)` 的批次当作"模型一定会被调用"来写;
+   意图若是 `其他`/`闲聊`/`投诉`,路由**根本不进 Agent 节点**,那些批次一个都
+   消费不到 —— 结果是一堆 `pop from empty list` 之类的**看不出因果的红**。
+   默认值定在业务数据类,现有批次脚本就仍由 Agent 节点照常消费。
+
+   需要单独覆盖路由行为的用例(闲聊话术、投诉按钮)显式传 `intent="闲聊"` /
+   `intent="投诉"`。
+
+> **别为 `done` 帧的 `usage` 纠结。** Step 5 里它被写成 `None`(ch02 曾报真实
+> usage),全仓**没有任何消费方**:`app/static/`、`scripts/`、`evals/` 与
+> `tests/test_api_chat.py` 里 grep 不到一处读 `done.usage` 的代码。这是记在案的
+> 行为变更,不是遗漏;图里没有一处汇总 token,硬凑一个假数只会更糟。
+
+> **删掉的那三条 ch02 守卫不丢覆盖。** T8 会连 `tests/test_chat_service.py` 里
+> 这三条一起删:同轮两个 tool_call 都要回灌、第二轮 assistant 先于它的
+> tool 消息、回灌的是**全文**不是截断摘要。它们在 T6 的修复轮里**已经逐条
+> 复制进 `tests/test_agent_node.py`** 了(那次修复轮正是因为"T8 要删掉它们的家"
+> 才补的)。删之前确认这三条在 `tests/test_agent_node.py` 里**确实存在**,
+> 且**各有一个变异能打红它** —— 存量覆盖的搬迁要看得见,不能靠"应该有"。
+
+- [ ] **Step 7: 删掉手写循环**
 
 ```bash
 git rm app/agent/loop.py tests/test_agent_loop.py
 ```
 
-- [ ] **Step 7: 跑全量快路径 + db**
+- [ ] **Step 8: 跑全量快路径 + db**
 
 ```bash
 .venv/Scripts/python.exe -m pytest -m "not db"
@@ -2540,11 +2603,11 @@ git rm app/agent/loop.py tests/test_agent_loop.py
 
 预期:全绿。**db 测试需要 MySQL 起着**;没起就用 `docker start mysql`。
 
-- [ ] **Step 8: 记账**
+- [ ] **Step 9: 记账**
 
 在 spec §12 追加一条订正,并在 `dev-notes/ch05.md` 记本任务。
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 
 ```bash
 git add -A
