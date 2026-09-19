@@ -121,3 +121,30 @@ def build_messages(
 
 def build_extract_messages(text: str) -> list:
     return EXTRACT_PROMPT.format_messages(text=text)
+
+
+INTENT_SYSTEM_PROMPT = """你是电商客服的意图识别助手。
+判断用户这一句话属于下面七类中的哪一类,并以 JSON 对象输出。
+
+七类:
+- 物流:查询包裹位置、发货进度、配送时效
+- 订单:查询订单状态、金额、下单时间
+- 商品咨询:咨询商品价格、库存、规格、功能
+- 退款退货:申请退款、退货、换货,或询问相关政策
+- 售后:商品质量问题、维修、补发、安装
+- 投诉:表达不满、要求赔偿、要求人工处理
+- 闲聊:问候、感谢等日常寒暄(如「你好」「谢谢」「今天天气不错」)
+
+输出一个 JSON 对象,只有 intent 一个字段,取值为上述七类之一的原文。
+无法归入任何一类时,intent 输出「其他」。注意:向客服提出与购物无关的**具体请求**
+(如写诗、写代码、打听与本店无关的事),不属于寒暄,一律算「其他」。
+不要输出 JSON 以外的任何内容。"""
+
+_INTENT_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", INTENT_SYSTEM_PROMPT), ("human", "{text}")]
+)
+
+
+def build_intent_messages(text: str) -> list:
+    """组装意图识别的消息。"""
+    return _INTENT_PROMPT.format_messages(text=text)

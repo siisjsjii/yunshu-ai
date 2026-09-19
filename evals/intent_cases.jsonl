@@ -1,0 +1,24 @@
+{"text": "我的包裹什么时候能到", "expected": "物流"}
+{"text": "快递到哪了", "expected": "物流"}
+{"text": "发货了吗", "expected": "物流"}
+{"text": "订单 1001 什么状态", "expected": "订单"}
+{"text": "我这个单子多少钱", "expected": "订单"}
+{"text": "我什么时候下的单", "expected": "订单"}
+{"text": "智能猫砂盆 Pro 多少钱", "expected": "商品咨询"}
+{"text": "MH-LP100 有货吗", "expected": "商品咨询"}
+{"text": "这个保温杯什么规格", "expected": "商品咨询"}
+{"text": "我要退款", "expected": "退款退货"}
+{"text": "七天无理由怎么算", "expected": "退款退货"}
+{"text": "我想换成另一个尺码", "expected": "退款退货"}
+{"text": "收到的杯子是碎的", "expected": "售后"}
+{"text": "键盘用了两天就坏了,能修吗", "expected": "售后"}
+{"text": "少发了一件,能补发吗", "expected": "售后"}
+{"text": "我要投诉你们客服", "expected": "投诉"}
+{"text": "太差了,我要找你们领导", "expected": "投诉"}
+{"text": "这什么破服务,转人工", "expected": "投诉"}
+{"text": "你好", "expected": "闲聊"}
+{"text": "谢谢啦", "expected": "闲聊"}
+{"text": "今天天气不错", "expected": "闲聊"}
+{"text": "帮我写一首关于月亮的诗", "expected": "其他"}
+{"text": "asdkjhaskjd", "expected": "其他"}
+{"text": "你们老板是谁", "expected": "其他"}

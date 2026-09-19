@@ -1,0 +1,81 @@
+"""意图识别节点:解析失败/越界必须降级为「其他」,**不许抛异常**。"""
+
+import pytest
+from langchain_core.exceptions import OutputParserException
+
+from app.agent.nodes import make_classify_intent_node
+from app.agent.routing import OTHER
+from app.agent.state import IntentResult
+
+
+class FakeStructuredModel:
+    """替身:with_structured_output 返回一个可注入结果或异常的链。"""
+
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def with_structured_output(self, schema, method=None):
+        assert method == "json_mode", "抽取类出参只能用 json_mode(本项目硬约束)"
+        self.schema = schema
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls.append(list(messages))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _Intent:
+    def __init__(self, intent):
+        self.intent = intent
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("intent", ["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"])
+async def test_seven_labels_pass_through(intent):
+    model = FakeStructuredModel(result=_Intent(intent))
+    node = make_classify_intent_node(model=model)
+    out = await node({"user_input": "随便问点什么"})
+    assert out["intent"] == intent
+    assert out["trace"] == [f"classify_intent:{intent}"]
+
+
+@pytest.mark.anyio
+async def test_out_of_vocabulary_intent_degrades_to_other():
+    """模型吐了七类之外的标签 → 「其他」,由路由送兜底。"""
+    model = FakeStructuredModel(result=_Intent("退款"))
+    node = make_classify_intent_node(model=model)
+    assert (await node({"user_input": "x"}))["intent"] == OTHER
+
+
+@pytest.mark.anyio
+async def test_parse_failure_degrades_to_other_instead_of_raising():
+    """解析失败**不许**抛 —— 意图识别是骨架第一步,它的失败不该毁掉整轮对话。"""
+    model = FakeStructuredModel(error=OutputParserException("模型输出不是 JSON"))
+    node = make_classify_intent_node(model=model)
+    out = await node({"user_input": "x"})
+    assert out["intent"] == OTHER
+    assert out["trace"] == [f"classify_intent:{OTHER}"]
+
+
+@pytest.mark.anyio
+async def test_structured_output_is_bound_to_the_intent_schema():
+    """绑错 schema 时上面 10 条全绿(替身不看 schema,只看返回对象的 .intent)。
+
+    出参 schema 是**下游契约**:换掉它,json_mode 的真机路径会直接失效,
+    而所有替身用例照过 —— 所以这里必须钉住。
+    """
+    model = FakeStructuredModel(result=_Intent("闲聊"))
+    make_classify_intent_node(model=model)
+    assert model.schema is IntentResult
+
+
+@pytest.mark.anyio
+async def test_prompt_carries_the_user_utterance():
+    model = FakeStructuredModel(result=_Intent("闲聊"))
+    node = make_classify_intent_node(model=model)
+    await node({"user_input": "你好呀"})
+    assert "你好呀" in model.calls[0][-1].text
