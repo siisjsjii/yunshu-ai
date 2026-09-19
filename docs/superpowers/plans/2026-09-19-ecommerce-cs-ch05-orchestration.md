@@ -1669,6 +1669,7 @@ async def test_no_evidence_means_no_evidence_block_in_the_prompt():
     await _node(model).__call__(_state(evidence=[]))
     assert "以下是知识库中" not in _text(model.bound_messages[-1])
     assert _text(model.bound_messages[-1]) == "订单 1001 发货了吗"
+```
 
 - [ ] **Step 6: 跑测试确认失败**
 
