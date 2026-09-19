@@ -17,6 +17,7 @@ from app.sanitize import redact_api_key
 from app.schemas import ChatRequest, TicketRequest
 from app.services.chat import prepare_turn
 from app.services.history import ensure_conversation, load_history
+from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import execute_tool
 from app.tools.registry import build_retriever, build_tools, registry_for
 
@@ -243,5 +244,15 @@ async def create_ticket_endpoint(
                 detail=redact_api_key(outcome.summary, settings.openai_api_key),
             )
         return json.loads(outcome.content)
+    except ToolInfrastructureError as exc:
+        # 基础设施故障(DB 不可用等)必须变 502 + 固定文案,**不是** FastAPI 默认的
+        # 500 —— 500 会把「服务端出问题」说成「你的请求有问题」,与本仓既定的
+        # 错误语义边界不一致(CLAUDE.md:上游/基础设施故障一律 502)。
+        # executor 抛出的文本已经是固定文案,这里再过一次 redact_api_key 是
+        # 纵深防御:它是出站文本,而出站文本一律要过脱敏。
+        raise HTTPException(
+            status_code=502,
+            detail=redact_api_key(str(exc), settings.openai_api_key),
+        ) from exc
     finally:
         lock.release()

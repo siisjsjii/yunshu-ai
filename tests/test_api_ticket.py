@@ -11,13 +11,27 @@
 真库的「写进去了吗」由 `tests/test_tools_db.py::test_create_ticket_writes_row`
 独占(它用新 session 回查 `select(Ticket)`)—— 那条钉的是工具,
 这条钉的是**端点真的把工具调起来了**。
+
+修复轮 1 追加:基础设施故障必须走 502(I1)、失败退出路径必须放锁(I2a)、
+409 分支要有自己的断言(I2b),以及「建单即转人工」这条只有真工具会做的
+副作用(M6)。
 """
 
-from fastapi.testclient import TestClient
+import asyncio
+import json
 
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from langchain.tools import tool
+from sqlalchemy.exc import OperationalError
+
+from app.api import chat as chat_api
+from app.config import Settings
 from app.db.models import Ticket
 from app.db.session import get_session
 from app.main import app
+from app.memory.store import SessionStore
 
 # 顶层 import(`tests/` 没有 `__init__.py`,pytest 默认的 prepend 导入模式会把
 # `tests/` 放进 sys.path)—— **不要**写成 `tests.test_api_chat`:那会让同一份
@@ -46,12 +60,43 @@ class _TicketSession(FakeSession):
             super().add(obj)
 
 
-def _client(session):
-    async def _override():
+_REQUIRED_SETTINGS = dict(
+    openai_base_url="https://example.invalid/v1",
+    openai_api_key="sk-test",
+    openai_model="test-model",
+    database_url="mysql+aiomysql://u:p@localhost/db",
+)
+
+
+def _settings(**overrides):
+    """测试用 Settings:`_env_file=None` 是仓规(不让本机 .env 决定测试通过与否)。"""
+    return Settings(_env_file=None, **{**_REQUIRED_SETTINGS, **overrides})
+
+
+def _client(session, *, store=None, **settings_overrides):
+    """端点级测试客户端:三条依赖缝都替换掉(会话 / 会话存储 / 配置)。
+
+    ⚠️ **替换 `get_settings` 并不能让这个文件摆脱仓库根的 `.env`** ——
+    `build_tools` 内部的 `build_retriever` 是**硬连线**调模块级 `get_settings()`
+    (`app/tools/registry.py:30`),不走 `Depends`,所以 DI 缝够不到它。
+
+    实测(移走 `.env` 后跑,修复轮 1 现数):本文件红 **1** 条 —— 只剩主用例,
+    因为另外 4 条要么被替身换掉了 `build_tools`、要么压根不进端点;而
+    **全量快路径红 24 条**(其余散在 `test_api_chat.py` / `test_api_kb.py` /
+    `test_registry.py`)。这条覆盖的用途是**控制等锁超时与密钥占位值**,
+    不是可移植性。
+    """
+    store = store if store is not None else SessionStore(ttl_seconds=60, max_sessions=100)
+
+    async def _session_override():
         yield session
 
-    app.dependency_overrides[get_session] = _override
-    return TestClient(app)
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[chat_api.get_store] = lambda: store
+    app.dependency_overrides[chat_api.get_settings] = lambda: _settings(**settings_overrides)
+    client = TestClient(app)
+    client.store = store          # 便于断言锁对象
+    return client
 
 
 def test_build_ticket_invokes_the_tool_and_returns_its_payload():
@@ -76,7 +121,12 @@ def test_build_ticket_invokes_the_tool_and_returns_its_payload():
     # ↓ 判别性断言:工具的写动作真的发生了,且号与响应里的一模一样
     assert [t.ticket_no for t in session.tickets] == [body["ticket_no"]]
     assert session.tickets[0].conversation_id == SID
-    assert session.commits >= 1
+    # ↓ 只有**真工具**会「建单即转人工」。端点若把建单逻辑内联重写一遍,
+    #   状态会停在 ensure_conversation 建的 "active" —— 这条正好抓它。
+    #   (原来这里断的是 `session.commits >= 1`,它近乎恒真:ensure_conversation
+    #   自己就会 commit,把工具那行 `await session.commit()` 删掉它照样绿 ——
+    #   所以换成上面这条只有真工具会满足的断言。)
+    assert session.conversations[SID].status == "pending_human"
 
 
 def test_session_id_length_is_bounded_like_chat_request():
@@ -96,3 +146,130 @@ def test_session_id_length_is_bounded_like_chat_request():
     assert resp.status_code == 422
     # 请求**根本没进端点**(校验先于函数体):长 session_id 不该建出工单
     assert session.tickets == []
+
+
+def _failing_create_ticket():
+    """建工单工具的替身:写库时 DB 不可用。
+
+    走的是**真实**的故障分类路径:executor 捕 `SQLAlchemyError` 后抛
+    `ToolInfrastructureError`(app/tools/executor.py:91),端点必须把它翻成 502。
+    """
+
+    @tool
+    async def create_ticket(description: str, ticket_type: str) -> str:
+        """替身:写库时 DB 不可用。"""
+        raise OperationalError("INSERT INTO tickets", {}, Exception("连接断开"))
+
+    return create_ticket
+
+
+def _slow_create_ticket():
+    """建工单工具的替身:慢工具。本端点没有模型,「占住锁」只能靠它。"""
+
+    @tool
+    async def create_ticket(description: str, ticket_type: str) -> str:
+        """替身:慢工具,持锁 0.4s 后正常返回。"""
+        await asyncio.sleep(0.4)
+        return json.dumps(
+            {"ticket_no": "T-slow", "conversation_id": SID, "status": "open"},
+            ensure_ascii=False,
+        )
+
+    return create_ticket
+
+
+def test_infrastructure_failure_returns_502_not_500(monkeypatch):
+    """DB 故障必须是 502 + 固定文案,**不是** FastAPI 默认的 500。
+
+    这是端点里**唯一真会发生的故障路径**:`if not outcome.ok` 那条 502 分支今天
+    不可达(registry 必有 create_ticket、args 是硬编码合法值、`ToolNotFound` 要求
+    description 为空 —— 三者都不可能),而 MySQL 瞬时不可用走的是
+    `executor` → `ToolInfrastructureError` → 端点没有 `except` 时是 **500**
+    「Internal Server Error」。500 会把「服务端出问题」说成「你的请求有问题」,
+    与本仓的错误语义边界相悖(CLAUDE.md:基础设施故障一律 502)。
+
+    **顺序**:这个 `except` 子句先于本用例落盘。反过来写的话,这里会红在
+    `500 != 502`,而那个红不告诉你到底是测试写错了还是实现错了。
+    """
+    session = _TicketSession()
+    client = _client(session)
+    monkeypatch.setattr(
+        chat_api,
+        "build_tools",
+        lambda *, session, conversation_id: [_failing_create_ticket()],
+    )
+    try:
+        resp = client.post("/api/ticket", json={"session_id": SID})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 502
+    # 出站的是 executor 那句固定文案,不是原始 SQLAlchemy 异常文本
+    # (等价于「不回显密钥」:原始文本里带什么都不会流出去)。
+    assert resp.json()["detail"] == "数据服务暂时不可用"
+
+
+def test_failed_request_releases_lock_so_the_session_stays_usable(monkeypatch):
+    """失败退出路径也必须放锁 —— 漏放的后果是**该会话永久 409**。
+
+    持锁的锁既不被 TTL 也不被 LRU 回收,而且 ticket 端点与聊天端点**共用同一个
+    进程级 `_store`**,泄漏会连带毒掉聊天。审查者变异实测:把端点里
+    `finally: lock.release()` 换成 `finally: pass`,本文件**依然 2 passed** ——
+    所以这条断言不是锦上添花,它是这个文件里唯一能看见锁的东西。
+
+    等锁超时调成 0.15s:真漏了放锁,第二次请求会在 0.15s 内变红,而不是用默认
+    的 60s 把测试挂死。
+    """
+    session = _TicketSession()
+    client = _client(session, session_lock_timeout_seconds=0.15)
+    monkeypatch.setattr(
+        chat_api,
+        "build_tools",
+        lambda *, session, conversation_id: [_failing_create_ticket()],
+    )
+    try:
+        first = client.post("/api/ticket", json={"session_id": SID})
+        second = client.post("/api/ticket", json={"session_id": SID})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 502
+    # 第二次仍是 502 —— 关键是它**不是 409**:锁被放掉了,这个会话还能继续用。
+    assert second.status_code == 502
+    # 顺带断一次锁对象本身,便于定位(两条都在断"会话仍可用"这件事)。
+    assert client.store.lock_for(SID).locked() is False
+
+
+@pytest.mark.anyio
+async def test_concurrent_same_session_second_request_times_out_with_409(monkeypatch):
+    """同 session 并发:一个拿到锁走完,另一个等锁超时 → 恰好一个 409。
+
+    这段 409 与对话端点 `app/api/chat.py` 的那段**行为等价**(同状态码、同 detail
+    字符串),而那段在 `tests/test_api_chat.py` 有具名测试。**"它是复制过来的、
+    那边测过了"正是本项目复盘时吃过亏的论证方式** —— 复制品要有自己的断言。
+
+    照抄那边的并发写法(`httpx.ASGITransport` + `asyncio.gather`):TestClient 是
+    同步的,两个线程里跑同一事件循环会带来额外的调度不确定性。
+    """
+    session = _TicketSession()
+    client = _client(session, session_lock_timeout_seconds=0.15)
+    monkeypatch.setattr(
+        chat_api,
+        "build_tools",
+        lambda *, session, conversation_id: [_slow_create_ticket()],
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as c:
+            first, second = await asyncio.gather(
+                c.post("/api/ticket", json={"session_id": SID}),
+                c.post("/api/ticket", json={"session_id": SID}),
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    loser = first if first.status_code == 409 else second
+    assert "正在处理另一条消息" in loser.text

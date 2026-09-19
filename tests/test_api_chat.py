@@ -110,7 +110,7 @@ class FakeIntentModel:
 
     **为什么必须有这个替身**:ch05 在模型**前面**插了意图识别节点,而它
     **每一个请求都会跑**、每一个请求都会真的 `.ainvoke` 一次。不替换掉它,
-    本文件 27 条用例会各自朝 `https://example.invalid/v1` 发一次真实请求 ——
+    进入端点/图的用例都会朝 `https://example.invalid/v1` 发一次真实请求 ——
     「单测全程不联网」是硬规矩,不是偏好。端点为它留了 `get_intent_model`
     这个 `Depends` 缝(与 `get_chat_model` 并排),下面一行 override 就接上了。
 
