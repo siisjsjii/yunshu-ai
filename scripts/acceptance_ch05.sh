@@ -139,6 +139,18 @@ SID=$(new_sid)
 # 订单里有 `product` 字段(`app/tools/business.py:79`),商品名**只能**先查订单
 # 才知道,所以「不止一步」是**问题本身的形状**保证的,与轮数怎么数无关。
 ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > /tmp/ch05_5.sse
+# ⚠️ 这一条是**概率性**的,绿色不可重放 —— 2026-09-20 实测 16 次只过约 10 次。
+# 不是脚本缺陷:意图分类器对这个**混合问题**在「订单」与「商品咨询」之间摇摆,
+# 而「商品咨询 → KNOWLEDGE」是设计如此(`app/agent/routing.py`),标签一变就走
+# 强制检索、Agent 根本不跑(`agent_steps=0`)。**看到红先读 `intent`**:
+#   intent=订单    → Agent 跑,query_order + query_product 两次串行调用,steps=3 过
+#   intent=商品咨询 → retrieve_knowledge:0 hits → confidence_gate:fail → fallback
+# 后半段那个 0 hits 另有根因(与本脚本无关、也是验收 1 拿不到真答案的原因):
+# `retrieval_score_threshold` 0.58 是 ch03 在 **dense 余弦**分数上定的
+# (ch03 spec §12:正例最低 0.609/干扰最高 0.560),ch04 加重排时**原值沿用**
+# (ch04-hybrid-rerank spec §9),于是拿 dense 的阈值去卡 **reranker sigmoid** 分数。
+# 实测(2026-09-20,直连 retriever):自然长问句 rerank 分 0.27~0.34(正确块在内),
+# 光问「退货」0.73。**判据不变、阈值不改**(ch05 spec §11 只写「复用」),记录在案。
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
 BAD=$(bad_tool_results < /tmp/ch05_5.sse)
