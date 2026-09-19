@@ -3159,7 +3159,7 @@ create_ticket 里 session.add/commit 抛 SQLAlchemyError
 
 **这一行还顺带修掉一个既有 bug,不是可选的清理**:`ctx.bubble` 在改动前
 **从来没被赋过值**,而 `index.html` 的 error 帧分支与 `catch` 分支都在读它 ——
-今天任何一次 error 帧都会让页面**砖掉**(详见 Step 4 的说明框)。改末行:
+今天任何一次 error 帧报的错都会被**静默吞掉**(⚠️ 建出来但从未进 DOM,用户什么也看不到;详见 Step 4 的说明框)。改末行:
 
 ```js
     return { bubble, badges, body, citations: [] };
@@ -3279,12 +3279,24 @@ netstat -ano | grep ":8000"     # 先查僵尸进程,再起
 > `ctx.bubble` 在改动前的现场代码里**根本没有被赋值**:`addAssistant()` 的返回值
 > 只有 `{ badges, body, citations }`,而 `send()` 用 `{ ...addAssistant(), ... }` 造 ctx ——
 > 可是 `index.html` 有**两处**在读 `ctx.bubble`(error 帧分支与 `catch` 分支)。
-> 后果是**级联的**,不是"报个错而已":
-> error 帧一来,error 分支先抛 `TypeError` → 落进外层 `catch` → `catch` 里**还是**
-> `ctx.bubble.appendChild` → **再抛一次且无人接** → `finally` 不执行 → `busy` 永远为
-> `true`、输入框与发送键永远禁用 —— **页面当场砖掉,只能刷新**。
-> (以上是从代码读出来的结论,**没有在浏览器里复现过**;Step 1a 之后这条路径才第一次
-> 真正可用。)
+> **后果不是"砖机",是"错误被静默吞掉"** —— 这一段原计划写错了,2026-09-20 订正。
+> 原文断言「catch 里再抛一次且无人接 → `finally` 不执行 → `busy` 永远为 `true` →
+> **页面当场砖掉,只能刷新**」。**前半段对,后半段错**:
+> ECMAScript 里 `finally` **即使在 catch 块继续抛出时也照常执行**
+> (node 实测 `busy after = false | PAGE BRICKED? false`)。
+> 真实后果分两条路径,**都不会砖掉**:
+>
+> - **error 帧路径**:`:371` 先设 `ctx.failed = true` → `:375` 抛 → `catch` 里建好 ⚠️ 之后
+>   `:426` **再抛一次** → `finally` 照跑,但 `:428` 那个 `!ctx.failed` 守卫**为假**,
+>   于是连 `(没有返回内容)` 都不写 → **气泡完全空白、⚠️ 从未进 DOM、用户看不到任何
+>   错误**,只在 console 留一条 unhandled rejection。
+> - **网络失败路径**:`fetch` reject → `catch` → `:426` 抛 → `finally` 里 `ctx.failed`
+>   从未被设过,守卫为真 → 写入 **`(没有返回内容)`** —— 一个**误导性**提示
+>   (真实原因是连接中断),⚠️ 同样没进 DOM。
+>
+> 两条路径 `busy` 都被 `finally` 复位(`:432`),**输入框与发送键保持可用**。
+> 所以 **Step 1a 修掉的是「错误被静默吞掉 + 提示误导」,不是砖机**;
+> 严重性依然成立(用户报错时得不到任何反馈),但别把它说成砖机。
 >
 > **确认方式(必须实测,不许只读代码)。**
 >
@@ -3305,10 +3317,15 @@ netstat -ano | grep ":8000"     # 先查僵尸进程,再起
 >    可以接着发下一条。
 > 5. 把 Throttling 调回 **No throttling**。
 >
-> **必须再做一次"改前"的对照**,否则「Step 1a 修掉了砖机」就只是读代码读出来的结论:
+> **必须再做一次"改前"的对照** —— 它检验的是上面那段静态分析,不是别的:
 > 把 `return { bubble, badges, body, citations: [] };` 里的 **`bubble,` 临时删掉**
-> → 重复 2–4 → 这次**必须**看到页面砖掉(⚠️ 出现之后输入框与发送键**永久禁用**,
-> 只能刷新恢复)→ 还原那一行。
+> → 重复 2–4 → 期望(**改前**):
+> - **没有** ⚠️「连接中断」,只有 `(没有返回内容)`(⚠️ 建出来了,但 `appendChild` 当场就抛);
+> - 输入框与发送键**仍然可用** —— **页面不会砖掉**;
+> - console 里有一条 unhandled rejection。
+>
+> 然后还原那一行。
+> **如果你反而看到了砖机,那说明上面那段静态分析漏了东西 —— 如实记下,别迁就预期。**
 >
 > 两次现象都写进报告。**"改前"那一次是这条结论唯一的实测依据** ——
 > 没做就只能写"从代码读出",那不算验证。
@@ -3402,6 +3419,24 @@ for i, l in enumerate(lines):
             bad += 1
 print(bad)'
 }
+
+# ---- 预检:8000 上那个进程**是不是当前代码** ------------------------------------
+# 这条不是形式主义,是实测撞出来的:开发期起的 uvicorn **没有 --reload**,
+# ch05 的 T8/T9 改了端点之后它仍跑旧代码。2026-09-20 实测:旧进程上
+# `POST /api/ticket` 回 **405**(静态目录对非 GET/HEAD 的兜底),
+# 而当前代码回 **422**(session_id 超过 32)。不预检的话五条验收**全部假红**,
+# 而且看起来像「新代码坏了」—— 本项目已栽过一次的类型。
+# 33 个 x 触发 TicketRequest 的 max_length=32 校验;422 只证明路由+校验层在,
+# **不会**建出任何工单(校验先于函数体,T9 有用例钉着)。
+PRE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/ticket"   -H 'Content-Type: application/json'   --data-binary '{"session_id":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}')
+if [ "$PRE_CODE" != "422" ]; then
+  echo "预检失败:$BASE 上的服务不是当前代码 —— POST /api/ticket 期望 422,实得 $PRE_CODE。"
+  echo "8000 上多半是旧进程(无 --reload,不会自己更新)。按序执行:"
+  echo "  netstat -ano | grep ':8000'                                   # 记下 PID"
+  echo "  powershell -NoProfile -Command \"Stop-Process -Id <PID> -Force\""
+  echo "  .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000"
+  exit 1
+fi
 
 echo "== 验收 1:政策类问题走到强制检索节点 =="
 SID=$(new_sid)
