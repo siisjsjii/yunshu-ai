@@ -2492,7 +2492,10 @@ def test_session_id_length_is_bounded_like_chat_request():
 .venv/Scripts/python.exe -m pytest tests/test_api_ticket.py -m "not db"
 ```
 
-预期:404(端点不存在)。
+预期:**404 或 405**(端点还不存在)。`app/main.py` 在 `include_router` 之后
+`mount("/")` 了静态目录,Starlette 的 `StaticFiles` 对非 GET/HEAD 一律回
+**405**,所以这里看到 405 是**正常的**,不是「路由顺序错了」。两条用例都该红,
+但红的原因不同:第一条 404/405,第二条同样 404/405(而不是它最终要的 422)。
 
 - [ ] **Step 3: 写 schema**
 
@@ -2592,7 +2595,19 @@ git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后�
 `addAssistant()` 在 **287–312 行**建 `.badges` / `.body` / `.feedback`;`.fb` 胶囊样式在 **164–166 行**;
 `ctx` 是单轮局部对象;**流结束后**在 `finally`(431 行)调 `makeCitesClickable`。
 
-- [ ] **Step 1: 加 `choices` 分支**
+- [ ] **Step 1a: 让 `addAssistant()` 把气泡元素**也**返回出来**
+
+`addAssistant()` 现在的末行是 `return { badges, body, citations: [] };` ——
+`bubble` 只是**局部变量**,没进返回对象。而下面 `renderChoices(ctx.bubble, ...)`
+要的正是它:不改这一行,`ctx.bubble` 是 `undefined`,
+`bubble.appendChild(bar)` 直接抛 TypeError,**两个按钮一个都不出现**,
+验收 3 卡在第一步。改末行:
+
+```js
+    return { bubble, badges, body, citations: [] };
+```
+
+- [ ] **Step 1b: 加 `choices` 分支**
 
 在 `handleBlock` 的 switch 里(`citations` 分支之后)加:
 
@@ -2730,7 +2745,10 @@ git commit -m "feat: ch05 聊天页渲染「转人工」「建工单」两个独
 # 不靠模型自由文本(deepseek 在 temperature=0 下依然非确定),也不 grep 原始
 # SSE 流(逐 token 推送会把 "1001" 切成三帧)。
 set -uo pipefail
-BASE="http://localhost:8000"
+BASE="${BASE:-http://localhost:8000}"
+# 与 scripts/acceptance.sh 一致:一律用 venv 里的解释器。裸 `python` 在本机
+# 不保证存在、也不保证是 venv 那个 —— 那样 new_sid 会产出空串,整个脚本静默走偏。
+PYTHON="${PYTHON:-.venv/Scripts/python.exe}"
 PASS=0; FAIL=0
 
 ok()  { echo "  PASS  $1"; PASS=$((PASS+1)); }
@@ -2747,11 +2765,11 @@ ask() {
 JSON
 }
 
-new_sid() { python -c "import uuid;print(uuid.uuid4().hex)"; }
+new_sid() { "$PYTHON" -c "import uuid;print(uuid.uuid4().hex)"; }
 
 # 把 token 帧拼回整段回复(逐 token 推送,不能直接 grep)
 join_tokens() {
-  python -c '
+  "$PYTHON" -c '
 import json, sys
 lines = sys.stdin.read().splitlines()
 parts = []
@@ -2763,7 +2781,7 @@ sys.stdout.buffer.write("".join(parts).encode("utf-8"))'
 
 # 从最后一帧(done)的 data 里取一个字段
 done_field() {
-  python -c '
+  "$PYTHON" -c '
 import json, sys
 lines = sys.stdin.read().splitlines()
 data = [l[6:] for l in lines if l.startswith("data: ")]
