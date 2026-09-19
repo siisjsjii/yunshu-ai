@@ -359,8 +359,12 @@ def test_missing_intent_falls_back(state):
     assert route_by_intent(state) == FALLBACK
 
 
-def test_make_emitter_outside_graph_is_a_noop_collector():
-    """图外调用必须退化,不能抛 RuntimeError(见 spec §12 订正)。"""
+def test_make_emitter_outside_graph_degrades_to_collector():
+    """图外调用必须退化到 collector,不能抛 RuntimeError(见 spec §12 订正)。
+
+    (旧名 `..._is_a_noop_collector` 名实不符:走的就是那条**会调用** collector
+    的分支 —— 本项目已抓到过一次「名字说回灌、函数体在断言 raises」。)
+    """
     from app.agent.emit import make_emitter
 
     got = []
