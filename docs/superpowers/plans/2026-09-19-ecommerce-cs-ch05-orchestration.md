@@ -133,8 +133,9 @@ class ScriptedModel:
         return _BoundModel(self)
 
     async def ainvoke(self, messages):
+        # 刻意不记入参:未绑工具的入口只在步数用尽收尾时走一次,回灌的
+        # ToolMessage 记在这儿永远看不到 —— 要断回灌请读 `bound_messages`。
         self.unbound_rounds += 1
-        self.last_unbound_messages = list(messages)
         return self.rounds.pop(0)
 
 
@@ -1459,8 +1460,10 @@ class ScriptedModel:
         return _BoundModel(self)
 
     async def astream(self, messages):
+        # 这里**刻意不记**入参:agent 每一轮都绑着工具问,未绑工具的入口只在
+        # 步数用尽收尾时走一次 —— 把「回灌的 ToolMessage」记在这儿会永远看不到。
+        # 要断回灌就读 `bound_messages`(Task 1 已踩过一次,见 ledger Ruling 6)。
         self.unbound_rounds += 1
-        self.last_unbound_messages = list(messages)
         for chunk in self.rounds.pop(0):
             yield chunk
 
@@ -1531,6 +1534,15 @@ async def test_tool_call_round_emits_frames_and_feeds_result_back():
     # 只在步数用尽收尾时走一次。
     fed = [m for m in model.bound_messages if isinstance(m, ToolMessage)]
     assert [m.tool_call_id for m in fed] == ["c1"]
+    # 钉住 `msgs.append(acc)` 那一行:删掉它,上面 fed 的断言**依然全绿**,
+    # 而真实链路上会退化成「有 tool 消息、没有前置的 assistant(tool_calls)消息」——
+    # OpenAI 兼容 API 直接 400。这正是 CLAUDE.md 点名的「假绿」形态。
+    calls_idx = [i for i, m in enumerate(model.bound_messages)
+                 if getattr(m, "tool_calls", None)]
+    tool_idx = [i for i, m in enumerate(model.bound_messages)
+                if isinstance(m, ToolMessage)]
+    assert calls_idx and tool_idx, "第二轮入参缺 assistant(tool_calls) 或 ToolMessage"
+    assert tool_idx[0] == calls_idx[0] + 1   # 必须**紧邻**
     # trace 让验收 5「ReAct 不止一步」机械可断言
     assert out["trace"] == ["agent:step1 tool=query_order", "agent:converged"]
 
