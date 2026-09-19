@@ -1,5 +1,7 @@
 """意图识别节点:解析失败/越界必须降级为「其他」,**不许抛异常**。"""
 
+import re
+
 import pytest
 from langchain_core.exceptions import OutputParserException
 
@@ -90,9 +92,23 @@ def test_every_label_in_the_prompt_matches_the_routing_table():
 
     既有守卫 `tests/test_agent_routing.py:35`(`INTENT_LABELS == tuple(INTENT_TO_ROUTE)`)
     是恒真式(定义即如此),**正好抓不到这个**;这条才是真的守卫。
+
+    **必须匹配「枚举行」而不是子串**:Prompt 正文里散落着这些词(如末段的
+    「不属于寒暄」)。真机反例:把 `routing.py` 的「闲聊」改成「寒暄」,
+    `"寒暄" in INTENT_SYSTEM_PROMPT` 照样为真 —— 而模型永远不会吐「寒暄」,
+    闲聊桶静默降级。子串版在那次改动上是**假绿**。
     """
     from app.agent.routing import INTENT_LABELS
     from app.prompts import INTENT_SYSTEM_PROMPT
 
-    missing = [label for label in INTENT_LABELS if label not in INTENT_SYSTEM_PROMPT]
-    assert not missing, f"Prompt 里缺这些标签名,对应整桶会静默降级成「其他」:{missing}"
+    # Prompt 用 `- 标签:说明` 的形式枚举七类,取冒号前的标签名。
+    enumerated = set(re.findall(r"^\s*-\s*(.+?):", INTENT_SYSTEM_PROMPT, re.MULTILINE))
+
+    missing = [label for label in INTENT_LABELS if label not in enumerated]
+    assert not missing, (
+        f"Prompt 的枚举行里缺这些标签:{missing};实际枚举了 {sorted(enumerated)} —— "
+        f"缺的那个桶会静默降级成「其他」"
+    )
+
+    stale = sorted(enumerated - set(INTENT_LABELS))
+    assert not stale, f"Prompt 里枚举了不在 INTENT_TO_ROUTE 里的标签:{stale}"
