@@ -378,15 +378,14 @@ def test_make_emitter_outside_graph_is_a_noop_collector():
 ```python
 """ch05 图状态。
 
-用 `TypedDict` + `Annotated` reducer 而非 Pydantic:这是 LangGraph 的惯用法,
-且 `add_messages` 是官方为「消息序列」提供的 reducer —— 自己实现会重复造轮子,
-还容易漏掉它处理 `RemoveMessage` 等边界的方式。
+用 `TypedDict` + `Annotated` reducer 而非 Pydantic:这是 LangGraph 的惯用法。
+节点返回的是**部分**键,由 reducer 合并(`trace` 用 `operator.add` 追加、
+其余是**覆盖**语义)—— 搞错会得到「上一轮的值和这一轮混在一起」的诡异状态。
 """
 
 import operator
 from typing import Annotated, TypedDict
 
-from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from app.schemas import Message
@@ -418,7 +417,9 @@ class ChatState(TypedDict):
     gate_passed: bool
 
     # ---- Agent ----
-    messages: Annotated[list, add_messages]   # Agent 内部 ReAct 消息序列
+    # 刻意**不**放 ReAct 的消息序列:agent 节点在那一轮内部用局部变量组装
+    # (`_stream_round` 的 msgs),落库走 append_turn 的 user+assistant 两条。
+    # 放一个没人读写的 state 字段 = 死代码 + 白搭一个 reducer。
     agent_steps: int
     tool_calls_made: list[dict]
 
@@ -1094,8 +1095,9 @@ def _chunk(score, answer="七天无理由退货"):
 
 @pytest.mark.anyio
 async def test_retrieval_uses_the_resolved_input_and_builds_citations():
+    frames = []
     retriever = FakeRetriever([_chunk(0.91)])
-    node = make_retrieve_knowledge_node(retriever=retriever)
+    node = make_retrieve_knowledge_node(retriever=retriever, emit=frames.append)
     out = await node({"resolved_input": "怎么退货"})
     assert retriever.calls == ["怎么退货"]
     assert out["evidence"][0]["score"] == 0.91
@@ -1107,19 +1109,36 @@ async def test_retrieval_uses_the_resolved_input_and_builds_citations():
 
 
 @pytest.mark.anyio
+async def test_citations_are_emitted_as_a_frame():
+    """**citations 必须发帧** —— 前端靠它渲染可点击的引用来源。
+
+    只写进 state 的话:ch04 的引用 UI 静默失效、老的 acceptance.sh 回归,
+    而所有断言 `out["citations"]` 的单测**照样全绿**。
+    """
+    frames = []
+    node = make_retrieve_knowledge_node(retriever=FakeRetriever([_chunk(0.91)]),
+                                        emit=frames.append)
+    out = await node({"resolved_input": "怎么退货"})
+    assert frames == [{"frame": "citations", "citations": out["citations"]}]
+
+
+@pytest.mark.anyio
 async def test_empty_retrieval_is_recorded_in_trace_not_an_error():
-    node = make_retrieve_knowledge_node(retriever=FakeRetriever([]))
+    frames = []
+    node = make_retrieve_knowledge_node(retriever=FakeRetriever([]), emit=frames.append)
     out = await node({"resolved_input": "没有的问题"})
     assert out["evidence"] == []
     assert out["citations"] == []
     assert out["trace"] == ["retrieve_knowledge:0 hits"]
+    assert frames == []          # 没证据就不发空引用帧
 
 
 @pytest.mark.anyio
 async def test_infrastructure_failure_propagates_to_502():
     """检索器挂了必须抛上去(→502),绝不降级成「没搜到」。"""
     node = make_retrieve_knowledge_node(
-        retriever=FakeRetriever(error=ToolInfrastructureError("检索不可用"))
+        retriever=FakeRetriever(error=ToolInfrastructureError("检索不可用")),
+        emit=lambda p: None,
     )
     with pytest.raises(ToolInfrastructureError):
         await node({"resolved_input": "q"})
@@ -1197,12 +1216,15 @@ async def test_gate_uses_max_score_not_top1_position():
 # ---- 知识类:强制预检索 + 置信度闸 ----
 
 
-def make_retrieve_knowledge_node(*, retriever):
+def make_retrieve_knowledge_node(*, retriever, emit):
     """知识类意图的**强制**预检索(确定性骨架的一步,不走 query_faq 工具)。
 
     检索器的故障语义原样透传:`KnowledgeRetriever` 把 Milvus/嵌入的故障翻成
     `ToolInfrastructureError`,这里**不接** —— 它必须一路抛到 API 层变 502,
     绝不能被伪装成「没搜到」。
+
+    `citations` **同时**写进 state 并发一帧:state 那份给 Agent 组装引用编号,
+    帧那份给前端渲染可点击的来源。少发帧 = ch04 的引用 UI 静默失效。
     """
 
     async def retrieve_knowledge(state) -> dict:
@@ -1223,6 +1245,8 @@ def make_retrieve_knowledge_node(*, retriever):
                             ("chunk_id", "section_path", "question", "answer", "category")}}
             for i, e in enumerate(evidence)
         ]
+        if citations:
+            emit({"frame": "citations", "citations": citations})
         top = f" top={evidence[0]['score']:.2f}" if evidence else ""
         return {
             "evidence": evidence,
@@ -1275,7 +1299,7 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
 .venv/Scripts/python.exe -m pytest tests/test_agent_gate.py
 ```
 
-预期:`7 passed`。
+预期:`8 passed`。
 
 - [ ] **Step 5: 提交**
 
@@ -1290,13 +1314,13 @@ git commit -m "feat: ch05 强制预检索节点 + 置信度闸(分数阈值 + �
 
 **Files:**
 - Modify: `app/config.py`(追加两个配置)
-- Modify: `app/prompts.py`(追加 `build_agent_messages` 与证据块渲染)
+- Modify: `app/prompts.py`(追加 `render_evidence`;给 `build_messages` 加 `evidence` 可选参)
 - Modify: `app/agent/nodes.py`(追加 `make_agent_node`)
 - Modify: `tests/test_config.py`(追加两条)
 - Create: `tests/test_agent_node.py`
 
 **Interfaces:**
-- Consumes: `execute_tool`(任务 1 在用)、`build_agent_messages`
+- Consumes: `execute_tool`(任务 1 在用)、`build_messages`(**扩展 `evidence` 可选参**,不新建平行函数)
 - Produces: `make_agent_node(*, model, tools, registry, settings, emit)`;配置 `max_agent_steps`、`agent_token_budget`
 
 - [ ] **Step 1: 写失败的配置测试**
@@ -1581,7 +1605,7 @@ async def test_no_evidence_means_no_evidence_block_in_the_prompt():
 
 预期:`ImportError: cannot import name 'make_agent_node'`。
 
-- [ ] **Step 7: 写 `build_agent_messages`**
+- [ ] **Step 7: 写 `render_evidence` 并给 `build_messages` 加 `evidence` 可选参**
 
 在 `app/prompts.py` 追加(并用它组装,**不新增第二个转换点**):
 
@@ -1593,16 +1617,28 @@ def render_evidence(evidence: list[dict]) -> str:
         for i, e in enumerate(evidence)
     ]
     return "以下是知识库中与该问题相关的资料,回答时请在对应信息处标注编号:\n\n" + "\n\n".join(lines)
+```
 
+**然后给已有的 `build_messages` 加一个可选参**(不要新建平行函数):
 
-def build_agent_messages(
-    *, brand_name: str, history, evidence: list[dict], user_input: str
+```python
+def build_messages(
+    *,
+    brand_name: str,
+    history: Sequence[Message],
+    user_input: str,
+    evidence: list[dict] | None = None,
 ) -> list:
-    """Agent 节点的消息组装。
+    """组装本轮要发给模型的消息。
 
-    有证据块时把它并进本轮 human 消息(而不是插一条中段 system 消息 ——
-    中段 system 在多供应商兼容上不如并进 human 稳)。转换仍只经
-    `to_lc_messages`。`build_messages` 保持不变,老路径不受影响。
+    `evidence` 只在**知识类意图且过了置信度闸**时有值:把它并进本轮 human
+    消息,而不是插一条中段 system 消息 —— 中段 system 在多家兼容网关上的
+    支持不如并进 human 稳。
+
+    **不要另建一个 `build_agent_messages`**:本函数是 `prompts.py` 唯一的消息
+    组装出口,多一个平行函数会立刻变成死代码(节点只用新的那个,这里的调用点
+    在 ch05 被 `prepare_turn` 让出来),并连带 `tests/test_prompts.py` 的 4 条
+    用例变成孤儿。加一个带默认值的参数则零破坏。
     """
     messages = [SystemMessage(render_system_prompt(brand_name))]
     messages.extend(to_lc_messages(history))
@@ -1611,9 +1647,12 @@ def build_agent_messages(
     return messages
 ```
 
+> 改完请跑 `.venv/Scripts/python.exe -m pytest tests/test_prompts.py` 确认那 4 条老用例
+> **一字不改仍然通过** —— 那正是「加了可选参数」而非「另起炉灶」的证据。
+
 - [ ] **Step 8: 写 Agent 节点实现**
 
-在 `app/agent/nodes.py` 追加(顶部补 `from langchain_core.messages import ToolMessage`、`from app.prompts import build_agent_messages`、`from app.tools.executor import execute_tool`):
+在 `app/agent/nodes.py` 追加(顶部补 `from langchain_core.messages import ToolMessage`、`from app.prompts import build_messages`、`from app.tools.executor import execute_tool`):
 
 ```python
 # ---- 主力 Agent:手写 ReAct ----
@@ -1649,7 +1688,7 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         return acc, used
 
     async def agent_node(state) -> dict:
-        msgs = build_agent_messages(
+        msgs = build_messages(
             brand_name=settings.brand_name,
             history=state.get("history") or [],
             evidence=state.get("evidence") or [],
@@ -2101,7 +2140,10 @@ def build_graph(
 
     graph.add_node("resolve_references", make_resolve_references_node())
     graph.add_node("classify_intent", make_classify_intent_node(model=intent_model))
-    graph.add_node("retrieve_knowledge", make_retrieve_knowledge_node(retriever=retriever))
+    graph.add_node(
+        "retrieve_knowledge",
+        make_retrieve_knowledge_node(retriever=retriever, emit=emit),
+    )
     graph.add_node(
         "confidence_gate",
         make_confidence_gate_node(
