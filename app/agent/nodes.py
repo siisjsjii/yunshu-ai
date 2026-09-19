@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
+from app.kb.assess import record_low_confidence
 from app.prompts import build_intent_messages
 
 logger = logging.getLogger(__name__)
@@ -103,3 +104,87 @@ def make_complaint_reply_node(*, emit):
         }
 
     return complaint_reply
+
+
+# ---- 知识类:强制预检索 + 置信度闸 ----
+
+
+def make_retrieve_knowledge_node(*, retriever, emit):
+    """知识类意图的**强制**预检索(确定性骨架的一步,不走 query_faq 工具)。
+
+    检索器的故障语义原样透传:`KnowledgeRetriever` 把 Milvus/嵌入的故障翻成
+    `ToolInfrastructureError`,这里**不接** —— 它必须一路抛到 API 层变 502,
+    绝不能被伪装成「没搜到」。
+
+    `citations` **同时**写进 state 并发一帧:state 那份给 Agent 组装引用编号,
+    帧那份给前端渲染可点击的来源。少发帧 = ch04 的引用 UI 静默失效。
+    """
+
+    async def retrieve_knowledge(state) -> dict:
+        chunks = await retriever.search(state["resolved_input"])
+        evidence = [
+            {
+                "chunk_id": c.chunk_id,
+                "section_path": c.section_path,
+                "question": c.question,
+                "answer": c.answer,
+                "category": c.category,
+                "score": c.score,
+            }
+            for c in chunks
+        ]
+        citations = [
+            {"n": i + 1, **{k: e[k] for k in
+                            ("chunk_id", "section_path", "question", "answer", "category")}}
+            for i, e in enumerate(evidence)
+        ]
+        if citations:
+            # 载荷键必须是 **`items`**,不是 `citations`:ch04 的
+            # `app/static/index.html` 里是 `ctx.citations = payload.items || []`。
+            # 换个键名 = 帧到了、前端仍渲染不出引用(静默失效),而且
+            # ch05 的单测只断言「发了一帧」,照样全绿。
+            emit({"frame": "citations", "items": citations})
+        top = f" top={evidence[0]['score']:.2f}" if evidence else ""
+        return {
+            "evidence": evidence,
+            "citations": citations,
+            "trace": [f"retrieve_knowledge:{len(evidence)} hits{top}"],
+        }
+
+    return retrieve_knowledge
+
+
+def make_confidence_gate_node(*, settings, session, conversation_id):
+    """置信度闸:卡在检索之后、进 Agent 之前。
+
+    **为什么必须在这儿**:Agent 的答复是流式吐给用户的,等答完再判就晚了
+    (ch04 的自评正是那个位置,本章把它撤掉)。证据弱就直接回兜底话术、
+    不进 Agent,同时把问题落池留给后面的数据飞轮。
+
+    判据是纯**检索分数阈值**(取最高分),零额外模型调用 —— 最简版;
+    正式的置信度检查留给「可观测」那章。
+    """
+
+    async def confidence_gate(state) -> dict:
+        scores = [e["score"] for e in (state.get("evidence") or [])]
+        passed = bool(scores) and max(scores) >= settings.retrieval_score_threshold
+
+        if not passed:
+            await record_low_confidence(
+                session,
+                question=state["user_input"],
+                source_conversation_id=conversation_id,
+                entry_point="置信度闸",
+                reject_reason=(
+                    "检索为空"
+                    if not scores
+                    else f"最高分 {max(scores):.2f} 低于阈值 {settings.retrieval_score_threshold}"
+                ),
+            )
+
+        return {
+            "gate_passed": passed,
+            "trace": [f"confidence_gate:{'pass' if passed else 'fail'}"],
+        }
+
+    return confidence_gate
