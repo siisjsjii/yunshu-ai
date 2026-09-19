@@ -36,7 +36,18 @@ class Reranker:
                     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                     from FlagEmbedding import FlagReranker
 
-                    self._model = FlagReranker(self._model_path, use_fp16=self._use_fp16)
+                    # 有 CUDA 就走 GPU(use_fp16),否则 CPU。精排是 560M
+                    # cross-encoder,CPU 上极慢(ch04 实测 5.4s/查询),GPU 上快一个量级。
+                    import torch
+
+                    if torch.cuda.is_available():
+                        self._model = FlagReranker(
+                            self._model_path, devices=["cuda:0"], use_fp16=True
+                        )
+                    else:
+                        self._model = FlagReranker(
+                            self._model_path, use_fp16=False
+                        )
         return self._model
 
 
