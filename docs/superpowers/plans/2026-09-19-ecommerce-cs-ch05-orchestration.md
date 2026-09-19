@@ -2919,7 +2919,15 @@ case "$TXT" in *"客服小猫"*) ok "闲聊固定话术:$TXT";; *) bad "闲聊�
 
 echo "== 验收 5:复杂问题 ReAct 不止一步 =="
 SID=$(new_sid)
-ask "$SID" "订单 1001 是什么商品,它的物流现在到哪了" > /tmp/ch05_5.sse
+# 问题必须是**强制串行**的:第二次工具调用的入参**只能**来自第一次的返回。
+# `query_order` 与 `query_logistics` **都直接收 order_id**,所以
+# 「订单 1001 的物流到哪了」这类问法,模型完全可能在**同一轮里并发**发两个
+# tool_call —— 而 `agent_steps` 数的是**绑工具的轮数**,于是它是 1,
+# 下面这条 `-ge 2` 就会在一个**完全正确**的实现上判红(验收脚本的假红)。
+# 「订单 1001 买的是什么商品?那件商品现在还有货吗」在结构上不可能并发:
+# 订单里有 `product` 字段(`app/tools/business.py:79`),商品名**只能**先查订单
+# 才知道,所以必然是两步。
+ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > /tmp/ch05_5.sse
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
 if [ "$STEPS" -ge 2 ] && [ "$N" -ge 2 ]; then
