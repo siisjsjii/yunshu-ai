@@ -229,3 +229,20 @@ def test_overlap_not_smaller_than_max_chars_is_rejected(bad):
             chunk_overlap_chars=bad,
         )
     assert "chunk_overlap_chars" in str(exc.value)
+
+
+# ---- ch05:编排 ----
+
+def test_agent_step_limit_must_be_positive():
+    """<=0 会让 ReAct 循环一次都不跑 —— 必须在启动时炸,不能运行时静默。"""
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **REQUIRED, max_agent_steps=0)
+
+
+def test_agent_token_budget_must_be_positive():
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **REQUIRED, agent_token_budget=0)

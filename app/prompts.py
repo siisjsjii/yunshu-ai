@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 
 from app.schemas import Message
 
@@ -57,14 +57,6 @@ _SYSTEM_PROMPT = ChatPromptTemplate.from_messages(
     [("system", SYSTEM_PROMPT_TEMPLATE)]
 )
 
-CHAT_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", SYSTEM_PROMPT_TEMPLATE),
-        MessagesPlaceholder("history", optional=True),
-        ("human", "{input}"),
-    ]
-)
-
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", EXTRACT_SYSTEM_PROMPT),
@@ -105,18 +97,38 @@ def to_lc_messages(history: Sequence[Message]) -> list:
     return converted
 
 
+def render_evidence(evidence: list[dict]) -> str:
+    """把检索证据渲染成一段文本,编号与 citations 的 n 对齐。"""
+    lines = [
+        f"[{i + 1}] ({e['section_path'] or e['category']}) {e['answer']}"
+        for i, e in enumerate(evidence)
+    ]
+    return "以下是知识库中与该问题相关的资料,回答时请在对应信息处标注编号:\n\n" + "\n\n".join(lines)
+
+
 def build_messages(
     *,
     brand_name: str,
     history: Sequence[Message],
     user_input: str,
+    evidence: list[dict] | None = None,
 ) -> list:
-    """按 system + 历史 + 本轮输入的顺序组装消息。"""
-    return CHAT_PROMPT.format_messages(
-        brand_name=brand_name,
-        history=to_lc_messages(history),
-        input=user_input,
-    )
+    """组装本轮要发给模型的消息。
+
+    `evidence` 只在**知识类意图且过了置信度闸**时有值:把它并进本轮 human
+    消息,而不是插一条中段 system 消息 —— 中段 system 在多家兼容网关上的
+    支持不如并进 human 稳。
+
+    **不要另建一个 `build_agent_messages`**:本函数是 `prompts.py` 唯一的消息
+    组装出口,多一个平行函数会立刻变成死代码(节点只用新的那个,这里的调用点
+    在 ch05 被 `prepare_turn` 让出来),并连带 `tests/test_prompts.py` 的 4 条
+    用例变成孤儿。加一个带默认值的参数则零破坏。
+    """
+    messages = [SystemMessage(render_system_prompt(brand_name))]
+    messages.extend(to_lc_messages(history))
+    text = user_input if not evidence else f"{render_evidence(evidence)}\n\n用户问题:{user_input}"
+    messages.append(HumanMessage(text))
+    return messages
 
 
 def build_extract_messages(text: str) -> list:

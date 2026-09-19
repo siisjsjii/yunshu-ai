@@ -8,12 +8,14 @@
 import logging
 
 from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import ToolMessage
 from pydantic import ValidationError
 
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
-from app.prompts import build_intent_messages
+from app.prompts import build_intent_messages, build_messages
+from app.tools.executor import execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -188,3 +190,94 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
         }
 
     return confidence_gate
+
+
+# ---- 主力 Agent:手写 ReAct ----
+
+
+def _total_tokens(chunk) -> int:
+    meta = getattr(chunk, "usage_metadata", None) or {}
+    return int(meta.get("total_tokens") or 0)
+
+
+def make_agent_node(*, model, tools, registry, settings, emit):
+    """主力 Agent 的 ReAct 循环。
+
+    **不用 ToolNode / create_react_agent**:工具执行必须走 `execute_tool`,
+    它承载本项目的错误语义 —— 基础设施故障抛 `ToolInfrastructureError`(→502)、
+    重试用白名单(`create_ticket` 永不重试)、`ValidationError`/`ToolNotFound`
+    不重试、10s 超时。`ToolNode` 直接 `tool.ainvoke`,这些语义全丢。
+
+    停止条件是**结构保证**:循环里绑着 tools 走 `max_agent_steps` 轮;步数用尽
+    或预算超限后,收尾那一轮**不绑 tools**,模型在结构上无法再调。
+    """
+    bound = model.bind_tools(list(tools))
+
+    async def _stream_round(target, msgs, parts) -> tuple[object, int]:
+        acc = None
+        used = 0
+        async for chunk in target.astream(msgs):
+            acc = chunk if acc is None else acc + chunk
+            used += _total_tokens(chunk)
+            if chunk.text:
+                parts.append(chunk.text)
+                emit({"frame": "token", "text": chunk.text})
+        return acc, used
+
+    async def agent_node(state) -> dict:
+        msgs = build_messages(
+            brand_name=settings.brand_name,
+            history=state.get("history") or [],
+            evidence=state.get("evidence") or [],
+            user_input=state["resolved_input"],
+        )
+        parts: list[str] = []
+        made: list[dict] = []
+        trace: list[str] = []
+        steps = 0
+        usage_total = 0
+        needs_final = False
+
+        for step in range(1, settings.max_agent_steps + 1):
+            steps = step
+            acc, used = await _stream_round(bound, msgs, parts)
+            usage_total += used
+            tool_calls = list(getattr(acc, "tool_calls", None) or [])
+
+            if not tool_calls:
+                needs_final = False
+                break
+
+            needs_final = True
+            msgs.append(acc)
+            for call in tool_calls:
+                emit({"frame": "tool_call", "name": call["name"],
+                      "args": call["args"], "tool_call_id": call["id"]})
+                outcome = await execute_tool(
+                    tool_call=call, registry=registry, settings=settings
+                )
+                emit({"frame": "tool_result", "tool_call_id": outcome.tool_call_id,
+                      "ok": outcome.ok, "summary": outcome.summary})
+                msgs.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
+                made.append({"name": call["name"], "ok": outcome.ok})
+                trace.append(f"agent:step{step} tool={call['name']}")
+
+            if usage_total > settings.agent_token_budget:
+                break
+
+        if needs_final:
+            # 收尾:不绑 tools。预算已超也照做一次 —— 它是**唯一**能产出
+            # 用户可见答复的调用,不做的话这一轮就是「有工具调用、没有回答」。
+            _, used = await _stream_round(model, msgs, parts)
+            usage_total += used
+
+        trace.append("agent:converged")
+        return {
+            "reply": "".join(parts),
+            "agent_steps": steps,
+            "tool_calls_made": made,
+            "usage": {"total_tokens": usage_total},
+            "trace": trace,
+        }
+
+    return agent_node

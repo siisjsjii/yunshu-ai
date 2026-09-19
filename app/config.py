@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     tool_retry_attempts: int = Field(default=1, ge=0)
     tool_retry_delay_seconds: float = Field(default=0.3, ge=0)
 
+    # ch05 编排。两个数都加了界:写错要在启动时炸,不能等运行时变成
+    # 「ReAct 循环一次都不跑」或「预算恒超 → 第一步就强制收敛」这种静默故障。
+    max_agent_steps: int = Field(default=5, ge=1)
+    agent_token_budget: int = Field(default=20000, ge=1)
+
     # ---- ch03:知识库与向量检索。全部可选带默认值,检索组件懒初始化,----
     # ---- 配置有值不等于启动就连接 Milvus / 加载 BGE-M3。           ----
     embedding_model_path: str = "models/bge-m3"
