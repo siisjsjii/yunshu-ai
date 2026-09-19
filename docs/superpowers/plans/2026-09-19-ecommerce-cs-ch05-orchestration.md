@@ -2120,7 +2120,7 @@ async def test_second_turn_on_same_thread_reports_only_its_own_turn():
     断言钉住**,不能只修一条。
 
     本文件其余 10 条用例每条都新建 `InMemorySaver`、只跑一轮 —— **没有一条
-    能看见它**。
+    能看见这个**。
     """
     retriever = FakeRetriever([RetrievedChunk("怎么退货", "七天无理由", "退换货",
                                               chunk_id=1, section_path="退货政策", score=0.9)])
