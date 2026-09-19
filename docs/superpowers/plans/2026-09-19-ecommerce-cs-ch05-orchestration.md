@@ -2887,6 +2887,22 @@ sys.stdout.buffer.write(
     (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)).encode("utf-8"))' "$1"
 }
 
+# 数一数有多少个 tool_result 帧是**失败**的(ok 为假)。
+# 存在的理由见验收 5 那段注释:它是 `"type": "tool_call"` 键在真实链路上的**唯一**探针。
+# 逐帧解析而不是 grep —— `_frame` 的 JSON 分隔符格式不属于本脚本的契约,
+# 用空格敏感的字符串匹配去断帧内容是自找假红。
+bad_tool_results() {
+  "$PYTHON" -c '
+import json, sys
+bad = 0
+lines = sys.stdin.read().splitlines()
+for i, l in enumerate(lines):
+    if l.strip() == "event: tool_result" and i + 1 < len(lines) and lines[i+1].startswith("data: "):
+        if not json.loads(lines[i+1][6:]).get("ok", True):
+            bad += 1
+print(bad)'
+}
+
 echo "== 验收 1:政策类问题走到强制检索节点 =="
 SID=$(new_sid)
 ask "$SID" "退货政策是怎么规定的" > /tmp/ch05_1.sse
@@ -2932,9 +2948,20 @@ SID=$(new_sid)
 ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > /tmp/ch05_5.sse
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
-if [ "$STEPS" -ge 2 ] && [ "$N" -ge 2 ]; then
-  ok "ReAct 走了 $STEPS 步、$N 次工具调用(trace=$(done_field trace < /tmp/ch05_5.sse))"
-else bad "步数不足:agent_steps=$STEPS tool_calls=$N"; fi
+BAD=$(bad_tool_results < /tmp/ch05_5.sse)
+if [ "$STEPS" -ge 2 ] && [ "$N" -ge 2 ] && [ "$BAD" -eq 0 ]; then
+  ok "ReAct 走了 $STEPS 步、$N 次工具调用、0 次工具失败(trace=$(done_field trace < /tmp/ch05_5.sse))"
+else bad "步数不足或工具失败:agent_steps=$STEPS tool_calls=$N 失败工具数=$BAD"; fi
+
+# ⚠️ `BAD -eq 0` 这一条**不是补充,是唯一的探针**,别删。
+# `"type": "tool_call"` 键的丢失在**单测层捕获不到**:替身 `FakeTool` 不查这个键、
+# `execute_tool` 原样透传 —— T6 审查实测,把该键从 `FakeChunk.__init__` 与 `__add__`
+# 同时删掉,`tests/test_agent_node.py` **仍然 7 passed**。而真实链路上,
+# `BaseTool.ainvoke` 判「这是不是工具调用」**只看这一个键**,缺了它就把整个 dict 当
+# **参数**去校验 schema → `ValidationError` → `app/tools/executor.py:77` 转成
+# `ok=False` +「工具参数不合法」。**不抛异常、不报错、不写日志**,
+# 只是模型永远拿不到数据、于是开始编 —— 本项目最怕的那类静默故障。
+# `BAD` 就是它的探针:真模型 + 真 `@tool` + 真执行器,缺键则必然非 0。
 
 echo
 echo "结果:$PASS 通过,$FAIL 失败"
