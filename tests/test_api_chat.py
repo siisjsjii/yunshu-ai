@@ -110,7 +110,7 @@ class FakeIntentModel:
 
     **为什么必须有这个替身**:ch05 在模型**前面**插了意图识别节点,而它
     **每一个请求都会跑**、每一个请求都会真的 `.ainvoke` 一次。不替换掉它,
-    本文件 28 条用例会各自朝 `https://example.invalid/v1` 发一次真实请求 ——
+    本文件 27 条用例会各自朝 `https://example.invalid/v1` 发一次真实请求 ——
     「单测全程不联网」是硬规矩,不是偏好。端点为它留了 `get_intent_model`
     这个 `Depends` 缝(与 `get_chat_model` 并排),下面一行 override 就接上了。
 
@@ -237,7 +237,7 @@ def client_factory(monkeypatch):
         )
         app.dependency_overrides[chat_api.get_store] = lambda: store
         app.dependency_overrides[chat_api.get_chat_model] = lambda: model
-        # 意图识别是每请求都跑的一步 —— 这一行不做,28 条用例全部发真实请求。
+        # 意图识别是每请求都跑的一步 —— 这一行不做,27 条用例全部发真实请求。
         app.dependency_overrides[chat_api.get_intent_model] = lambda: intent_model
         app.dependency_overrides[get_session] = _session_override
 
@@ -901,8 +901,8 @@ def test_infrastructure_failure_emits_error_frame(client_factory):
 # 上面 25 条全部走 `intent="订单"`(业务数据类 → Agent 节点)。下面两条**显式**
 # 传非默认意图,覆盖两件上面一条都看不见的事:
 #   ① 路由真的按意图分叉(闲聊 / 投诉**不进** Agent 节点);
-#   ② ch05 新增的 `choices` 帧真的走到了 SSE 线上 —— 前端的「转人工 / 建工单」
-#      两个按钮就靠它,帧丢了后端一句话都不报,只是按钮永远不出现。
+#   ② ch05 新增的 `choices` 帧真的走到了 SSE 线上 —— T10 的前端将消费这个帧
+#      (「转人工 / 建工单」两个按钮),帧丢了后端一句话都不报,只是按钮永远不出现。
 
 
 def test_chitchat_intent_returns_fixed_copy_without_calling_the_chat_model(client_factory):

@@ -14,9 +14,10 @@ from app.llm import create_chat_model, create_extract_model
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
 from app.sanitize import redact_api_key
-from app.schemas import ChatRequest
+from app.schemas import ChatRequest, TicketRequest
 from app.services.chat import prepare_turn
 from app.services.history import ensure_conversation, load_history
+from app.tools.executor import execute_tool
 from app.tools.registry import build_retriever, build_tools, registry_for
 
 router = APIRouter()
@@ -51,7 +52,7 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
     作参数、FastAPI 侧靠 Depends 注入、测试用 dependency_overrides 替换),
     `tests/test_api_chat.py` 的 `client_factory` 里已经有一行
     `app.dependency_overrides[chat_api.get_chat_model] = lambda: model`,
-    加一行同形的即可。**不做这层,端点测试里 28 条都会朝
+    加一行同形的即可。**不做这层,端点测试里 27 条都会朝
     `https://example.invalid/v1` 发真实请求,而且不联网这一条是硬规矩。**
     """
     return create_extract_model(settings)
@@ -196,3 +197,51 @@ async def chat_stream(
         generate(),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/api/ticket")
+async def create_ticket_endpoint(
+    request: TicketRequest,
+    settings: Settings = Depends(get_settings),
+    store: SessionStore = Depends(get_store),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """建工单:「建工单」按钮的后端入口。
+
+    为什么需要它:`create_ticket` 是**模型工具**,只能由模型在对话里调;
+    而按钮点击是 HTTP 请求,够不到模型工具。不加这个端点,验收 3 的
+    「点建工单写 tickets 表」无法达成(spec §8.2)。
+
+    护栏与对话端点一致:同一把会话锁串行化;`create_ticket` 是非幂等写操作,
+    executor 的重试白名单不含它,**永不重试**。
+    """
+    lock = store.lock_for(request.session_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=settings.session_lock_timeout_seconds)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail="该会话正在处理另一条消息,请稍后重试") from exc
+
+    try:
+        await ensure_conversation(
+            session=session, session_id=request.session_id, user_id="demo-user"
+        )
+        tools = build_tools(session=session, conversation_id=request.session_id)
+        registry = registry_for(tools)
+        outcome = await execute_tool(
+            tool_call={
+                "name": "create_ticket",
+                "args": {"description": "用户在会话中主动点击「建工单」", "ticket_type": "其他"},
+                "id": "manual-ticket",
+                "type": "tool_call",
+            },
+            registry=registry,
+            settings=settings,
+        )
+        if not outcome.ok:
+            raise HTTPException(
+                status_code=502,
+                detail=redact_api_key(outcome.summary, settings.openai_api_key),
+            )
+        return json.loads(outcome.content)
+    finally:
+        lock.release()

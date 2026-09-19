@@ -41,6 +41,13 @@ async def assess_sufficiency(question: str, chunks: list, model) -> dict:
 
     解析失败退化为 sufficient=True(宁可放行由生成阶段兜底,也不因自评故障
     误拒一个能答的问题)。上游故障(401/超时)原样向上抛。
+
+    **当前不在请求路径上**(ch05 spec §50):ch05 起「召回够不够」改由
+    `app/agent/nodes.py` 的**置信度闸在事前**判定,ch04 这套「生成后再自评」
+    被整段替换。T8 删掉 `services/chat.py:stream_turn` 后,本函数的生产调用方
+    为零,只剩 `tests/test_kb_assess.py` 在跑它 —— 那个文件全绿**不代表**线上
+    有这条链路。函数本身没坏,也不删(删它等于在 ch05 里改掉 ch04 已交付的
+    接口面);留着是为了将来需要「生成后二次自评」时有现成的、有测试的实现。
     """
     chunk_text = "\n\n".join(f"[{i + 1}] {c.answer}" for i, c in enumerate(chunks))
     chain = model.with_structured_output(AssessResult, method="json_mode")

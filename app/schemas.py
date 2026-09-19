@@ -63,6 +63,17 @@ class ChatRequest(BaseModel):
     user_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class TicketRequest(BaseModel):
+    """建工单请求(ch05「建工单」按钮)。
+
+    `session_id` 的上限 32 与 `ChatRequest` 一致,理由见那处的 docstring:
+    它是 `conversations.id` 的 varchar(32) 主键,放宽会以 DataError 形态复现
+    并被错误分类判成不可恢复 → 502。
+    """
+
+    session_id: str = Field(min_length=1, max_length=32)
+
+
 class ExtractRequest(BaseModel):
     text: str = Field(min_length=1)
 

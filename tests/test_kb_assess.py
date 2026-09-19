@@ -1,4 +1,8 @@
-"""生成 QC:自评 prompt 两禁 + json_mode + 解析失败退化;落池 db 测试。"""
+"""生成 QC:自评 prompt 两禁 + json_mode + 解析失败退化;落池 db 测试。
+
+注意:被测的 `assess_sufficiency` 当前**不在请求路径上**(ch05 spec §50 用事前
+置信度闸取代了它的事后自评),本文件全绿不代表线上有这条链路;理由见该函数 docstring。
+"""
 
 import pytest
 from langchain_core.exceptions import OutputParserException
