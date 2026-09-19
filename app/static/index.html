@@ -165,6 +165,14 @@
     border: 1.5px solid #cdd9e4; border-radius: 999px; cursor: pointer; }
   .fb.active { background: var(--brand); border-color: var(--brand-dim); }
   .fb-state { font-size: 11.5px; color: #5b7186; }
+  .choices { display: flex; gap: 8px; margin-top: 10px; }
+  .choice-btn {
+    background: #fff; color: var(--brand); border: 1.5px solid var(--brand);
+    border-radius: 999px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+  }
+  .choice-btn:hover:not(:disabled) { background: #dcebf9; }
+  .choice-btn:disabled { opacity: .6; cursor: default; }
+  .row.system .bubble { background: #eef4fa; color: #5b7186; border-style: dashed; }
   .cite { color: var(--brand); text-decoration: none; font-weight: 700;
     border-bottom: 1px dashed var(--brand); cursor: pointer; padding: 0 1px; }
   .cite-pop { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
@@ -308,7 +316,7 @@
         fb.querySelector(".fb-state").textContent = "已反馈";
       });
     });
-    return { badges, body, citations: [] };
+    return { bubble, badges, body, citations: [] };
   }
 
   function addBadge(badges, name) {
@@ -366,6 +374,9 @@
         break;
       case "citations":
         ctx.citations = payload.items || [];
+        break;
+      case "choices":
+        renderChoices(ctx.bubble, payload.options || []);
         break;
       case "error":
         ctx.failed = true;
@@ -463,6 +474,70 @@
     box.innerHTML = `${path}<div class="cite-answer">${c.answer}</div>`;
     box.onclick = () => box.remove();
     document.body.appendChild(box);
+  }
+
+  // ── 选项按钮(投诉场景)──────────────────────────────
+
+  // 「转人工」「建工单」是**两件事**,分开渲染成两个独立按钮,互不绑定。
+  // 都不点、继续发消息 → 一切照常,后端不会被调用。
+  function renderChoices(bubble, options) {
+    const bar = document.createElement("div");
+    bar.className = "choices";
+    options.forEach((opt) => {
+      const btn = document.createElement("button");
+      btn.className = "choice-btn";
+      btn.dataset.key = opt.key;
+      btn.textContent = opt.label;
+      btn.addEventListener("click", () => onChoice(opt, btn, bar, bubble));
+      bar.appendChild(btn);
+    });
+    bubble.appendChild(bar);
+  }
+
+  function onChoice(opt, btn, bar, bubble) {
+    if (btn.disabled) return;          // 一次性锁定:同 👍/👎 的既有语义
+    btn.disabled = true;
+    if (opt.key === "handoff") {
+      // 本章是**纯前端模拟**,不接真人系统、不调后端。
+      appendSystem("已转接人工客服");
+      appendAssistantText("您好,我是客服小猫,请问有什么可以帮您的");
+    } else if (opt.key === "ticket") {
+      createTicket(btn, bar);
+    }
+  }
+
+  async function createTicket(btn, bar) {
+    btn.textContent = "建单中…";
+    try {
+      const resp = await fetch("/api/ticket", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+      btn.textContent = "已建单 " + data.ticket_no;
+    } catch (err) {
+      btn.textContent = "建单失败,请重试";
+      btn.disabled = false;            // 失败允许重试
+    }
+  }
+
+  function appendSystem(text) {
+    const row = document.createElement("div");
+    row.className = "row system";
+    const b = document.createElement("div");
+    b.className = "bubble";
+    b.textContent = text;
+    row.appendChild(b);
+    logEl.appendChild(row);
+    scrollToEnd();
+  }
+
+  function appendAssistantText(text) {
+    const ctx = addAssistant();
+    ctx.body.textContent = text;
+    scrollToEnd();
   }
 
   // ── 交互 ──────────────────────────────────────────────
