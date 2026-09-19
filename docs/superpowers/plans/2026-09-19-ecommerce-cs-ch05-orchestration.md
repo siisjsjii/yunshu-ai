@@ -1906,7 +1906,17 @@ class FakeChunk:
         self.usage_metadata = usage
 
     def __add__(self, other):
-        return FakeChunk(self.text + other.text)
+        # 与 T6 的替身同一条理由:**累积时不能丢 tool_calls,更不能丢
+        # `"type": "tool_call"` 键**(见 Ruling 21)。丢了前者,「模型在一轮里
+        # 分多次吐完一次工具调用」在替身里就永远累积不起来;丢了后者,
+        # `BaseTool.ainvoke` 会把 dict 当**参数**去校验 schema(CLAUDE.md 的硬约束)。
+        # 本文件的用例目前每轮只有一个 chunk,所以这条分支**走不到** ——
+        # 但替身必须忠实于真实 chunk 的形状,否则它会教后来的人写错的形状,
+        # 而且错得**不会红**。真实的多 chunk 累积由 T11 的验收 5 兜底。
+        return FakeChunk(
+            self.text + other.text,
+            tool_calls=self.tool_calls + other.tool_calls,
+        )
 
 
 class ScriptedModel:
