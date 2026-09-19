@@ -2654,7 +2654,7 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
     作参数、FastAPI 侧靠 Depends 注入、测试用 dependency_overrides 替换),
     `tests/test_api_chat.py` 的 `client_factory` 里已经有一行
     `app.dependency_overrides[chat_api.get_chat_model] = lambda: model`,
-    加一行同形的即可。**不做这层,端点测试里 28 条都会朝
+    加一行同形的即可。**不做这层,端点测试里 25 条都会朝
     `https://example.invalid/v1` 发真实请求,而且不联网这一条是硬规矩。**
     """
     return create_extract_model(settings)
@@ -2732,7 +2732,7 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
 > 它和 token 帧走**同一条** emit 通道,所以不需要 `stream_mode=["custom","values"]`
 > ——少一个流模式就少一处「帧会不会被缓冲住」的风险。
 
-- [ ] **Step 6: 改 `tests/test_api_chat.py`(28 条端点用例的接缝)**
+- [ ] **Step 6: 改 `tests/test_api_chat.py`(25 条端点用例的接缝;**数字用 `pytest --collect-only` 现数,不要凭印象写**)
 
 这批用例是**对着 ch02 那条直线流**写的:发消息 → 模型 → 工具 → 模型。ch05 在
 模型**前面**插了两个节点(指代消解、意图识别),路由又是**按意图分叉**的。
