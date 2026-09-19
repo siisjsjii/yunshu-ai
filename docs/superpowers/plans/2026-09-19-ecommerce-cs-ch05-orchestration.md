@@ -42,7 +42,7 @@
 | `tests/test_agent_loop.py` | 上者的测试(任务 8 一并删除) | 1 |
 | `app/agent/state.py` | `ChatState`(TypedDict)+ `IntentResult` | 2 |
 | `app/agent/routing.py` | 七类 → 四出口的**纯函数**路由表 | 2 |
-| `app/agent/emit.py` | `make_emitter()`:图内=真 writer,图外=no-op | 2 |
+| `app/agent/emit.py` | `make_emitter(collector=None)`:图内=真 writer,图外=退化到 `collector`(可调用) | 2 |
 | `app/agent/nodes.py` | 全部节点工厂 | 3,4,5,6,7 |
 | `app/agent/graph.py` | 组装 `StateGraph` + 编译;checkpointer 单例 | 7 |
 | `app/prompts.py` | + 意图识别 Prompt、+ 带证据块的消息组装 | 3,6 |
@@ -305,7 +305,9 @@ git commit -m "feat: ch05 祛魅热身 —— 手写最裸 Agent 循环(临时�
   - `INTENT_TO_ROUTE: dict[str, str]`、`INTENT_LABELS: tuple[str, ...]`
   - `KNOWLEDGE/BUSINESS/COMPLAINT/CHITCHAT/FALLBACK: str`
   - `route_by_intent(state) -> str`
-  - `make_emitter(collector: list | None = None) -> Callable[[dict], None]`
+  - `make_emitter(collector: Callable[[dict], None] | None = None) -> Callable[[dict], None]`
+    —— `collector` 是**可调用**(单测里传 `frames.append`),不是 list。传 list 会
+    `TypeError: 'list' object is not callable`。
 
 - [ ] **Step 1: 写失败的测试**
 
