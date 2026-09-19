@@ -2042,7 +2042,10 @@ async def test_business_route_skips_retrieval_and_gate():
     graph, _ = _graph("物流", retriever=retriever)
     out = await _run(graph, "订单 1001 的物流到哪了")
     assert retriever.calls == []
-    assert "confidence_gate:pass" not in out["trace"]
+    # 精确表述:**闸一次都没跑**,而不是"闸跑了但没过"。
+    # 旧的 `"confidence_gate:pass" not in out["trace"]` 会收下一个把物流也送进闸的
+    # 图 —— 那种图留下的是 `confidence_gate:fail`,照样绿。
+    assert not any(t.startswith("confidence_gate") for t in out["trace"])
     assert "agent:converged" in out["trace"]
 
 
@@ -2075,15 +2078,97 @@ async def test_fallback_route_for_out_of_vocabulary_intent():
 @pytest.mark.anyio
 async def test_successful_turn_is_persisted_to_mysql_history():
     graph, session = _graph("闲聊", rounds=[])
-    await _run(graph, "你好")
+    out = await _run(graph, "你好")
     roles = [m.role for m in session.added]
     assert roles == ["user", "assistant"]
+    # **断言内容,不只断言角色。** 只断角色时,把两条消息的**内容对调**
+    # (把 user_input 存成 assistant)照样绿 —— 闲聊是固定话术、确定性,
+    # 可以安全地断内容。
+    assert session.added[0].content == "你好"
+    assert session.added[1].content == out["reply"]
 
 
 @pytest.mark.anyio
 async def test_checkpointer_is_a_process_level_singleton():
     """每请求新建 checkpointer 的话,下一轮 thread 状态就没了。"""
     assert get_checkpointer() is get_checkpointer()
+
+
+@pytest.mark.anyio
+async def test_weak_evidence_..._records_the_turns_own_conversation_id():
+    """闸落库时必须用**当轮会话 id**,不是 `build_graph` 闭包随手给的那个。
+
+    这是 Ruling 22 不变量**唯一**的守卫:`build_graph` 把 `conversation_id`
+    传给 `make_confidence_gate_node`,而闸**从不读** `state["conversation_id"]`
+    —— 同一个事实两个来源,测试里两者永远同值,所以不匹配**看不见**
+    (实测:把闭包值改成 `"WRONG-CONV"`,修这条之前 **10/10 全绿**)。
+    """
+    # 在既有的 test_weak_evidence_skips_agent_and_records_low_confidence 里,
+    # `_run` 之后补这一行即可(RecordingSession.add 顺序收集,
+    # record_low_confidence 是这一轮唯一写库的动作):
+    assert session.added[0].source_conversation_id == "conv-1"
+
+
+@pytest.mark.anyio
+async def test_second_turn_on_same_thread_reports_only_its_own_turn():
+    """**跨轮证据链**:同一个 thread 连跑两轮,第二轮只许报第二轮。
+
+    checkpointer 是**进程级单例**、`thread_id = session_id`、而 `trace` 是
+    `operator.add` 累积通道、其余通道**未写就保留旧值**。三件事叠起来:
+    第 N 轮的 trace 帧是「第 1..N 轮」的拼接,于是**验收 1 的
+    「trace 里有 retrieve_knowledge」会在一条根本没检索的轮上通过**(上一轮
+    留下的)。这是本章最高价值证据链上的假绿通道,所以两条修法
+    **(逐轮重置 + trace 切片)各自都要有断言钉住**。
+
+    本文件其余用例每条都新建 `InMemorySaver`、只跑一轮 —— **没有一条能看见它**。
+    """
+    # 第 1 轮知识类(检索 → 过闸 → 进 Agent),第 2 轮闲聊 —— 两轮走**不同分支**,
+    # 残留才看得见。意图替身按调用顺序回放:
+    #   intent_model=ScriptedModel([[_I("商品咨询")], [_I("闲聊")]])
+    # 两轮**共用**同一个 InMemorySaver、同一个 thread_id="t"。
+    #
+    # 第 2 轮的入参**刻意不给 `agent_steps` 初值**(第 1 轮仍走 `_run`)。
+    # 原因**实测**得到,不是推理:入参里的值会**覆写**非归约通道,所以
+    # `agent_steps: 0` 一给就等于替实现把上一轮的残留抹掉 ——
+    # 变异实测(只重置 gate_passed、agent_steps 不清)下:
+    #   第 2 轮入参**给** `agent_steps: 0` → 帧里报 0 → 断言**假绿**;
+    #   第 2 轮入参**不给**             → 帧里报 1(上一轮的值)→ 断言红。
+    # 而真机端点(T8)的入参里**没有** `agent_steps`(见 T8 Step 5)——
+    # 残留会一路进 `done` 帧,所以这里必须真的能红。
+    #
+    # 断言:
+    #   前置 —— 第 1 轮**确实**检索了、过闸了、进了 Agent("没有"才是在说
+    #          "被清掉了",而不是"第 1 轮本来就没有");
+    #   前提 —— `len(second["trace"]) > len(first["trace"])`,累积**确实**发生了。
+    #          没有这一条,下面的断言可能只是因为"根本没累积"而通过;
+    #   当轮 —— 第 2 轮 trace 帧:首项 resolve_references、无任何
+    #          `confidence_gate*`、无 `retrieve_knowledge`、
+    #          `gate_passed is None`、`agent_steps == 0`。
+
+
+@pytest.mark.anyio
+async def test_resolve_references_resets_every_per_turn_channel():
+    """每轮开头必须清掉上一轮的**全部**逐轮通道。
+
+    为什么值得单钉:**删除其中任何一个键都不会有别的测试变红** —— 而后果按
+    通道不同而不等。`evidence` 尤其真实:它被 agent 节点读进 `build_messages`,
+    业务轮跟在知识轮后会把**上一轮的检索结果**当本轮知识塞进 prompt ——
+    用户看到上一轮的知识,且完全静默。
+
+    上面那条两轮整图用例盖不住它:第二轮是**闲聊**,根本不读 `evidence`。
+    """
+    # node = make_resolve_references_node()
+    # out = await node({"user_input": "在吗", "evidence": [{"answer": "上一轮的旧知识"}],
+    #                   "gate_passed": True, "agent_steps": 3, "reply": "上一轮的回复",
+    #                   "choices": ["handoff"], "citations": [{"n": 1}],
+    #                   "tool_calls_made": [{"name": "query_order"}]})
+    # 逐键断言:resolved_input == "在吗"、trace == ["resolve_references"]、
+    # 以及 7 个重置通道全部回到初值(evidence/gate_passed/agent_steps/reply/
+    # choices/citations/tool_calls_made)。
+    #
+    # **变异验证**:把重置字典里的 `"evidence": []` **单独**删掉,确认**只有**
+    # 这条用例红;还原后 `"citations": []` 单独删掉,同样只有它红。
+    # 若删掉某个键时**没有**用例变红,那就是还有缺口,要报告。
 
 
 @pytest.mark.anyio
@@ -2281,7 +2366,16 @@ _OUTLETS = ("agent", "complaint_reply", "chitchat_reply", "fallback_reply")
 
 @lru_cache(maxsize=1)
 def get_checkpointer() -> InMemorySaver:
-    """**进程级单例**。按请求新建 = 每轮都是新 thread,状态全丢。"""
+    """**进程级单例**。按请求新建 = 每轮都是新 thread,状态全丢。
+
+    **无淘汰、无 TTL**:见过的每个 thread 状态常驻进程(含累积的 `trace`)。
+    本章可接受(演示规模);正式版要换成有界的持久化 checkpointer。
+
+    另:`InMemorySaver` 是纯进程内存储,**不含** `asyncio.Lock` 之类
+    loop-bound 原语(已实测 grep 无命中)—— 所以它**不适用** ch04 那类
+    "lru_cache 单例绑在首个事件循环上"的故障模式。要在测试里换掉它,
+    理由是**状态跨测试累积**,不是跨循环。
+    """
     return InMemorySaver()
 
 
