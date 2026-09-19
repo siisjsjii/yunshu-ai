@@ -2766,12 +2766,36 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
 > `tests/test_api_chat.py` 里 grep 不到一处读 `done.usage` 的代码。这是记在案的
 > 行为变更,不是遗漏;图里没有一处汇总 token,硬凑一个假数只会更糟。
 
-> **删掉的那三条 ch02 守卫不丢覆盖。** T8 会连 `tests/test_chat_service.py` 里
-> 这三条一起删:同轮两个 tool_call 都要回灌、第二轮 assistant 先于它的
-> tool 消息、回灌的是**全文**不是截断摘要。它们在 T6 的修复轮里**已经逐条
-> 复制进 `tests/test_agent_node.py`** 了(那次修复轮正是因为"T8 要删掉它们的家"
-> 才补的)。删之前确认这三条在 `tests/test_agent_node.py` 里**确实存在**,
-> 且**各有一个变异能打红它** —— 存量覆盖的搬迁要看得见,不能靠"应该有"。
+> **删掉的 ch02 守卫不丢覆盖 —— 逐条填表,不靠"应该有"。** 本步会删掉
+> `tests/test_chat_service.py` 里 `stream_turn` 的 **15 条**用例。删测试**永远全绿**,
+> 这类损失没有任何自动化信号,所以**逐条**给出新家,填不进表的一律补:
+>
+> | 被删的守卫 | 新家 | 结论 |
+> |---|---|---|
+> | `:319` 同轮两个 tool_call 都执行都配对 | `tests/test_agent_node.py:247` | 已在(更严:帧序 + 紧邻 + 步号) |
+> | `:449` 回灌全文不是截断摘要 | `tests/test_agent_node.py:311` | 已在(断言 `> SUMMARY_MAX_CHARS`) |
+> | `:419` assistant(tool_calls) 紧邻其 tool 消息 | `tests/test_agent_node.py:135` + `:247` | 已在(出现两次) |
+> | `:244` 基础设施故障向上抛 | `tests/test_agent_node.py:205` | 已在 |
+> | `:142` 第二轮不绑 tools | —— | **按设计不存在**:T6 的节点每轮都绑 tools、靠步数/预算收敛(已验收) |
+> | `:508/:527/:551` done 帧的 usage | —— | **本步明写丢弃**(全仓无消费方),记账即可 |
+> | `:492` 调工具那一轮**不发 token 帧** | **无** | ⚠️ **本步补** |
+> | `:278` 第二轮炸了 → 整轮不落库 | **无** | ⚠️ **本步补** |
+>
+> 两个缺口**就地补上**,各配一个能打红的变异:
+>
+> - `nodes.py` 的 `if chunk.text:` 是"不发空 token 帧"的**唯一**屏障,而
+>   `test_tool_call_round_emits_frames_and_feeds_result_back` 用的是 `in frames`
+>   **不是精确列表** —— 删掉 `if chunk.text:`,空串 token 帧照样全绿。
+>   补:`[p["text"] for p in frames if p["frame"] == "token"] == ["已发货。"]`;
+>   变异 = 删 `if chunk.text:`(只留 `parts.append`/`emit`)→ 该条红。
+> - 「失败不落库」在新架构里**结构上成立**(`log_turn` 是唯一写方且在下游,
+>   agent 节点抛异常则图走不到它),但**零断言**:端点侧
+>   `test_upstream_error_becomes_sse_error_event` 只断言 error 帧,不断言
+>   `session.added == []`。补一条断言(在该用例里加即可);变异 = 把 `log_turn`
+>   挪到 agent 之前(或在异常路径上也调 `append_turn`)→ 该条红。
+> - 若填表时还发现第三个没家的,**报上来,不要静默丢弃**。
+>
+> 表与两个补口写进 T8 的报告。
 
 - [ ] **Step 7: 删掉手写循环**
 
