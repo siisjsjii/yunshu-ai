@@ -140,6 +140,10 @@ async def test_weak_evidence_skips_agent_and_records_low_confidence():
     assert out["gate_passed"] is False
     assert out["agent_steps"] == 0          # **没进 Agent**
     assert session.added[0].entry_point == "置信度闸"
+    # 落库的那条记录必须用的是**当轮会话 id**,不是闭包随手给的值。闭包与
+    # state 各持一份 `conversation_id`,是同一个事实的两个来源 —— 不匹配时
+    # 问题会被记到别的会话名下,而此前**没有任何断言看得见**(审查实测)。
+    assert session.added[0].source_conversation_id == "conv-1"
 
 
 @pytest.mark.anyio
@@ -149,7 +153,7 @@ async def test_business_route_skips_retrieval_and_gate():
     graph, _ = _graph("物流", retriever=retriever)
     out = await _run(graph, "订单 1001 的物流到哪了")
     assert retriever.calls == []
-    assert "confidence_gate:pass" not in out["trace"]
+    assert not any(t.startswith("confidence_gate") for t in out["trace"])
     assert "agent:converged" in out["trace"]
 
 
@@ -182,9 +186,13 @@ async def test_fallback_route_for_out_of_vocabulary_intent():
 @pytest.mark.anyio
 async def test_successful_turn_is_persisted_to_mysql_history():
     graph, session = _graph("闲聊", rounds=[])
-    await _run(graph, "你好")
+    out = await _run(graph, "你好")
     roles = [m.role for m in session.added]
     assert roles == ["user", "assistant"]
+    # 只断言角色的话,把两条消息的**内容对调**(把 user_input 存成 assistant)
+    # 照样绿 —— 断言必须咬住内容。闲聊是固定话术,确定性,可以安全断言。
+    assert session.added[0].content == "你好"
+    assert session.added[1].content == out["reply"]
 
 
 @pytest.mark.anyio
@@ -202,7 +210,7 @@ async def test_log_turn_emits_trace_frame_for_end_to_end_acceptance():
     """
     frames = []
     graph, _ = _graph("闲聊", rounds=[], frames=frames)
-    await _run(graph, "你好")
+    out = await _run(graph, "你好")
     kinds = [p["frame"] for p in frames]
     assert "trace" in kinds
     trace = next(p for p in frames if p["frame"] == "trace")["trace"]
@@ -210,6 +218,80 @@ async def test_log_turn_emits_trace_frame_for_end_to_end_acceptance():
     assert "classify_intent:闲聊" in trace
     assert "chitchat_reply" in trace
     assert trace[-1] == "log_turn"
+    # 上面那条断言的是 **emit 的载荷**,而载荷是 `[*(state.get("trace") or []),
+    # "log_turn"]` 拼的 —— 里面**天然**有 "log_turn"。`log_turn` 的**返回值**
+    # 也要断言,否则把 `return {"trace": ["log_turn"]}` 改成 `{}` 全绿。
+    assert out["trace"][-1] == "log_turn"
+
+
+@pytest.mark.anyio
+async def test_second_turn_on_same_thread_reports_only_its_own_turn():
+    """**跨轮证据链**:同一个 thread 连跑两轮,第二轮只许报第二轮。
+
+    checkpointer 是**进程级单例**、`thread_id = session_id`、而 `trace` 是
+    `operator.add` 累积通道、其余通道**未写就保留旧值**。三件事叠起来:
+    第 N 轮的 trace 帧是「第 1..N 轮」的拼接,于是**验收 1 的
+    「trace 里有 retrieve_knowledge」会在一条根本没检索的轮上通过**(上一轮
+    留下的),逐轮的 `gate_passed` / `agent_steps` 同理。这是本章最高价值
+    证据链上的假绿通道,所以两条修法**(逐轮重置 + trace 切片)各自都要有
+    断言钉住**,不能只修一条。
+
+    本文件其余 10 条用例每条都新建 `InMemorySaver`、只跑一轮 —— **没有一条
+    能看见这个**。
+    """
+    retriever = FakeRetriever([RetrievedChunk("怎么退货", "七天无理由", "退换货",
+                                              chunk_id=1, section_path="退货政策", score=0.9)])
+    frames = []
+    session = RecordingSession()
+    graph = build_graph(
+        model=ScriptedModel([[FakeChunk("模型回复")]]),
+        # 意图替身按**调用顺序**回放(ainvoke 是 rounds.pop(0)):第 1 轮知识类,
+        # 第 2 轮闲聊 —— 两轮走**不同分支**,残留才看得见。
+        intent_model=ScriptedModel([
+            [type("_I", (), {"intent": "商品咨询"})()],
+            [type("_I", (), {"intent": "闲聊"})()],
+        ]),
+        tools=[], registry={}, settings=_settings(),
+        retriever=retriever, session=session, conversation_id="conv-1",
+        emit=frames.append,
+        # 两轮**共用**同一个 checkpointer,且 thread_id 相同 —— 这正是要测的场景。
+        checkpointer=InMemorySaver(),
+    )
+
+    first = await _run(graph, "怎么退货")
+    one_turn = len(frames)
+    # 第二轮的入参**刻意不给 `agent_steps` 初值**(第一轮仍走 `_run`)。
+    # 原因**实测**得到,不是推理:入参里的值会**覆写**非归约通道,所以
+    # `agent_steps: 0` 一给,就等于替实现把上一轮的残留抹掉了 ——
+    # 变异实测(只重置 `gate_passed`、`agent_steps` 不清)下:
+    #   第二轮入参**给** `agent_steps: 0` → 帧里报 0 → 断言**假绿**;
+    #   第二轮入参**不给**         → 帧里报 1(上一轮的值)→ 断言红。
+    # 而真机端点(T8)的入参里**没有** `agent_steps`(见计划 T8 Step 5),
+    # 残留会一路进 `done` 帧 —— 所以这里必须真的能红。
+    second = await graph.ainvoke(
+        {"conversation_id": "conv-1", "user_input": "你好", "history": [], "trace": []},
+        config={"configurable": {"thread_id": "t"}},
+    )
+    second_frames = frames[one_turn:]
+
+    # 前置条件:第 1 轮**确实**检索了、过了闸、进了 Agent —— 这样第二轮的
+    # 「没有」才是在说「被清掉了」,而不是「第 1 轮本来就没有」。
+    assert retriever.calls == ["怎么退货"]
+    assert "retrieve_knowledge:1 hits top=0.90" in first["trace"]
+    assert "confidence_gate:pass" in first["trace"]
+    assert "agent:converged" in first["trace"]
+
+    # 前提:累积通道**确实**累积了 —— 这正是本用例存在的理由。
+    # 没有这一条,下面那些断言可能只是因为"根本没累积"而通过。
+    assert len(second["trace"]) > len(first["trace"])
+
+    payload = second_frames[-1]                    # 第二轮的 trace 帧
+    assert payload["frame"] == "trace"
+    assert payload["trace"][0] == "resolve_references"
+    assert not any(t.startswith("confidence_gate") for t in payload["trace"])
+    assert "retrieve_knowledge" not in " ".join(payload["trace"])
+    assert payload["gate_passed"] is None          # 第 1 轮过闸了;第 2 轮没进闸
+    assert payload["agent_steps"] == 0             # 第 1 轮进过 Agent;第 2 轮没有
 
 
 @pytest.mark.anyio

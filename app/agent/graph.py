@@ -39,7 +39,11 @@ _OUTLETS = ("agent", "complaint_reply", "chitchat_reply", "fallback_reply")
 
 @lru_cache(maxsize=1)
 def get_checkpointer() -> InMemorySaver:
-    """**进程级单例**。按请求新建 = 每轮都是新 thread,状态全丢。"""
+    """进程级单例。
+
+    **无淘汰、无 TTL**:见过的每个 thread 状态常驻进程(含累积的 trace)。
+    本章可接受(演示规模);正式版要换成有界的持久化 checkpointer。
+    """
     return InMemorySaver()
 
 

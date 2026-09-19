@@ -1881,7 +1881,10 @@ git commit -m "feat: ch05 主力 ReAct Agent 节点 + token 预算/步数停止�
 - Create: `tests/test_agent_graph.py`
 
 **Interfaces:**
-- Produces: `make_log_turn_node(*, session)`、`make_resolve_references_node()`、`get_checkpointer()`、`build_graph(*, model, intent_model, tools, registry, settings, retriever, session, conversation_id, emit, checkpointer)`
+- Produces: `make_log_turn_node(*, session, emit)`、`make_resolve_references_node()`、`get_checkpointer()`、`build_graph(*, model, intent_model, tools, registry, settings, retriever, session, conversation_id, emit, checkpointer)`
+
+> 签名以 **Step 3 的代码块**为准。此前这行把 `make_log_turn_node` 写成 `(*, session)`,
+> 漏了 `emit` —— 而节点体里要用它发 trace 帧。实现者按代码块写是对的。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2152,10 +2155,34 @@ def make_resolve_references_node():
 
     节点本身先立在这里,是为了把「骨架的第一步」这个位置固定下来 ——
     正式版换实现时,图的拓扑一行都不用动。
+
+    它同时承担**每轮重置**:图是每请求现编译的,但 checkpointer 是**进程级**
+    单例(`get_checkpointer` 的 lru_cache),而 thread_id = session_id ——
+    所以同一会话的**第二轮**会带着上一轮的通道值进来。未写的通道**保留旧值**
+    (LangGraph 不把未写通道重新写成默认值)。不清零,trace 帧与日志行就会把
+    上一轮的 `gate_passed` / `agent_steps` 报成本轮的,而且**一路静默**:
+    物流轮的 `gate_passed` 会是上一轮知识检索的结论。
+
+    为什么放在这个节点:它是**每轮第一个**执行节点(START 的唯一出边),
+    放这儿等于「每轮开头清一次」,不依赖任何调用方记得播种初值。
+
+    `trace` 通道不在此列 —— 它是 `operator.add` 归约通道,写 `[]` 等于没写,
+    清不掉;**它靠 `log_turn` 切片取当轮**(见下)。
     """
 
     async def resolve_references(state) -> dict:
-        return {"resolved_input": state["user_input"], "trace": ["resolve_references"]}
+        return {
+            "resolved_input": state["user_input"],
+            "trace": ["resolve_references"],
+            # 每轮归零的**逐轮**通道:它们描述的是「这一轮」,不是「这段会话」。
+            "gate_passed": None,
+            "agent_steps": 0,
+            "reply": "",
+            "choices": [],
+            "citations": [],
+            "evidence": [],
+            "tool_calls_made": [],
+        }
 
     return resolve_references
 
@@ -2171,7 +2198,20 @@ def make_log_turn_node(*, session, emit):
     """
 
     async def log_turn(state) -> dict:
-        full_trace = [*(state.get("trace") or []), "log_turn"]
+        # **只取当轮**。`trace` 是 operator.add 通道,同一 thread 的第二轮
+        # 拿到的是「第一轮 + 第二轮」的拼接 —— 直接发出去,验收 1 的
+        # 「trace 里有 retrieve_knowledge」会在一条**根本没检索**的物流轮上
+        # 通过(上一轮留下的),这是本章最高价值证据链上的假绿通道。
+        #
+        # `resolve_references` 是 START 的唯一出边、每轮第一个执行,
+        # 所以**最后一次**出现它就是当轮起点。找不到时(直接调 log_turn、
+        # 或将来拓扑变了)退化为整段,不抛异常。
+        accumulated = list(state.get("trace") or [])
+        turn_trace = accumulated
+        if "resolve_references" in accumulated:
+            start = len(accumulated) - 1 - accumulated[::-1].index("resolve_references")
+            turn_trace = accumulated[start:]
+        full_trace = [*turn_trace, "log_turn"]
         logger.info(
             "chat_turn conv=%s intent=%s gate=%s steps=%s tools=%s trace=%s",
             state.get("conversation_id"), state.get("intent"), state.get("gate_passed"),
