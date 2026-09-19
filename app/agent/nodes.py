@@ -15,6 +15,8 @@ from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
 from app.prompts import build_intent_messages, build_messages
+from app.schemas import Message
+from app.services.history import append_turn
 from app.tools.executor import execute_tool
 
 logger = logging.getLogger(__name__)
@@ -281,3 +283,54 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         }
 
     return agent_node
+
+
+# ---- 骨架的首尾两步 ----
+
+
+def make_resolve_references_node():
+    """指代消解:**本章原样透传**,正式版留给下一步(用户点名)。
+
+    节点本身先立在这里,是为了把「骨架的第一步」这个位置固定下来 ——
+    正式版换实现时,图的拓扑一行都不用动。
+    """
+
+    async def resolve_references(state) -> dict:
+        return {"resolved_input": state["user_input"], "trace": ["resolve_references"]}
+
+    return resolve_references
+
+
+def make_log_turn_node(*, session, emit):
+    """日志记录:落一行结构化日志、把 trace 发成帧、把这一轮写回 MySQL。
+
+    `trace` 是本轮**唯一**的确定性证据链:验收 1「走了强制检索节点」与
+    验收 5「ReAct 不止一步」都靠它断言,而不是靠模型自由文本。
+
+    它同时以 `trace` 帧发给端点(端点折进 `done`、不外推给前端)—— 走的是
+    和 token 帧同一条 emit 通道,所以**不需要第二个 stream_mode**。
+    """
+
+    async def log_turn(state) -> dict:
+        full_trace = [*(state.get("trace") or []), "log_turn"]
+        logger.info(
+            "chat_turn conv=%s intent=%s gate=%s steps=%s tools=%s trace=%s",
+            state.get("conversation_id"), state.get("intent"), state.get("gate_passed"),
+            state.get("agent_steps"),
+            [t["name"] for t in (state.get("tool_calls_made") or [])],
+            " > ".join(full_trace),
+        )
+        emit({"frame": "trace", "trace": full_trace,
+              "intent": state.get("intent"), "gate_passed": state.get("gate_passed"),
+              "agent_steps": state.get("agent_steps") or 0})
+        await append_turn(
+            session=session,
+            conversation_id=state["conversation_id"],
+            messages=[
+                Message(role="user", content=state["user_input"]),
+                Message(role="assistant", content=state.get("reply") or ""),
+            ],
+        )
+        return {"trace": ["log_turn"]}
+
+    return log_turn

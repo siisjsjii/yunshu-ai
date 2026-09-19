@@ -13,3 +13,4 @@ asyncmy==0.2.14
 cryptography==50.0.1
 pymilvus==2.6.17
 FlagEmbedding==1.4.2
+langgraph==1.2.11
