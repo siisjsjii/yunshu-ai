@@ -113,6 +113,10 @@ class _BoundModel:
 
     async def ainvoke(self, messages):
         self._owner.bound_rounds += 1
+        # 记录入参:循环里**每一轮都是绑着工具**问的,所以「回灌进去的
+        # ToolMessage」只能在绑工具的入口上看到(未绑工具的入口只在步数
+        # 用尽收尾时走一次)。
+        self._owner.bound_messages = list(messages)
         return self._owner.rounds.pop(0)
 
 
@@ -179,7 +183,7 @@ async def test_tool_call_is_executed_and_result_is_fed_back():
     assert len(tool_obj.calls) == 1
     assert tool_obj.calls[0]["args"] == {"order_id": "1001"}
     # 回灌:第二轮的消息里必须有一条 tool_call_id 对得上的 ToolMessage
-    tool_msgs = [m for m in model.last_unbound_messages if isinstance(m, ToolMessage)]
+    tool_msgs = [m for m in model.bound_messages if isinstance(m, ToolMessage)]
     assert [m.tool_call_id for m in tool_msgs] == ["c1"]
     assert "已发货" in tool_msgs[0].content
 
@@ -187,9 +191,11 @@ async def test_tool_call_is_executed_and_result_is_fed_back():
 @pytest.mark.anyio
 async def test_step_limit_forces_convergence_without_tools():
     """步数用尽:最后一轮**不绑 tools**,模型在结构上无法再调。"""
+    # 脚本必须与消费顺序对齐:循环里绑工具问 2 轮(== max_steps),各弹走一条;
+    # 第 3 条留给收尾那一轮(未绑工具)弹。多写的条目只会被弹到前几条。
     looping = [
         FakeAIMessage(tool_calls=[{"name": "query_order", "args": {"order_id": "1001"}, "id": f"c{i}"}])
-        for i in range(5)
+        for i in range(2)
     ]
     model = ScriptedModel(looping + [FakeAIMessage(text="收敛了")])
     tool_obj = FakeTool()
@@ -1516,8 +1522,10 @@ async def test_tool_call_round_emits_frames_and_feeds_result_back():
             "args": {"order_id": "1001"}, "tool_call_id": "c1"} in frames
     assert {"frame": "tool_result", "tool_call_id": "c1", "ok": True,
             "summary": '{"status": "已发货"}'} in frames
-    # 回灌的 ToolMessage 必须与 tool_call_id 配对
-    fed = [m for m in model.last_unbound_messages if isinstance(m, ToolMessage)]
+    # 回灌的 ToolMessage 必须与 tool_call_id 配对。
+    # 注意记的是**绑工具**那个入口:agent 每一轮都绑着工具问,未绑工具的入口
+    # 只在步数用尽收尾时走一次。
+    fed = [m for m in model.bound_messages if isinstance(m, ToolMessage)]
     assert [m.tool_call_id for m in fed] == ["c1"]
     # trace 让验收 5「ReAct 不止一步」机械可断言
     assert out["trace"] == ["agent:step1 tool=query_order", "agent:converged"]
@@ -1526,9 +1534,11 @@ async def test_tool_call_round_emits_frames_and_feeds_result_back():
 @pytest.mark.anyio
 async def test_step_limit_converges_without_tools_bound():
     """步数用尽 → 最后一次调用**不绑 tools**,结构上保证收敛。"""
+    # 脚本按消费顺序对齐:绑工具的 2 轮(== max_agent_steps)各弹一条,
+    # 第 3 条留给收尾那一轮(未绑工具)。
     looping = [
         [FakeChunk(tool_calls=[{"name": "query_order", "args": {"order_id": str(i)}, "id": f"c{i}"}])]
-        for i in range(5)
+        for i in range(2)
     ]
     model = ScriptedModel(looping + [[FakeChunk("收敛了")]])
     tool_obj = FakeTool()
