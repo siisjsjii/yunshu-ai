@@ -53,8 +53,8 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
     作参数、FastAPI 侧靠 Depends 注入、测试用 dependency_overrides 替换),
     `tests/test_api_chat.py` 的 `client_factory` 里已经有一行
     `app.dependency_overrides[chat_api.get_chat_model] = lambda: model`,
-    加一行同形的即可。**不做这层,端点测试里 27 条都会朝
-    `https://example.invalid/v1` 发真实请求,而且不联网这一条是硬规矩。**
+    加一行同形的即可。**不做这层,凡是进入端点/图的用例都会朝
+    `https://example.invalid/v1` 发真实请求,而不联网这一条是硬规矩。**
     """
     return create_extract_model(settings)
 

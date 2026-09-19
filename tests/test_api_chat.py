@@ -237,7 +237,7 @@ def client_factory(monkeypatch):
         )
         app.dependency_overrides[chat_api.get_store] = lambda: store
         app.dependency_overrides[chat_api.get_chat_model] = lambda: model
-        # 意图识别是每请求都跑的一步 —— 这一行不做,27 条用例全部发真实请求。
+        # 意图识别是每请求都跑的一步 —— 这一行不做,进入端点/图的用例都会发真实请求。
         app.dependency_overrides[chat_api.get_intent_model] = lambda: intent_model
         app.dependency_overrides[get_session] = _session_override
 

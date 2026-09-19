@@ -188,8 +188,11 @@ def test_infrastructure_failure_returns_502_not_500(monkeypatch):
     「Internal Server Error」。500 会把「服务端出问题」说成「你的请求有问题」,
     与本仓的错误语义边界相悖(CLAUDE.md:基础设施故障一律 502)。
 
-    **顺序**:这个 `except` 子句先于本用例落盘。反过来写的话,这里会红在
-    `500 != 502`,而那个红不告诉你到底是测试写错了还是实现错了。
+    **顺序**:这个 `except` 子句先于本用例落盘。反过来写的话,`ToolInfrastructureError`
+    会从 `client.post(...)` **直接抛出**(`TestClient` 默认 `raise_server_exceptions=True`,
+    未处理异常被重新抛出,而不是变成 500 响应),用例以 **error** 收场,而不是红在
+    `500 != 502` 这条断言上 —— 那种红不告诉你是测试写错了还是实现错了,
+    这正是「先把实现落盘、再写用例」的理由。
     """
     session = _TicketSession()
     client = _client(session)
