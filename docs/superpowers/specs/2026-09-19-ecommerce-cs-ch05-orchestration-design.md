@@ -204,8 +204,8 @@ CLAUDE.md 点名的错误语义 —— `ToolInfrastructureError` 必须向上抛
 由 `complaint_reply` 节点用 `get_stream_writer()` 发出(`stream_mode="custom"`),也可由
 Agent 在判断合适时发出(需求 8:「Agent 判断合适时」)。前端按帧渲染按钮,**不反解文本**。
 
-`messages` 流模式取 token:按 `metadata["langgraph_node"]` 只转最终回答节点的 token,
-避免意图识别等节点的模型调用文字漏到用户面前。
+**token 也走 `custom` 帧**:`agent` 节点自己在每一轮流式读模型时 `emit({"frame":"token","text":...})`。
+所有帧因此只有**一条发出路径**(见 §12 的订正 —— 原设计用的 `messages` 流模式在真机验证时被否掉)。
 
 ### 5.7 日志与验收可检查性
 
@@ -256,8 +256,9 @@ trace = ["resolve_references",
 `finally` 释放锁)全部保留,只把 `stream_turn(...)` 换成**驱动图**:
 
 ```python
-async for mode, chunk in graph.astream(state, config={"configurable": {"thread_id": session_id}},
-                                       stream_mode=["messages", "custom"]):
+async for chunk in graph.astream(state, config={"configurable": {"thread_id": session_id}},
+                                 stream_mode="custom"):
+    # chunk 形如 {"frame": "token"|"tool_call"|"tool_result"|"choices", ...}
     ...
 ```
 
@@ -318,3 +319,36 @@ async for mode, chunk in graph.astream(state, config={"configurable": {"thread_i
 ## 12. 实现订正
 
 (实现过程中与本文的偏离,连同原因记录于此。)
+
+### §5.6/§8.1 之订正:改 `stream_mode="custom"` 单模式,弃用 `messages` 流模式(2026-09-19,写计划期真机验证)
+
+原设计用 `stream_mode=["messages","custom"]`,靠 `metadata["langgraph_node"]` 过滤出
+最终回答节点的 token。真机验证(`langgraph 1.2.11`)发现两条硬事实:
+
+1. **`messages` 流模式只对真的 LangChain Runnable 生效** —— 用普通对象替身(本项目
+   `tests/test_chat_service.py` 的 `ScriptedModel` 就是这类)调 `astream`,**一条都不流出来**。
+2. **langchain 自带的 `GenericFakeChatModel` 虽然能用 `messages` 模式,但 `bind_tools` 抛
+   `NotImplementedError`** —— 而 ReAct 节点每轮都要 `bind_tools`。要用它测,就得手写一个
+   同时实现 `bind_tools` 与 `_astream` 的完整 `BaseChatModel` 子类。
+
+第 2 条是决定性的:本项目最怕「复杂替身掩盖真实行为」(CLAUDE.md 头号风险是假绿测试),
+为测一个流模式而引入复杂替身,方向反了。改为**只走 `custom` 单模式、`agent` 节点自己
+`emit` token 帧** —— 所有帧一条发出路径,节点能用普通对象替身直接单测。
+对前端的帧协议**一字未变**,技术选型(LangGraph 图 + State + checkpointer)未动。
+
+### §5.3/§5.6 之订正:`get_stream_writer()` 在图外抛 `RuntimeError`,需包一层 emit(2026-09-19,写计划期真机验证)
+
+真机验证:`get_stream_writer()` 在非图运行上下文里抛
+`RuntimeError: Called get_config outside of a runnable context`。而节点要能被**直接单测**
+(不经图),就必须容忍这个异常。故统一包一个 `app/agent/emit.py:make_emitter()`,
+图内发真帧、图外退化为 no-op 收集器(测试断言用)。原设计直接调
+`get_stream_writer()`,节点将无法脱离图测试。
+
+**`make_emitter()` 返回的必须是「每次发帧时现取 writer」的函数,不能进去取一次。**
+`make_emitter()` 是在**端点里**调的 —— 那时图还没开始跑,上下文里没有 writer,
+一次性的取法会永远落到 no-op 分支:**前端一帧都收不到**,而所有单测仍然全绿
+(单测把 collector 直接注入节点,根本不经过这条路径)。这是写计划期自检抓到的,
+属本项目 CLAUDE.md 点名的头号风险(假绿测试 + 静默故障)。钉它的用例是
+`tests/test_agent_graph.py::test_emitter_sends_frames_through_astream_custom_mode`:
+在真实的 `graph.astream(stream_mode="custom")` 下断言帧到了消费端、且 collector
+**没被碰过**。
