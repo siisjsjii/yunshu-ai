@@ -59,7 +59,7 @@
 
 ---
 
-## 任务 1:祛魅热身 —— 手写最裸的 Agent 循环
+## Task 1:祛魅热身 —— 手写最裸的 Agent 循环
 
 先不用任何框架,把「Agent 就是个带工具的循环」写出来跑通。**这个产物在任务 8 会被删除**,
 它的价值是:① 看清循环的本质;② 给后面 LangGraph 版一个行为基线。
@@ -284,7 +284,7 @@ git commit -m "feat: ch05 祛魅热身 —— 手写最裸 Agent 循环(临时�
 
 ---
 
-## 任务 2:State schema + 路由纯函数 + emit 适配
+## Task 2:State schema + 路由纯函数 + emit 适配
 
 **Files:**
 - Create: `app/agent/state.py`
@@ -544,7 +544,7 @@ git commit -m "feat: ch05 图状态 schema + 分流纯函数 + emit 适配层"
 
 ---
 
-## 任务 3:意图识别节点 + Prompt + 标注样例验证
+## Task 3:意图识别节点 + Prompt + 标注样例验证
 
 意图识别 Prompt 是**非可单测产出**(用户工作要求 1),TDD 那步换成**拿标注样例跑一遍**。
 
@@ -836,7 +836,7 @@ git commit -m "feat: ch05 意图识别节点 + 七类 Prompt + 标注样例评�
 
 ---
 
-## 任务 4:三个固定话术出口(闲聊 / 兜底 / 投诉)
+## Task 4:三个固定话术出口(闲聊 / 兜底 / 投诉)
 
 **关键断言**:闲聊与兜底**不调模型**(用户需求 3:「不花模型调用」)。
 投诉要发 `choices` 帧。
@@ -1025,7 +1025,7 @@ git commit -m "feat: ch05 闲聊/兜底/投诉三个固定话术出口(零模型
 
 ---
 
-## 任务 5:强制预检索节点 + 置信度闸
+## Task 5:强制预检索节点 + 置信度闸
 
 **Files:**
 - Modify: `app/agent/nodes.py`(追加)
@@ -1310,7 +1310,7 @@ git commit -m "feat: ch05 强制预检索节点 + 置信度闸(分数阈值 + �
 
 ---
 
-## 任务 6:主力 Agent 节点(ReAct)+ 配置项
+## Task 6:主力 Agent 节点(ReAct)+ 配置项
 
 **Files:**
 - Modify: `app/config.py`(追加两个配置)
@@ -1771,7 +1771,7 @@ git commit -m "feat: ch05 主力 ReAct Agent 节点 + token 预算/步数停止�
 
 ---
 
-## 任务 7:日志节点 + 图组装
+## Task 7:日志节点 + 图组装
 
 **Files:**
 - Modify: `app/agent/nodes.py`(追加 `make_log_turn_node`、`make_resolve_references_node`)
@@ -2218,7 +2218,7 @@ git commit -m "feat: ch05 日志节点 + 图组装(checkpointer 单例、图按�
 
 ---
 
-## 任务 8:接入 SSE 端点 + 删掉手写循环
+## Task 8:接入 SSE 端点 + 删掉手写循环
 
 **Files:**
 - Modify: `app/services/chat.py`(`prepare_turn` 改返回裁剪后历史;删 `stream_turn`)
@@ -2416,7 +2416,7 @@ git commit -m "feat: ch05 接入图骨架到 SSE 端点;删掉祛魅用的手写
 
 ---
 
-## 任务 9:`POST /api/ticket`(建工单按钮的后端)
+## Task 9:`POST /api/ticket`(建工单按钮的后端)
 
 **Files:**
 - Modify: `app/schemas.py`(追加 `TicketRequest`)
@@ -2553,7 +2553,7 @@ git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后�
 
 ---
 
-## 任务 10:前端两个独立按钮(Vibe Coding,不套 TDD)
+## Task 10:前端两个独立按钮(Vibe Coding,不套 TDD)
 
 **Files:**
 - Modify: `app/static/index.html`
@@ -2680,7 +2680,7 @@ git commit -m "feat: ch05 聊天页渲染「转人工」「建工单」两个独
 
 ---
 
-## 任务 11:验收脚本(五条)
+## Task 11:验收脚本(五条)
 
 **Files:**
 - Create: `scripts/acceptance_ch05.sh`
