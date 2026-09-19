@@ -3484,9 +3484,26 @@ ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > 
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
 BAD=$(bad_tool_results < /tmp/ch05_5.sse)
-if [ "$STEPS" -ge 2 ] && [ "$N" -ge 2 ] && [ "$BAD" -eq 0 ]; then
-  ok "ReAct 走了 $STEPS 步、$N 次工具调用、0 次工具失败(trace=$(done_field trace < /tmp/ch05_5.sse))"
-else bad "步数不足或工具失败:agent_steps=$STEPS tool_calls=$N 失败工具数=$BAD"; fi
+TR=$(done_field trace < /tmp/ch05_5.sse)
+# ⚠️ **订正(2026-09-20,T11 审查 I1)**:原来这里是 `[ "$STEPS" -ge 2 ]`,
+#    那是**同义反复** —— 上面那段注释自己就写了「收敛那一轮也被算了一步」,
+#    即**任何一次工具调用**都得到 `agent_steps == 2`(实证:验收 2 只调 1 次
+#    `query_logistics`,done 帧仍读 `agent_steps: 2`)。
+#    于是 `STEPS >= 2` 在 `N >= 2` 之外**零判别力**,且**漏得掉**真回归:
+#    循环被改成单轮、模型在一轮里**并发**发两个 tool_call → N=2/BAD=0/STEPS=2
+#    → 照样绿,而那正是「ReAct 根本没有第二轮」。
+#    ⇒ 改断 **`agent:step2`**:`app/agent/nodes.py:265` 的
+#    `trace.append(f"agent:step{step} ...")` **只在第 2 轮真的发了工具调用时**
+#    才追加,所以它才真能区分「走了第二轮」与「一轮里并发发了两个」。
+case "$TR" in
+  *"agent:step2"*) MULTI=1;;
+  *) MULTI=0;;
+esac
+if [ "$MULTI" -eq 1 ] && [ "$N" -ge 2 ] && [ "$BAD" -eq 0 ]; then
+  ok "ReAct 走了 $STEPS 步、$N 次工具调用、0 次工具失败(trace=$TR)"
+else
+  bad "非真正多轮或多/少调工具:agent_steps=$STEPS tool_calls=$N 失败工具数=$BAD intent=$(done_field intent < /tmp/ch05_5.sse) trace=$TR"
+fi
 
 # ⚠️ `BAD -eq 0` 这一条**不是补充,是唯一的探针**,别删。
 # `"type": "tool_call"` 键的丢失在**单测层捕获不到**:替身 `FakeTool` 不查这个键、
