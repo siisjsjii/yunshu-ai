@@ -79,3 +79,20 @@ async def test_prompt_carries_the_user_utterance():
     node = make_classify_intent_node(model=model)
     await node({"user_input": "你好呀"})
     assert "你好呀" in model.calls[0][-1].text
+
+
+def test_every_label_in_the_prompt_matches_the_routing_table():
+    """标签名在两处各写一份,必须自动对齐。
+
+    `INTENT_SYSTEM_PROMPT` 里的七个标签是**手写**的;`INTENT_TO_ROUTE` 是代码里的
+    权威表。谁改了 `app/agent/routing.py` 的键名,模型仍会吐**旧名**,
+    `nodes.py` 的越界检查把**整个桶**静默降级成「其他」—— 全部进兜底,零报错。
+
+    既有守卫 `tests/test_agent_routing.py:35`(`INTENT_LABELS == tuple(INTENT_TO_ROUTE)`)
+    是恒真式(定义即如此),**正好抓不到这个**;这条才是真的守卫。
+    """
+    from app.agent.routing import INTENT_LABELS
+    from app.prompts import INTENT_SYSTEM_PROMPT
+
+    missing = [label for label in INTENT_LABELS if label not in INTENT_SYSTEM_PROMPT]
+    assert not missing, f"Prompt 里缺这些标签名,对应整桶会静默降级成「其他」:{missing}"
