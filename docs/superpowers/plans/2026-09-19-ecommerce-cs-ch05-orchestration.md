@@ -2094,18 +2094,16 @@ async def test_checkpointer_is_a_process_level_singleton():
     assert get_checkpointer() is get_checkpointer()
 
 
-@pytest.mark.anyio
-async def test_weak_evidence_..._records_the_turns_own_conversation_id():
-    """闸落库时必须用**当轮会话 id**,不是 `build_graph` 闭包随手给的那个。
-
-    这是 Ruling 22 不变量**唯一**的守卫:`build_graph` 把 `conversation_id`
-    传给 `make_confidence_gate_node`,而闸**从不读** `state["conversation_id"]`
-    —— 同一个事实两个来源,测试里两者永远同值,所以不匹配**看不见**
-    (实测:把闭包值改成 `"WRONG-CONV"`,修这条之前 **10/10 全绿**)。
-    """
-    # 在既有的 test_weak_evidence_skips_agent_and_records_low_confidence 里,
-    # `_run` 之后补这一行即可(RecordingSession.add 顺序收集,
-    # record_low_confidence 是这一轮唯一写库的动作):
+async def test_weak_evidence_skips_agent_and_records_low_confidence():
+    """弱证据 → 不进 Agent、落低置信度池。"""
+    # ...(既有断言略:不进 Agent、落库、trace 里没有 confidence_gate:pass)
+    # ↓ **新补的这一行**是 Ruling 22 不变量**唯一**的守卫。
+    # `build_graph` 把 `conversation_id` 传给 `make_confidence_gate_node`,
+    # 而闸**从不读** `state["conversation_id"]` —— 同一个事实两个来源,
+    # 测试里两者永远同值,所以不匹配**看不见**
+    # (实测:把闭包值改成 `"WRONG-CONV"`,补这行之前 **10/10 全绿**)。
+    # `RecordingSession.add` 顺序收集,`record_low_confidence` 是这一轮
+    # 唯一写库的动作,所以 `added[0]` 就是那条低置信度记录。
     assert session.added[0].source_conversation_id == "conv-1"
 
 
@@ -2117,58 +2115,111 @@ async def test_second_turn_on_same_thread_reports_only_its_own_turn():
     `operator.add` 累积通道、其余通道**未写就保留旧值**。三件事叠起来:
     第 N 轮的 trace 帧是「第 1..N 轮」的拼接,于是**验收 1 的
     「trace 里有 retrieve_knowledge」会在一条根本没检索的轮上通过**(上一轮
-    留下的)。这是本章最高价值证据链上的假绿通道,所以两条修法
-    **(逐轮重置 + trace 切片)各自都要有断言钉住**。
+    留下的),逐轮的 `gate_passed` / `agent_steps` 同理。这是本章最高价值
+    证据链上的假绿通道,所以两条修法**(逐轮重置 + trace 切片)各自都要有
+    断言钉住**,不能只修一条。
 
-    本文件其余用例每条都新建 `InMemorySaver`、只跑一轮 —— **没有一条能看见它**。
+    本文件其余 10 条用例每条都新建 `InMemorySaver`、只跑一轮 —— **没有一条
+    能看见它**。
     """
-    # 第 1 轮知识类(检索 → 过闸 → 进 Agent),第 2 轮闲聊 —— 两轮走**不同分支**,
-    # 残留才看得见。意图替身按调用顺序回放:
-    #   intent_model=ScriptedModel([[_I("商品咨询")], [_I("闲聊")]])
-    # 两轮**共用**同一个 InMemorySaver、同一个 thread_id="t"。
-    #
-    # 第 2 轮的入参**刻意不给 `agent_steps` 初值**(第 1 轮仍走 `_run`)。
+    retriever = FakeRetriever([RetrievedChunk("怎么退货", "七天无理由", "退换货",
+                                              chunk_id=1, section_path="退货政策", score=0.9)])
+    frames = []
+    session = RecordingSession()
+    graph = build_graph(
+        model=ScriptedModel([[FakeChunk("模型回复")]]),
+        # 意图替身按**调用顺序**回放(ainvoke 是 rounds.pop(0)):第 1 轮知识类,
+        # 第 2 轮闲聊 —— 两轮走**不同分支**,残留才看得见。
+        intent_model=ScriptedModel([
+            [type("_I", (), {"intent": "商品咨询"})()],
+            [type("_I", (), {"intent": "闲聊"})()],
+        ]),
+        tools=[], registry={}, settings=_settings(),
+        retriever=retriever, session=session, conversation_id="conv-1",
+        emit=frames.append,
+        # 两轮**共用**同一个 checkpointer,且 thread_id 相同 —— 这正是要测的场景。
+        checkpointer=InMemorySaver(),
+    )
+
+    first = await _run(graph, "怎么退货")
+    one_turn = len(frames)
+    # 第二轮的入参**刻意不给 `agent_steps` 初值**(第一轮仍走 `_run`)。
     # 原因**实测**得到,不是推理:入参里的值会**覆写**非归约通道,所以
-    # `agent_steps: 0` 一给就等于替实现把上一轮的残留抹掉 ——
-    # 变异实测(只重置 gate_passed、agent_steps 不清)下:
-    #   第 2 轮入参**给** `agent_steps: 0` → 帧里报 0 → 断言**假绿**;
-    #   第 2 轮入参**不给**             → 帧里报 1(上一轮的值)→ 断言红。
-    # 而真机端点(T8)的入参里**没有** `agent_steps`(见 T8 Step 5)——
-    # 残留会一路进 `done` 帧,所以这里必须真的能红。
-    #
-    # 断言:
-    #   前置 —— 第 1 轮**确实**检索了、过闸了、进了 Agent("没有"才是在说
-    #          "被清掉了",而不是"第 1 轮本来就没有");
-    #   前提 —— `len(second["trace"]) > len(first["trace"])`,累积**确实**发生了。
-    #          没有这一条,下面的断言可能只是因为"根本没累积"而通过;
-    #   当轮 —— 第 2 轮 trace 帧:首项 resolve_references、无任何
-    #          `confidence_gate*`、无 `retrieve_knowledge`、
-    #          `gate_passed is None`、`agent_steps == 0`。
+    # `agent_steps: 0` 一给,就等于替实现把上一轮的残留抹掉了 ——
+    # 变异实测(只重置 `gate_passed`、`agent_steps` 不清)下:
+    #   第二轮入参**给** `agent_steps: 0` → 帧里报 0 → 断言**假绿**;
+    #   第二轮入参**不给**         → 帧里报 1(上一轮的值)→ 断言红。
+    # 而真机端点(T8)的入参里**没有** `agent_steps`(见计划 T8 Step 5),
+    # 残留会一路进 `done` 帧 —— 所以这里必须真的能红。
+    second = await graph.ainvoke(
+        {"conversation_id": "conv-1", "user_input": "你好", "history": [], "trace": []},
+        config={"configurable": {"thread_id": "t"}},
+    )
+    second_frames = frames[one_turn:]
+
+    # 前置条件:第 1 轮**确实**检索了、过了闸、进了 Agent —— 这样第二轮的
+    # 「没有」才是在说「被清掉了」,而不是「第 1 轮本来就没有」。
+    assert retriever.calls == ["怎么退货"]
+    assert "retrieve_knowledge:1 hits top=0.90" in first["trace"]
+    assert "confidence_gate:pass" in first["trace"]
+    assert "agent:converged" in first["trace"]
+
+    # 前提:累积通道**确实**累积了 —— 这正是本用例存在的理由。
+    # 没有这一条,下面那些断言可能只是因为"根本没累积"而通过。
+    assert len(second["trace"]) > len(first["trace"])
+
+    payload = second_frames[-1]                    # 第二轮的 trace 帧
+    assert payload["frame"] == "trace"
+    assert payload["trace"][0] == "resolve_references"
+    assert not any(t.startswith("confidence_gate") for t in payload["trace"])
+    assert "retrieve_knowledge" not in " ".join(payload["trace"])
+    assert payload["gate_passed"] is None          # 第 1 轮过闸了;第 2 轮没进闸
+    assert payload["agent_steps"] == 0             # 第 1 轮进过 Agent;第 2 轮没有
 
 
 @pytest.mark.anyio
 async def test_resolve_references_resets_every_per_turn_channel():
     """每轮开头必须清掉上一轮的**全部**逐轮通道。
 
-    为什么值得单钉:**删除其中任何一个键都不会有别的测试变红** —— 而后果按
-    通道不同而不等。`evidence` 尤其真实:它被 agent 节点读进 `build_messages`,
-    业务轮跟在知识轮后会把**上一轮的检索结果**当本轮知识塞进 prompt ——
-    用户看到上一轮的知识,且完全静默。
+    为什么值得单钉:**删除其中一个键不会有任何测试变红** —— 而后果按通道
+    不同而不等。`evidence` 尤其真实:它被 agent 节点读进 `build_messages`
+    (`app/agent/nodes.py:234` 附近),业务轮跟在知识轮后会把**上一轮的检索
+    结果**当本轮知识塞进 prompt —— 用户看到的是上一轮的知识,且完全静默。
 
-    上面那条两轮整图用例盖不住它:第二轮是**闲聊**,根本不读 `evidence`。
+    两轮整图用例(闲聊轮)盖不住它:闲聊不读 `evidence`。
     """
-    # node = make_resolve_references_node()
-    # out = await node({"user_input": "在吗", "evidence": [{"answer": "上一轮的旧知识"}],
-    #                   "gate_passed": True, "agent_steps": 3, "reply": "上一轮的回复",
-    #                   "choices": ["handoff"], "citations": [{"n": 1}],
-    #                   "tool_calls_made": [{"name": "query_order"}]})
-    # 逐键断言:resolved_input == "在吗"、trace == ["resolve_references"]、
-    # 以及 7 个重置通道全部回到初值(evidence/gate_passed/agent_steps/reply/
-    # choices/citations/tool_calls_made)。
-    #
-    # **变异验证**:把重置字典里的 `"evidence": []` **单独**删掉,确认**只有**
-    # 这条用例红;还原后 `"citations": []` 单独删掉,同样只有它红。
-    # 若删掉某个键时**没有**用例变红,那就是还有缺口,要报告。
+    node = make_resolve_references_node()
+    out = await node({
+        "user_input": "在吗",
+        "evidence": [{"answer": "上一轮的旧知识"}],
+        "gate_passed": True,
+        "agent_steps": 3,
+        "reply": "上一轮的回复",
+        "choices": ["handoff"],
+        "citations": [{"n": 1}],
+        "tool_calls_made": [{"name": "query_order"}],
+    })
+
+    assert out["resolved_input"] == "在吗"
+    assert out["trace"] == ["resolve_references"]
+    assert out["evidence"] == []
+    assert out["gate_passed"] is None
+    assert out["agent_steps"] == 0
+    assert out["reply"] == ""
+    assert out["choices"] == []
+    assert out["citations"] == []
+    assert out["tool_calls_made"] == []
+```
+
+> **变异验证(7 个键全扫,已实测)**:逐个单删重置字典里的键 → 跑 → 还原。
+> `evidence` / `citations` / `reply` / `choices` / `tool_calls_made` 各**只**打红本用例;
+> `gate_passed` / `agent_steps` 打红本用例 **+** 两轮整图用例(两条独立用例都钉,预期)。
+> **没有任何键是「删掉也不红」的。**
+>
+> 分工:`gate_passed`/`agent_steps` 由两轮用例覆盖(它们跨轮可见);
+> `evidence` **只有本用例**是防线 —— 删它时两轮用例**全绿**(第二轮走闲聊、不读它)。
+
+```python
 
 
 @pytest.mark.anyio
