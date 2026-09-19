@@ -3103,7 +3103,7 @@ ch05 spec §50 用**事前置信度闸**取代了它的事后自评,但它本身
 - [ ] **Step 7: 提交**
 
 ```bash
-git add app/schemas.py app/api/chat.py tests/test_api_ticket.py         tests/test_api_chat.py app/kb/assess.py
+git add app/schemas.py app/api/chat.py tests/test_api_ticket.py         tests/test_api_chat.py app/kb/assess.py tests/test_kb_assess.py
 git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后端入口"
 ```
 
