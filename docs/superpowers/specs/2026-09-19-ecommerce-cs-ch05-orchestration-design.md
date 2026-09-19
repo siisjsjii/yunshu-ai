@@ -352,3 +352,37 @@ async for chunk in graph.astream(state, config={"configurable": {"thread_id": se
 `tests/test_agent_graph.py::test_emitter_sends_frames_through_astream_custom_mode`:
 在真实的 `graph.astream(stream_mode="custom")` 下断言帧到了消费端、且 collector
 **没被碰过**。
+
+### §4.3 之订正:`prepare_turn` 的**产出语义变更**(2026-09-20,T8 落地)
+
+ch01–ch04 的 `prepare_turn` 返回的是**组装好的消息列表**(system + 裁剪后历史 + 本轮 user)。
+ch05 起它**只返回裁剪后的历史** —— 消息组装搬进了图里:节点要在**检索之后**往 user
+消息里插**证据块**(§5.3),而那一步在端点里做不到。
+
+保留它的理由不变,而且更硬:「**预算校验必须在流开始前完成**」这条约束仍然需要它
+(SSE 一旦 yield 过第一帧,响应头就发出去了,状态码再也改不了,溢出只能在此之前变 400)。
+签名收窄为 `-> list[Message]`(裁剪后历史),**它是唯一知道「这轮能不能跑」的地方**。
+
+连带:删 `stream_turn`(单轮编排语义已无处可留,改由图的节点承担);
+`tests/test_chat_service.py` 的断言从「消息组装正确」改为「裁剪后历史正确」。
+
+### §8.2 之订正:建工单端点必须**自己**捕 `ToolInfrastructureError` 才是 502(2026-09-20,T9 审查探针实测)
+
+§8.2 给的端点骨架只处理了 `if not outcome.ok` 那条 502 分支。T9 审查用探针实测:
+**那条分支今天不可达,而真会发生的故障会变成 500。**
+
+- **不可达**:`create_ticket` 必在 registry 里、args 是硬编码合法值、
+  `ToolNotFound` 要求 description 为空 —— 三者都不可能;
+- **真会发生的**:`create_ticket` 写库时抛 `SQLAlchemyError`
+  → `app/tools/executor.py:91` 抛 `ToolInfrastructureError("数据服务暂时不可用")`
+  → 端点**没有** `except` ⇒ FastAPI 默认 **500**(修复前探针实测 `{"status": 500}`)。
+
+这与 CLAUDE.md 的错误语义边界相悖(基础设施故障一律 502 + 固定文案;
+`ToolInfrastructureError` 必须向上抛、不许被伪装成「查不到」)。
+修法:在 `finally` 之前插 `except ToolInfrastructureError` →
+`HTTPException(502, redact_api_key(str(exc), settings.openai_api_key))`。
+
+**这是本仓第一个「非流式 + 会跑工具」的端点**,所以那条约定第一次有了真实后果。
+钉它的用例:`tests/test_api_ticket.py::test_infrastructure_failure_returns_502_not_500`,
+连同失败退出路径**放锁**(漏放 = 该会话永久 409,且 ticket 与 chat 共用同一个
+进程级 `_store`,会连带毒掉聊天)与 **409 分支**两条,本文件 2 → 5 条。
