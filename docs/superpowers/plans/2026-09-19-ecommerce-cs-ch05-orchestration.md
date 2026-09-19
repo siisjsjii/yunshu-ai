@@ -3107,6 +3107,37 @@ git add app/schemas.py app/api/chat.py tests/test_api_ticket.py         tests/te
 git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后端入口"
 ```
 
+- [ ] **Step 8: 记实现订正(spec §12 + dev-notes)**
+
+**本任务实现时发现计划 Step 4 的代码有一处真实缺陷**,照抄会留下一个可达的 500。
+按「文档即设计源」记账:
+
+**(a)端点必须捕 `ToolInfrastructureError`。** Step 4 那段代码只处理了
+`if not outcome.ok`,而那条 502 分支**今天不可达**(registry 必有 `create_ticket`、
+args 是硬编码合法值、`ToolNotFound` 要求 description 为空 —— 三者都不可能)。
+**真会发生的**基础设施故障走的是另一条路:
+
+```
+create_ticket 里 session.add/commit 抛 SQLAlchemyError
+  → app/tools/executor.py:91  raise ToolInfrastructureError("数据服务暂时不可用")
+  → 端点没有 except → FastAPI 默认 500 "Internal Server Error"
+```
+
+而 CLAUDE.md 的约定是「基础设施故障一律 502 + 固定文案」。审查者探针实测修复前为
+`P3_infra {"status": 500}`。修法是在 `finally` 之前插一个
+`except ToolInfrastructureError` → `HTTPException(502, redact_api_key(str(exc), ...))`。
+
+**(b)由此补 3 条用例**(本文件 2 → 5):infra→502、失败退出路径放锁、
+409 分支。三条各自有变异证明其判别力,详见 ledger 的 Ruling 44/45/49。
+其中**锁释放**那条尤其要紧:变异实测 `finally: lock.release()` → `pass` 时
+**本文件依然 2 passed** —— 而锁泄漏的后果是**该会话永久 409**,且 ticket 与 chat
+共用同一个进程级 `_store`,会连带毒掉聊天。
+
+**(c)`_client` 的 docstring 里那句 `.env` 实测数字以**现数**为准**(24 / 本文件 1,
+不是计划写作时的 25 / 2)—— 数字变小正是本次改动本身造成的,见 Ruling 48。
+
+在 spec §12 追加一条订正,并在 `dev-notes/ch05.md` 记本任务。
+
 ---
 
 ## Task 10:前端两个独立按钮(Vibe Coding,不套 TDD)
@@ -3518,5 +3549,7 @@ git commit -m "test: ch05 验收脚本 1–5"
 - [ ] `bash scripts/acceptance.sh`(ch01–ch04 的老验收)**仍然全绿** —— 本章改了 `/api/chat/stream` 的实现,老验收是回归网
 - [ ] 确认 `app/agent/loop.py` 与 `tests/test_agent_loop.py` 已删除
 - [ ] `dev-notes/ch05.md` 补齐每个阶段(不许收尾一次性补记)
-- [ ] spec §12 记齐实现订正(至少:`prepare_turn` 语义变更、`emit` 适配层)
+- [ ] spec §12 记齐实现订正(至少:`prepare_turn` 语义变更、`emit` 适配层、
+      **T9 端点必须捕 `ToolInfrastructureError` 才是 502** —— 计划原文只写了
+      `if not outcome.ok` 那条不可达分支,可达的 infra 故障会变 500)
 - [ ] 交付:演示命令、测试结果、dev-notes 路径
