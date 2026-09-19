@@ -2840,22 +2840,82 @@ git commit -m "feat: ch05 接入图骨架到 SSE 端点;删掉祛魅用的手写
 创建 `tests/test_api_ticket.py`:
 
 ```python
-"""建工单端点:按钮点击是 HTTP 请求,够不到模型工具 —— 故需要这个入口。"""
+"""建工单端点:按钮点击是 HTTP 请求,够不到模型工具 —— 故需要这个入口。
+
+**这里刻意不用真库**(否则是本仓第一个「TestClient + 真实 engine」的组合):
+`TestClient` 在它自己的 portal 事件循环里跑请求,会把 `get_engine()` 那个
+**lru_cache 单例**绑到那个循环上;退出 `with` 后 portal 循环关闭,同进程里
+后面所有走 `get_sessionmaker()` 的 db 测试(文件名排在 `test_api_ticket` 之后)
+都会拿到跨循环的连接 —— 这是 ch04 记过账的故障形态。端点级测试在本仓
+**一律替换 `get_session`**(`tests/test_api_chat.py` 的 `client_factory` 即此),
+这里沿用同一条缝。
+
+真库的「写进去了吗」由 `tests/test_tools_db.py::test_create_ticket_writes_row`
+独占(它用新 session 回查 `select(Ticket)`)—— 那条钉的是工具,
+这条钉的是**端点真的把工具调起来了**。
+"""
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.db.models import Ticket
 from app.main import app
+from app.api import chat as chat_api
+from app.db.session import get_session
+from tests.test_api_chat import FakeSession
+
+SID = "00000000000000000000000000000001"
 
 
-@pytest.mark.db
-def test_build_ticket_writes_a_row_and_returns_ticket_no():
-    with TestClient(app) as client:
-        resp = client.post("/api/ticket", json={"session_id": "00000000000000000000000000000001"})
+class _TicketSession(FakeSession):
+    """在既有端点替身上补 `Ticket` 支持 —— 建工单端点写的正是它。
+
+    继承而不是另写一份:`execute`/`commit`/`Conversation` 的行为必须与
+    对话端点测试**同一套**,否则两个端点的替身会各自漂移。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.tickets: list[Ticket] = []
+
+    def add(self, obj):
+        if isinstance(obj, Ticket):
+            self.tickets.append(obj)
+        else:
+            super().add(obj)
+
+
+def _client(session):
+    async def _override():
+        yield session
+
+    app.dependency_overrides[get_session] = _override
+    return TestClient(app)
+
+
+def test_build_ticket_invokes_the_tool_and_returns_its_payload():
+    """按钮 → HTTP → **真的**调到 `create_ticket` 并把它的回参原样返回。
+
+    **必须断言落库动作,不能只断言响应体**:把 `execute_tool(...)` 那段换成
+    `return {"ticket_no": "T-假", "status": "open"}`,响应断言**全绿** —— 一个
+    假 `ticket_no` 与真的一模一样(都是 `T-` 开头)。`session.tickets` 是唯一
+    能区分「调了工具」和「编了一个」的东西。
+    """
+    session = _TicketSession()
+    client = _client(session)
+    try:
+        resp = client.post("/api/ticket", json={"session_id": SID})
+    finally:
+        app.dependency_overrides.clear()
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["ticket_no"].startswith("T-")
     assert body["status"] == "open"
+    # ↓ 判别性断言:工具的写动作真的发生了,且号与响应里的一模一样
+    assert [t.ticket_no for t in session.tickets] == [body["ticket_no"]]
+    assert session.tickets[0].conversation_id == SID
+    assert session.commits >= 1
 
 
 def test_session_id_length_is_bounded_like_chat_request():
@@ -2868,13 +2928,17 @@ def test_session_id_length_is_bounded_like_chat_request():
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_api_ticket.py -m "not db"
+.venv/Scripts/python.exe -m pytest tests/test_api_ticket.py
 ```
 
-预期:**404 或 405**(端点还不存在)。`app/main.py` 在 `include_router` 之后
-`mount("/")` 了静态目录,Starlette 的 `StaticFiles` 对非 GET/HEAD 一律回
-**405**,所以这里看到 405 是**正常的**,不是「路由顺序错了」。两条用例都该红,
-但红的原因不同:第一条 404/405,第二条同样 404/405(而不是它最终要的 422)。
+预期:**两条都红,红法不同**。第一条 404 或 405(端点还不存在)。`app/main.py`
+在 `include_router` 之后 `mount("/")` 了静态目录,Starlette 的 `StaticFiles` 对
+非 GET/HEAD 一律回 **405**,所以这里看到 405 是**正常的**,不是「路由顺序错了」。
+第二条同样 404/405,而不是它最终要的 422。
+
+> ⚠️ 这个文件**不需要 `@pytest.mark.db`**(改过一轮:原设计用真库,会引入本仓
+> 第一个「TestClient + 真实 engine」组合并污染 `get_engine()` 的 lru_cache,
+> 详见文件头 docstring)。`-m "not db"` 过滤对它是空操作,直接跑文件即可。
 
 - [ ] **Step 3: 写 schema**
 
@@ -2954,7 +3018,13 @@ async def create_ticket_endpoint(
 .venv/Scripts/python.exe -m pytest tests/test_api_ticket.py
 ```
 
-预期:全绿(需 MySQL 起着)。
+预期:**2 passed**,不需要 MySQL。
+
+**变异验证(必须做)**:把端点里的 `outcome = await execute_tool(...)` 那一段
+连同 `return json.loads(outcome.content)` 一起换成
+`return {"ticket_no": "T-20260101000000-DEAD", "status": "open"}` ——
+`test_build_ticket_invokes_the_tool_and_returns_its_payload` 必须**恰好**打红
+(红在 `session.tickets == []` 那条),第二条不受影响。然后还原。
 
 - [ ] **Step 6: 提交**
 
@@ -2980,7 +3050,11 @@ git commit -m "feat: ch05 新增 POST /api/ticket —— 建工单按钮的后�
 `bubble` 只是**局部变量**,没进返回对象。而下面 `renderChoices(ctx.bubble, ...)`
 要的正是它:不改这一行,`ctx.bubble` 是 `undefined`,
 `bubble.appendChild(bar)` 直接抛 TypeError,**两个按钮一个都不出现**,
-验收 3 卡在第一步。改末行:
+验收 3 卡在第一步。
+
+**这一行还顺带修掉一个既有 bug,不是可选的清理**:`ctx.bubble` 在改动前
+**从来没被赋过值**,而 `index.html` 的 error 帧分支与 `catch` 分支都在读它 ——
+今天任何一次 error 帧都会让页面**砖掉**(详见 Step 4 的说明框)。改末行:
 
 ```js
     return { bubble, badges, body, citations: [] };
@@ -3094,6 +3168,30 @@ netstat -ano | grep ":8000"     # 先查僵尸进程,再起
 2. 点「转人工」→ 出现「已转接人工客服」+「您好,我是客服小猫,请问有什么可以帮您的」。
 3. 点「建工单」→ 按钮文字变成 `已建单 T-...`;`tickets` 表新增一行。
 4. 刷新页面重来,**都不点**,直接继续发消息 → 正常对话,`tickets` 表无新增。
+
+> **Step 1a 顺带修掉一个既有 bug,必须单独确认 —— 它比"按钮不出现"严重得多。**
+>
+> `ctx.bubble` 在改动前的现场代码里**根本没有被赋值**:`addAssistant()` 的返回值
+> 只有 `{ badges, body, citations }`,而 `send()` 用 `{ ...addAssistant(), ... }` 造 ctx ——
+> 可是 `index.html` 有**两处**在读 `ctx.bubble`(error 帧分支与 `catch` 分支)。
+> 后果是**级联的**,不是"报个错而已":
+> error 帧一来,error 分支先抛 `TypeError` → 落进外层 `catch` → `catch` 里**还是**
+> `ctx.bubble.appendChild` → **再抛一次且无人接** → `finally` 不执行 → `busy` 永远为
+> `true`、输入框与发送键永远禁用 —— **页面当场砖掉,只能刷新**。
+> (以上是从代码读出来的结论,**没有在浏览器里复现过**;Step 1a 之后这条路径才第一次
+> 真正可用。)
+>
+> 确认方式(**确定性、5 秒**):打开 DevTools 控制台,输入
+> ```js
+> Object.keys(addAssistant())          // 必须包含 "bubble"
+> ```
+> 然后**制造一次 error 帧**再看页面是否还能继续发消息。制造方式(任选其一):
+> 把 `.env` 的 key 改成无效值后重启服务;或在控制台里手工喂一帧:
+> ```js
+> handleBlock("event: error\ndata: {\"message\":\"boom\"}", ctx)
+> ```
+> —— 期望:页面出现 ⚠️ 提示,**且发送键仍然可用**。改前做一次(砖)、改后再做一次(不砖),
+> 两次都记进报告。
 
 - [ ] **Step 5: 提交**
 
@@ -3306,6 +3404,15 @@ PY
 
 预期:输出的 `trace` 里能看到 `retrieve_knowledge:... > confidence_gate:pass > ...` ——
 这就是验收 1 的权威证据(强制检索节点被走到)。
+
+> ⚠️ **两点口径**(T7 复评提出):
+> 1. `out["trace"]` 是**未切片的累积通道**。这里只跑一次、且 thread 是这个脚本
+>    新建的,所以它等于当轮 —— **但别把它当通用做法**。权威性来自 `log_turn`
+>    打的那行**日志**(那行是切过片的,`nodes.py:358`),不是这个返回值。
+>    要在同一 thread 上跑第二次,必须改用日志行或 `stream_mode="custom"` 的
+>    `trace` 帧,否则读到的是两轮的拼接。
+> 2. 这个片段**照抄自 Step 1 的脚本骨架**,`build_graph` 的签名若在 T7/T8 落地时
+>    有出入,以 `app/agent/graph.py` 的实况为准(先读再用)。
 
 - [ ] **Step 4: 提交**
 
