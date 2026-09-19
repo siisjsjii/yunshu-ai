@@ -3255,17 +3255,32 @@ netstat -ano | grep ":8000"     # 先查僵尸进程,再起
 > (以上是从代码读出来的结论,**没有在浏览器里复现过**;Step 1a 之后这条路径才第一次
 > 真正可用。)
 >
-> 确认方式(**确定性、5 秒**):打开 DevTools 控制台,输入
-> ```js
-> Object.keys(addAssistant())          // 必须包含 "bubble"
-> ```
-> 然后**制造一次 error 帧**再看页面是否还能继续发消息。制造方式(任选其一):
-> 把 `.env` 的 key 改成无效值后重启服务;或在控制台里手工喂一帧:
-> ```js
-> handleBlock("event: error\ndata: {\"message\":\"boom\"}", ctx)
-> ```
-> —— 期望:页面出现 ⚠️ 提示,**且发送键仍然可用**。改前做一次(砖)、改后再做一次(不砖),
-> 两次都记进报告。
+> **确认方式(必须实测,不许只读代码)。**
+>
+> ⚠️ **这一版计划原本给的是"在 DevTools 控制台里跑 `Object.keys(addAssistant())` /
+> `handleBlock(..., ctx)`" —— 已订正,那样跑必红。** 整个脚本包在
+> `(() => { ... })();` 里(`index.html:248` 开、`:501` 闭),带 `"use strict"`,
+> 且**全文件零个 `window.` 赋值** —— 所以 `addAssistant`、`handleBlock` **从控制台
+> 一律够不到**,只会得到 `ReferenceError`;而 `ctx` 本身是 `send()` 里的 `const`
+> (`:386`),函数作用域,任何情况下都拿不到。
+>
+> 改用**网络层**触发:确定性、不改代码、不用重启,而且打到的是读 `ctx.bubble` 的
+> 两处之一(`catch` 分支):
+>
+> 1. 起服务,浏览器开 `http://localhost:8000`(先 `netstat -ano | grep ":8000"` 查僵尸)。
+> 2. DevTools → Network → Throttling → **Offline**。
+> 3. 发一条消息(`fetch` 会 reject → 落进 `catch` → `ctx.bubble.appendChild`)。
+> 4. 期望(**改后**):出现 ⚠️「连接中断(...)」,**且输入框与发送键仍然可用**,
+>    可以接着发下一条。
+> 5. 把 Throttling 调回 **No throttling**。
+>
+> **必须再做一次"改前"的对照**,否则「Step 1a 修掉了砖机」就只是读代码读出来的结论:
+> 把 `return { bubble, badges, body, citations: [] };` 里的 **`bubble,` 临时删掉**
+> → 重复 2–4 → 这次**必须**看到页面砖掉(⚠️ 出现之后输入框与发送键**永久禁用**,
+> 只能刷新恢复)→ 还原那一行。
+>
+> 两次现象都写进报告。**"改前"那一次是这条结论唯一的实测依据** ——
+> 没做就只能写"从代码读出",那不算验证。
 
 - [ ] **Step 5: 提交**
 
