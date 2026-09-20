@@ -13,9 +13,12 @@ fixture 是**模块局部**的(`tests/` 没有 `__init__.py`,别的模块取不�
 在此重建一个。
 """
 
+import asyncio
+
 import httpx
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
 
 from app.api import chat as chat_api
 from app.config import Settings, get_settings
@@ -136,10 +139,15 @@ async def test_creates_row_with_valid_category(client_factory):
             )
         ).scalars().one()
         assert row.reason_category == REFUND_REASON_CATEGORIES[0]
-        # 上面 `.one()` 已经证明"有行";这里再钉住**写进去的是请求里的那单** ——
-        # 只回显请求、库里却写常量(order_no 写死 / conversation_id 用错 id)的实现
-        # 能骗过 response 那两行断言,骗不过这一条。
+        # 上面 `.one()` 已经证明"有行";下面把响应体**逐字段**钉回库行 ——
+        # 只回显请求、库里却写常量(order_no 写死 / conversation_id 用错 id /
+        # status 硬编码 "pending")的实现能骗过纯响应断言,骗不过这一组。
+        # `status` 尤其要两边都断:响应里硬编码的 "pending" 恰好等于 ORM `default`
+        # 与 DDL `server_default` 两层的值,只看响应是看不出来的。
         assert row.order_no == body["order_no"]
+        assert row.status == body["status"]
+        assert row.conversation_id == body["conversation_id"] == SCRATCH
+        assert row.created_at.isoformat() == body["created_at"]
 
 
 @pytest.mark.anyio
@@ -151,21 +159,35 @@ async def test_rejects_category_outside_the_closed_set(client_factory):
     assert await _rows_for_scratch() == []
 
 
+async def _db_is_down(*a, **k):
+    """写库时数据库连不上。**裸 SQLAlchemy 错误** —— 见下面用例的 docstring。"""
+    raise OperationalError("INSERT INTO refund_requests", {}, Exception("连接断开"))
+
+
 @pytest.mark.anyio
-async def test_infra_failure_is_502_not_500(client_factory, monkeypatch):
-    """基础设施故障一律 502 + 固定文案,不是 FastAPI 默认的 500。"""
+async def test_infrastructure_failure_returns_502_not_500(client_factory, monkeypatch):
+    """数据库故障必须是 502 + **固定文案**,不是 FastAPI 默认的 500。
+
+    **注入的是裸 `OperationalError`,不是 `ToolInfrastructureError`** —— 这一条是
+    本用例的要害,写错整条就废了。`ToolInfrastructureError` 是
+    `app/tools/executor.py:89-91` 那张分类表的**产物**,而本端点手写写库、不经过
+    executor。注入一个"已经翻译好"的错误,等于**跳过被验的那一步**:在"真故障返回
+    500、`except ToolInfrastructureError` 是死代码"的实现下,它照样绿 —— 这正是本
+    仓定义的假绿,也是 ch05 spec §8.2 记账的那条(`tests/test_api_ticket.py:151-212`
+    就是这个改法的样板)。
+
+    断言固定文案而不只是状态码:502 也可能是别的分支给的,文案才钉住"这是本仓定的
+    那条基础设施答复"。原始异常文本**不得**出站(`OperationalError` 的 `str()` 里
+    带着 SQL 语句)。
+    """
     import app.api.refund as mod
 
-    async def boom(*a, **k):
-        from app.tools.errors import ToolInfrastructureError
-
-        raise ToolInfrastructureError("数据库暂时不可用")
-
-    monkeypatch.setattr(mod, "_persist", boom)
+    monkeypatch.setattr(mod, "_persist", _db_is_down)
     client = client_factory()
     r = await client.post("/api/refund", json=_body())
     assert r.status_code == 502
-    assert await _rows_for_scratch() == []
+    assert r.json()["detail"] == "数据服务暂时不可用"
+    assert "INSERT INTO refund_requests" not in r.text
 
 
 @pytest.mark.anyio
@@ -199,8 +221,12 @@ async def test_lock_is_released_on_every_exit_path(client_factory, monkeypatch):
 
     持锁的锁既不被 TTL 也不被 LRU 回收,而且退款端点与对话端点共用同一个注册表,
     泄漏会连带毒掉聊天。两条路径分开断,是因为它们对应两种不同的写错法:把
-    `finally: lock.release()` 删掉,成功那条红;把它挪进 `except ToolInfrastructureError`
-    里(只给异常路径放锁),失败那条绿而成功这条红。
+    `finally: lock.release()` 删掉,两条都红;把它挪进某个 `except` 里(只给异常
+    路径放锁),失败那条绿而成功这条红。
+
+    失败路径注入的仍是**裸 `OperationalError`**(复用 `_db_is_down`),理由同
+    `test_infrastructure_failure_returns_502_not_500`:注入已翻译的错误会绕开被验
+    的那一步。
 
     等锁超时是 0.15s(`client_factory` 的默认),真漏了放锁,第二次请求会在 0.15s 内
     变红,而不是用默认的 60s 把测试挂死。
@@ -215,12 +241,7 @@ async def test_lock_is_released_on_every_exit_path(client_factory, monkeypatch):
     assert [ok_first.status_code, ok_second.status_code] == [200, 200]
 
     # 失败路径
-    async def boom(*a, **k):
-        from app.tools.errors import ToolInfrastructureError
-
-        raise ToolInfrastructureError("数据库暂时不可用")
-
-    monkeypatch.setattr(mod, "_persist", boom)
+    monkeypatch.setattr(mod, "_persist", _db_is_down)
     bad_first = await client.post("/api/refund", json=_body())
     bad_second = await client.post("/api/refund", json=_body())
     assert bad_first.status_code == 502
@@ -228,4 +249,44 @@ async def test_lock_is_released_on_every_exit_path(client_factory, monkeypatch):
     assert bad_second.status_code == 502
 
     # 顺带断一次锁对象本身,便于定位(上面两条都在断"会话仍可用"这件事)。
+    assert client.store.lock_for(SCRATCH).locked() is False
+
+
+@pytest.mark.anyio
+async def test_cancelled_request_releases_lock(client_factory, monkeypatch):
+    """**取消**也必须放锁 —— `CancelledError` 是 `BaseException`,不是 `Exception`。
+
+    这条路径在本端点上确实是结构安全的(持锁之后的整段都在一个 `try/finally` 里,
+    且 `acquire()` 成功到进 `try` 之间**没有 await**),但本仓的规矩是「每一条退出
+    路径都要有**具名测试**」—— 而"结构上必然安全"正是复盘时吃过亏的那种论证:
+    把 `finally` 换成一个只捕 `Exception` 的 `except` 分支,这段代码**读起来依然对**
+    (谁会把 `CancelledError` 当异常呢),只有这条用例会红。
+
+    做法:把 `_persist` 卡在一个**永不 set 的 Event** 上 —— 请求因此停在"已持锁"的
+    状态里 —— 确认锁真被持住之后 cancel 掉那个任务,再断锁已释放。
+    `locked() is True` 那一步是必要的:没有它,若 `_persist` 压根没被调到,
+    后面 `locked() is False` 会因为"锁从来没被拿过"而恒真。
+    """
+    import app.api.refund as mod
+
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hang(*a, **k):
+        entered.set()
+        await never.wait()
+        raise AssertionError("取消之后不该继续执行")
+
+    monkeypatch.setattr(mod, "_persist", hang)
+    client = client_factory()
+
+    task = asyncio.create_task(client.post("/api/refund", json=_body()))
+    await entered.wait()
+    # 前置条件:此刻端点确实**持着**那把锁(否则下面的 False 是恒真的)。
+    assert client.store.lock_for(SCRATCH).locked() is True
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     assert client.store.lock_for(SCRATCH).locked() is False

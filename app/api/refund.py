@@ -7,8 +7,10 @@
 """
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.chat import get_store          # 复用同一把会话锁的单例依赖
@@ -22,7 +24,29 @@ from app.schemas import RefundRequestIn
 from app.services.history import ensure_conversation
 from app.tools.errors import ToolInfrastructureError
 
+logger = logging.getLogger(__name__)
+
+#: 基础设施故障对外的**固定文案**。**与 `app/tools/executor.py:91` 同一条**
+#: (spec §5.3 / §8:「502 + 固定文案」)—— 不是这里另立的一份。原始异常只进
+#: 服务端日志(`logger.exception`),不出站:出站文本里带上游异常原文会把
+#: 「服务端出问题」的细节泄漏给调用方。
+INFRA_FAILURE_DETAIL = "数据服务暂时不可用"
+
 router = APIRouter()
+
+
+def _infra_failure(api_key: str) -> HTTPException:
+    """基础设施故障 → 502 + 固定文案。
+
+    两条 `except` 共用,是为了让 502 的文案**只有一处** —— 分头写两份的话,
+    下一次改文案必然漏掉一条。仍然过一遍 `redact_api_key`(spec §8:出站文本
+    一律过它):字面量本身不含密钥,但把"所有出站文本都过同一个出口"这条规则
+    留成无例外的,比每次判断"这个字符串要不要脱敏"可靠。
+    """
+    return HTTPException(
+        status_code=502,
+        detail=redact_api_key(INFRA_FAILURE_DETAIL, api_key),
+    )
 
 
 async def _persist(session, request: RefundRequestIn) -> RefundRequest:
@@ -47,10 +71,11 @@ async def create_refund(
 ) -> dict:
     """退款表单的提交入口:一行 `refund_requests` + 回填的 id / status。
 
-    **类目校验先于任何 IO**(`pytest` 断的就是这个顺序):不在固定集里就是请求语义
-    错 → 422,一行都不写。2024-09 的实现若把校验放在 `session.add` 之后,"先落库
-    再校验"照样能返回 422,库里却留了行 —— 调用方看到的是拒绝,数据库里是一次
-    成功的退款申请。
+    **类目校验先于任何 IO**:不在固定集里就是请求语义错 → 422,一行都不写。
+    顺序是有载荷的 —— 把校验挪到 `session.add` 之后,"先落库再校验"同样会返回
+    422,库里却已经留了行:调用方看到的是**拒绝**,数据库里却是一次**成功的
+    退款申请**。`test_rejects_category_outside_the_closed_set` 断的就是这个
+    (只看状态码是看不出来的)。
 
     **锁只在一处释放**:`lock.acquire()` 之后的全部退出路径(成功、502、
     以及 `CancelledError` 这类 `BaseException`)都走同一个 `finally`。这与
@@ -89,12 +114,23 @@ async def create_refund(
             "created_at": row.created_at.isoformat(),
         }
     except ToolInfrastructureError as exc:
-        # 基础设施故障必须变 502 + 固定文案,**不是** FastAPI 默认的 500 ——
-        # 500 会把「服务端出问题」说成「你的请求有问题」,与本仓既定的错误语义
-        # 边界不一致(CLAUDE.md:上游/基础设施故障一律 502)。这里的文本是
-        # 出站文本,一律过脱敏(纵深防御:密钥可能出现在上游异常里)。
-        raise HTTPException(
-            status_code=502, detail=redact_api_key(str(exc), settings.openai_api_key)
-        ) from exc
+        # 纵深防御。**今天这条在本端点不可达**:`ToolInfrastructureError` 全仓只有
+        # `app/tools/executor.py:89-91` 一个产地,而本端点手写写库、不经过 executor;
+        # `ensure_conversation`(`app/services/history.py`)也只是裸 DB I/O。
+        # 留着是为了 `_persist` 将来改成委托给别处时不会静默退回 500。
+        logger.exception("退款单提交命中基础设施故障")
+        raise _infra_failure(settings.openai_api_key) from exc
+    except SQLAlchemyError as exc:
+        # **这条才是真会发生的**:`_persist` / `ensure_conversation` 里任何一次
+        # 写库失败(MySQL 连不上是最可能的那个)抛的都是裸 `SQLAlchemyError`。
+        # 不接它,FastAPI 默认返回 **500**,把「服务端出问题」说成「你的请求有
+        # 问题」—— 与 spec §5.3 / §8 的错误语义边界相悖。ch05 spec §8.2 记的是
+        # 同一类缺陷(那边靠 executor 的分类表,这边没有可依赖的翻译层)。
+        #
+        # 分类成「基础设施」是成立的:三个入参的 `max_length` 都对齐了各自列宽
+        # (见 `RefundRequestIn`),到不了 DataError;`ensure_conversation` 的建会话
+        # 竞态又已被会话锁关掉。剩下的 SQLAlchemyError 就是连接/运维类的。
+        logger.exception("退款单提交命中数据库故障")
+        raise _infra_failure(settings.openai_api_key) from exc
     finally:
         lock.release()
