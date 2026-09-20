@@ -159,8 +159,9 @@ class ChatState(TypedDict):
 
 - **位置**:`retrieve_knowledge` 之后、`agent` 之前。理由就是用户说的「Agent 的答复是
   流式吐给用户的,**答完再判就晚了**」。
-- **判据**:`evidence` 非空 且 `max(score) >= settings.retrieval_score_threshold`(0.58,
-  ch04 实测得出)。
+- **判据**:`evidence` 非空 且 `max(score) >= settings.retrieval_score_threshold`(原 0.58,
+  **2026-09-20 已改为 0.25**,见 §12 订正;0.58 是 ch03 在 dense 余弦上标定的,
+  ch04 换混合+重排时原值沿用)。
 - **不通过**:回兜底话术、**不进 Agent**、问题落 `low_confidence_questions`
   (`entry_point="置信度闸"`)留给后续数据飞轮。
 - **business 出口不走这道闸**:业务数据类没有检索证据,证据强弱无从谈起(用户明确)。
@@ -311,7 +312,7 @@ async for chunk in graph.astream(state, config={"configurable": {"thread_id": se
 | `max_agent_steps` | 5 | ReAct 最大步数,超限强制收敛 |
 | `agent_token_budget` | 20000 | Agent 累计 token 上限,超限强制收敛 |
 
-复用:`retrieval_score_threshold`(0.58,置信度闸)、`retrieval_top_k`、
+复用:`retrieval_score_threshold`(原 0.58,**2026-09-20 已改为 0.25**,见 §12 订正)、`retrieval_top_k`、
 `tool_timeout_seconds`、`session_lock_timeout_seconds`。
 
 `requirements.txt` 补 `langgraph==1.2.11`(已装但未登记)。
@@ -386,3 +387,27 @@ ch05 起它**只返回裁剪后的历史** —— 消息组装搬进了图里:�
 钉它的用例:`tests/test_api_ticket.py::test_infrastructure_failure_returns_502_not_500`,
 连同失败退出路径**放锁**(漏放 = 该会话永久 409,且 ticket 与 chat 共用同一个
 进程级 `_store`,会连带毒掉聊天)与 **409 分支**两条,本文件 2 → 5 条。
+
+### §5.4/§11 之订正:`retrieval_score_threshold` 0.58 → 0.25(2026-09-20,跨章缺陷)
+
+§5.4 与 §11 都按「复用 ch04 的值 0.58」写,而**该值自 ch04 换了检索链路起就已不
+适用** —— 本章只是第一个被它咬出**用户可见**故障的章节。0.58 的来源是 ch03 在
+**dense 余弦**分数上标定(正例最低 0.609 / 干扰最高 0.560,可用区间仅 0.049 宽);
+ch04 把检索换成混合 + 重排后,阈值卡的是重排器 `compute_score(normalize=True)`
+输出的 **sigmoid** 分数,两个尺度**不可通约**。
+
+**症状(本章三个验收同时红的根因)**:knowledge 出口的强制预检索**正常跑了**,
+但正确块被 0.58 整体滤空 → `evidence` 为空 → 置信度闸 `fail` → `fallback_reply`,
+用户拿到「抱歉,我没太理解您的意思」。**不报错、不写日志**,trace 里只看得到
+`retrieve_knowledge:0 hits`(节点跑了、只是没命中)—— 所以只看 trace 是否含
+`retrieve_knowledge` 是**判不出**这个故障的。
+
+**2026-09-20 在重排链路上重测并拍板改为 0.25**:能命中的正例 top-1 最低 **0.389** /
+干扰项 top-1 最高 **0.114** → 可用区间 `(0.114, 0.389]` 取中点;23 条用例 0.58 得
+9/23、0.25 得 13/23(其余 10 条与阈值无关,检索质量问题单独记账)。**判据本身没动**
+(仍是 `evidence` 非空且 `max(score) >= 阈值`,零额外模型调用),只换了那个数的尺度。
+**可回退**:改回 0.58 即恢复改前行为。
+
+连带:`evals/run_retrieval_eval.py` 自 ch04 起就跑不动(`KnowledgeRetriever` 多了必填
+的 `reranker`,而它的 `--dist` 分支还停在 dense 单路)——**这正是 0.58 两章没被复核
+的机制原因**,该脚本本轮一并修好。

@@ -134,6 +134,22 @@ print(",".join(states))
 '
 }
 
+# 取「某个工具的每次调用」的结果(逗号分隔;从未调用 → 空)。
+# **按下标配对**,不要分别在两个列表里做包含匹配:`called_tools` 与
+# `tool_result_states` 是同序的,而 `*query_faq*` + `*ok*` 这种分开的包含匹配会
+# 把「Agent 调了 query_faq 但**它失败了**,另一次别的调用成功」判成通过 —— 那正是
+# 假绿(知识没召回到,断言却绿了)。
+states_of_tool() {
+  NAMES="$1" STATES="$2" NEEDLE="$3" "$PYTHON" -c '
+import os, sys
+
+names = os.environ["NAMES"].split(",")
+states = os.environ["STATES"].split(",")
+needle = os.environ["NEEDLE"]
+picked = [states[i] for i, n in enumerate(names) if n == needle and i < len(states)]
+sys.stdout.buffer.write(",".join(picked).encode("ascii"))'
+}
+
 # 从**最后一帧(done)**的 data 里取一个字段;取不到输出空。
 # 同 join_tokens:按字节读写 stdin/stdout。done 帧里除了 ASCII 的 trace/intent
 # 还有模型输出,文本模式在 cp936 管道上会解成乱码甚至抛 UnicodeEncodeError
@@ -609,38 +625,51 @@ JSON
 
 TOOLS6=$(echo "$OUT6" | called_tools)
 STATES6=$(echo "$OUT6" | tool_result_states)
+QF6=$(states_of_tool "$TOOLS6" "$STATES6" query_faq)
 TRACE6=$(echo "$OUT6" | done_field trace)
+INTENT6=$(echo "$OUT6" | done_field intent)
 CITES6=$(echo "$OUT6" | citations_count)
 REPLY6=$(echo "$OUT6" | join_tokens)
-echo "  调用的工具:[$TOOLS6]  结果:[$STATES6](ch05 起知识路由不发工具帧,空是正常的)"
-echo "  citations 帧条目数:$CITES6"
+echo "  调用的工具:[$TOOLS6]  结果:[$STATES6]"
+echo "  intent=$INTENT6  citations 帧条目数:$CITES6  query_faq 调用结果:[$QF6]"
+echo "  trace=$TRACE6"
 echo "  回复:$REPLY6"
 
-# 判据同验收 5,但**本题面的意图是摇摆的**(2026-09-20 实测 12 次:7 次判
-# 「物流」→ BUSINESS → Agent 自己调 query_faq —— 那条路上**没有** citations
-# 帧、trace 里也**没有** retrieve_knowledge;5 次判「商品咨询」→ 知识路由)。
-# 于是下面两条**路由类**断言(① trace 有 retrieve_knowledge、② citations >= 1)
-# 在「物流」那一支上必然红 —— 那是**意图分类的摇摆**(与 ch05 验收 5 同类,
-# 见 `scripts/acceptance_ch05.sh` 里那段),不是链路缺陷。
-# 与路由无关、每次都必须成立的是 ③(没跌进兜底)与最后的**运费要点内容断言**,
-# 后者因此从「辅助」升为本题面的主证据。
-# 注:旧断言 `TOOLS6 = query_faq` 同属路由类,它恰好在「物流」那一支上通过 ——
-# 也就是说这条验收**在改动前后都是抛硬币**,只是通过的那一面换了。
+# ⚠️ 本条**断需求,不断机制**:需求是「换种说法也要能召回运费条款」,
+# 而本题面的**意图标签会摇**(2026-09-20 实测 12 次:7 次判「物流」→ BUSINESS
+# → Agent 自己调 query_faq;5 次判「商品咨询」→ KNOWLEDGE → 强制预检索)。
+# 两条路**都真的召回了运费条款、都答对了**(用户可见结果一致),所以断言认两条:
+#   A 知识路由:done 帧 trace 含 retrieve_knowledge **且** citations 帧 items >= 1
+#   B Agent 路由:Agent 自己调了 query_faq **且该次调用有结果(ok)**
+# 走通任一条即为「召回到了」。
+#
+# **主次关系(别弄反)**:真正承重的是 ② citations >= 1 / query_faq 调用 ok
+# (「证据真的到了」)与 ③ 不含兜底话术(「用户没拿到那句抱歉」)。
+# A 里的 `trace 含 retrieve_knowledge` **不是主判据、也当不了主判据** ——
+# 链路坏掉时(检索被阈值滤空)trace 里**照样**有 `retrieve_knowledge:0 hits`,
+# 节点跑了、只是没命中,所以它对「召回失败」这一类故障**没有判别力**
+# (2026-09-20 用合成流验过)。它在这里只起「标记走的是哪条路」的作用。
+#
+# 记账:旧断言(`TOOLS6 = query_faq` 且 `STATES6 = ok`)是**同一枚硬币的另一面**
+# —— 它只在「物流」路上通过、在「商品咨询」路上失败。也就是说本条验收
+# **在 ch05 改动前后都是抛硬币**,这次的红不是 ch05 引入的。
+A6=no
+case "$TRACE6" in
+  *retrieve_knowledge*)
+    if [ "${CITES6:-0}" -ge 1 ] 2>/dev/null; then A6=yes; fi;;
+esac
+B6=no
+case ",$QF6," in *,ok,*) B6=yes;; esac
+
 if echo "$OUT6" | grep -q "event: error" && [ "$TRACE6" = "null" ]; then
   fail "端点发了 error 帧、没有 done 帧(基础设施故障,不是路由问题):$(echo "$OUT6" | grep -A1 'event: error' | tail -1)"
+elif [ "$A6" = "yes" ] || [ "$B6" = "yes" ]; then
+  pass "运费条款被召回(A 知识路由=$A6 / B Agent 调 query_faq 且 ok=$B6)"
 else
-  case "$TRACE6" in
-    *retrieve_knowledge*) pass "trace 里有强制检索节点(走了知识路由):$TRACE6";;
-    *) fail "trace 里没有 retrieve_knowledge —— 没走知识路由:$TRACE6"
-       echo "     ↳ 先确认 8000 上跑的不是 ch02 的旧进程,再确认 build_kb 跑过"
-       echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)";;
-  esac
-fi
-
-if [ "${CITES6:-0}" -ge 1 ] 2>/dev/null; then
-  pass "citations 帧有 $CITES6 条证据(检索返回了非空块,不是关键词命中)"
-else
-  fail "没有 citations 帧或条目为 0(检索被阈值滤空,或根本没检索)"
+  fail "两条路都没走通,知识没召回到:intent=$INTENT6 cite=$CITES6 qf=[$QF6] trace=$TRACE6"
+  echo "     ↳ B 需要「Agent 真的调了 query_faq 且那次调用 ok」;A 需要「知识路由 + citations >= 1」。"
+  echo "       两者都空:先确认 8000 上跑的不是旧进程,再确认 build_kb 跑过"
+  echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)"
 fi
 
 if [ "$(echo "$REPLY6" | has_fallback)" = "no" ]; then

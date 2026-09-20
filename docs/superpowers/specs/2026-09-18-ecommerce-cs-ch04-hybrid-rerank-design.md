@@ -195,7 +195,7 @@ CREATE TABLE low_confidence_questions (
 
 ## 12. 配置项
 
-`retrieval_score_threshold`(0.58)、`retrieval_top_k` 沿用;新增可加 `rerank_top_k`(默认 10)、`hybrid_top_k`(默认 50)。其余复用 ch03/ch04。
+`retrieval_score_threshold`(0.58 —— ⚠️ **2026-09-20 已改为 0.25**,见 §13 订正)、`retrieval_top_k` 沿用;新增可加 `rerank_top_k`(默认 10)、`hybrid_top_k`(默认 50)。其余复用 ch03/ch04。
 
 ## 13. 实现订正
 
@@ -225,3 +225,21 @@ CREATE TABLE low_confidence_questions (
 `huggingface_hub` 的 httpx 对 hf-mirror.com 报 SSL 证书校验失败(certifi 不含其
 CA),而 curl 能连。故改 curl 直下 6 个文件(config/safetensors/tokenizer 等)到
 `models/bge-reranker-v2-m3/`。权重 2.0G,加载 ~25s(同 bge-m3)。
+
+### §12 之订正:`retrieval_score_threshold` 0.58 → 0.25(2026-09-20,跨章缺陷)
+
+§12 写的「`retrieval_score_threshold`(0.58) 沿用」**在当时是对的、事后被证否**。
+0.58 的来源是 ch03 在 **dense 余弦**分数上标定(正例 top-1 最低 0.609 / 干扰项
+top-1 最高 0.560,可用区间仅 0.049 宽),而本章把检索换成**混合 + 重排**之后,
+阈值卡的是重排器 `compute_score(normalize=True)` 输出的 **sigmoid** 分数 ——
+两个尺度**不可通约**。原值沿用等于拿余弦的尺子去量 sigmoid,后果是**正确块被整体
+滤空**:实测自然长问句 rerank 分 0.27~0.34(正确块在内),0.58 下一条都不过。
+它**不报错**,只让用户拿到兜底话术。
+
+**2026-09-20 在重排链路上重测**(`evals/run_retrieval_eval.py`,ch03 那 23 条用例):
+能命中的正例 top-1 最低 **0.389** / 干扰项 top-1 最高 **0.114** → 可用区间
+`(0.114, 0.389]`,取中点 **0.25**(两侧余量各约 0.135)。同一批用例 0.58 得 9/23、
+0.25 得 13/23;其余 10 条与阈值无关(检索质量问题,单独记账)。
+
+**可回退**:改回 0.58 即恢复本次改动前的行为。依据与推导写在 `app/config.py`
+该字段旁的注释里(数字要有出处是本仓的规矩)。

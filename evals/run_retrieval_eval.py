@@ -201,12 +201,6 @@ async def main() -> None:
         scores.append(hits)
         emit(f"\n===== 第 {run + 1} 遍:{hits}/{len(cases)} = {hits / len(cases):.1%}"
              f"(耗时 {time.perf_counter() - started:.1f}s)=====")
-        if args.dist:
-            for r in results:
-                case, chunks = r["case"], r["chunks"]
-                top = chunks[0].answer[:34].replace("\n", " ") if chunks else "—"
-                flag = "✓" if r["ok"] else "✗"
-                emit(f"  {flag} {case['query'][:18]:20} {r['why'][:28]:30} top={top}")
 
     if args.repeat > 1:
         emit(f"\n稳定性:{scores}(每遍一致 = 检索链路确定性 OK)")
