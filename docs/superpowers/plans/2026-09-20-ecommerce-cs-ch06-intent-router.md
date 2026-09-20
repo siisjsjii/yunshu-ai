@@ -702,6 +702,20 @@ class IntentResult(BaseModel):
     )
 ```
 
+> **预检订正(PF-1)**:`confidence` 不能只停在 state —— spec §4.2 要求它**进 done 帧**。
+> 本任务负责把 `log_turn` 的 `trace` 帧载荷加上它(T8 再透到 done 帧),
+> 否则这条链路只做了一半。
+
+`app/agent/nodes.py` 的 `log_turn` 里那一帧加 `confidence`(现为 `nodes.py:360-362`,
+只带 `trace` / `intent` / `gate_passed` / `agent_steps`):
+
+```python
+        emit({"frame": "trace", "trace": full_trace,
+              "intent": state.get("intent"), "gate_passed": state.get("gate_passed"),
+              "agent_steps": state.get("agent_steps") or 0,
+              "confidence": state.get("confidence")})
+```
+
 `app/agent/nodes.py` 的 `classify_intent` 返回值改为:
 
 ```python
@@ -867,8 +881,14 @@ RESOLVE_SYSTEM_PROMPT = """你在做电商客服对话的**指代消解与问题
 ```
 
 `app/agent/nodes.py` 的 `make_resolve_references_node` 改为收 `model`,
-try 里调 `build_resolve_messages`,失败则透传原话;重置逻辑**原样保留**且
-新增清 `order_no` / `order_data` / `refund_decision`。
+try 里调 `build_resolve_messages`,失败则透传原话;重置逻辑**原样保留**。
+
+> **预检订正(PF-2)**:本任务**只清既有通道**(`intent` / `evidence` / `gate_passed` /
+> `agent_steps` / `tool_calls_made` / `reply` / `citations` / `choices`)。
+> **不要**在这里清 `order_no` / `order_data` / `refund_decision` ——
+> 那三个通道是 **T7** 才加进 `ChatState` 的,现在写它们会被 LangGraph 忽略或报错,
+> 而那只在**跑图时**才暴露(典型「报错指向别处」)。
+> **通道与它的清零同处一地**:那三个的清零并入 T7。
 
 `app/agent/graph.py` 相应传 `model=model`。
 
@@ -1121,6 +1141,13 @@ Expected: FAIL —— 节点不存在
     refund_decision: bool | None  # None = 还没判
 ```
 
+> **预检订正(PF-2,承 T5)**:这三个通道的**清零也在这里做** ——
+> 在 `make_resolve_references_node` 既有那组重置里加上 `order_no=""`、
+> `order_data={}`、`refund_decision=None`。
+> **通道与它的清零必须同处一地**:T5 已经明确不清它们(那时它们还不存在)。
+> 漏了清零的后果是**静默串轮** —— 上一轮填过的订单号会被这一轮当成本轮槽位,
+> 用户明明在问别的却直接跳进退款子流程。T7 的测试须覆盖这一点。
+
 `app/agent/refund_nodes.py` 的**第一个节点必须极薄**:
 
 ```python
@@ -1280,11 +1307,25 @@ class ChatRequest(BaseModel):
                 ...                                           # 原有的 custom 分支不动
 ```
 
-**两处必须一并处理**:
+**三处必须一并处理**:
 
 1. `request.message` 为 None 且无 `resume` → `422`(请求语义错),别让 `prepare_turn` 拿到 None;
 2. **挂起时 `log_turn` 没跑**,所以这一轮的锁与历史都要照常释放/不落库 —— 现有
    `finally: lock.release()` 已经覆盖,但**不要**在 interrupt 分支里额外写库。
+3. **PF-1 的后半截**:done 帧加上 confidence(承 T4 —— 它已把 confidence 放进
+   `trace` 帧的载荷里):
+
+   ```python
+           yield _frame("done", {
+               "finish_reason": "stop",
+               "usage": None,
+               "trace": final.get("trace") or [],
+               "intent": final.get("intent"),
+               "confidence": final.get("confidence"),      # ← 新增
+               "gate_passed": final.get("gate_passed"),
+               "agent_steps": final.get("agent_steps") or 0,
+           })
+   ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
