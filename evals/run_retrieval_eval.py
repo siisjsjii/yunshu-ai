@@ -74,6 +74,25 @@ def judge(case: dict, chunks) -> tuple[bool, str]:
     return False, f"召回了 {len(chunks)} 条但没有一块同时含 {needed}"
 
 
+def _case_upper_bound(case: dict, chunks) -> tuple[bool, float]:
+    """这条正例的**阈值上界**:含齐期望片段的那些块里的**最大分**。
+
+    **不是 top-1**。`KnowledgeRetriever._rerank` 返回 Top-K,命中 judge 的块
+    **未必是第 1 名**;阈值只要 <= 某个块的分数,那个块就还在结果里,所以
+    「这条用例仍能命中」的临界值 = max(命中块的分数)。拿 top-1 当上界会**偏乐观**:
+    实测(ch03 那 23 条)有一条正例靠第 3 名的 **0.358** 命中,而它的 top-1 是
+    0.766 —— 代理量打出 0.389,正确值只有 0.358。
+
+    needles 的判定与 `judge` 同一组口径(同一 `expect_contains`、同一 `_blob`),
+    这里只是额外要求出分数。
+    """
+    needed = case["expect_contains"]
+    scores = [c.score for c in chunks if all(n in _blob(c) for n in needed)]
+    if not scores:
+        return False, 0.0
+    return True, max(scores)
+
+
 async def _print_distribution(retriever, cases) -> None:
     """打印每条用例的**原始重排分数**(阈值 0,不过滤),用于定阈值。
 
@@ -82,28 +101,28 @@ async def _print_distribution(retriever, cases) -> None:
     是 dense 余弦分、而阈值卡的是重排 sigmoid 分 —— 两者不可通约,照着它定阈值
     必然定错。**这正是 0.58 从未被复核的机制原因**,别再改回去。
 
-    关注两个极值:**能命中用例的最低 top-1 分**(阈值不能高过它)与
+    关注两个极值:**能命中用例的阈值上界的最低值**(阈值不能高过它)与
     **干扰项的最高 top-1 分**(阈值必须高过它)。两者之间就是可用区间。
 
     「能命中」沿用 `judge` 的同一套闭式口径(某一召回块里含齐期望片段),
     与阈值无关:阈值 0 时仍召不回期望块的用例是**检索质量问题**,调阈值救不回来,
     不能把它们的最低分当成区间上界(那样会得出"无干净区间"的错误结论)。
     """
-    positive_tops: list[float] = []
-    negative_tops: list[float] = []
-    hitting_tops: list[float] = []  # 能命中的正例的 top-1 分 → 阈值**上界**
+    positive_tops: list[float] = []   # 各正例的 top-1 —— 只作**分布**看,不参与定界
+    negative_tops: list[float] = []   # 干扰项 top-1 → 区间**下界**
+    upper_bounds: list[float] = []    # 能命中的正例的 `_case_upper_bound` → 区间**上界**候选
     positive_total = missed = empty_cases = 0
 
-    emit("\n===== 原始重排分数分布(阈值 0,当前混合+重排链路,取第 1 名)=====")
+    emit("\n===== 原始重排分数分布(阈值 0,当前混合+重排链路)=====")
     for case in cases:
         chunks = await retriever.search(case["query"])
         top = chunks[0].score if chunks else None
         negative = bool(case.get("expect_empty"))
-        hit, _ = judge(case, chunks)
         if negative:
             if top is not None:
                 negative_tops.append(top)
             mark = "干扰"
+            bound = 0.0
         else:
             positive_total += 1
             if top is None:
@@ -112,29 +131,34 @@ async def _print_distribution(retriever, cases) -> None:
                 empty_cases += 1
             else:
                 positive_tops.append(top)
+            hit, bound = _case_upper_bound(case, chunks)
             if hit:
-                hitting_tops.append(top)
+                upper_bounds.append(bound)
             else:
                 missed += 1
             mark = "正例" if hit else "漏召"
         shown = "   nan" if top is None else f"{top:6.3f}"
-        emit(f"  {mark} {shown}  {case['query']}")
+        tail = f"  上界={bound:.3f}" if mark == "正例" else ""
+        emit(f"  {mark} {shown}  {case['query']}{tail}")
 
     emit("")
     if positive_tops:
-        emit(f"正例 top-1(共 {positive_total} 条,含漏召的):最低 {min(positive_tops):.3f}"
+        # 分母要写准:`positive_tops` 只收**有候选**的正例,无候选的另计。
+        emit(f"正例 top-1(有候选的 {len(positive_tops)} 条 / 正例共 {positive_total} 条"
+             f",另 {empty_cases} 条无候选):最低 {min(positive_tops):.3f}"
              f" / 中位 {statistics.median(positive_tops):.3f} / 最高 {max(positive_tops):.3f}")
     if negative_tops:
         emit(f"干扰 top-1(共 {len(negative_tops)} 条):最高 {max(negative_tops):.3f}"
              f" / 最低 {min(negative_tops):.3f}")
-    if hitting_tops:
-        emit(f"其中**能命中**的正例 {len(hitting_tops)} 条:top-1 最低 {min(hitting_tops):.3f}"
-             f" / 最高 {max(hitting_tops):.3f}   ← 阈值上界取这个最低值")
-    if negative_tops and hitting_tops and max(negative_tops) < min(hitting_tops):
-        emit(f"→ 可用阈值区间:({max(negative_tops):.3f}, {min(hitting_tops):.3f}]"
-             f"  宽 {min(hitting_tops) - max(negative_tops):.3f}")
+    if upper_bounds:
+        emit(f"其中**能命中**的正例 {len(upper_bounds)} 条:各自的阈值上界"
+             f"(含齐期望片段那块的最大分)最低 {min(upper_bounds):.3f}"
+             f" / 最高 {max(upper_bounds):.3f}   ← 区间上界取这个最低值")
+    if negative_tops and upper_bounds and max(negative_tops) < min(upper_bounds):
+        emit(f"→ 可用阈值区间:({max(negative_tops):.3f}, {min(upper_bounds):.3f}]"
+             f"  宽 {min(upper_bounds) - max(negative_tops):.3f}")
     else:
-        emit("→ 无干净区间:干扰项 top-1 与能命中正例的 top-1 重叠 ——"
+        emit("→ 无干净区间:干扰项与能命中的正例在分数上重叠 ——"
              " 这不是调阈值能解决的,要靠 Top-K 或语料层面解决")
     if missed:
         emit(f"注:另有 {missed} 条正例在阈值 0 下也召不回期望块,**与阈值无关**"
@@ -206,15 +230,14 @@ async def main() -> None:
         emit(f"\n稳定性:{scores}(每遍一致 = 检索链路确定性 OK)")
 
     # 失败用例逐条列出 —— 失败信息才是这次评估的产出
-    if not args.dist:
-        failed = [r for r in results if not r["ok"]]
-        if failed:
-            emit(f"\n未命中 {len(failed)} 条:")
-        for r in failed:
-            emit(f"  ✗ {r['case']['query']}({r['case'].get('note', '')})")
-            emit(f"      {r['why']}")
-            for chunk in r["chunks"]:
-                emit(f"      · [{chunk.category[:12]}] {chunk.answer[:44].replace(chr(10), ' ')}")
+    failed = [r for r in results if not r["ok"]]
+    if failed:
+        emit(f"\n未命中 {len(failed)} 条:")
+    for r in failed:
+        emit(f"  ✗ {r['case']['query']}({r['case'].get('note', '')})")
+        emit(f"      {r['why']}")
+        for chunk in r["chunks"]:
+            emit(f"      · [{chunk.category[:12]}] {chunk.answer[:44].replace(chr(10), ' ')}")
 
     await get_engine().dispose()
 

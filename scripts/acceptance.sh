@@ -184,9 +184,41 @@ else:
     sys.stdout.buffer.write(b"0")'
 }
 
+# citations 帧里**至少一条**证据的 question/answer 含运费标志词(输出 yes/no)。
+#
+# 为什么必须查到内容级:`citations` 帧只要 `chunks` 非空就发
+# (`app/agent/nodes.py`),**不区分是哪些块** —— 只数条数的话,「召回了 2 条
+# 与运费无关的块」也会被打成「运费条款被召回」,而判据并**没有**证明这件事
+# (2026-09-20 审查者用这样一条流复现过:条数 >= 1 为真,内容断言为假)。
+# 标志词与下面的内容断言**同一组**,两处口径必须一致。
+citations_has_marker() {
+  "$PYTHON" -c '
+import json, sys
+
+MARKERS = ("99", "包邮", "8 元")
+lines = sys.stdin.buffer.read().decode("utf-8", "replace").splitlines()
+for i, line in enumerate(lines):
+    if line.strip() == "event: citations" and i + 1 < len(lines) and lines[i + 1].startswith("data: "):
+        items = json.loads(lines[i + 1][6:]).get("items") or []
+        found = False
+        for item in items:
+            text = str(item.get("question", "")) + "\n" + str(item.get("answer", ""))
+            if any(m in text for m in MARKERS):
+                found = True
+                break
+        sys.stdout.buffer.write(b"yes" if found else b"no")
+        break
+else:
+    sys.stdout.buffer.write(b"no")'
+}
+
 # 文本里是否含**固定兜底话术**。判断放在 Python 里而不是 `grep -F "<中文>"`:
 # 模式若被平台按 CP936 重编码,匹配会恒不命中 —— 于是「回复里没有兜底话术」
 # 这条断言变成**恒真的假绿**,恰好把要防的故障放过去。
+#
+# ⚠️ **空输入返回 `no`**(空文本里当然不含这句话)—— 所以调用方**必须**先判空,
+# 否则端点出错、一个 token 帧都没发时,这条会对着空气打出一行绿
+# (2026-09-20 审查者发现的 Important 2)。现在是调用方(验收 5/6 的 ③)负责。
 has_fallback() {
   "$PYTHON" -c '
 import sys
@@ -598,7 +630,11 @@ else
   fail "没有 citations 帧或条目为 0(检索被阈值滤空,或根本没检索)"
 fi
 
-if [ "$(echo "$REPLY5" | has_fallback)" = "no" ]; then
+# ③ 空回复**判红**(同验收 6 那段):`has_fallback` 对空输入返回 `no`,
+# 不先判空的话,端点出错、一个 token 帧都没发时这里会白打一行绿。
+if [ -z "$REPLY5" ]; then
+  fail "回复为空 —— 没有任何 token 帧(端点出错?)。「没跌进兜底」在空回复上不成立,不给绿"
+elif [ "$(echo "$REPLY5" | has_fallback)" = "no" ]; then
   pass "回复没有跌进兜底话术(没走 fallback_reply)"
 else
   fail "回复是兜底话术 —— 走了 fallback_reply:$REPLY5"
@@ -629,9 +665,10 @@ QF6=$(states_of_tool "$TOOLS6" "$STATES6" query_faq)
 TRACE6=$(echo "$OUT6" | done_field trace)
 INTENT6=$(echo "$OUT6" | done_field intent)
 CITES6=$(echo "$OUT6" | citations_count)
+MARK6=$(echo "$OUT6" | citations_has_marker)
 REPLY6=$(echo "$OUT6" | join_tokens)
 echo "  调用的工具:[$TOOLS6]  结果:[$STATES6]"
-echo "  intent=$INTENT6  citations 帧条目数:$CITES6  query_faq 调用结果:[$QF6]"
+echo "  intent=$INTENT6  citations 帧条目数:$CITES6  含运费标志词:$MARK6  query_faq 调用结果:[$QF6]"
 echo "  trace=$TRACE6"
 echo "  回复:$REPLY6"
 
@@ -639,16 +676,30 @@ echo "  回复:$REPLY6"
 # 而本题面的**意图标签会摇**(2026-09-20 实测 12 次:7 次判「物流」→ BUSINESS
 # → Agent 自己调 query_faq;5 次判「商品咨询」→ KNOWLEDGE → 强制预检索)。
 # 两条路**都真的召回了运费条款、都答对了**(用户可见结果一致),所以断言认两条:
-#   A 知识路由:done 帧 trace 含 retrieve_knowledge **且** citations 帧 items >= 1
+#   A 知识路由:done 帧 trace 含 retrieve_knowledge
+#              **且** citations 帧 items >= 1 **且** 其中至少一条的
+#              question/answer 含运费标志词(`citations_has_marker`)
 #   B Agent 路由:Agent 自己调了 query_faq **且该次调用有结果(ok)**
-# 走通任一条即为「召回到了」。
+# 走通任一条即为「走通了」。
 #
-# **主次关系(别弄反)**:真正承重的是 ② citations >= 1 / query_faq 调用 ok
-# (「证据真的到了」)与 ③ 不含兜底话术(「用户没拿到那句抱歉」)。
-# A 里的 `trace 含 retrieve_knowledge` **不是主判据、也当不了主判据** ——
+# A 的第三项是 2026-09-20 审查后**收紧**的:citations 帧只要 chunks 非空就发、
+# 不区分是哪些块,所以「条数 >= 1」只证明「召回了**若干**块」——
+# 一条**召回 2 条无关块**的流能让旧判据打绿,而通过语却声称「运费条款被召回」。
+#
+# **主次关系(别弄反)**:真正承重的是 A 的 citations(条数 + 内容)与
+# B 的 `ok`(「证据真的到了」),以及 ③ 不含兜底话术。A 里的
+# `trace 含 retrieve_knowledge` **不是主判据、也当不了主判据** ——
 # 链路坏掉时(检索被阈值滤空)trace 里**照样**有 `retrieve_knowledge:0 hits`,
 # 节点跑了、只是没命中,所以它对「召回失败」这一类故障**没有判别力**
-# (2026-09-20 用合成流验过)。它在这里只起「标记走的是哪条路」的作用。
+# (2026-09-20 用合成流与 8001 真链路各验过一次)。它只起「标记走的是哪条路」的作用。
+#
+# **两条路能证明的东西不对称,通过语因此不对称(不许说过头)**:
+#   A 有内容级证据(citations 载荷里带 question/answer)→ 可以说「带回了含运费
+#     标志词的块」;
+#   B **没有**内容级证据 —— `tool_result` 帧只带 tool_call_id / ok / summary
+#     (`app/agent/nodes.py`),没有召回文本,所以 B 只能证明「工具返回了非空结果」
+#     (`query_faq` 仅在 0 条时抛 ToolNotFound)。**不为对称去改产品代码多传字段。**
+#   ⇒ 「运费条款是否真被用上」由下面的**运费要点内容断言**负责。
 #
 # 记账:旧断言(`TOOLS6 = query_faq` 且 `STATES6 = ok`)是**同一枚硬币的另一面**
 # —— 它只在「物流」路上通过、在「商品咨询」路上失败。也就是说本条验收
@@ -656,23 +707,30 @@ echo "  回复:$REPLY6"
 A6=no
 case "$TRACE6" in
   *retrieve_knowledge*)
-    if [ "${CITES6:-0}" -ge 1 ] 2>/dev/null; then A6=yes; fi;;
+    if [ "${CITES6:-0}" -ge 1 ] 2>/dev/null && [ "$MARK6" = "yes" ]; then A6=yes; fi;;
 esac
 B6=no
 case ",$QF6," in *,ok,*) B6=yes;; esac
 
 if echo "$OUT6" | grep -q "event: error" && [ "$TRACE6" = "null" ]; then
   fail "端点发了 error 帧、没有 done 帧(基础设施故障,不是路由问题):$(echo "$OUT6" | grep -A1 'event: error' | tail -1)"
-elif [ "$A6" = "yes" ] || [ "$B6" = "yes" ]; then
-  pass "运费条款被召回(A 知识路由=$A6 / B Agent 调 query_faq 且 ok=$B6)"
+elif [ "$A6" = "yes" ]; then
+  pass "知识路由带回了**含运费标志词**的块(A:citations=$CITES6 条,含标志词=$MARK6)"
+elif [ "$B6" = "yes" ]; then
+  pass "Agent 自调 query_faq 拿到了非空结果(B:qf=[$QF6])—— 这条**只证明工具返回了结果**;帧里没有召回文本,运费条款是否真被用上由下面的要点断言负责"
 else
-  fail "两条路都没走通,知识没召回到:intent=$INTENT6 cite=$CITES6 qf=[$QF6] trace=$TRACE6"
-  echo "     ↳ B 需要「Agent 真的调了 query_faq 且那次调用 ok」;A 需要「知识路由 + citations >= 1」。"
+  fail "两条路都没走通:intent=$INTENT6 cite=$CITES6 含标志词=$MARK6 qf=[$QF6] trace=$TRACE6"
+  echo "     ↳ A 需要「知识路由 + citations >= 1 且其中至少一条含运费标志词」;"
+  echo "       B 需要「Agent 真的调了 query_faq 且那次调用 ok」。"
   echo "       两者都空:先确认 8000 上跑的不是旧进程,再确认 build_kb 跑过"
   echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)"
 fi
 
-if [ "$(echo "$REPLY6" | has_fallback)" = "no" ]; then
+# ③ 空回复**判红**:空回复既证明不了「没跌进兜底」,也不该白拿一行绿
+# (端点出错时一个 token 帧都没有,而 has_fallback 对空输入返回 no —— 2026-09-20 审查发现)。
+if [ -z "$REPLY6" ]; then
+  fail "回复为空 —— 没有任何 token 帧(端点出错?)。「没跌进兜底」在空回复上不成立,不给绿"
+elif [ "$(echo "$REPLY6" | has_fallback)" = "no" ]; then
   pass "回复没有跌进兜底话术(没走 fallback_reply)"
 else
   fail "回复是兜底话术 —— 走了 fallback_reply:$REPLY6"

@@ -104,7 +104,12 @@ async def test_infrastructure_failure_propagates_to_502():
 
 @pytest.mark.anyio
 async def test_gate_passes_at_threshold_boundary_inclusive():
-    """0.58 恰好等于阈值 → 通过(与 ch04 的阈值语义一致:>=)。"""
+    """0.58 恰好等于阈值 → 通过(语义是 **`>=`**,边界含等号)。
+
+    ⚠️ 这里的 `0.58` 是**本用例自己传进去的局部阈值**,不是生产默认值
+    (生产默认值由 `tests/test_config.py` 钉,与这里无关)。本用例要验的只是
+    `>=` 这个边界,**换成任何数都成立** —— 别把它读成「生产阈值是 0.58」。
+    """
     session = RecordingSession()
     node = make_confidence_gate_node(
         settings=_settings(retrieval_score_threshold=0.58),
