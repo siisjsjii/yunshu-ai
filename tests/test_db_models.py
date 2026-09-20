@@ -355,14 +355,15 @@ async def test_refund_request_roundtrips_chinese_and_defaults_status():
     """
     await _cleanup_refund_rows()  # 上一轮跑挂了也不污染本轮
     async with get_sessionmaker()() as session:
-        session.add(
-            RefundRequest(
-                conversation_id=SCRATCH_CONVERSATION,
-                order_no=SCRATCH_REFUND_ORDER,
-                reason_category=SCRATCH_REFUND_CATEGORY,
-            )
+        request = RefundRequest(
+            conversation_id=SCRATCH_CONVERSATION,
+            order_no=SCRATCH_REFUND_ORDER,
+            reason_category=SCRATCH_REFUND_CATEGORY,
         )
+        session.add(request)
         await session.commit()
+        # 自增主键提交后已回填(sessionmaker 是 expire_on_commit=False,读它不会触发隐式 IO)。
+        inserted_id = request.id
 
     async with get_sessionmaker()() as session:
         row = (
@@ -375,8 +376,10 @@ async def test_refund_request_roundtrips_chinese_and_defaults_status():
         assert row.reason_category == SCRATCH_REFUND_CATEGORY   # 中文往返
         assert row.order_no == SCRATCH_REFUND_ORDER
         assert row.status == "pending"                          # 默认值
-        assert row.created_at is not None                       # server_default
-        assert row.id is not None                               # 自增主键
+        # 这两条不写 `is not None` —— NOT NULL 列上那是不可能失败的断言(真坏了
+        # 会在 INSERT 就 1048/1364 抛,根本到不了断言),读了会误以为是覆盖。
+        assert row.id == inserted_id              # 读回的就是刚插的那一行
+        assert row.created_at.year >= 2026        # 服务器真的盖了当下的时间戳
 
     await _cleanup_refund_rows()
 

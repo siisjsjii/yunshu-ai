@@ -147,7 +147,7 @@ class QaExtractionStaging(Base):
 
 
 class RefundRequest(Base):
-    """退款单(ch06)。用户在前端表单确认后由 /api/refund 写入。
+    """退款单(ch06,DDL: db/ch06.sql)。用户在前端表单确认后由 /api/refund 写入。
 
     `reason_category` 必须是 `app/refund/categories.REFUND_REASON_CATEGORIES`
     里的一个 —— 校验在端点层做(DB 不建 CHECK,与既有表的做法一致)。
@@ -159,7 +159,15 @@ class RefundRequest(Base):
     conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     order_no: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_category: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    # 两侧默认值**都要**:`default` 让 ORM 插入时补值,`server_default` 让表本身
+    # 有 DEFAULT(裸 SQL 省略 status 也不至于 1364)。只留前者的话,create_all
+    # 建出的表与 db/ch06.sql 建出的表**形状不同**,行为变成「看谁建的库」。
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )

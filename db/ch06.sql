@@ -7,7 +7,10 @@
 SET NAMES utf8mb4;
 
 -- ch06:退款单。用户在前端退款表单里确认后才写入。
-CREATE TABLE IF NOT EXISTS refund_requests (
+-- 不带 IF NOT EXISTS(与 db/ch03.sql / db/ch04.sql 同规矩):重复执行要**响亮地失败**,
+-- 否则「表已存在但形状不对」会被静默咽掉(本表就踩过:create_all 先建了没有
+-- DEFAULT 的版本,IF NOT EXISTS 让这份 DDL 永远补不上)。
+CREATE TABLE refund_requests (
   id              BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
   conversation_id VARCHAR(32) NOT NULL,
   order_no        VARCHAR(32) NOT NULL,
