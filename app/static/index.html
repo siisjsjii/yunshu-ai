@@ -176,12 +176,20 @@
   .cite { color: var(--brand); text-decoration: none; font-weight: 700;
     border-bottom: 1px dashed var(--brand); cursor: pointer; padding: 0 1px; }
   .cite-pop { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
-    max-width: 480px; max-height: 60vh; overflow: auto; background: #fff;
-    border: 2px solid var(--ink); border-radius: 4px; padding: 14px 16px;
-    box-shadow: 6px 6px 0 rgba(28,43,57,.15); z-index: 999; cursor: pointer;
-    font-size: 13.5px; line-height: 1.6; }
+    max-width: 720px; width: min(720px, 92vw); max-height: 78vh; overflow: auto;
+    background: #fff; border: 2px solid var(--ink); border-radius: 4px;
+    padding: 14px 16px; box-shadow: 6px 6px 0 rgba(28,43,57,.15); z-index: 999;
+    cursor: default; font-size: 13.5px; line-height: 1.6; }
   .cite-path { color: var(--brand); font-weight: 700; margin-bottom: 8px; }
   .cite-answer { white-space: pre-wrap; word-break: break-word; }
+  .cite-close { position: absolute; top: 8px; right: 12px; cursor: pointer;
+    color: #5b7186; font-size: 18px; line-height: 1; }
+  .cite-note { margin-top: 8px; font-size: 12px; color: #5b7186; }
+  .cite-doc { white-space: pre-wrap; word-break: break-word; margin-top: 6px;
+    border-top: 1px dashed #cdd9e4; padding-top: 8px; }
+  .cite-doc mark { background: #ffe9a8; padding: 0 1px; }
+  .cite-hit { background: #dcebf9; border-left: 3px solid var(--brand);
+    padding: 6px 8px; margin: 6px 0; }
 
   /* ── 底栏 ── */
   footer {
@@ -467,13 +475,103 @@
     });
   }
 
-  function showCitation(c) {
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // 文档列表只在**第一次点引用**时拉一次并缓存 —— 它要给每个文件重新切分算
+  // chunk_count,不该在页面加载时就付这个代价。
+  //
+  // ⚠️ 反查口径(实测 2026-09-20,别想当然):
+  // 要用 **`section_path` 的首段**,不是 `category`。`section_path` 形如
+  // `退货退款政策 > 无理由退货 > 适用范围`,首段就是源文档的 H1 标题
+  // (→ 退货政策.md、售后手册.md、商品与购物 FAQ → 商品FAQ.md)。
+  // 而 `category` 是**主题标签**,不是文档名 —— 实测「退货政策是怎么规定的」
+  // 那 3 条引用里,按 category 匹配文档 **0/3 命中**(它是「退换货」),
+  // 按 section_path 首段匹配才命中。
+  // 另有块**根本没有 section_path**(FAQ 迁移 / 对话挖矿来的),那是**正常**的 ——
+  // 它们没有源文件,走片段回退。
+  let docListPromise = null;
+  function loadDocList() {
+    if (!docListPromise) {
+      docListPromise = fetch("/api/kb/documents")
+        .then((r) => (r.ok ? r.json() : []))
+        .catch(() => []);
+    }
+    return docListPromise;
+  }
+
+  // 源文档标题 = section_path 的首段(见上面那段实测说明)。
+  // section_path 为空时退回 category —— 对没有源文件的块,两者都匹配不上,
+  // 结果是同一个(走片段回退),但 category 至少能让提示文案更像样。
+  function docTitleOf(c) {
+    const first = (c.section_path || "").split(" > ")[0].trim();
+    return first || (c.category || "").trim() || null;
+  }
+
+  // 在整篇原文里定位命中章节:优先按 section_path 的**末段**(章节名)找标题行,
+  // 找不到再退回命中块的 answer 原文。返回 [html, 是否定位到]。
+  function locateInDoc(content, c) {
+    // ⚠️ 取**最后一段**,不是把中间几段拼起来。
+    // section_path 的层数不定:`售后手册 > 保修说明`(两层)与
+    // `退货退款政策 > 无理由退货 > 适用范围`(三层)都真实存在,
+    // 而文档里的标题行**只有末段那个名字**(`### 适用范围`)。
+    // 拼中间段去找 → 永远找不到,而且是**静默**找不到(只是没有高亮)。
+    const parts = (c.section_path || "").split(" > ").map((s) => s.trim()).filter(Boolean);
+    const section = parts.length ? parts[parts.length - 1] : "";
+    const lines = content.split("\n");
+    let hitIdx = -1;
+    if (section) {
+      hitIdx = lines.findIndex((l) => /^#{1,6}\s/.test(l) && l.includes(section));
+    }
+    const chunkHit = c.answer && content.includes(c.answer);
+    let chunkMd = "";
+    if (chunkHit) {
+      // 块原文在文档里逐字存在(语料块就是这么切出来的)→ 整段高亮
+      chunkMd = `<div class="cite-hit">${esc(c.answer)}</div>`;
+    }
+    const html = lines.map((l, i) => {
+      const isHit = i === hitIdx;
+      const body = isHit ? `<mark>${esc(l)}</mark>` : esc(l);
+      return isHit ? `<span id="citeAnchor">${body}</span>` : body;
+    }).join("\n");
+    return [chunkMd + `<div class="cite-doc">${html}</div>`, hitIdx >= 0 || chunkHit];
+  }
+
+  async function showCitation(c) {
     const box = document.createElement("div");
     box.className = "cite-pop";
-    const path = c.section_path ? `<div class="cite-path">${c.section_path}</div>` : "";
-    box.innerHTML = `${path}<div class="cite-answer">${c.answer}</div>`;
-    box.onclick = () => box.remove();
+    const head = `<span class="cite-close" title="关闭">×</span>
+      <div class="cite-path">${esc(c.section_path || c.category || "来源")}</div>`;
+    box.innerHTML = `${head}<div class="cite-answer">正在载入源文档…</div>`;
+    box.querySelector(".cite-close").addEventListener("click", () => box.remove());
     document.body.appendChild(box);
+
+    const docs = await loadDocList();
+    const docTitle = docTitleOf(c);
+    const hit = docTitle ? docs.find((d) => d.title === docTitle) : null;
+    if (!hit) {
+      // 没有源文件 —— 如实说明,并把命中块原文给出来,不假装有文档
+      box.innerHTML = `${head}<div class="cite-answer">${esc(c.answer)}</div>
+        <div class="cite-note">该条来自 FAQ 迁移或对话挖矿,没有对应的源文档;
+        以上是命中的知识块原文。</div>`;
+      return;
+    }
+    try {
+      const r = await fetch(`/api/kb/documents/${encodeURIComponent(hit.name)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      const [body, located] = locateInDoc(d.content || "", c);
+      box.innerHTML = `${head}${body}
+        <div class="cite-note">源文档:${esc(hit.name)}${located ? "(已定位并高亮命中处)" : "(未能定位到具体章节,已给出全文)"}</div>`;
+      const anchor = box.querySelector("#citeAnchor");
+      if (anchor) anchor.scrollIntoView({ block: "center" });
+    } catch (err) {
+      box.innerHTML = `${head}<div class="cite-answer">${esc(c.answer)}</div>
+        <div class="cite-note">源文档载入失败(${esc(err.message)}),以上是命中的知识块原文。</div>`;
+    }
   }
 
   // ── 选项按钮(投诉场景)──────────────────────────────
