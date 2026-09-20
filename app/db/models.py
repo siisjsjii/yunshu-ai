@@ -144,3 +144,22 @@ class QaExtractionStaging(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
+
+
+class RefundRequest(Base):
+    """退款单(ch06)。用户在前端表单确认后由 /api/refund 写入。
+
+    `reason_category` 必须是 `app/refund/categories.REFUND_REASON_CATEGORIES`
+    里的一个 —— 校验在端点层做(DB 不建 CHECK,与既有表的做法一致)。
+    """
+
+    __tablename__ = "refund_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    order_no: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )

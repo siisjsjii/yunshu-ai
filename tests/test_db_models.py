@@ -10,6 +10,7 @@ from app.db.models import (
     LowConfidenceQuestion,
     MessageRecord,
     QaExtractionStaging,
+    RefundRequest,
     Ticket,
 )
 
@@ -321,3 +322,97 @@ async def test_low_confidence_question_roundtrip():
         )
         await session.commit()
     await engine.dispose()
+
+
+# ---- ch06:refund_requests(DDL: db/ch06.sql)----
+
+SCRATCH_REFUND_ORDER = "20240915"
+SCRATCH_REFUND_CATEGORY = "商品质量问题"
+
+
+async def _cleanup_refund_rows() -> None:
+    """按会话 id 清掉探针行。
+
+    **必须 commit** —— `async with session` 退出时是 rollback,不 commit 的
+    DELETE 会原地作废,探针行留库;下一条测试里的 `.one()` 于是撞
+    MultipleResultsFound。(原计划文本里的 DELETE 就没有 commit,等于没删。)
+    """
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            text("DELETE FROM refund_requests WHERE conversation_id = :c"),
+            {"c": SCRATCH_CONVERSATION},
+        )
+        await session.commit()
+
+
+@pytest.mark.anyio
+async def test_refund_request_roundtrips_chinese_and_defaults_status():
+    """新表建得出来、中文往返不炸、status 有默认值。
+
+    插入时**不显式传** status / created_at:两者都靠默认值补上。
+    断言一律在**新 session** 读回 —— 身份映射持弱引用,同 session 重读是否
+    真打库取决于还有没有别的东西引用着那个 ORM 对象,会退化成「靠 refcount 走运」。
+    """
+    await _cleanup_refund_rows()  # 上一轮跑挂了也不污染本轮
+    async with get_sessionmaker()() as session:
+        session.add(
+            RefundRequest(
+                conversation_id=SCRATCH_CONVERSATION,
+                order_no=SCRATCH_REFUND_ORDER,
+                reason_category=SCRATCH_REFUND_CATEGORY,
+            )
+        )
+        await session.commit()
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(RefundRequest).where(
+                    RefundRequest.conversation_id == SCRATCH_CONVERSATION
+                )
+            )
+        ).scalars().one()
+        assert row.reason_category == SCRATCH_REFUND_CATEGORY   # 中文往返
+        assert row.order_no == SCRATCH_REFUND_ORDER
+        assert row.status == "pending"                          # 默认值
+        assert row.created_at is not None                       # server_default
+        assert row.id is not None                               # 自增主键
+
+    await _cleanup_refund_rows()
+
+
+@pytest.mark.anyio
+async def test_refund_request_persists_expected_columns():
+    """order_no / reason_category / status 三列原样落库(新 session 读回)。
+
+    与上一条的分工:上一条验的是「不给值也有默认值」,这条验的是
+    「给了值就存住」。两条都用 `.one()` —— 靠上面的清理保证只可能命中
+    本测试自己插的那一行,否则 `.one()` 会在残行上撞 MultipleResultsFound,
+    而在**没有残行**时又恒真。"""
+    await _cleanup_refund_rows()  # 保证下面 `.one()` 只可能命中本测试插的那行
+    async with get_sessionmaker()() as session:
+        session.add(
+            RefundRequest(
+                conversation_id=SCRATCH_CONVERSATION,
+                order_no=SCRATCH_REFUND_ORDER,
+                reason_category=SCRATCH_REFUND_CATEGORY,
+            )
+        )
+        await session.commit()
+
+    async with get_sessionmaker()() as session:      # 新 session 读回
+        row = (
+            await session.execute(
+                select(RefundRequest).where(
+                    RefundRequest.conversation_id == SCRATCH_CONVERSATION
+                )
+            )
+        ).scalars().one()
+        assert row.order_no == SCRATCH_REFUND_ORDER
+        assert row.reason_category == SCRATCH_REFUND_CATEGORY
+        assert row.status == "pending"
+        await session.execute(
+            text("DELETE FROM refund_requests WHERE conversation_id = :c"),
+            {"c": SCRATCH_CONVERSATION},
+        )
+        await session.commit()
