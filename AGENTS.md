@@ -106,12 +106,13 @@ ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 
 
 - `evals/tool_selection_cases.jsonl`:15 条,**13/15 = 86.7% 可引用**,但引用时须说明:无生产 system prompt 条件下测得、用例集偏弱。
 - `evals/extract_cases.jsonl` 的 `expected_solution` 分数**不可引用**(关键词是看到输出后才放宽的)。
-- `evals/retrieval_cases.jsonl`(ch03):23 条,**23/23 可引用但须一并说明口径** —— 阈值可用区间只有 0.049 宽、用例自造、干扰项 4 条中 3 条离阈值很远。**闭式口径**(期望片段取自语料逐字原文且须同块命中),不掺主观判断。
+- `evals/retrieval_cases.jsonl`(ch03):23 条,**闭式口径**(期望片段取自语料逐字原文且须同块命中),不掺主观判断。**⚠️「23/23」是 ch03 的 dense 单路;ch04 换混合+重排后从未复核,现链路 13/23** —— 引用必须说清是哪条链路。用例自造、干扰项 4 条中 3 条离阈值很远。
+- 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。0.58 在 **dense 余弦**上标定,ch04 换混合+重排后原值沿用,而重排器输出的是 **sigmoid** 分数,两把尺子不可通约。现链路可用区间 `(0.114, 0.389]`,取中点。改它要同时想到两处消费者:`app/tools/registry.py`(过滤块)与 `app/agent/nodes.py` 的置信度闸。
 - `evals/results/` 已 gitignore,是历史运行产物。
 
 ## Windows + Git Bash 平台陷阱(本机 locale cp936,复发型)
 
-- 含中文的请求体**不能走 curl argv**(MSYS2 按 CP936 重编码),一律 stdin heredoc。
+- 含中文的请求体**不能走 curl argv**(MSYS2 按 CP936 重编码),一律 stdin heredoc。**引用这条 ≠ 免疫于它**(ch05 实测:编排者刚在 dispatch 里逐字引用过它,转手自己就踩了)→ 含非 ASCII 的请求优先走 **httpx**,别依赖「我记得避开 argv」。
 - 子进程输出显式钉编码:测试给子进程加 `-X utf8`;脚本打印非 ASCII 用 `sys.stdout.buffer.write(...encode("utf-8"))`(`✓`/`✗` 不在 GBK 里,`print` 会崩)。
 - 验收不能直接 grep 原始 SSE 流(token 被切开),用 `join_tokens` 拼回再比;也不能用 `grep '[一-龥]'` 检查中文(C locale 下是恒真假断言),按 Python 码点判断。
 - **起服务前先查 8000 端口**:残留僵尸进程会让你 curl 到旧代码,得出假红/假绿。需要并行实例时用 `BASE` 覆盖换端口(如 8010),不要 kill 用户自己起的进程。
