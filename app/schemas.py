@@ -127,6 +127,24 @@ class UploadDocumentRequest(BaseModel):
         return v
 
 
+class RefundRequestIn(BaseModel):
+    """退款单提交入参。字段名与前端表单一一对应。
+
+    **与 ORM 的 `app.db.models.RefundRequest` 同名不同物**,别混:这个是 HTTP 入参,
+    那个是表行。三个字段的上限都对齐各自的列宽(`conversations.id` varchar(32) /
+    `refund_requests.order_no` varchar(32) / `reason_category` varchar(64)),
+    理由与 `TicketRequest.session_id` 那处一样 —— 放宽了会一路走到 INSERT 才抛
+    DataError,一个参数问题被报成 500/502,语义不诚实。
+
+    `reason_category` 这里**只做形状校验**,不做类目校验:`is_valid_category` 是
+    端点的职责(单一来源在 `app.refund.categories`,prompt / 帧 / 表单同读它)。
+    """
+
+    session_id: str = Field(min_length=1, max_length=32)
+    order_no: str = Field(min_length=4, max_length=32)
+    reason_category: str = Field(min_length=1, max_length=64)
+
+
 class ExtractResult(BaseModel):
     """从用户售后描述中抽取的结构化信息。"""
 
