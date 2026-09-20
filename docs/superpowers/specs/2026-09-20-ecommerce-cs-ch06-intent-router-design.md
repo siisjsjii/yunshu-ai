@@ -162,7 +162,7 @@ refund_judge               同一个主力 Agent,只判一次:「这一单能不
 ### 6.1 `db/ch06.sql` — 新表 `refund_requests`
 
 ```sql
-CREATE TABLE IF NOT EXISTS refund_requests (
+CREATE TABLE refund_requests (
   id              BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
   conversation_id VARCHAR(32)  NOT NULL,
   order_no        VARCHAR(32)  NOT NULL,
@@ -174,6 +174,18 @@ CREATE TABLE IF NOT EXISTS refund_requests (
 ```
 
 配 ORM 模型 `RefundRequest`(与 `db/ch04.sql` + models 的既有做法一致)。
+模型的 `status` **同时**写 Python 侧 `default="pending"` 与 `server_default="pending"`
+—— 与 `qa_extraction_staging` / `knowledge_chunks.vectorize_status` 的既有写法一致。
+
+> **订正(2026-09-21,T2 审查发现)**:最早这里写的是 **`CREATE TABLE IF NOT EXISTS`**,
+> 被裁定改掉。原因是一个**静默**的分歧:表实际由 `scripts/init_db.py` 的
+> `create_all` 建出,而模型只有 Python 侧 default ⇒ **live 列没有 SQL DEFAULT**;
+> 此时 `IF NOT EXISTS` 让 `.sql` 的每一次应用都成为**无声 no-op**,
+> 于是 `db/ch06.sql` 成了一张**哪儿都不存在的表**的文档,行为还变成**环境相关**
+> (dev 里裸 SQL 插入 `status` 会 1364,照本文件 provision 的环境却没事)。
+> `db/ch03.sql` / `db/ch04.sql` 用的都是**普通 `CREATE TABLE`** —— 重复执行会**响亮失败**
+> 而不是静默 no-op。本章改回普通建表,**并把 `server_default` 补进模型**,
+> 让三条路径(模型 / SQL / live 表)一致。
 
 ### 6.2 固定退款原因类目的**单一来源**
 
