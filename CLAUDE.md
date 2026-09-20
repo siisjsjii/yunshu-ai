@@ -72,13 +72,19 @@ ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm,
 ### ch03 的检索链路
 
 ```
-离线:knowledge/*.md ──chunker──┐
-      faq 表 12 条 ──迁移─────┴→ write_chunks(MySQL,pending)
+离线:knowledge/*.md ──chunker──→ write_chunks(MySQL,pending)
                                     ↓ vectorize_pending(嵌入 + Milvus upsert)
                                 MySQL: vector_id + status=done
 在线:query_faq(keyword) → KnowledgeRetriever.search
         = 嵌入 → Milvus Top-K → 阈值过滤 → 按 id 回查 MySQL → 按相似度序组装
 ```
+
+> **2026-09-20:`faq` 表已废弃删除。** 原先离线管线还有一路
+> 「faq 表 12 条 ──迁移──→ write_chunks」,那 12 条**已经迁完**并成为
+> `knowledge_chunks` 里 `content_type="faq"` 的块(在线检索查的是它 + Milvus)。
+> 该表此后没有读写方,**用户已删表**;`Faq` 模型、`faq_migration()`、
+> `build_kb.py` 的迁移分支、seed 里的 FAQ_ROWS 一并删除。
+> 注意:`content_type="faq"` 与上传类型 `"faq"` 是**取值**,与那张表无关,保留。
 
 - **Milvus 只当索引,不存文本**:集合只有 `id`(= `str(MySQL id)`)与 `vector`;原文一律回 MySQL 取,所以集合可随时 drop 重建(`build_kb --reindex`)。
 - **`retrieval/search.py` 是错误语义的翻译边界**:Milvus/嵌入故障 → `ToolInfrastructureError`(502),绝不降级成「没搜到」。`tools/errors.py` 是零依赖的错误词汇表,retrieval 反向引用它已记账(ch03 spec §12)。

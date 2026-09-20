@@ -59,22 +59,3 @@ def _dedupe_by_triple(chunks: list[Chunk]) -> list[Chunk]:
     return out
 
 
-def faq_migration(faq_rows) -> list[Chunk]:
-    """既有 Faq 行 → Chunk:questions=真实问法,category 沿用,无章节路径。
-
-    faq_rows 是任何具有 question / answer / category 属性的行(ORM 对象或
-    测试替身皆可)。
-    """
-    return _dedupe_by_triple(
-        [
-            Chunk(
-                category=r.category,
-                questions=r.question,
-                answer=r.answer,
-                section_path=None,
-                content_type="faq",
-                is_key_clause=False,
-            )
-            for r in faq_rows
-        ]
-    )

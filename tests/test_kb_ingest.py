@@ -1,19 +1,13 @@
-"""ingest 单元测试:语料目录解析、类型标记剥离、批内三元组去重、faq 迁移映射。"""
+"""ingest 单元测试:语料目录解析、类型标记剥离、批内三元组去重。
 
-from dataclasses import dataclass
+(原 `faq_migration` 的两条用例随该函数一并删除 —— `faq` 表已废弃。)
+"""
 
 import pytest
 
-from app.kb.ingest import faq_migration, parse_corpus_dir, parse_corpus_file
+from app.kb.ingest import parse_corpus_dir, parse_corpus_file
 
 MAX, OVERLAP = 100, 40
-
-
-@dataclass
-class _FaqRow:
-    question: str
-    answer: str
-    category: str
 
 
 def _write(tmp_path, name, text):
@@ -72,19 +66,3 @@ def test_parse_corpus_file_reads_exactly_one_file(tmp_path):
     assert [c.answer for c in chunks] == ["内容二。"]
 
 
-def test_faq_migration_maps_fields():
-    rows = [_FaqRow("退货政策是什么", "七天无理由退货。", "退换货")]
-    c = faq_migration(rows)[0]
-    assert (c.questions, c.answer, c.category, c.content_type) == (
-        "退货政策是什么",
-        "七天无理由退货。",
-        "退换货",
-        "faq",
-    )
-    assert c.section_path is None      # 无章节结构
-    assert c.is_key_clause is False
-
-
-def test_faq_migration_dedupes_identical_rows():
-    rows = [_FaqRow("q", "a", "c"), _FaqRow("q", "a", "c")]
-    assert len(faq_migration(rows)) == 1

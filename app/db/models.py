@@ -16,15 +16,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 
-class Faq(Base):
-    __tablename__ = "faq"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    question: Mapped[str] = mapped_column(String(255), nullable=False)
-    answer: Mapped[str] = mapped_column(Text, nullable=False)
-    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-
-
 class Conversation(Base):
     """会话壳。id 复用 ch01 的 session_id(uuid4().hex,32 字符)。"""
 

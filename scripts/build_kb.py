@@ -23,8 +23,8 @@ from sqlalchemy import func, select, update
 
 from app.config import get_settings
 from app.db.base import get_engine, get_sessionmaker
-from app.db.models import Faq, KnowledgeChunk
-from app.kb.ingest import faq_migration, parse_corpus_dir, parse_corpus_file
+from app.db.models import KnowledgeChunk
+from app.kb.ingest import parse_corpus_dir, parse_corpus_file
 from app.kb.writer import vectorize_pending, write_chunks
 from app.retrieval.embedder import get_embedder
 from app.retrieval.milvus import get_vector_store
@@ -38,11 +38,13 @@ def _out(message: str) -> None:
     sys.stdout.buffer.flush()
 
 
-def _corpus_chunks(args, settings) -> tuple[list, bool]:
-    """返回 (语料 chunk, 是否同时迁移 faq)。
+def _corpus_chunks(args, settings) -> list:
+    """切 `knowledge/` 下的语料(给了 `--source` 就只切那一个文件)。
 
-    `--source` 限定单个文件时**不**迁移 faq:那是一次定点补录,不该顺带
-    把 faq 表再走一遍(虽然幂等,但输出会误导人以为动了别的东西)。
+    **2026-09-20:不再迁移 `faq` 表。** 那张表的 12 条在 ch03 就已经迁进
+    `knowledge_chunks`(在线检索查的是它 + Milvus),`faq` 此后没有读写方,
+    用户已删表。这里原本还有一条 `select(Faq)` 的迁移分支 —— 表一没就会报错,
+    而验收 7 会跑本脚本,所以**删除**而不是加守卫:那张表不会再回来。
     """
     opts = {
         "max_chars": settings.chunk_max_chars,
@@ -52,14 +54,8 @@ def _corpus_chunks(args, settings) -> tuple[list, bool]:
         path = Path(args.source)
         if not path.is_absolute():
             path = KNOWLEDGE_DIR / path
-        return parse_corpus_file(path, **opts), False
-    return parse_corpus_dir(KNOWLEDGE_DIR, **opts), True
-
-
-async def _load_faq_chunks() -> tuple[list, int]:
-    async with get_sessionmaker()() as session:
-        rows = list((await session.execute(select(Faq))).scalars().all())
-    return faq_migration(rows), len(rows)
+        return parse_corpus_file(path, **opts)
+    return parse_corpus_dir(KNOWLEDGE_DIR, **opts)
 
 
 async def _status_counts() -> tuple[int, int, int]:
@@ -99,14 +95,8 @@ async def _run(args) -> None:
         store.drop_collection()
         _out(f"--reindex:{reset} 行打回 pending,Milvus 集合已删除,开始重建")
 
-    corpus, with_faq = _corpus_chunks(args, settings)
-    _out(f"语料切块:{len(corpus)} 块" + (f"(仅 {args.source})" if args.source else ""))
-
-    chunks = list(corpus)
-    if with_faq:
-        faq_chunks, faq_rows = await _load_faq_chunks()
-        chunks += faq_chunks
-        _out(f"faq 迁移:{faq_rows} 条 → {len(faq_chunks)} 块")
+    chunks = list(_corpus_chunks(args, settings))
+    _out(f"语料切块:{len(chunks)} 块" + (f"(仅 {args.source})" if args.source else ""))
     _out(f"待写入:{len(chunks)} 块")
 
     async with get_sessionmaker()() as session:

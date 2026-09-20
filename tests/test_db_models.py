@@ -6,7 +6,6 @@ from sqlalchemy import select, text
 from app.db.base import get_engine, get_sessionmaker
 from app.db.models import (
     Conversation,
-    Faq,
     KnowledgeChunk,
     LowConfidenceQuestion,
     MessageRecord,
@@ -18,12 +17,11 @@ pytestmark = pytest.mark.db
 
 SCRATCH_CONVERSATION = "test0000000000000000000000000000"
 
-#: 探针问题必须**不等于** seed 行。`scripts/seed_db.py` 的 `FAQ_ROWS[0]["question"]`
-#: 就是「退货政策是什么」—— 探针与它同串时,下面按名清理会连种子行一并删掉
-#: (实测日志:faq 表里那一行被本测试删除,直到 test_tools_db 的 seed() 才补回来;
-#: 全套件因文件排序侥幸自愈,单跑本文件则把验收 5 依赖的那行留成空档)。
-#: 加 probe 尾巴后,按名清理只可能命中本测试自己插入的那一行。
-SCRATCH_FAQ_QUESTION = "退货政策是什么probe"
+#: 探针问题必须**不等于**库里任何既有行 —— 下面按名清理是 `DELETE ... WHERE
+#: questions = :q`,探针与既有行同串就会把**真数据**一起删掉。
+#: 加 `probe` 尾巴后,按名清理只可能命中本测试自己插入的那一行。
+#: (原注:这条约束是在打 `faq` 表时踩出来的;改打 `knowledge_chunks` 后同理。)
+SCRATCH_CHUNK_QUESTION = "退货政策是什么probe"
 
 
 @pytest.mark.anyio
@@ -111,19 +109,24 @@ async def test_tables_exist_and_chinese_roundtrips():
 
 
 @pytest.mark.anyio
-async def test_faq_like_matches_chinese_substring():
+async def test_like_matches_chinese_substring():
     """中文子串能命中。实测已确认 utf8mb4_0900_ai_ci 正常,此测试防回归。
 
-    pattern 刻意**不是**裸 `%退货%`:种子里就有含「退货」的行,裸 pattern 加
-    `len(hits) == 1` 必挂,而原来的 `>= 1` 又可以被种子行单独满足 —— 那样即使
+    pattern 刻意**不是**裸 `%退货%`:库里本来就有含「退货」的行,裸 pattern 加
+    `len(hits) == 1` 必挂,而 `>= 1` 又可以被既有行单独满足 —— 那样即使
     本测试的 INSERT 整段失效,断言照样全绿(这正是「假绿」的形态)。把 pattern
     锚到探针独有的 probe 尾巴上,命中数就只可能来自本测试自己插的那一行;
     中文部分仍在 pattern 里,所以编码/排序规则一坏,这里同样会红。
+
+    **2026-09-20 改靶**:原先打的是 `faq` 表,该表已废弃删除。本测试验的是
+    **中文 LIKE 的排序规则**,与哪张表无关,于是改打 `knowledge_chunks`
+    (现在是知识唯一的权威源)。探针行带 `probe` 尾巴,收尾按名删除,
+    不留待向量化的脏行。
     """
     async with get_sessionmaker()() as session:
         session.add(
-            Faq(
-                question=SCRATCH_FAQ_QUESTION,
+            KnowledgeChunk(
+                questions=SCRATCH_CHUNK_QUESTION,
                 answer="七天无理由退货",
                 category="退换货",
             )
@@ -131,14 +134,16 @@ async def test_faq_like_matches_chinese_substring():
         await session.commit()
         hits = (
             await session.execute(
-                select(Faq).where(Faq.question.like("%退货%probe%"))
+                select(KnowledgeChunk).where(
+                    KnowledgeChunk.questions.like("%退货%probe%")
+                )
             )
         ).scalars().all()
         assert len(hits) == 1
-        assert hits[0].question == SCRATCH_FAQ_QUESTION
+        assert hits[0].questions == SCRATCH_CHUNK_QUESTION
         await session.execute(
-            text("DELETE FROM faq WHERE question = :q"),
-            {"q": SCRATCH_FAQ_QUESTION},
+            text("DELETE FROM knowledge_chunks WHERE questions = :q"),
+            {"q": SCRATCH_CHUNK_QUESTION},
         )
         await session.commit()
 

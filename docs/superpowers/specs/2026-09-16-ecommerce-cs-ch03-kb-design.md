@@ -110,7 +110,10 @@ KnowledgeRetriever.search(query) -> list[RetrievedChunk]
 ### 5.3 脚本契约
 
 ```
-.venv/Scripts/python.exe scripts/build_kb.py    # 建库:语料导入 + faq 迁移 + 向量化补齐;重跑 = 幂等补齐
+.venv/Scripts/python.exe scripts/build_kb.py    # 建库:语料导入 + 向量化补齐;重跑 = 幂等补齐
+                                                # (2026-09-20:faq 表已废弃删除,原先这一路
+                                                #  「faq 表 → chunk」的迁移已移除 —— 那 12 条
+                                                #  早已迁完并在 knowledge_chunks 里)
 .venv/Scripts/python.exe scripts/mine_qa.py     # 挖知识:读会话 → LLM 抽 QA → staging → 去重 → 入库(→ 向量化复用 build_kb 的补齐步)
 ```
 
