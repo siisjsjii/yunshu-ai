@@ -8,8 +8,10 @@
 #
 # **起服务之前先查 8000 端口**:残留的僵尸进程会让你 curl 到**旧代码**,
 # 于是得到"新代码坏了"的假红(ch02 的最终验证差点栽在这上面)。本脚本开头
-# 会探一次服务可达性,但探不出"在跑的是哪一版" —— 若下面验收 6 的
-# query_faq 报 ok=false,第一件该查的就是 8000 上跑的是不是 ch02 的旧进程。
+# 会探一次服务可达性,但探不出"在跑的是哪一版" —— 若下面验收 5/6 的知识路由
+# 断言报红,第一件该查的就是 8000 上跑的是不是旧进程;改了 `app/config.py`
+# 之后尤其要重启(uvicorn 没有 --reload,`get_settings` 是 lru_cache,
+# 阈值改了对已在跑的进程**无效**)。
 set -uo pipefail
 
 # ── 本仓库运行在 Windows + Git Bash 下,有两处平台陷阱,已在脚本内规避 ──
@@ -130,6 +132,51 @@ for block in sys.stdin.buffer.read().decode("utf-8", "replace").split("\n\n"):
             pass
 print(",".join(states))
 '
+}
+
+# 从**最后一帧(done)**的 data 里取一个字段;取不到输出空。
+# 同 join_tokens:按字节读写 stdin/stdout。done 帧里除了 ASCII 的 trace/intent
+# 还有模型输出,文本模式在 cp936 管道上会解成乱码甚至抛 UnicodeEncodeError
+# (`scripts/acceptance_ch05.sh` 记过这个**复发型**陷阱)。
+done_field() {
+  "$PYTHON" -c '
+import json, sys
+
+lines = sys.stdin.buffer.read().decode("utf-8", "replace").splitlines()
+data = [l[6:] for l in lines if l.startswith("data: ")]
+try:
+    payload = json.loads(data[-1])
+except (IndexError, json.JSONDecodeError):
+    sys.exit(0)
+value = payload.get(sys.argv[1])
+sys.stdout.buffer.write(
+    (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)).encode("utf-8"))' "$1"
+}
+
+# citations 帧里的证据条数(没有该帧 → 0)。逐帧解析而不是 grep:事件名与 data
+# 分处两行、条数是 JSON 结构,按空格敏感的子串匹配去断它属于自找假红。
+citations_count() {
+  "$PYTHON" -c '
+import json, sys
+
+lines = sys.stdin.buffer.read().decode("utf-8", "replace").splitlines()
+for i, line in enumerate(lines):
+    if line.strip() == "event: citations" and i + 1 < len(lines) and lines[i + 1].startswith("data: "):
+        sys.stdout.buffer.write(str(len(json.loads(lines[i + 1][6:]).get("items") or [])).encode("ascii"))
+        break
+else:
+    sys.stdout.buffer.write(b"0")'
+}
+
+# 文本里是否含**固定兜底话术**。判断放在 Python 里而不是 `grep -F "<中文>"`:
+# 模式若被平台按 CP936 重编码,匹配会恒不命中 —— 于是「回复里没有兜底话术」
+# 这条断言变成**恒真的假绿**,恰好把要防的故障放过去。
+has_fallback() {
+  "$PYTHON" -c '
+import sys
+
+text = sys.stdin.buffer.read().decode("utf-8", "replace")
+sys.stdout.buffer.write(b"yes" if "我没太理解您的意思" in text else b"no")'
 }
 
 # 取一个**已发货**的订单号。
@@ -486,7 +533,21 @@ else
 fi
 
 echo
-echo "=== 验收 5:FAQ 查表(验收标准 2) ==="
+echo "=== 验收 5:知识类问题走强制检索(验收标准 2) ==="
+# ⚠️ 判据在 ch05 换了。旧断言是 `TOOLS5 = query_faq && STATES5 = ok`。ch05 用
+# 「确定性骨架的强制预检索」替换了「模型自选工具」,`app/agent/nodes.py` 的
+# retrieve_knowledge 节点**直接调 retriever、不走 query_faq 工具**(节点
+# docstring 明写)。本题面 2026-09-20 实测 6/6 判为「退款退货」→ 知识路由,
+# 链路上**没有任何 tool_call 帧**,旧断言再也拿不到 query_faq。
+# 新判据断 ch05 之后真正该保证的三件事:
+#   ① 走了知识路由 —— done 帧 trace 里含 retrieve_knowledge;
+#   ② 真拿到了证据 —— 有 citations 帧且 items >= 1(citations 只在检索返回
+#      **非空块**时才发,是「阈值过滤后还有块」的直接证据);
+#   ③ 没跌进兜底   —— 回复不含固定兜底话术「我没太理解您的意思」。
+#      这条是**最强的防回归**:兜底话术是**常量**(不是自由文本),断它的**缺失**
+#      合法且确定性,而它正是阈值定错时用户**看得见**的那个故障
+#      (intent=退款退货 → retrieve_knowledge:0 hits → confidence_gate:fail →
+#       fallback_reply)。
 OUT5=$(curl -sN -X POST "$BASE/api/chat/stream" \
   -H 'Content-Type: application/json' \
   --data-binary @- <<'JSON'
@@ -496,14 +557,35 @@ JSON
 
 TOOLS5=$(echo "$OUT5" | called_tools)
 STATES5=$(echo "$OUT5" | tool_result_states)
+TRACE5=$(echo "$OUT5" | done_field trace)
+CITES5=$(echo "$OUT5" | citations_count)
 REPLY5=$(echo "$OUT5" | join_tokens)
-echo "  调用的工具:[$TOOLS5]  结果:[$STATES5]"
+echo "  调用的工具:[$TOOLS5]  结果:[$STATES5](ch05 起知识路由不发工具帧,空是正常的)"
+echo "  citations 帧条目数:$CITES5"
 echo "  回复:$REPLY5"
 
-if [ "$TOOLS5" = "query_faq" ] && [ "$STATES5" = "ok" ]; then
-  pass "query_faq 查到了退货政策"
+# 有 error 帧 = 端点故障,此时只发 error、**不发 done**,done_field 取到字面量
+# null。不特判就会把基础设施故障报成「没走知识路由」(路由问题)—— 正是本项目
+# 点名的「报错指向别处」。
+if echo "$OUT5" | grep -q "event: error" && [ "$TRACE5" = "null" ]; then
+  fail "端点发了 error 帧、没有 done 帧(基础设施故障,不是路由问题):$(echo "$OUT5" | grep -A1 'event: error' | tail -1)"
 else
-  fail "期望 query_faq 命中,实际工具=[$TOOLS5] 结果=[$STATES5]"
+  case "$TRACE5" in
+    *retrieve_knowledge*) pass "trace 里有强制检索节点(走了知识路由):$TRACE5";;
+    *) fail "trace 里没有 retrieve_knowledge —— 没走知识路由:$TRACE5";;
+  esac
+fi
+
+if [ "${CITES5:-0}" -ge 1 ] 2>/dev/null; then
+  pass "citations 帧有 $CITES5 条证据(检索返回了非空块)"
+else
+  fail "没有 citations 帧或条目为 0(检索被阈值滤空,或根本没检索)"
+fi
+
+if [ "$(echo "$REPLY5" | has_fallback)" = "no" ]; then
+  pass "回复没有跌进兜底话术(没走 fallback_reply)"
+else
+  fail "回复是兜底话术 —— 走了 fallback_reply:$REPLY5"
 fi
 
 if REASON=$(echo "$REPLY5" | has_cjk); then
@@ -527,16 +609,44 @@ JSON
 
 TOOLS6=$(echo "$OUT6" | called_tools)
 STATES6=$(echo "$OUT6" | tool_result_states)
+TRACE6=$(echo "$OUT6" | done_field trace)
+CITES6=$(echo "$OUT6" | citations_count)
 REPLY6=$(echo "$OUT6" | join_tokens)
-echo "  调用的工具:[$TOOLS6]  结果:[$STATES6]"
+echo "  调用的工具:[$TOOLS6]  结果:[$STATES6](ch05 起知识路由不发工具帧,空是正常的)"
+echo "  citations 帧条目数:$CITES6"
 echo "  回复:$REPLY6"
 
-if [ "$TOOLS6" = "query_faq" ] && [ "$STATES6" = "ok" ]; then
-  pass "query_faq 通过语义检索召回了知识(不是关键词命中)"
+# 判据同验收 5,但**本题面的意图是摇摆的**(2026-09-20 实测 12 次:7 次判
+# 「物流」→ BUSINESS → Agent 自己调 query_faq —— 那条路上**没有** citations
+# 帧、trace 里也**没有** retrieve_knowledge;5 次判「商品咨询」→ 知识路由)。
+# 于是下面两条**路由类**断言(① trace 有 retrieve_knowledge、② citations >= 1)
+# 在「物流」那一支上必然红 —— 那是**意图分类的摇摆**(与 ch05 验收 5 同类,
+# 见 `scripts/acceptance_ch05.sh` 里那段),不是链路缺陷。
+# 与路由无关、每次都必须成立的是 ③(没跌进兜底)与最后的**运费要点内容断言**,
+# 后者因此从「辅助」升为本题面的主证据。
+# 注:旧断言 `TOOLS6 = query_faq` 同属路由类,它恰好在「物流」那一支上通过 ——
+# 也就是说这条验收**在改动前后都是抛硬币**,只是通过的那一面换了。
+if echo "$OUT6" | grep -q "event: error" && [ "$TRACE6" = "null" ]; then
+  fail "端点发了 error 帧、没有 done 帧(基础设施故障,不是路由问题):$(echo "$OUT6" | grep -A1 'event: error' | tail -1)"
 else
-  fail "期望 query_faq 命中,实际工具=[$TOOLS6] 结果=[$STATES6]"
-  echo "     ↳ 若结果是 ok=false:先确认 8000 上跑的不是 ch02 的旧进程,再确认 build_kb 跑过"
-  echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)"
+  case "$TRACE6" in
+    *retrieve_knowledge*) pass "trace 里有强制检索节点(走了知识路由):$TRACE6";;
+    *) fail "trace 里没有 retrieve_knowledge —— 没走知识路由:$TRACE6"
+       echo "     ↳ 先确认 8000 上跑的不是 ch02 的旧进程,再确认 build_kb 跑过"
+       echo "       ($PYTHON scripts/build_kb.py;库里没有运费说明时会如实落空)";;
+  esac
+fi
+
+if [ "${CITES6:-0}" -ge 1 ] 2>/dev/null; then
+  pass "citations 帧有 $CITES6 条证据(检索返回了非空块,不是关键词命中)"
+else
+  fail "没有 citations 帧或条目为 0(检索被阈值滤空,或根本没检索)"
+fi
+
+if [ "$(echo "$REPLY6" | has_fallback)" = "no" ]; then
+  pass "回复没有跌进兜底话术(没走 fallback_reply)"
+else
+  fail "回复是兜底话术 —— 走了 fallback_reply:$REPLY6"
 fi
 
 # 回复里必须出现运费条款的**要点**。比的是语料原文里的数字与措辞:

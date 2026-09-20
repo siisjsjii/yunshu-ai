@@ -60,11 +60,15 @@ class Settings(BaseSettings):
     # top_k <= 0 → 搜索永远空,检索静默失效;阈值越界一个方向等于永远全滤空、
     # 另一个方向等于没有阈值(不相关也硬凑答案)。都在启动时拒。
     retrieval_top_k: int = Field(default=3, ge=1)
-    # 0.58 由检索评估集实测定夺(spec §9 预授权,记账见 §12):
-    # 正例 top-1 最低 0.609、干扰项 top-1 最高 0.560,0.5 落在干扰项区间里
-    # (实测确有一条超纲问题被召回)。可用区间 (0.560, 0.609],取 0.58 两边
-    # 余量相当。
-    retrieval_score_threshold: float = Field(default=0.58, ge=0.0, le=1.0)
+    # ⚠️ 0.25 是 **2026-09-20 在混合+重排链路上实测**得出的,不是原值。
+    # 原值 0.58 由 ch03 在 **dense 余弦**分数上标定(正例最低 0.609/干扰最高 0.560,
+    # 区间仅 0.049 宽),ch04 换混合+重排时原值沿用 —— 而重排器 `compute_score`
+    # 输出的是 **sigmoid** 分数,两者分布不可通约。
+    # 实测(evals/run_retrieval_eval.py,23 条用例,当前链路):能命中的正例 top-1
+    # 最低 **0.389**,干扰项 top-1 最高 **0.114** → 可用区间 `(0.114, 0.389]`,
+    # 取中点 0.25。在 0.58 下 23 条只得 9/23;0.25 得 13/23。
+    # 回退:改回 0.58 即恢复 2026-09-20 之前的行为(会丢 4 条本可命中的正例)。
+    retrieval_score_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
     dedupe_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
     chunk_max_chars: int = Field(default=800, gt=0)
     chunk_overlap_chars: int = Field(default=100, ge=0)

@@ -200,13 +200,20 @@ ask "$SID" "订单 1001 买的是什么商品?那件商品现在还有货吗" > 
 # 而「商品咨询 → KNOWLEDGE」是设计如此(`app/agent/routing.py`),标签一变就走
 # 强制检索、Agent 根本不跑(`agent_steps=0`)。**看到红先读 `intent`**:
 #   intent=订单    → Agent 跑,query_order + query_product 两次串行调用,steps=3 过
-#   intent=商品咨询 → retrieve_knowledge:0 hits → confidence_gate:fail → fallback
-# 后半段那个 0 hits 另有根因(与本脚本无关、也是验收 1 拿不到真答案的原因):
-# `retrieval_score_threshold` 0.58 是 ch03 在 **dense 余弦**分数上定的
+#   intent=商品咨询 → 先走强制检索;过不了置信度闸就 fallback
+# 上面第二条「过不了闸」的根因(与本脚本无关、也是验收 1 拿不到真答案的原因)
+# 是**阈值定错了**,2026-09-20 用户拍板已修:
+# `retrieval_score_threshold` 原值 0.58 是 ch03 在 **dense 余弦**分数上定的
 # (ch03 spec §12:正例最低 0.609/干扰最高 0.560),ch04 加重排时**原值沿用**
-# (ch04-hybrid-rerank spec §9),于是拿 dense 的阈值去卡 **reranker sigmoid** 分数。
-# 实测(2026-09-20,直连 retriever):自然长问句 rerank 分 0.27~0.34(正确块在内),
-# 光问「退货」0.73。**判据不变、阈值不改**(ch05 spec §11 只写「复用」),记录在案。
+# (ch04-hybrid-rerank spec §9)—— 拿 dense 的阈值去卡 **reranker sigmoid** 分数,
+# 两个分布不可通约。实测(2026-09-20,直连 retriever):自然长问句 rerank 分
+# 0.27~0.34(正确块在内),被 0.58 整体滤空;光问「退货」0.73。
+# **2026-09-20 在重排链路上重新实测并改为 0.25**:能命中的正例 top-1 最低 0.389
+# / 干扰项 top-1 最高 0.114 → 可用区间 (0.114, 0.389] 的中点;23 条用例实测
+# 0.58 得 9/23、0.25 得 13/23(`evals/run_retrieval_eval.py`,该脚本本轮一并修好)。
+# **一句话可回退**:改回 0.58 即恢复 2026-09-20 之前的行为。
+# 但阈值修好**不等于**这条验收稳:`intent=商品咨询` 那一支仍会**绕开 Agent**
+# (设计如此),`agent_steps=0` 照样红 —— 看到红先读 `intent`,别当成 ReAct 坏了。
 STEPS=$(done_field agent_steps < /tmp/ch05_5.sse)
 N=$(grep -c "event: tool_call" /tmp/ch05_5.sse)
 BAD=$(bad_tool_results < /tmp/ch05_5.sse)
