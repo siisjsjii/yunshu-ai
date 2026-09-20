@@ -174,8 +174,13 @@ CREATE TABLE refund_requests (
 ```
 
 配 ORM 模型 `RefundRequest`(与 `db/ch04.sql` + models 的既有做法一致)。
-模型的 `status` **同时**写 Python 侧 `default="pending"` 与 `server_default="pending"`
-—— 与 `qa_extraction_staging` / `knowledge_chunks.vectorize_status` 的既有写法一致。
+模型的 `status` **同时**写 Python 侧 `default="pending"` 与 `server_default="pending"`。
+
+> ⚠️ **这两层都要留,别"对齐"成一层**(2026-09-21 复评指出):本仓其余模型
+> (`qa_extraction_staging` / `knowledge_chunks.vectorize_status`)**只有** Python 侧
+> default,没有 `server_default`。`RefundRequest` **是有意的超集** ——
+> 正因为**两层都写**,「`init_db.py` 的 `create_all`」与「照 `db/ch06.sql` provision」
+> 两条路径产出的列**才一致**。把 `server_default` 删掉,分歧会原样回来。
 
 > **订正(2026-09-21,T2 审查发现)**:最早这里写的是 **`CREATE TABLE IF NOT EXISTS`**,
 > 被裁定改掉。原因是一个**静默**的分歧:表实际由 `scripts/init_db.py` 的
