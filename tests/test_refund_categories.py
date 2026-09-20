@@ -13,6 +13,22 @@ def test_valid_category_accepts_only_exact_members():
     assert is_valid_category(first) is True
 
 
+def test_categories_are_exactly_the_agreed_five():
+    """类目**内容**是前后端契约,不是可以随手增删的集合。
+
+    上面的用例只断「>= 3 项且互不相同」,于是从元组里删掉「与描述不符」
+    (或换成任何一个新词)**照样全绿** —— 而前端仍会把它作为选项发上来,
+    `/api/refund` 的校验会把用户的正常选择判成 422。所以内容要逐个钉死。
+    """
+    assert set(REFUND_REASON_CATEGORIES) == {
+        "商品质量问题",
+        "不想要了",
+        "发错货",
+        "少发/漏发",
+        "与描述不符",
+    }
+
+
 def test_valid_category_accepts_every_member():
     """**每一个**成员都必须通过,不能只认第一个。
 
