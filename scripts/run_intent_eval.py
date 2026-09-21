@@ -7,6 +7,13 @@
 
 「其他」是本章的验收点之一,**单独统计**(spec §10 验收 2:怪问题落「其他」)。
 confidence 分布用来定 `intent_confidence_threshold`(spec §9 的待实测项)。
+
+**准确率必须带口径**:用例里有一部分与 `INTENT_SYSTEM_PROMPT` 的 few-shot
+**逐字或近乎重合**,那些行测的是「模型会不会照抄 few-shot」,不是泛化。
+用例文件用 `"fewshot"` 键自己标出来,本脚本**分别算三个数**:
+  全部 / 去掉逐字重合 / 去掉逐字+近乎重合。
+标记规则(人工判定,与用例文件同源):
+  `verbatim` = 与某条 few-shot 逐字相同;`near` = 同句改写(共用主干词)。
 """
 
 import asyncio
@@ -36,10 +43,20 @@ def emit(line: str = "") -> None:
     stream.flush()
 
 
+def _accuracy(rows: list[dict], hits: dict[int, bool]) -> str:
+    if not rows:
+        return "0/0(无可统计条目)"
+    got = sum(hits[i] for i, _ in rows)
+    return f"{got}/{len(rows)} = {got / len(rows):.1%}"
+
+
 async def main() -> int:
     settings = get_settings()
     node = make_classify_intent_node(model=create_extract_model(settings))
     rows = [json.loads(line) for line in CASES.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:                      # 空文件不许 ZeroDivisionError
+        emit(f"用例文件是空的:{CASES}")
+        return 1
 
     hit = 0
     missing_confidence = 0
@@ -47,11 +64,13 @@ async def main() -> int:
     conf_of: list[float] = []
     conf_hit: list[float] = []
     conf_miss: list[float] = []
+    ok_by_index: dict[int, bool] = {}
 
-    for row in rows:
+    for i, row in enumerate(rows):
         got = await node({"user_input": row["text"]})
         ok = got["intent"] == row["expected"]
         hit += ok
+        ok_by_index[i] = bool(ok)
         # 缺键**单独计数**:`.get("confidence", 0)` 会把「节点不再出参」伪装成
         # 一片 conf=0.00,而这正是本节要看的分布。
         if "confidence" not in got:
@@ -62,11 +81,19 @@ async def main() -> int:
         bucket = per_label.setdefault(row["expected"], [0, 0])
         bucket[0] += ok
         bucket[1] += 1
+        tag = f" [few-shot:{row['fewshot']}]" if row.get("fewshot") else ""
         emit(f"{'OK ' if ok else 'MISS'} 期望={row['expected']:<6} "
-             f"实际={got['intent']:<6} conf={conf:.2f}  {row['text']}")
+             f"实际={got['intent']:<6} conf={conf:.2f}  {row['text']}{tag}")
+
+    indexed = list(enumerate(rows))
+    self_only = [(i, r) for i, r in indexed if not r.get("fewshot")]
+    not_verbatim = [(i, r) for i, r in indexed if r.get("fewshot") != "verbatim"]
 
     emit()
-    emit(f"准确率 {hit}/{len(rows)} = {hit / len(rows):.1%}")
+    emit(f"准确率(全部)        {hit}/{len(rows)} = {hit / len(rows):.1%}")
+    emit(f"  去掉 few-shot 逐字  {_accuracy(not_verbatim, ok_by_index)}")
+    emit(f"  去掉逐字+近乎重合   {_accuracy(self_only, ok_by_index)}")
+    emit("  ↑ 只有第三个数是「泛化」口径:前两档测的是模型会不会照抄 few-shot")
     emit(f"缺 confidence 的行数 {missing_confidence}/{len(rows)}")
 
     emit()

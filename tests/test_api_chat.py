@@ -101,8 +101,14 @@ class ScriptedModel:
 
 
 class _Intent:
-    def __init__(self, intent):
+    """意图分类器出参替身。`confidence` 必须跟着补 —— 见
+    `tests/test_agent_graph.py:_Intent`:少一个字段,替身就不是生产结果的形状,
+    而节点那边一加 `getattr` 兜底,「字段缺失」就再也不会红了。
+    """
+
+    def __init__(self, intent, confidence=0.9):
         self.intent = intent
+        self.confidence = confidence
 
 
 class FakeIntentModel:

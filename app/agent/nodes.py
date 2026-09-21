@@ -39,10 +39,10 @@ def make_classify_intent_node(*, model):
             result = await chain.ainvoke(build_intent_messages(state["user_input"]))
             intent = result.intent
             # `getattr` 而不是直接取属性:confidence 只是**日志字段**,出参形状
-            # 不合预期时不该把整轮打成 500 —— 本节点的契约就是「降级,不抛异常」
-            # (brief 原文 `result.confidence` 会让 3 处鸭子类型替身全炸,
-            # 而它们只是没跟着补新字段)。同文件读模型输出处
-            # (`acc.tool_calls`、`chunk.usage_metadata`)用的是同一种写法。
+            # 不合预期时不该把整轮打成 500 —— 本节点的契约就是「降级,不抛异常」。
+            # 同文件读模型输出处(`acc.tool_calls`、`chunk.usage_metadata`)是同一种写法。
+            # 注意这条兜底**真机不可达**(`with_structured_output` 保证拿到的是校验过的
+            # `IntentResult`,其 default 保证字段不缺失),所以它是纯防御、无测试能区分。
             confidence = float(getattr(result, "confidence", 0.0) or 0.0)
         except (OutputParserException, ValidationError) as exc:
             logger.warning("意图识别解析失败,降级为「其他」:%s", exc)

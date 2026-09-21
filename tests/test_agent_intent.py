@@ -133,9 +133,16 @@ def _enumerated_labels(prompt: str) -> set[str]:
     prompt 上报红(实测:stale=['confidence','intent'])—— 假红会诱人
     去改 prompt,而真正的守卫(标签名两处对齐)反而被放过。
 
-    段落边界 = 「八类」标题 → 「**输出一个 JSON 对象」契约段标题。两个边界
-    都断言在,缺任一(改名/删段)就**显式报错**,不让守卫悄悄退化成空集
-    (空集能过 missing 与 stale 两条断言 —— 那才是恒真的假绿)。
+    两个边界 = `八类` → `**输出一个 JSON 对象`(契约段标题),都 `assert` 在。
+    这两条 assert 只是**让失效时报得清楚**(改名/删段时给一句人话),
+    **不是**为了防「空集恒真假绿」—— 解析成空集会被下面的 `missing` 断言挡下
+    (`INTENT_LABELS` 非空)。这里真正的风险是**解析得太多**(把契约段当标签),
+    也就是上面那段说的假红。
+
+    另外,下边界 `partition("八类")` 命中的是**介绍句**里的「八类」
+    (`判断用户这一句话属于下面八类中的哪一类…`),不是段头那一行。
+    介绍句里没有 `- 标签:` 形状的行,所以结果不受影响 —— 但这是**偶然**,
+    不是设计;真要换文案时留意这里。
     """
     _, sep, tail = prompt.partition("八类")
     assert sep, "Prompt 里找不到「八类」段标题,标签守卫已失效"
@@ -172,6 +179,19 @@ def test_every_label_in_the_prompt_matches_the_routing_table():
 
     stale = sorted(enumerated - set(INTENT_LABELS))
     assert not stale, f"Prompt 里枚举了不在 INTENT_TO_ROUTE 里的标签:{stale}"
+
+
+def test_chitchat_fewshot_keeps_the_smalltalk_example():
+    """裁定项:闲聊的 few-shot 必须留着「今天天气不错」。
+
+    ch06 重写 prompt 时把这条例子删了,而它不是新加的用例(从 ch05 就在评估集里)。
+    实测(各 8 次采样):删掉后该句 1/8 落「其他」、**判对时 conf 只有 0.60–0.85**;
+    补回后 8/8 且 0.95–0.97。评估集只能**概率性**发现这种回退(6 轮里 3 轮才红),
+    所以这里要一条确定的守卫。
+    """
+    from app.prompts import INTENT_SYSTEM_PROMPT
+
+    assert "今天天气不错" in INTENT_SYSTEM_PROMPT
 
 
 # ---- ch06 T4:confidence ----

@@ -18,15 +18,21 @@
 {"text": "这什么破服务,转人工", "expected": "投诉"}
 {"text": "你好", "expected": "闲聊"}
 {"text": "谢谢啦", "expected": "闲聊"}
-{"text": "今天天气不错", "expected": "闲聊"}
-{"text": "帮我写一首关于月亮的诗", "expected": "其他"}
+{"text": "今天天气不错", "expected": "闲聊", "fewshot": "verbatim"}
+{"text": "帮我写一首关于月亮的诗", "expected": "其他", "fewshot": "near"}
 {"text": "asdkjhaskjd", "expected": "其他"}
 {"text": "你们老板是谁", "expected": "其他"}
-{"text": "这个能退吗", "expected": "退款退货"}
-{"text": "你们客服态度太差了", "expected": "投诉"}
-{"text": "订单 1001 买的是什么", "expected": "订单"}
-{"text": "帮我写一首诗", "expected": "其他"}
+{"text": "这个能退吗", "expected": "退款退货", "fewshot": "verbatim"}
+{"text": "你们客服态度太差了", "expected": "投诉", "fewshot": "near"}
+{"text": "订单 1001 买的是什么", "expected": "订单", "fewshot": "verbatim"}
+{"text": "帮我写一首诗", "expected": "其他", "fewshot": "verbatim"}
 {"text": "今天股市怎么样", "expected": "其他"}
 {"text": "asdfghjkl", "expected": "其他"}
 {"text": "机械键盘和猫砂盆哪个好养猫", "expected": "其他"}
 {"text": "我要退货但是我不知道订单号", "expected": "退款退货"}
+{"text": "这个保温杯能装热水吗", "expected": "商品咨询"}
+{"text": "收到货了,少了一件", "expected": "售后"}
+{"text": "怎么开增值税发票", "expected": "其他"}
+{"text": "where is my package", "expected": "物流"}
+{"text": "我要退货,退回的运费谁出", "expected": "退款退货"}
+{"text": "帮我查一下明天北京的天气", "expected": "其他"}

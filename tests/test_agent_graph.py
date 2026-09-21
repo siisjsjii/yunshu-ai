@@ -10,6 +10,19 @@ from app.config import Settings
 from app.retrieval.search import RetrievedChunk
 
 
+class _Intent:
+    """意图分类器的出参替身。
+
+    `confidence` **必须跟着补**(T4 起 `IntentResult` 有这个字段):不补的话
+    替身不是生产结果的形状,而 `classify_intent` 那边一加 `getattr` 兜底
+    「缺字段」就再也不会红 —— T4 初版正是这样让「通道没声明」溜过去的。
+    """
+
+    def __init__(self, intent, confidence=0.9):
+        self.intent = intent
+        self.confidence = confidence
+
+
 class FakeChunk:
     def __init__(self, text="", tool_calls=None, usage=None):
         self.text = text
@@ -81,13 +94,14 @@ def _settings(**over):
     )
 
 
-def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None):
+def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None,
+           confidence=0.9):
     session = RecordingSession()
     # rounds is None 才用默认;显式传 [] 要保留成空脚本 ——
     # 那是「碰模型就炸」的探针,`rounds or [...]` 会把空列表换掉、探针失效。
     graph = build_graph(
         model=ScriptedModel(rounds if rounds is not None else [[FakeChunk("模型回复")]]),
-        intent_model=ScriptedModel([[type("_I", (), {"intent": intent})()]]),
+        intent_model=ScriptedModel([[_Intent(intent, confidence)]]),
         tools=[], registry={}, settings=settings or _settings(),
         retriever=retriever or FakeRetriever(),
         session=session, conversation_id="conv-1",
@@ -226,6 +240,31 @@ async def test_log_turn_emits_trace_frame_for_end_to_end_acceptance():
 
 
 @pytest.mark.anyio
+async def test_confidence_travels_from_classifier_through_the_graph_to_the_trace_frame():
+    """**接缝测试**:分类器的 confidence 必须真的**在图里**走到 `trace` 帧。
+
+    T4 初版漏了这条,而两半各自都有测试:
+    - `tests/test_agent_intent.py` 断言节点的返回值;
+    - 同文件另一条断言 `log_turn` 的帧载荷 —— 但它**把 confidence 直接注进 state**,
+      LangGraph 全程没参与。
+    于是「`ChatState` 里根本没声明 `confidence` 这个通道」溜了过去:通道集合由
+    `StateGraph(ChatState)` 的注解决定,LangGraph 对未声明通道的写入是**静默丢弃**
+    (`wrote to unknown channel ..., ignoring it`,只 warning 不抛)—— 真机上
+    `log_turn` 每帧发出去的 confidence **恒为 null**,而两条测试全绿。
+
+    本用例的 confidence **由替身分类器给**(0.87,与任何默认值都不撞),经
+    `classify_intent` → state 通道 → `log_turn`,两端都断言。
+    """
+    frames = []
+    graph, _ = _graph("闲聊", rounds=[], frames=frames, confidence=0.87)
+    out = await _run(graph, "你好")
+
+    payload = next(f for f in frames if f["frame"] == "trace")
+    assert payload["confidence"] == pytest.approx(0.87)   # T8 要折进 done 帧的那份载荷
+    assert out["confidence"] == pytest.approx(0.87)       # 通道里确实落了值
+
+
+@pytest.mark.anyio
 async def test_second_turn_on_same_thread_reports_only_its_own_turn():
     """**跨轮证据链**:同一个 thread 连跑两轮,第二轮只许报第二轮。
 
@@ -249,8 +288,8 @@ async def test_second_turn_on_same_thread_reports_only_its_own_turn():
         # 意图替身按**调用顺序**回放(ainvoke 是 rounds.pop(0)):第 1 轮知识类,
         # 第 2 轮闲聊 —— 两轮走**不同分支**,残留才看得见。
         intent_model=ScriptedModel([
-            [type("_I", (), {"intent": "商品咨询"})()],
-            [type("_I", (), {"intent": "闲聊"})()],
+            [_Intent("商品咨询", 0.93)],
+            [_Intent("闲聊", 0.97)],
         ]),
         tools=[], registry={}, settings=_settings(),
         retriever=retriever, session=session, conversation_id="conv-1",
@@ -342,7 +381,7 @@ async def test_emitter_sends_frames_through_astream_custom_mode():
     session = RecordingSession()
     graph = build_graph(
         model=ScriptedModel([]),
-        intent_model=ScriptedModel([[type("_I", (), {"intent": "投诉"})()]]),
+        intent_model=ScriptedModel([[_Intent("投诉", 0.95)]]),
         tools=[], registry={}, settings=_settings(), retriever=FakeRetriever(),
         session=session, conversation_id="conv-emit", emit=emit,
         checkpointer=get_checkpointer(),
