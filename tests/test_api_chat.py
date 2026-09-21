@@ -334,13 +334,16 @@ def client_factory(monkeypatch):
         db = session if session is not None else FakeSession()
         store = SessionStore(ttl_seconds=60, max_sessions=10)
 
-        if retriever is not None:
-            # 端点每请求自己 `build_retriever(session)`,真实实现会连 Milvus 并
-            # 按需加载 BGE-M3 权重。退款子流程的检索腿必须换掉,否则用例会真的
-            # 出网(「单测全程不联网」是硬规矩)。
-            monkeypatch.setattr(
-                chat_api, "build_retriever", lambda session: retriever
-            )
+        # 端点每请求自己 `build_retriever(session)`,真实实现会连 Milvus 并按需
+        # 加载 BGE-M3 权重 —— **默认也要换掉**,不是"传了才换":任何一条将来走到
+        # 退款检索腿却没传 `retriever=` 的用例,都会在无人察觉的情况下真的出网
+        # (「单测全程不联网」是硬规矩)。默认给一个**空结果**的哑检索器:
+        # 走到检索腿的用例拿到"没命中"这个确定行为,而不是一次真实 IO。
+        monkeypatch.setattr(
+            chat_api,
+            "build_retriever",
+            lambda session: retriever if retriever is not None else FakeRetriever([]),
+        )
 
         if registry is not None:
             # 端点用 build_tools 组装工具集、再 registry_for 建映射。
@@ -1289,7 +1292,14 @@ async def test_request_with_neither_message_nor_resume_is_rejected(client_factor
             "/api/chat/stream",
             json={"session_id": "s1", "message": "这个能退吗", "resume": {"order_no": "1"}},
         )
-        # 反面:`resume` 单独给是合法的(ch06 新增的入口)。
+        # 反面:`resume` 单独给是合法的(ch06 新增的入口)。**先造一个真的挂起点**
+        # —— 没有挂起点时 200 也能拿到,但那是失败路径产的:请求带着 `Command`
+        # 从 START 重开,`resolve_references` 抛 `KeyError('user_input')`,端点的
+        # `except Exception` 把它变成**一个 `error` 帧的 200**。只断状态码的写法
+        # 区分不了「续跑成功」与「炸在流里」,审查实测确认过这条。
+        c.post(
+            "/api/chat/stream", json={"session_id": "s1", "message": "这个能退吗"}
+        )
         only_resume = c.post(
             "/api/chat/stream", json={"session_id": "s1", "resume": {"order_no": "1"}}
         )
@@ -1298,7 +1308,69 @@ async def test_request_with_neither_message_nor_resume_is_rejected(client_factor
     # 两个都给同样拒:resume 会**静默吞掉** message,用户那句原话既没被回答、
     # 也不会落库 —— 事后连查都查不到。
     assert both.status_code == 422
+    # 续跑**走完了**:帧序列以 done 收尾,且中间没有 error。
     assert only_resume.status_code == 200
+    assert [name for name, _ in _parse_sse(only_resume.text)][-1] == "done"
+    assert "event: error" not in only_resume.text
+
+
+@pytest.mark.anyio
+async def test_resume_without_a_pending_flow_is_rejected_before_the_stream(client_factory):
+    """没有挂起点就 resume → **流开始之前** 409 + 固定文案。
+
+    首版实测的结局是 HTTP 200 + 一个 error 帧,里面是裸的 `'user_input'`
+    (图带着 `Command` 从 START 重开,`resolve_references` 取不到键)——
+    用户看不懂、我们也没法查。可达场景:服务重启(InMemorySaver 是进程内的)
+    之后用户点一张还挂在页面上的旧卡片。
+
+    三条断言缺一不可:状态码(不是 200)、**不是 SSE 流**(一旦开始流式就再也
+    改不了状态码)、以及流里**没有 error 帧**(「因为报错所以 200」正是这条
+    用例要防的假绿;句子也不能带任何 Python 标识符)。
+
+    顺带钉住这条退出路径的锁:它在 `try` 守卫**之内**抛,靠 `except BaseException`
+    放锁 —— 漏了的话该会话从此永久 409(本仓的既定规矩:每条退出路径都要有具名测试)。
+    """
+    client, _ = client_factory(
+        batches=[], intent="退款退货", session_lock_timeout_seconds=0.15
+    )
+    with client as c:
+        resp = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-no-pending", "resume": {"order_no": PICKED_ORDER}},
+        )
+        # 锁若没放掉,下面这次请求会等锁超时 → 409(文案不同,见断言)。
+        follow_up = c.post(
+            "/api/chat/stream", json={"session_id": "s-no-pending", "message": "在吗"}
+        )
+
+    assert resp.status_code == 409
+    assert resp.headers["content-type"].startswith("application/json")
+    assert "event:" not in resp.text
+    assert "error" not in resp.text
+    assert "user_input" not in resp.text          # 裸标识符绝不能出现
+    assert resp.json()["detail"] == "该会话没有待处理的流程,请直接发送消息开始新一轮。"
+    assert client.store.lock_for("s-no-pending").locked() is False
+    assert follow_up.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_resume_after_the_flow_finished_is_rejected(client_factory):
+    """走完之后的会话再 resume 一次 → 同样 409(那条 thread **有** checkpoint,
+    只是没有待续任务 —— 与上一条的"从来没有过"分开,两条走的是不同的分支)。"""
+    client, _ = client_factory(batches=[], intent="退款退货")
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": "s-done", "message": "这个能退吗"})
+        first = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-done", "resume": {"order_no": PICKED_ORDER}},
+        )
+        again = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-done", "resume": {"order_no": PICKED_ORDER}},
+        )
+
+    assert [name for name, _ in _parse_sse(first.text)][-1] == "done"
+    assert again.status_code == 409
 
 
 @pytest.mark.anyio

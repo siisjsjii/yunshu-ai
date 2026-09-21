@@ -60,6 +60,16 @@ def get_intent_model(settings: Settings = Depends(get_settings)):
     return create_extract_model(settings)
 
 
+#: 「resume 打在一个没有挂起流程的会话上」时给客户端的固定文案。
+#:
+#: **不得出现任何 Python 标识符**:这条路径的默认结局(不校验就放它进流)是
+#: 图带着 `Command` 从 START 重开 → `resolve_references` 取不到 `user_input`
+#: → `KeyError` → 端点那句 `str(exc)` 把它变成 HTTP 200 的 error 帧,
+#: **用户看到的是一句裸的 `'user_input'`**(实测)。既没有可操作性,
+#: 也不是服务端故障该有的样子。
+RESUME_WITHOUT_PENDING = "该会话没有待处理的流程,请直接发送消息开始新一轮。"
+
+
 def _frame(event: str, payload: dict) -> bytes:
     return format_sse_event(
         event=event,
@@ -101,32 +111,13 @@ async def chat_stream(
         await ensure_conversation(
             session=session, session_id=session_id, user_id=user_id
         )
-        if request.resume is not None:
-            # **续跑不是新的一轮**(ch06,spec §5.1)。两件事因此都不做:
-            #
-            # ① 不读历史。`Command(resume=…)` 只把 resume 值交回挂起的那个节点,
-            #    **不会**把输入合并进 state —— 历史、user_input、槽位全都从
-            #    checkpointer 的断点里恢复。读出来没有任何读者。
-            # ② 不跑 `prepare_turn`。它既拿不到本轮输入(挂起那轮的原话在 state
-            #    里,不在这里),预算校验也失去意义:这一轮**没有新的用户输入**,
-            #    上下文规模在挂起那一刻就已经定死了。真拿 None 递进去,它会炸在
-            #    tiktoken 里 —— 一个请求语义问题变成 500。
-            stream_input = Command(resume=request.resume)
-        else:
+        if request.resume is None:
             history = await load_history(session=session, conversation_id=session_id)
             # 产出是**裁剪后的历史**(不是组装好的消息):消息组装搬进了
             # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
             history = prepare_turn(
                 settings=settings, history=history, user_input=request.message
             )
-            # 这一句刻意留在守卫之内:`build_graph` 每请求现编,输入也在这里
-            # 一次性定下来 —— `generate()` 只管把它递给图。
-            stream_input = {
-                "conversation_id": session_id,
-                "user_input": request.message,
-                "history": history,        # prepare_turn 返回的**裁剪后**历史
-                "trace": [],
-            }
         # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
         # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
         # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
@@ -139,6 +130,66 @@ async def chat_stream(
         # 症状与"泄漏"毫无相似之处。
         tools = build_tools(session=session, conversation_id=session_id)
         registry = registry_for(tools)
+
+        # emit 必须在图**之外**创建、在节点里才被调用 —— make_emitter 返回的
+        # 是可重复调用的函数,每次发帧时现取 writer(见 app/agent/emit.py)。
+        emit = make_emitter()
+        # 图在这里(而不是在 generate 里)组装:构造 `StateGraph` 与 `compile`
+        # 是纯内存操作、不做 IO,而**续跑的待续检查要用它 `aget_state`** ——
+        # 那个检查必须发生在响应开始之前(理由见下面那一段)。
+        graph = build_graph(
+            model=model,
+            intent_model=intent_model,
+            tools=tools,
+            registry=registry,
+            settings=settings,
+            retriever=build_retriever(session),
+            session=session,
+            conversation_id=session_id,
+            emit=emit,
+            checkpointer=get_checkpointer(),
+        )
+
+        if request.resume is not None:
+            # **续跑不是新的一轮**(ch06,spec §5.1),而且**必须先确认真的有待续
+            # 任务**。两件事都在这里说清:
+            #
+            # ① 待续检查。没有待续任务时放它进流,结局实测是:图带着 `Command`
+            #    从 START 重开 → `resolve_references` 取不到 `user_input` →
+            #    `KeyError` → 端点那句 `str(exc)` 把它变成 **HTTP 200 的 error
+            #    帧**,用户看到一句裸的 `'user_input'`。可达场景:服务重启
+            #    (InMemorySaver 是进程内的)之后,用户点一张还挂在页面上的旧卡片
+            #    —— 页面把 sessionId 留在内存里,这次点击照样发得出来。
+            #    检查放在这里,是因为**这里还改得动状态码**(一旦 yield 过首帧
+            #    就再也不能):与预算校验同一个窗口。
+            #
+            # ② 不读历史、不跑 `prepare_turn`。`Command(resume=…)` 只把 resume 值
+            #    交回挂起的那个节点,**不会**把输入合并进 state —— 历史、user_input、
+            #    槽位全都从 checkpointer 的断点里恢复,读出来没有读者。而
+            #    `prepare_turn` 更不能用:它拿不到本轮输入(挂起那轮的原话在 state
+            #    里),真拿 None 递进去会炸在 tiktoken 里 —— 请求语义问题变 500。
+            snapshot = await graph.aget_state(
+                {"configurable": {"thread_id": session_id}}
+            )
+            if not snapshot.next:
+                # 409 而不是 422:请求体本身**完全合约定**(spec §5.1 的形状),
+                # 冲突的是**这个会话的状态**(没有待续流程)—— 与本文件上面那条
+                # 「该会话正在处理另一条消息」同一族。422 在本仓专指"请求本身
+                # 不合约定"(类目不在固定集、缺必填字段)。
+                raise HTTPException(
+                    status_code=409,
+                    detail=redact_api_key(
+                        RESUME_WITHOUT_PENDING, settings.openai_api_key
+                    ),
+                )
+            stream_input = Command(resume=request.resume)
+        else:
+            stream_input = {
+                "conversation_id": session_id,
+                "user_input": request.message,
+                "history": history,        # prepare_turn 返回的**裁剪后**历史
+                "trace": [],
+            }
     except ContextOverflowError as exc:
         lock.release()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -154,22 +205,6 @@ async def chat_stream(
     async def generate():
         try:
             yield _frame("meta", {"session_id": session_id, "model": settings.openai_model})
-
-            # emit 必须在图**之外**创建、在节点里才被调用 —— make_emitter 返回的
-            # 是可重复调用的函数,每次发帧时现取 writer(见 app/agent/emit.py)。
-            emit = make_emitter()
-            graph = build_graph(
-                model=model,
-                intent_model=intent_model,
-                tools=tools,
-                registry=registry,
-                settings=settings,
-                retriever=build_retriever(session),
-                session=session,
-                conversation_id=session_id,
-                emit=emit,
-                checkpointer=get_checkpointer(),
-            )
 
             final = {"trace": [], "intent": None, "gate_passed": None, "agent_steps": 0}
             suspended = False
@@ -190,11 +225,21 @@ async def chat_stream(
                         # 挂起:载荷原样是 `{"frame": "order_choice", "options": [...]}`
                         # (spec §5.2),帧名与载荷由它自己说 —— 端点只做搬运,不认
                         # "order_choice" 这个字面量(将来多一种挂起,这里不用改)。
-                        payload = chunk["__interrupt__"][0].value
+                        value = chunk["__interrupt__"][0].value
+                        if not isinstance(value, dict):
+                            # 下面两句要 `payload.get(...)` / `payload.items()`,
+                            # 非 dict 会变成一句 `AttributeError` 的 error 帧。
+                            # **只有我们自己的节点会 `interrupt(...)`,它们一律给
+                            # dict**(见 `app/agent/refund_nodes.py`),所以走到这里
+                            # 是接线/实现 bug —— 响亮地抛,别让它长成
+                            # 「用户看不懂、我们也没法查」的样子。
+                            raise TypeError(
+                                f"interrupt 载荷必须是 dict,收到 {type(value).__name__}"
+                            )
                         suspended = True
                         yield _frame(
-                            payload.get("frame", "interrupt"),
-                            {k: v for k, v in payload.items() if k != "frame"},
+                            value.get("frame", "interrupt"),
+                            {k: v for k, v in value.items() if k != "frame"},
                         )
                     continue
 
