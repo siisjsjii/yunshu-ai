@@ -33,6 +33,21 @@ class IntentResult(BaseModel):
     )
 
 
+class RefundJudgement(BaseModel):
+    """退款判定的结构化出参。走 `method="json_mode"`(与抽取/意图/扩写同源)。
+
+    只有两个字段,**没有**「依据」那一项:依据以 `[n]` 编号写进 `reply`
+    (编号与 `citations` 帧对齐),多一个字段就多一处模型会写歪的地方。
+    `json_mode` 这条路**不把 schema 描述发给模型** —— 模型看到的契约在
+    `prompts.REFUND_JUDGE_SYSTEM_PROMPT` 里(同 `IntentResult` 那条注释)。
+    """
+
+    can_refund: bool = Field(
+        description="这一单能不能退。条款没写明、或条款与这一单对不上时必须为 false。"
+    )
+    reply: str = Field(default="", description="给用户看的话术,不超过三句话。")
+
+
 class ChatState(TypedDict):
     """贯穿全图的状态。节点返回的是**部分**键,由 reducer 合并(LangGraph 语义)。"""
 
@@ -53,6 +68,16 @@ class ChatState(TypedDict):
     confidence: float             # 分类器自评(0–1);本章只进日志,不参与路由
     evidence: list[dict]          # 知识类:检索到的 chunk(含 score/section_path/chunk_id)
     gate_passed: bool
+
+    # ---- 退款子流程(ch06)----
+    # 三个通道**连同它们的每轮清零**一起落地(清零在
+    # `nodes.make_resolve_references_node`,计划 PF-2:通道与它的清零必须同处一地)。
+    # 漏了清零的后果是**静默串轮** —— checkpointer 是进程级单例、thread_id =
+    # session_id,未写的通道保留上一轮的值,于是上一轮填过的订单号会被这一轮
+    # 当成本轮槽位:用户明明在问别的,却拿着**上一单**去判能不能退。
+    order_no: str                 # 订单号槽位;空串 = 待回填(interrupt 弹卡片)
+    order_data: dict              # query_order 的返回;空 dict = 查不到这一单
+    refund_decision: bool | None  # None = 还没判 / 判不出来;**不是** False(那是结论)
 
     # ---- Agent ----
     # 刻意**不**放 ReAct 的消息序列:agent 节点在那一轮内部用局部变量组装

@@ -1,3 +1,4 @@
+import json
 from collections.abc import Sequence
 
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -216,6 +217,54 @@ def build_expand_messages(*, text: str, max_queries: int) -> list:
        在这里由 `tests/test_retrieval_expand.py` 接续钉住)。
     """
     return _EXPAND_PROMPT.format_messages(text=text, max_queries=max_queries)
+
+
+REFUND_JUDGE_SYSTEM_PROMPT = """你在做电商退款审核。给你**一个订单的信息**与**知识库里的退款条款**,
+判断这一单能不能退,并给出一句给用户看的话术。
+
+**你只有一次回答机会:不能调用工具、不能追问、不能要求用户补充信息。**
+
+判据(只依据下面给出的订单信息与条款):
+1. 条款写明这一单**可以**退 → can_refund 为 true,话术里说清依据,
+   并在对应信息处标出条款编号(如 [1]);
+2. 条款写明这一单**不能**退(如超出七天无理由、已拆封使用、定制类商品)→ can_refund 为 false,
+   话术里说明**具体原因**,并建议联系人工客服进一步核实;
+3. **没有给出条款、或条款与这一单对不上 → 不要凭常识猜**:can_refund 为 false,
+   话术里如实说明「暂时判断不了这一单能不能退」,并建议转人工核实。
+
+话术要求:中文、口语、不超过三句话;不承诺时效与金额;不讲订单信息里没有的内容。
+
+**输出一个 JSON 对象,只有 can_refund 与 reply 两个字段。**
+- can_refund:布尔值(true 表示这一单可以退款);
+- reply:字符串,给用户看的那句话术。
+不要输出 JSON 以外的任何内容。"""
+
+#: 检索一条都没命中时给判定的说明。**不能省**:省掉的话模型看到的是一段
+#: 「以下是知识库中与该问题相关的资料」后面**空空如也** —— 那是在邀请它
+#: 编一条 [1] 出来(prompt 里那句「标注编号」还在)。
+NO_CLAUSE_NOTE = "(知识库里没有检索到与退款政策相关的条款)"
+
+_REFUND_JUDGE_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", REFUND_JUDGE_SYSTEM_PROMPT), ("human", "{text}")]
+)
+
+
+def build_refund_judge_messages(
+    *, order: dict, evidence: list[dict], user_input: str
+) -> list:
+    """组装退款判定的消息:订单信息 + 条款(编号规则与 `citations` 同一套)+ 用户问题。
+
+    条款段**复用 `render_evidence`**:编号规则([n] 按 evidence 顺序)必须与
+    发出去的 `citations` 帧是同一套 —— 各写一份的话,模型标注的 [1] 与前端
+    可点开的第 1 条会指向不同的块,而且两边都"看起来正常"。
+
+    `text` 里的任何花括号(订单 JSON 里没有,但话术可能带)都只是**值**,
+    不参与模板解析 —— 与 `build_expand_messages` 同一形状。
+    """
+    parts = ["【订单信息】", json.dumps(order, ensure_ascii=False)]
+    parts += ["", render_evidence(evidence) if evidence else NO_CLAUSE_NOTE]
+    parts += ["", "【用户问题】", user_input]
+    return _REFUND_JUDGE_PROMPT.format_messages(text="\n".join(parts))
 
 
 def build_resolve_messages(*, history: Sequence[Message], user_input: str) -> list:

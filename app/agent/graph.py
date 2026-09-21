@@ -23,18 +23,37 @@ from app.agent.nodes import (
     make_resolve_references_node,
     make_retrieve_knowledge_node,
 )
+from app.agent.refund_nodes import (
+    make_refund_expand_retrieve_node,
+    make_refund_explain_node,
+    make_refund_fetch_order_node,
+    make_refund_judge_node,
+    make_refund_offer_node,
+    make_refund_pick_order_node,
+    route_after_fetch,
+    route_after_judge,
+)
 from app.agent.routing import (
     BUSINESS,
     CHITCHAT,
     COMPLAINT,
     FALLBACK,
     KNOWLEDGE,
+    REFUND,
     route_by_intent,
 )
 from app.agent.state import ChatState
 
 #: 出口节点 —— 它们统一汇进 log_turn 再结束。
-_OUTLETS = ("agent", "complaint_reply", "chitchat_reply", "fallback_reply")
+#:
+#: `refund_pick_order` **不在此列**:它可能停在 `interrupt()` 上,那时 run 根本
+#: 走不到 `log_turn`("挂起的那一轮不落库",spec §5.1)。它若也连上 log_turn,
+#: 挂起路径就成了「一半写库、一半没写」—— 而这在单测里看不出来(单测要显式
+#: resume 才走得到那儿)。
+_OUTLETS = (
+    "agent", "complaint_reply", "chitchat_reply", "fallback_reply",
+    "refund_offer", "refund_explain",
+)
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +118,24 @@ def build_graph(
     graph.add_node("complaint_reply", make_complaint_reply_node(emit=emit))
     graph.add_node("chitchat_reply", make_chitchat_reply_node(emit=emit))
     graph.add_node("fallback_reply", make_fallback_reply_node(emit=emit))
+    # ---- 退款子流程(ch06)----
+    # 入口节点的**参数里没有 emit**:它除了 `interrupt()` 什么都不干(见
+    # `app/agent/refund_nodes.py` 的 F3 说明)。取数用它下游的节点,这样 resume
+    # 重跑入口时不会产生第二次查询。
+    graph.add_node("refund_pick_order", make_refund_pick_order_node())
+    graph.add_node(
+        "refund_fetch_order",
+        make_refund_fetch_order_node(registry=registry, settings=settings),
+    )
+    graph.add_node(
+        "refund_expand_retrieve",
+        make_refund_expand_retrieve_node(model=model, retriever=retriever, emit=emit),
+    )
+    # 判定**不新建 Agent**:同一个主力模型、一次结构化调用、不绑工具
+    # (第二轮的 `bind_tools` 缺失在这里是结构保证,不是提示词约定)。
+    graph.add_node("refund_judge", make_refund_judge_node(model=model))
+    graph.add_node("refund_offer", make_refund_offer_node(emit=emit))
+    graph.add_node("refund_explain", make_refund_explain_node(emit=emit))
     graph.add_node("log_turn", make_log_turn_node(session=session, emit=emit))
 
     graph.add_edge(START, "resolve_references")
@@ -112,7 +149,25 @@ def build_graph(
             COMPLAINT: "complaint_reply",
             CHITCHAT: "chitchat_reply",
             FALLBACK: "fallback_reply",
+            REFUND: "refund_pick_order",
         },
+    )
+    # ---- 退款子流程的走向(三个条件边,判据都是 state 的纯函数)----
+    # 入口 → 取数:`refund_pick_order` 无条件连出 —— 有订单号时它直接返回,
+    # 缺号时它 interrupt,resume 之后**从它自己**继续,并不会"再走一遍"下游。
+    graph.add_edge("refund_pick_order", "refund_fetch_order")
+    graph.add_conditional_edges(
+        "refund_fetch_order",
+        route_after_fetch,
+        {"refund_expand_retrieve": "refund_expand_retrieve",
+         # 查不到单:报告,不判(refund_decision 在取数节点里已置 False)。
+         "refund_explain": "refund_explain"},
+    )
+    graph.add_edge("refund_expand_retrieve", "refund_judge")
+    graph.add_conditional_edges(
+        "refund_judge",
+        route_after_judge,
+        {"refund_offer": "refund_offer", "refund_explain": "refund_explain"},
     )
     graph.add_edge("retrieve_knowledge", "confidence_gate")
     graph.add_conditional_edges(

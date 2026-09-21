@@ -336,7 +336,8 @@ def make_resolve_references_node(*, model):
     **这里返回的每个 key 都必须在 `ChatState` 里声明过**:通道集合由
     `StateGraph(ChatState)` 的注解决定,LangGraph 对未声明通道的写入是
     **静默丢弃**的(T4 的 Critical 就是它)。T7 的 `order_no` / `order_data` /
-    `refund_decision` 三个通道**连同它们的清零一起**在 T7 落地(计划 PF-2)。
+    `refund_decision` 三个通道**连同它们的清零一起**在 T7 落地(计划 PF-2)
+    —— 加通道的人就是加清零的人,别把两者拆到两次改动里。
     """
 
     async def resolve_references(state) -> dict:
@@ -373,6 +374,14 @@ def make_resolve_references_node(*, model):
             "citations": [],
             "evidence": [],
             "tool_calls_made": [],
+            # 退款子流程的三个槽位(T7 新加)。**通道与它的清零同处一地**:
+            # 漏了这三行的后果是**静默串轮** —— 上一轮填过的订单号会被这一轮
+            # 当成本轮槽位,用户明明没提订单号却既不弹卡片、又拿着**上一单**
+            # 去判能不能退(`tests/test_agent_refund.py::
+            # test_second_turn_on_same_thread_clears_refund_slots` 钉着它)。
+            "order_no": "",
+            "order_data": {},
+            "refund_decision": None,
         }
 
     return resolve_references

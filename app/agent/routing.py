@@ -10,20 +10,24 @@ BUSINESS = "business"
 COMPLAINT = "complaint"
 CHITCHAT = "chitchat"
 FALLBACK = "fallback"
+#: ch06:退款退货 / 售后走**确定性子流程**(见 `app/agent/refund_nodes.py`)。
+REFUND = "refund"
 
 #: 意图识别失败或输出越界时统一落这个标签,再由本表送进兜底出口。
 OTHER = "其他"
 
-#: 八类意图 → 四个出口。
-#: 商品咨询 / 退款退货 → 知识(强制预检索;退款退货的 Agent 仍可自调订单工具);
-#: 物流 / 订单 / 售后 → 业务数据(直接进 Agent 调工具,无检索证据故不过置信度闸);
+#: 八类意图 → 五出口。
+#: 商品咨询 → 知识(强制预检索 + 置信度闸);
+#: 物流 / 订单 → 业务数据(直接进 Agent 调工具,无检索证据故不过置信度闸);
+#: **退款退货 / 售后 → 退款子流程**(ch06:取这一单 → 查条款 → 判一次 → 给入口
+#: 或解释;缺订单号时在子流程里 `interrupt` 弹卡片);
 #: 投诉、闲聊各有专属出口;其他 → 兜底。
 INTENT_TO_ROUTE: dict[str, str] = {
     "商品咨询": KNOWLEDGE,
-    "退款退货": KNOWLEDGE,
+    "退款退货": REFUND,
     "物流": BUSINESS,
     "订单": BUSINESS,
-    "售后": BUSINESS,
+    "售后": REFUND,
     "投诉": COMPLAINT,
     "闲聊": CHITCHAT,
     # 显式写进来才让 `INTENT_LABELS` 带得上它 —— 提示词的标签表与这张表同源,

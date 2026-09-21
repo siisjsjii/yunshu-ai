@@ -11,15 +11,19 @@ from app.agent.routing import (
     INTENT_TO_ROUTE,
     KNOWLEDGE,
     OTHER,
+    REFUND,
     route_by_intent,
 )
 
 CASES = [
     ("商品咨询", KNOWLEDGE),
-    ("退款退货", KNOWLEDGE),
+    # ch06:退款退货 / 售后从「知识 / 业务」改走**退款子流程**(spec §3.2)。
+    # 两行都必须改 —— 只改一行的话,另一条意图会静默留在旧出口上:
+    # 售后走 BUSINESS 时用户拿到的是「Agent 调工具回答」,永远弹不出订单卡片。
+    ("退款退货", REFUND),
     ("物流", BUSINESS),
     ("订单", BUSINESS),
-    ("售后", BUSINESS),
+    ("售后", REFUND),
     ("投诉", COMPLAINT),
     ("闲聊", CHITCHAT),
     # ch06 起「其他」是**显式标签**(spec §3.2):它本来就落 `.get()` 的默认值,
