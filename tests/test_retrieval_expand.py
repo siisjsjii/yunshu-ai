@@ -21,11 +21,19 @@ import logging
 
 import pytest
 from langchain_core.exceptions import OutputParserException
+from sqlalchemy.exc import OperationalError
 
 from app.prompts import EXPAND_SYSTEM_PROMPT, build_expand_messages
 from app.retrieval.expand import ExpandQueries, expand_queries, multi_search
-from app.retrieval.search import RetrievedChunk
+from app.retrieval.search import KnowledgeRetriever, RetrievedChunk
 from app.tools.errors import ToolInfrastructureError
+
+
+def _raw_db_error() -> OperationalError:
+    """**未翻译**的 MySQL 故障,与 `_load_rows` 里实际会抛出来的形态一致。"""
+    return OperationalError(
+        "SELECT knowledge_chunks ...", {}, Exception("Lost connection to MySQL server")
+    )
 
 
 def _chunk(chunk_id: int, score: float, question: str = "怎么退货") -> RetrievedChunk:
@@ -82,6 +90,9 @@ async def test_multi_search_merges_and_dedupes_by_chunk_id():
     got = await multi_search(r, ["q1", "q2"])
     assert [c.chunk_id for c in got] == [1, 3, 2]      # 按 score 降序
     assert len([c for c in got if c.chunk_id == 2]) == 1
+    # 每条查询各跑一次、按传入顺序 —— 少了这条,`calls` 属性只写不读,
+    # 「跳过某条」或「重复跑某条」都没有断言看着。
+    assert r.calls == ["q1", "q2"]
 
 
 @pytest.mark.anyio
@@ -100,6 +111,27 @@ async def test_same_chunk_keeps_the_higher_score_not_the_first_seen():
     r = _FakeRetriever({
         "q1": [_chunk(1, 0.9), _chunk(2, 0.4)],
         "q2": [_chunk(3, 0.6), _chunk(2, 0.85)],
+    })
+    got = await multi_search(r, ["q1", "q2"])
+    assert [c.chunk_id for c in got] == [1, 2, 3]
+    assert [c.score for c in got] == [0.9, 0.85, 0.6]
+
+
+@pytest.mark.anyio
+async def test_duplicate_appearing_first_with_the_higher_score_also_wins():
+    """**镜像用例**:重复块先以高分出现、后又以低分出现 → 仍是高分那份。
+
+    上一条把高分放在**后面**,于是「完全不做比较」的
+    `merged[chunk.chunk_id] = chunk`(**last-wins**)恰好也给出正确答案。
+    这一条把顺序反过来:last-wins 会塌成 `[1, 3, 2]` / `[0.9, 0.6, 0.4]`,
+    正确实现是 `[1, 2, 3]` / `[0.9, 0.85, 0.6]`。
+
+    两条合起来,「留首次 / 留最高 / 留最后」三种写法**两两可分** ——
+    单看任何一条都不够。
+    """
+    r = _FakeRetriever({
+        "q1": [_chunk(1, 0.9), _chunk(2, 0.85)],
+        "q2": [_chunk(3, 0.6), _chunk(2, 0.4)],
     })
     got = await multi_search(r, ["q1", "q2"])
     assert [c.chunk_id for c in got] == [1, 2, 3]
@@ -127,6 +159,19 @@ async def test_multi_search_tolerates_one_query_failing():
     """一条查询挂掉不该让整次检索失败 —— 用剩下的。"""
     r = _FlakyRetriever(fail_on="q2")
     got = await multi_search(r, ["q1", "q2"])
+    assert [c.chunk_id for c in got] == [1]
+
+
+@pytest.mark.anyio
+async def test_multi_search_keeps_going_after_a_broken_query():
+    """**第一路**就挂(非基础设施)时,后面的路照样跑 —— 用剩下的。
+
+    与 brief 那条(`fail_on="q2"`)合起来才完整:那条里坏的是**最后一路**,
+    「遇到失败就 `break`」的实现照样绿。这里断言两路**都**跑过。
+    """
+    r = _FlakyRetriever(fail_on="q1")
+    got = await multi_search(r, ["q1", "q2"])
+    assert r.calls == ["q1", "q2"]
     assert [c.chunk_id for c in got] == [1]
 
 
@@ -164,6 +209,80 @@ async def test_infrastructure_fault_propagates_even_though_other_queries_succeed
     )
     with pytest.raises(ToolInfrastructureError):
         await multi_search(r, ["q1", "q2"])
+
+
+@pytest.mark.anyio
+async def test_raw_db_error_from_a_query_is_escalated_not_swallowed():
+    """**未翻译的**数据库故障同样必须响亮 —— 上面那两条看不见这个洞。
+
+    上面两条注入的是 `ToolInfrastructureError`(分类表的**产物**)。而
+    `KnowledgeRetriever._load_rows` 原先**没有**任何翻译:MySQL 故障时它抛的是
+    **裸 `OperationalError`**,`search()` 只回滚再原样上抛。一个「宽 except 吞掉
+    一切」的 `multi_search` 会把它当成「这一路查询失败」跳过 → 返回**剩余查询的
+    结果**,用户得到「知识库里没有」,而单路 `query_faq` 走 executor 是响亮 502。
+
+    注入已翻译的异常 = **跳过被验的那一步**(本仓定义的假绿,样板见
+    `tests/test_api_refund.py:171-186`);所以这里注入**裸** `OperationalError`。
+
+    断言**类型**:`app/api/chat.py` 只按 `ToolInfrastructureError` 给 502,
+    原样重抛 `OperationalError` 会变成 500(把「服务端出问题」说成「你的请求有问题」)。
+    """
+    r = _FlakyRetriever(fail_on="q2", exc=_raw_db_error())
+    with pytest.raises(ToolInfrastructureError):
+        await multi_search(r, ["q1", "q2"])
+
+
+@pytest.mark.anyio
+async def test_raw_db_error_on_the_first_query_is_also_escalated():
+    """坏在第一路时同样升级 —— 免得「第一路成功才升级」这种靠顺序走运的实现溜过。"""
+    r = _FlakyRetriever(fail_on="q1", exc=_raw_db_error())
+    with pytest.raises(ToolInfrastructureError):
+        await multi_search(r, ["q1", "q2"])
+
+
+class _StubStore:
+    def hybrid_search(self, vector, text, top_k, category=None):
+        return [("1", 0.9)]
+
+
+class _StubEmbedder:
+    def encode(self, texts):
+        return [[0.1, 0.1] for _ in texts]
+
+
+class _StubReranker:
+    def rerank(self, query, candidates):
+        return [0.9 for _ in candidates]
+
+
+class _DeadSession:
+    """MySQL 挂了:回查原文时抛**裸** `OperationalError`(与真实现一致)。"""
+
+    async def execute(self, *args, **kwargs):
+        raise _raw_db_error()
+
+    async def rollback(self):
+        pass
+
+
+@pytest.mark.anyio
+async def test_real_retriever_db_fault_is_not_downgraded_to_empty_by_multi_search():
+    """**接缝用例**:真 `KnowledgeRetriever` + 真 `multi_search`,两者合起来仍要响亮。
+
+    上面两条(根修一处、纵深防御一处)各自只验自己那一段;而「合起来对最终调用方
+    是什么」没人验 —— 根修漏翻一处、或 `multi_search` 的宽 except 又把它吞回去,
+    两段的用例都可能仍然绿。这里让**真的**检索器撞上死 session(不碰真库:
+    store/embedder/reranker 都是桩),走**真的** `multi_search`,断言整次检索**上抛**
+    `ToolInfrastructureError`,**不是返回空列表** —— 空列表会让
+    `make_retrieve_knowledge_node` 报 `0 hits`,用户得到「知识库里没有这条」,
+    而库其实只是挂了。这正是 CLAUDE.md 禁止的那种降级。
+    """
+    retriever = KnowledgeRetriever(
+        _DeadSession(), _StubStore(), _StubEmbedder(), _StubReranker(),
+        top_k=3, score_threshold=0.5, hybrid_top_k=10,
+    )
+    with pytest.raises(ToolInfrastructureError):
+        await multi_search(retriever, ["能退吗", "退货运费谁出"])
 
 
 @pytest.mark.anyio
@@ -277,6 +396,38 @@ async def test_expand_empty_model_output_falls_back_to_original_question():
     for raw in ([], ["", "   "]):
         got = await expand_queries(_ExpandModel(raw), text="这个能退吗", max_queries=3)
         assert got == ["这个能退吗"], f"queries={raw!r} 时没有退回原问题"
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_expand_rejects_non_positive_max_queries(bad):
+    """`max_queries < 1` 必须**响亮**,不能静默返回空、更不能静默少一条。
+
+    两种边界都实测过:`0 → []`(正是本模块通篇在防的「检索空转」形状);
+    **`-1 → ['a']`** —— Python 负切片是「去掉最后 N 条」,于是负配置**静默少一条**、
+    看起来完全正常。所以这里要的是异常,不是「悄悄夹到 1」。
+    顺带钉**先校验后调用**:配置错误不该先花一次模型调用。
+    """
+    model = _ExpandModel(["a", "b"])
+    with pytest.raises(ValueError):
+        asyncio.run(expand_queries(model, text="能退吗", max_queries=bad))
+    assert model.calls == []
+    assert model.structured == []
+
+
+def test_expand_schema_really_validates_the_prompt_contract():
+    """`ExpandQueries` 得**真的**能校验 prompt 承诺的那个形状。
+
+    其余用例喂的都是鸭子类型 `_ExpandedQueries`(只有一个 `.queries` 属性),
+    所以这个 schema **从没被真跑过** —— 字段名写成别的(如 `query`)时,生产上
+    `with_structured_output` 会解析失败,而失败被吞成**合法的** `[原话]` 回退:
+    整条链路静默降级成单路,而单测全绿。这里按 prompt 里的字面字段名真校验一次。
+    """
+    assert set(ExpandQueries.model_fields) == {"queries"}      # spec §4.3:只有它一个
+    parsed = ExpandQueries.model_validate({"queries": ["退货政策", "运费谁出"]})
+    assert parsed.queries == ["退货政策", "运费谁出"]
+    # 缺字段是**正常**的(模型偶尔只吐 `{}`):default_factory 给空数组,
+    # 再由 `expand_queries` 走「空 → 退回原问题」那条路,而不是 KeyError。
+    assert ExpandQueries().queries == []
 
 
 @pytest.mark.anyio

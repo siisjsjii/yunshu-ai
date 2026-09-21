@@ -12,8 +12,10 @@ import logging
 
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.prompts import build_expand_messages
+from app.retrieval.search import _INFRA_MESSAGE, RetrievedChunk
 from app.tools.errors import ToolInfrastructureError
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,7 @@ class ExpandQueries(BaseModel):
     queries: list[str] = Field(default_factory=list)
 
 
-async def multi_search(retriever, queries: list[str]) -> list:
+async def multi_search(retriever, queries: list[str]) -> list[RetrievedChunk]:
     """多路检索 → 按 `chunk_id` 去重 → 按 `score` 降序。
 
     **同一 chunk 被多路召回、两次分数不同时:留分数更高的那一份**
@@ -46,14 +48,25 @@ async def multi_search(retriever, queries: list[str]) -> list:
     dict(插入序即首次出现序),`sorted` 又是稳定排序,两者叠加即得。
 
     单路失败的处理见模块 docstring:非基础设施故障**跳过**(留日志),基础设施
-    故障**照抛**。两个 `except` 的**顺序不能换** —— 换过来就是「静默吞掉 502」。
+    故障**照抛**。三个 `except` 的**顺序不能换** —— 换过来就是「静默吞掉 502」。
     """
-    merged: dict[int, object] = {}
+    merged: dict[int, RetrievedChunk] = {}
     for query in queries:
         try:
             chunks = await retriever.search(query)
         except ToolInfrastructureError:
             raise  # 基础设施故障照抛,不降级(见模块 docstring)
+        except SQLAlchemyError as exc:
+            # **纵深防御**:未翻译的数据库故障同样不许降级成「这一路没搜到」。
+            # 根修在 `KnowledgeRetriever._load_rows`(它自己的 docstring 早就承诺了
+            # 这个翻译边界),但检索器是**注入**的 —— 别的实现、或将来又漏翻译一处,
+            # 这里得认得出裸 SQLAlchemy 错误。
+            #
+            # **必须翻成 `ToolInfrastructureError`,不能原样重抛**:
+            # `app/api/chat.py` 只按这个类型给 502,原样抛出去是 **500**(而 500 把
+            # 「服务端出问题」说成「你的请求有问题」)。文案借用 search.py 的同一条
+            # —— 出站文本必须一致,不在这里复制一遍字面量(会静默漂移)。
+            raise ToolInfrastructureError(_INFRA_MESSAGE) from exc
         except Exception as exc:
             # 单条查询的其他故障:跳过,用剩下的。**必须留痕** —— 否则这一路的
             # 召回悄悄消失,日志里什么都没有,形态与「库里本来就没有」一致。
@@ -78,8 +91,10 @@ async def expand_queries(model, *, text: str, max_queries: int) -> list[str]:
 
     契约(逐条都有用例钉着):
 
-    - **绝不返回空列表** —— 扩写失败退回 `[text]`,让检索至少有一条路走。
-      空列表 = 检索空转,而它看起来与「库里没有这条知识」一模一样;
+    - **`max_queries >= 1` 时绝不返回空列表** —— 扩写失败退回 `[text]`,让检索
+      至少有一条路走。空列表 = 检索空转,而它看起来与「库里没有这条知识」
+      一模一样。`max_queries < 1` 时这个不变式**结构上无法成立**(见下面那道护栏),
+      所以它不在承诺内 —— 那是一个会让空列表变成合法返回值的入参;
     - **条数上限是结构保证,不是提示词约定**:`max_queries` 既进 prompt 也在此处
       截断 —— 模型不照做时,截断发生在代码里;
     - **先去重(保序)再截断**,顺带清空白条目。顺序反了会白丢角度:
@@ -92,6 +107,15 @@ async def expand_queries(model, *, text: str, max_queries: int) -> list[str]:
     端点的 error 帧,后者更不能被伪装成「这轮没扩写」。宽 `except Exception` 会把
     这两类都变成静默降级,而本仓栽在这上面太多次。
     """
+    if max_queries < 1:
+        # 「绝不返回空列表」在 `max_queries < 1` 时**结构上不可能成立**,而两种
+        # 难看形态都实测过:`0` → `[]`(正是本模块通篇在防的「检索空转」);
+        # `-1` → **静默少一条**(Python 负切片是「去掉最后 N 条」,不是空也不是截断)
+        # —— 后者看起来完全正常,是最坏的一种。所以直接抛,把配置错误变成响声。
+        # 生产不可达:spec §9 的配置项按 `Field(ge=1)` 在**启动时**拒(接线任务落地),
+        # 这里是那道校验之外的最后一道。
+        raise ValueError(f"max_queries 必须 >= 1,收到 {max_queries}")
+
     # 装配在 try 之外:它出错是我自己的实现缺陷(签名/模板),必须响。
     messages = build_expand_messages(text=text, max_queries=max_queries)
     chain = model.with_structured_output(ExpandQueries, method="json_mode")

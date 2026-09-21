@@ -8,6 +8,7 @@ import asyncio
 
 import pytest
 from sqlalchemy import delete, select
+from sqlalchemy.exc import OperationalError
 
 from app.db.base import get_engine, get_sessionmaker
 from app.db.models import KnowledgeChunk
@@ -90,6 +91,79 @@ async def test_embedder_failure_becomes_infrastructure_error():
     embedder = _FakeEmbedder(error=RuntimeError("模型加载失败"))
     with pytest.raises(ToolInfrastructureError):
         await _retriever(_FakeStore(), embedder).search("邮费")
+
+
+class _DeadSession:
+    """MySQL 挂了:回查原文时抛**裸** `SQLAlchemyError`(未翻译的原始形态)。
+
+    `rollback_raises=True` 模拟「回滚时发现连接已死,回滚自己也抛」。
+    """
+
+    def __init__(self, rollback_raises: bool = False):
+        self.rollback_raises = rollback_raises
+        self.rollbacks = 0
+
+    async def execute(self, *args, **kwargs):
+        raise OperationalError(
+            "SELECT knowledge_chunks ...", {}, Exception("Lost connection to MySQL server")
+        )
+
+    async def rollback(self):
+        self.rollbacks += 1
+        if self.rollback_raises:
+            raise OperationalError("ROLLBACK", {}, Exception("Lost connection"))
+
+
+@pytest.mark.anyio
+async def test_db_fault_while_loading_rows_becomes_infrastructure_error():
+    """回查原文时 MySQL 挂了,必须走 502 那条路 —— **注入的是裸 `OperationalError`**。
+
+    ⚠️ 注入「已经翻译好的」`ToolInfrastructureError` 等于**跳过被验的那一步**:
+    在「`_load_rows` 不翻译、裸 SQLAlchemy 错误原样逃出」的实现下照样绿 ——
+    这正是本仓定义的假绿(ch05 spec §8.2 记账,`tests/test_api_refund.py:171-186`
+    与 `tests/test_api_ticket.py:151-212` 是同一形态的样板)。
+
+    这个洞**只在这一个文件里成立**:`_hybrid_hits` 覆盖嵌入/Milvus、`_rerank`
+    覆盖重排器,唯独回查没翻译 —— 漏一处就隐形。后果不是报错而是**降级**:
+    多路检索(`multi_search`)会把「库挂了」当成「这一路没搜到」跳过,最终返回空,
+    用户看到「知识库里没有这条」;而单路 `query_faq` 经 executor 的分类表是响亮 502。
+
+    断言**类型**而不只是「抛了」:`app/api/chat.py` 只按 `ToolInfrastructureError`
+    给 502,原样抛 `OperationalError` 是 500。
+    """
+    store = _FakeStore(hits=[("1", 0.9)])
+    session = _DeadSession()
+    with pytest.raises(ToolInfrastructureError):
+        await _retriever(store, session=session).search("邮费")
+    assert session.rollbacks == 1
+
+
+@pytest.mark.anyio
+async def test_failing_rollback_does_not_replace_the_original_error():
+    """回滚**自己也失败**时,逃出去的仍是**原异常**(翻译后的那个),不是回滚的异常。
+
+    回滚失败抛的是裸 `SQLAlchemyError`;让它顶掉原异常逃出本模块,调用方按
+    `ToolInfrastructureError` 认故障就认不出 —— 整条链路又变回「没搜到」。
+    """
+    session = _DeadSession(rollback_raises=True)
+    with pytest.raises(ToolInfrastructureError):
+        await _retriever(_FakeStore(hits=[("1", 0.9)]), session=session).search("邮费")
+    assert session.rollbacks == 1
+
+
+@pytest.mark.anyio
+async def test_cancellation_survives_a_failing_rollback():
+    """取消语义**不能让位**:回滚失败时 `CancelledError` 仍是 `CancelledError`。
+
+    超时靠 `asyncio.wait_for` 取消协程;被取消的任务把异常换成
+    `ToolInfrastructureError`(或让回滚异常顶出来),`execute_tool` 的超时分类就错了。
+    这一条同时钉住「回滚失败不翻译成 ToolInfrastructureError」这个选择。
+    """
+    session = _DeadSession(rollback_raises=True)
+    store = _FakeStore(error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _retriever(store, session=session).search("邮费")
+    assert session.rollbacks == 1
 
 
 @pytest.mark.anyio

@@ -12,12 +12,15 @@ ch04 起检索换成混合 + 重排:
 故障,一律翻成 `ToolInfrastructureError`(502),绝不降级成「没搜到」。
 """
 
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
 
 from app.db.models import KnowledgeChunk
 from app.tools.errors import ToolInfrastructureError
+
+logger = logging.getLogger(__name__)
 
 #: 翻译后的对外文案。**不含底层异常文本** —— openai/pymilvus 的 str(exc)
 #: 可能带上端点信息,统一由 api 层的 redact_api_key 再兜一道。
@@ -59,7 +62,19 @@ class KnowledgeRetriever:
             # 未收尾事务上,而 query_faq 会重试复用同一 session → PendingRollbackError
             # 把「超时」升级成 502。这里回滚再抛。BaseException 覆盖 CancelledError。
             if self._session is not None:
-                await self._session.rollback()
+                try:
+                    await self._session.rollback()
+                except Exception as rollback_exc:
+                    # rollback **自己也失败**(连接已死)时,那个替代异常是**未翻译**
+                    # 的裸 SQLAlchemy 错误;让它逃出本模块,调用方按
+                    # `ToolInfrastructureError` 认基础设施故障就认不出它 —— 又变回
+                    # 「没搜到」。所以这里吞掉回滚的失败、保留**原异常**(下面的裸
+                    # `raise`):原异常要么已翻译、要么本就是取消,语义都比
+                    # 「回滚也失败了」更该被上游看到(取消语义尤其不能换)。
+                    logger.warning(
+                        "检索回滚失败(连接可能已断),保留原异常:%s",
+                        type(rollback_exc).__name__,
+                    )
             raise
 
     async def _search(self, query: str) -> list[RetrievedChunk]:
@@ -135,13 +150,24 @@ class KnowledgeRetriever:
                 continue
         if not numeric_ids:
             return {}
-        rows = (
-            (
-                await self._session.execute(
-                    select(KnowledgeChunk).where(KnowledgeChunk.id.in_(numeric_ids))
+        try:
+            rows = (
+                (
+                    await self._session.execute(
+                        select(KnowledgeChunk).where(KnowledgeChunk.id.in_(numeric_ids))
+                    )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
+        except ToolInfrastructureError:
+            raise
+        except Exception as exc:
+            # **本模块 docstring 承诺的翻译边界,原先只有这一处漏了**:
+            # `_hybrid_hits` 覆盖嵌入/Milvus,`_rerank` 覆盖重排器,唯独回查把裸
+            # `SQLAlchemyError`(OperationalError 等)交给 `search()` 原样上抛。
+            # 单路 `query_faq` 有 executor 的分类表兜底,多路 `multi_search` 没有
+            # —— 它会把「MySQL 挂了」当成「这一路没搜到」跳过,最后返回空,用户
+            # 得到「知识库里没有这条」。这正是 CLAUDE.md 禁止的那种降级。
+            raise ToolInfrastructureError(_INFRA_MESSAGE) from exc
         return {str(row.id): row for row in rows}
