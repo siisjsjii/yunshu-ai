@@ -61,11 +61,10 @@ from app.tools.executor import (
 
 logger = logging.getLogger(__name__)
 
-#: Query 扩写的条数上限。spec §9 的配置项 `query_expansion_max_queries(默认 3)`
-#: 尚未落地(config.py 不在本任务的文件清单里),先在这里写死 —— 与 T6 的
-#: 评估脚本同一个值。**接线任务(T8)把它挪进 Settings 时,`ge=1` 不能省**:
-#: `expand_queries` 在 `max_queries < 1` 时直接抛,正是为了让配置错误有响声。
-REFUND_EXPAND_MAX_QUERIES = 3
+# Query 扩写的条数上限现在是 `Settings.query_expansion_max_queries`(spec §9,
+# 默认 3,`Field(ge=1)`)—— T8 接线落地。**这里不再留模块常量**:留一份就是
+# 「改了 settings 没反应」的那种配置项(它看起来在、其实没人读)。
+# 取值边界与理由见 `app/config.py` 该字段旁边的实测记录。
 
 #: 取数的 tool_call id。固定值即可 —— 这一轮里每次调用只有一次,且它**不出站**
 #: (不像 Agent 那轮会把 tool_call 帧发给前端)。
@@ -361,7 +360,7 @@ def route_after_fetch(state) -> str:
 # ---- ③ 扩写 → 多路检索 ----------------------------------------------------
 
 
-def make_refund_expand_retrieve_node(*, model, retriever, emit):
+def make_refund_expand_retrieve_node(*, model, retriever, emit, settings):
     """Query 扩写 → 多路检索 → 去重合并。
 
     扩写输入按 spec §4.3 是「已消解的问题 + 这一单的上下文」:带上商品与状态,
@@ -384,7 +383,7 @@ def make_refund_expand_retrieve_node(*, model, retriever, emit):
         queries = await expand_queries(
             model,
             text=f"{text}(这一单:{context})" if context else text,
-            max_queries=REFUND_EXPAND_MAX_QUERIES,
+            max_queries=settings.query_expansion_max_queries,
         )
         chunks = await multi_search(retriever, queries)
 

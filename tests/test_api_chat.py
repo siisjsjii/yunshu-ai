@@ -16,13 +16,18 @@ from langchain_core.messages import AIMessage
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql.elements import BinaryExpression
 
+from app.agent.state import RefundJudgement
 from app.api import chat as chat_api
 from app.config import Settings, get_settings
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
 from app.main import app
 from app.memory.store import SessionStore
+from app.refund.orders import DEMO_ORDERS
+from app.retrieval.expand import ExpandQueries
+from app.retrieval.search import RetrievedChunk
 from app.tools import registry as tools_registry
+from app.tools.business import _order_record
 from app.tools.errors import ToolNotFound
 
 REQUIRED = {
@@ -35,6 +40,25 @@ REQUIRED = {
 
 def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **REQUIRED, **overrides)
+
+
+# ---------- ch06 退款子流程的常量 ----------
+
+#: 点选卡片时递上去的订单号。**必须不在 `DEMO_ORDERS` 里**(T7 报告点名的第一种
+#: 假绿形态):取演示池里的号的话,「resume 真的生效了」与「端点根本没读 resume、
+#: 卡片候选里的演示单被拿去查了」会给出**同一个观测值**,断言零判别力。
+PICKED_ORDER = "83746592"
+
+#: 判定「能退」时给的话术。**字面量**,且与 `refund_nodes` 的两个兜底文案
+#: (OFFER_FALLBACK / EXPLAIN_FALLBACK)都不撞 —— 撞上的话「判定的话术真的流到
+#: 线上了吗」这条断言就恒真(节点退回兜底文案也照样绿)。
+JUDGE_YES_REPLY = "这一单还在七天无理由期内,可以申请退款。"
+
+#: 检索到的条款块。判定 prompt 里的 [n] 编号与 `citations` 帧同源,靠它认出来。
+CLAUSE_CHUNK = RetrievedChunk(
+    "定制商品能退货吗", "定制类商品一经确认不支持七天无理由退货", "退换货",
+    chunk_id=7, section_path="退货政策 > 例外", score=0.71,
+)
 
 
 # ---------- 替身 ----------
@@ -100,16 +124,32 @@ class ScriptedModel(_EchoAinvoke):
     记录每次 astream 走的是**绑了工具**还是**未绑工具**的入口,以及
     绑上去的到底是哪批工具 —— 后者是"绑给模型的集合与注册表同源"的
     观测点,而事件序列本身看不出这件事。
+
+    ch06 起它还兼任**退款子流程的判定/扩写模型**(子流程用的是同一个主力
+    模型,不新起一个),所以补上 `with_structured_output` 那一半入口 ——
+    与 `_EchoAinvoke` 补 `ainvoke` 同一条理由:替身必须与生产形状一致,
+    少一半入口时红的是「本该 done 却 error」,而错误指向脚手架。
     """
 
-    def __init__(self, batches):
+    def __init__(self, batches, judge_reply=JUDGE_YES_REPLY, queries=("退款政策",)):
         self.batches = list(batches)
         self.calls = []
         self.bound_tools = None
+        self.judge_reply = judge_reply
+        self.queries = list(queries)
+        #: 每次结构化出参的 (schema 名, messages)。**判定 prompt 里有没有
+        #: 那一单的数据**只能从这里看 —— 帧上只能看到订单号,看不到取数结果。
+        self.structured: list[tuple[str, list]] = []
 
     def bind_tools(self, tools):
         self.bound_tools = list(tools)
         return _BoundModel(self)
+
+    def with_structured_output(self, schema, method=None):
+        # 与 `FakeIntentModel` 同一行断言:本项目端点上结构化出参只有 json_mode
+        # 一条路(function_calling / json_schema 均返回 400)。
+        assert method == "json_mode", "结构化出参只能用 json_mode(本项目硬约束)"
+        return _ScriptedChain(self, schema)
 
     async def astream(self, messages):
         self.calls.append(("unbound", list(messages)))
@@ -119,6 +159,50 @@ class ScriptedModel(_EchoAinvoke):
     @property
     def last_messages(self):
         return self.calls[-1][1] if self.calls else None
+
+
+class _ScriptedChain:
+    """`with_structured_output(...)` 的返回物:一个只有 `ainvoke` 的对象。"""
+
+    def __init__(self, model, schema):
+        self._model, self._schema = model, schema
+
+    async def ainvoke(self, messages):
+        self._model.structured.append((self._schema.__name__, list(messages)))
+        if self._schema is ExpandQueries:
+            return _Queries(self._model.queries)
+        if self._schema is RefundJudgement:
+            return _Judgement(self._model.judge_reply)
+        raise AssertionError(f"未预期的结构化出参 schema:{self._schema}")
+
+
+class _Queries:
+    def __init__(self, queries):
+        self.queries = list(queries)
+
+
+class _Judgement:
+    def __init__(self, reply, can_refund=True):
+        self.can_refund = can_refund
+        self.reply = reply
+
+
+class FakeRetriever:
+    """检索器替身。
+
+    **必须有**:端点每请求都会 `build_retriever(session)`(真实实现会连 Milvus
+    并按需加载 BGE-M3 权重),而「单测全程不联网」是硬规矩。用例通过
+    `client_factory(retriever=...)` 把 `chat_api.build_retriever` 换掉 ——
+    与 `build_tools` 走同一个注入缝。
+    """
+
+    def __init__(self, chunks=()):
+        self.chunks = list(chunks)
+        self.calls: list[str] = []
+
+    async def search(self, query):
+        self.calls.append(query)
+        return list(self.chunks)
 
 
 class _Intent:
@@ -147,15 +231,19 @@ class FakeIntentModel:
     就看不出这件事,所以这一行必须留着。
     """
 
-    def __init__(self, intent="订单"):
+    def __init__(self, intent="订单", confidence=0.9):
         self.intent = intent
+        #: 可改。`test_done_frame_carries_the_intent_confidence` 用一个**非默认**
+        #: 的值改它 —— 与默认值撞车时,「端点透传了 confidence」与「谁给了个默认
+        #: 值」给出同一个观测值。
+        self.confidence = confidence
 
     def with_structured_output(self, schema, method=None):
         assert method == "json_mode", "结构化出参只能用 json_mode(本项目硬约束)"
         return self
 
     async def ainvoke(self, messages):
-        return _Intent(self.intent)
+        return _Intent(self.intent, self.confidence)
 
 
 class _Result:
@@ -239,11 +327,20 @@ def client_factory(monkeypatch):
     `intent="闲聊"` / `intent="投诉"`。
     """
 
-    def make(batches, session=None, registry=None, intent="订单", **settings_overrides):
+    def make(batches, session=None, registry=None, intent="订单", retriever=None,
+             **settings_overrides):
         model = ScriptedModel(batches)
         intent_model = FakeIntentModel(intent)
         db = session if session is not None else FakeSession()
         store = SessionStore(ttl_seconds=60, max_sessions=10)
+
+        if retriever is not None:
+            # 端点每请求自己 `build_retriever(session)`,真实实现会连 Milvus 并
+            # 按需加载 BGE-M3 权重。退款子流程的检索腿必须换掉,否则用例会真的
+            # 出网(「单测全程不联网」是硬规矩)。
+            monkeypatch.setattr(
+                chat_api, "build_retriever", lambda session: retriever
+            )
 
         if registry is not None:
             # 端点用 build_tools 组装工具集、再 registry_for 建映射。
@@ -986,3 +1083,265 @@ def test_complaint_intent_emits_choices_frame(client_factory):
         {"key": "ticket", "label": "建工单"},
     ]
     assert [name for name, _ in events][-1] == "done"
+
+
+# ---------- ch06:退款子流程(挂起 → 点卡片 → resume) ----------
+#
+# 图那一半(T7)由 `tests/test_agent_refund.py` 覆盖;这里只问端点这一半的三件事:
+# **帧出得来吗**(F1)、**resume 请求体认不认**、**挂起的那一轮有没有脏写/占锁**。
+#
+# 本节所有用例都用 `intent="退款退货"` —— 上一节 27 条的默认意图是「订单」,
+# 走的是 Agent 出口,**根本到不了子流程**,`batches` 也照常被消费。意图传错时
+# 红法是「卡片的帧没出现」,与「流模式漏了 updates」长得一模一样 —— 所以每条
+# 用例的注释里都写明了它到底在防什么。
+
+
+@pytest.mark.anyio
+async def test_suspended_turn_emits_the_order_choice_frame(client_factory):
+    """F1 的回归防线:`stream_mode` 漏掉 `updates` 时,interrupt **被整个吞掉**。
+
+    实测(langgraph 1.2.11):只给 `custom` 时 run 照常结束、`state.next` 停在
+    待续节点、**一个帧都不吐、也不报错**。这个故障的形态极难定位 —— 用户侧看到
+    的不是「卡片没出现」,是**除了 meta 什么都没有**;库里连一行痕都没有
+    (log_turn 在下游,没跑)。所以这里两样都断。
+
+    `["meta", "order_choice"]` 这条**逐帧相等**的断言是有意的:它同时钉住
+    「挂起的一轮不发 done 帧」—— done 帧自报的是「这一轮跑完了」,而挂起时
+    trace / intent / agent_steps 全是初值,发出去是在撒谎。
+    """
+    client, _ = client_factory(batches=[], intent="退款退货")
+    with client as c:
+        resp = c.post(
+            "/api/chat/stream", json={"session_id": "s-card", "message": "这个能退吗"}
+        )
+
+    events = _parse_sse(resp.text)
+    assert [name for name, _ in events] == ["meta", "order_choice"]
+
+    options = events[1][1]["options"]
+    # 卡片候选来自 `app.refund.orders` 的演示池(语料里一个号都没出现过)。
+    # 断言的是**整份** options:少一项、顺序变了,前端渲染出来的卡片就跟着变。
+    assert [o["order_no"] for o in options] == list(DEMO_ORDERS)
+    # 前端读的是 `payload.options`,每个候选要么是裸串、要么带这三项 ——
+    # 少了它们,卡片上只有一串数字(前端容忍,但用户看不到商品与金额)。
+    assert all({"order_no", "status", "product", "amount"} <= set(o) for o in options)
+
+    # **挂起的那一轮不落库**:log_turn 在下游,没跑。这里断的是「一行都没有」,
+    # 而不是「没有 assistant」—— 半条 user 消息同样会毒化下一轮的 load_history。
+    assert client.db.messages == []
+
+
+@pytest.mark.anyio
+async def test_suspended_turn_releases_the_lock(client_factory):
+    """挂起即放锁 —— 用户可能很久才点那张卡片。
+
+    锁若跟着挂起不放,该 session **永久 409**:持锁的锁既不被 TTL 也不被 LRU
+    回收(见 `app/memory/store.py`),症状看起来与「锁泄漏」毫无相似之处。
+    等锁超时调成 0.15s:真漏了 `finally: lock.release()`,第二次请求会在
+    0.15s 内以 409 变红,而不是用默认 60s 把测试挂死。
+    """
+    client, _ = client_factory(
+        batches=[], intent="退款退货", session_lock_timeout_seconds=0.15
+    )
+    with client as c:
+        first = c.post(
+            "/api/chat/stream", json={"session_id": "s-hold", "message": "这个能退吗"}
+        )
+        # 同一 session 的第二个请求:锁没放掉时它等锁超时 → 409。
+        second = c.post(
+            "/api/chat/stream", json={"session_id": "s-hold", "message": "在吗"}
+        )
+
+    assert first.status_code == 200
+    assert client.store.lock_for("s-hold").locked() is False
+    assert second.status_code == 200
+
+    # 顺带钉住 spec F4「挂起期间用户改问别的」这条**用户路径**:新消息另起一轮,
+    # 旧的挂起被丢弃 —— 不是 409、不是 error 帧(实测如此,见 dev-notes 的探针)。
+    names = [name for name, _ in _parse_sse(second.text)]
+    assert names[0] == "meta"
+    assert "error" not in names
+
+
+@pytest.mark.anyio
+async def test_resume_request_continues_the_flow_to_the_refund_offer(client_factory):
+    """带 `resume` 的请求走 `Command(resume=...)`,把流程推完**并落库**。
+
+    两次 POST 之间是**跨请求**的:第一次挂起后 HTTP 响应就结束了、锁也放了,
+    第二次靠 checkpointer 的断点续跑 —— 这正是浏览器里点一张卡片的路径
+    (前端 `resumeWith` 发的就是 `{session_id, resume: {order_no}}`)。
+
+    四条断言各有分工,少一条就有一种实现能蒙混过去:
+
+    ① `refund_offer` 帧报的订单号 = resume 递上去的那个 —— 「resume 载荷被
+       翻译成了槽位」;
+    ② 判定 prompt 里带着**这一单**的订单号 —— 光看 ① 不够:`refund_offer` 报的是
+       槽位里的号,而取数完全可能拿的是别的号(卡片候选/空串),那时 ① 照样绿;
+    ③ token 帧拼回的文本 = 判定给的话术 —— 「判定的话术真的流出去了」;
+    ④ 库里恰好一轮 user + assistant —— 「挂起的一轮没写、续跑的那一轮写了」
+       (第一次请求若也落了库,这里会是四行)。
+    """
+    retriever = FakeRetriever([CLAUSE_CHUNK])
+    client, model = client_factory(
+        batches=[], intent="退款退货", retriever=retriever
+    )
+    with client as c:
+        first = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-resume", "message": "这个能退吗"},
+        )
+        assert "event: order_choice" in first.text
+
+        second = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-resume", "resume": {"order_no": PICKED_ORDER}},
+        )
+
+    events = _parse_sse(second.text)
+    names = [name for name, _ in events]
+
+    # 不再问一次(卡片只在缺号时弹);这一轮也不再挂起 → 有 done。
+    assert "order_choice" not in names
+    assert names[-1] == "done"
+
+    # ①
+    offer = next(p for name, p in events if name == "refund_offer")
+    assert offer["order_no"] == PICKED_ORDER
+
+    # ② 判定 prompt 的「【订单信息】」段是取数结果的 JSON,订单号在其中。
+    judged = [msgs for schema, msgs in model.structured if schema == "RefundJudgement"]
+    assert len(judged) == 1                      # 恰好判一次
+    rendered = "\n".join(str(m.content) for m in judged[0])
+    assert PICKED_ORDER in rendered
+
+    # ③ 逐 token 推送会把一句话切成好几帧,必须拼回来再比(CLAUDE.md 平台陷阱)。
+    assert "".join(p["text"] for name, p in events if name == "token") == JUDGE_YES_REPLY
+
+    # ④
+    assert [m.role for m in client.db.messages] == ["user", "assistant"]
+    assert client.db.messages[1].content == JUDGE_YES_REPLY
+    assert {m.conversation_id for m in client.db.messages} == {"s-resume"}
+
+
+@pytest.mark.anyio
+async def test_resume_runs_the_retrieval_leg_with_the_expanded_queries(client_factory):
+    """续跑要真的走「扩写 → 多路检索 → citations 帧」这一腿(不是空转)。
+
+    这条与上一条分开,是因为它们是**两条独立的腿**:检索腿断了(比如检索器
+    注入错、扩写出来的查询没被用上),上一条的④条断言**全都照样绿** ——
+    判定的 prompt 里那份证据为空也有 `NO_CLAUSE_NOTE` 兜着。
+    """
+    retriever = FakeRetriever([CLAUSE_CHUNK])
+    client, _ = client_factory(batches=[], intent="退款退货", retriever=retriever)
+    with client as c:
+        c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-retr", "message": "这个能退吗"},
+        )
+        resp = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-retr", "resume": {"order_no": PICKED_ORDER}},
+        )
+
+    events = _parse_sse(resp.text)
+    # 扩写出来的每一路都真的搜了(帧里的命中来自 `multi_search` 的合并结果)。
+    assert "退款政策" in retriever.calls
+    citations = next(p for name, p in events if name == "citations")
+    assert [c["chunk_id"] for c in citations["items"]] == [CLAUSE_CHUNK.chunk_id]
+
+
+@pytest.mark.anyio
+async def test_expansion_cap_really_comes_from_settings(client_factory):
+    """`query_expansion_max_queries` 必须**真的被节点读**(spec §9 的接线)。
+
+    只测「配置项存在 + 越界被拒」是不够的:把那行改回模块常量 3,所有别的用例
+    照样全绿 —— 那就是一个「改了没反应」的配置项。这里把上限压到 1、让扩写
+    替身吐三条,再看检索器**实际收到几条**。
+    """
+    retriever = FakeRetriever([CLAUSE_CHUNK])
+    client, model = client_factory(
+        batches=[], intent="退款退货", retriever=retriever,
+        query_expansion_max_queries=1,
+    )
+    model.queries = ["退款政策", "退货时效", "运费谁出"]
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": "s-cap", "message": "这个能退吗"})
+        c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-cap", "resume": {"order_no": PICKED_ORDER}},
+        )
+
+    assert retriever.calls == ["退款政策"]
+
+
+@pytest.mark.anyio
+async def test_request_with_neither_message_nor_resume_is_rejected(client_factory):
+    """两个字段都没有 = 请求语义错 → 422,**不是**把 None 递给下游。
+
+    `message` 在 ch06 之前是必填(缺了本来就 422);加了 `resume` 之后它必须
+    变成可选,于是「两个都没给」这条路径**新开出来了** —— 没人守着的话它会
+    一路走到 `prepare_turn(user_input=None)`,在 tiktoken 里炸成一个 500。
+    """
+    client, _ = client_factory(batches=[], intent="退款退货")
+    with client as c:
+        neither = c.post("/api/chat/stream", json={"session_id": "s1"})
+        both = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s1", "message": "这个能退吗", "resume": {"order_no": "1"}},
+        )
+        # 反面:`resume` 单独给是合法的(ch06 新增的入口)。
+        only_resume = c.post(
+            "/api/chat/stream", json={"session_id": "s1", "resume": {"order_no": "1"}}
+        )
+
+    assert neither.status_code == 422
+    # 两个都给同样拒:resume 会**静默吞掉** message,用户那句原话既没被回答、
+    # 也不会落库 —— 事后连查都查不到。
+    assert both.status_code == 422
+    assert only_resume.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_empty_resume_payload_is_not_a_new_turn(client_factory):
+    """`{"resume": {}}` 走**续跑**分支,不是"没有 message 就炸"。
+
+    这一条钉的是端点的分支判据必须是 `is not None` 而不是真值判断:写成
+    `if request.resume:` 时,空 dict 会掉进"开新一轮"那一支,而那一支要
+    `message`(None)—— 于是 `prepare_turn` 在 tiktoken 里炸成一个 500。
+
+    载荷本身没意义(槽位是空串),子流程的既定行为是**如实说明查不到**
+    (T7 已记账:文案里那个空订单号略糙但无害)。这里只要求「不是服务端故障」。
+    """
+    client, _ = client_factory(batches=[], intent="退款退货")
+    with client as c:
+        c.post(
+            "/api/chat/stream", json={"session_id": "s-empty", "message": "这个能退吗"}
+        )
+        resp = c.post("/api/chat/stream", json={"session_id": "s-empty", "resume": {}})
+
+    assert resp.status_code == 200
+    # **实测(langgraph 1.2.11)**:空 dict 会被 `_loop.py` 判成"**空的 resume 映射**"
+    # (`all(is_xxh3_128_hexdigest(k) for k in {})` 恒为真),于是这一次续跑**没有**
+    # 递任何 resume 值 —— 节点重跑、`interrupt()` 再次挂起,用户又拿到一次卡片。
+    # 那是个可接受的结局(不是服务端故障),所以这里只断"没有 error 帧 + 卡片还在"。
+    assert [name for name, _ in _parse_sse(resp.text)] == ["meta", "order_choice"]
+
+
+@pytest.mark.anyio
+async def test_done_frame_carries_the_intent_confidence(client_factory):
+    """`confidence` 要进 done 帧(spec §4.2)—— 它是这条链路唯一的出口。
+
+    T4 把 confidence 写进了 state 与 `trace` 帧的载荷,端点这一半在 T8:
+    `done` 帧少了这个键,值就在端点被丢掉,而**除了这条用例没有任何东西看得见**
+    (前端不读它,验收脚本也不读)。期望值刻意用 0.77 而不是 `_Intent` 的默认
+    0.9 —— 与替身默认值撞车时,「端点真把值透出来了」与「谁给了个默认值」
+    给出同一个观测值。
+    """
+    client, _ = client_factory(batches=[], intent="闲聊")
+    client.intent_model.confidence = 0.77
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"session_id": "s1", "message": "你好"})
+
+    done = _parse_sse(resp.text)[-1]
+    assert done[0] == "done"
+    assert done[1]["confidence"] == 0.77

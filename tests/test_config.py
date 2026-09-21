@@ -247,3 +247,27 @@ def test_agent_token_budget_must_be_positive():
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, **REQUIRED, agent_token_budget=0)
+
+
+# ---- ch06:退款子流程 ----
+
+
+def test_query_expansion_cap_defaults_to_three():
+    assert Settings(_env_file=None, **REQUIRED).query_expansion_max_queries == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_query_expansion_cap_is_rejected(bad):
+    """两种越界**都不报错、只静默变坏**,所以必须在启动时拒:
+
+    - `0` → `expand_queries` 返回**空列表**,检索空转 —— 而它与「库里没这条
+      知识」长得一模一样(两个受害者:召回为空、以及随后那句「我没太理解」);
+    - 负数 → `queries[:-1]` 是 Python 的负切片语义「去掉最后 N 条」,于是
+      **静默少一条**,看起来完全正常。
+
+    `expand_queries` 自己也会抛(第二道闸),但那时已经是运行期、且只在
+    真的走到退款子流程时才响 —— 配置错误该在**启动**时就响。
+    """
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, query_expansion_max_queries=bad)
+    assert "query_expansion_max_queries" in str(exc.value)

@@ -56,11 +56,49 @@ class ChatRequest(BaseModel):
 
     `user_id` 的上限 128 与 `conversations.user` 的列宽一致,同理 ——
     否则宽度不一致会以同一个 DataError 形态复现。
+
+    ---- ch06:`resume` ----
+
+    `message` 从「必填」变成「与 `resume` 二选一」,因为**续跑请求体里没有
+    新消息**(spec §5.1):
+
+    ```jsonc
+    { "session_id": "…", "message": "…" }              // 开一轮
+    { "session_id": "…", "resume": {"order_no": "1002"} } // 从挂起点续跑
+    ```
+
+    两条校验都放在**模型层**,不放在端点里:端点拿到的是校验过的对象,而
+    422 必须在**流开始之前**返回(见 `app/api/chat.py` 的预算校验注释)。
+
+    `resume` 的形状**只做 `dict` 这一层**:里面那个订单号由
+    `refund_nodes._picked_order_no` 认(裸串 / `{"order_no": …}` / 带该属性的
+    对象三种都收),它才是「什么算一个有效载荷」的权威。在这里再写一遍形状校验
+    = 同一条规则两处实现,漂移的表现是「图收得下、端点却 422」。
     """
 
     session_id: str | None = Field(default=None, min_length=1, max_length=32)
-    message: str = Field(min_length=1)
+    message: str | None = Field(default=None, min_length=1)
     user_id: str | None = Field(default=None, min_length=1, max_length=128)
+    #: 从挂起点续跑(点订单卡片)。给订单号即 resume;不给则开新一轮(见 spec F4)。
+    resume: dict | None = None
+
+    @model_validator(mode="after")
+    def _message_and_resume_are_exclusive(self) -> Self:
+        """`message` 与 `resume` **恰好给一个**。
+
+        - **两个都不给**:没有任何东西可跑。放过去的话 `message=None` 会一路
+          走到 `prepare_turn(user_input=None)`,在 tiktoken 里炸成一个 500 ——
+          一个请求语义错被报成服务端故障。必须在**入参**上拒。
+        - **两个都给**:是自相矛盾的请求,而 `resume` 会**静默吞掉** `message`
+          —— 用户那句原话既没被回答、也没落库,事后什么都查不到。
+          (spec F4 的「挂起时改发普通新消息」是**只给 message** 那条路,与这里
+          不冲突;前端也从不两个一起发。)
+        """
+        if self.message is None and self.resume is None:
+            raise ValueError("必须给 message(开新一轮)或 resume(从挂起点续跑)")
+        if self.message is not None and self.resume is not None:
+            raise ValueError("message 与 resume 互斥,不能同时给")
+        return self
 
 
 class TicketRequest(BaseModel):

@@ -4,6 +4,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, format_sse_event
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.emit import make_emitter
@@ -100,12 +101,32 @@ async def chat_stream(
         await ensure_conversation(
             session=session, session_id=session_id, user_id=user_id
         )
-        history = await load_history(session=session, conversation_id=session_id)
-        # 产出是**裁剪后的历史**(不是组装好的消息):消息组装搬进了
-        # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
-        history = prepare_turn(
-            settings=settings, history=history, user_input=request.message
-        )
+        if request.resume is not None:
+            # **续跑不是新的一轮**(ch06,spec §5.1)。两件事因此都不做:
+            #
+            # ① 不读历史。`Command(resume=…)` 只把 resume 值交回挂起的那个节点,
+            #    **不会**把输入合并进 state —— 历史、user_input、槽位全都从
+            #    checkpointer 的断点里恢复。读出来没有任何读者。
+            # ② 不跑 `prepare_turn`。它既拿不到本轮输入(挂起那轮的原话在 state
+            #    里,不在这里),预算校验也失去意义:这一轮**没有新的用户输入**,
+            #    上下文规模在挂起那一刻就已经定死了。真拿 None 递进去,它会炸在
+            #    tiktoken 里 —— 一个请求语义问题变成 500。
+            stream_input = Command(resume=request.resume)
+        else:
+            history = await load_history(session=session, conversation_id=session_id)
+            # 产出是**裁剪后的历史**(不是组装好的消息):消息组装搬进了
+            # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
+            history = prepare_turn(
+                settings=settings, history=history, user_input=request.message
+            )
+            # 这一句刻意留在守卫之内:`build_graph` 每请求现编,输入也在这里
+            # 一次性定下来 —— `generate()` 只管把它递给图。
+            stream_input = {
+                "conversation_id": session_id,
+                "user_input": request.message,
+                "history": history,        # prepare_turn 返回的**裁剪后**历史
+                "trace": [],
+            }
         # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
         # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
         # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
@@ -151,16 +172,33 @@ async def chat_stream(
             )
 
             final = {"trace": [], "intent": None, "gate_passed": None, "agent_steps": 0}
-            async for payload in graph.astream(
-                {
-                    "conversation_id": session_id,
-                    "user_input": request.message,
-                    "history": history,        # prepare_turn 返回的**裁剪后**历史
-                    "trace": [],
-                },
+            suspended = False
+            # `stream_mode` **必须带上 `updates`**(ch06,spec F1)。实测
+            # (langgraph 1.2.11):只给 `custom` 时 `interrupt()` 被**整个吞掉**
+            # —— run 照常结束、`state.next` 停在待续节点、一个帧不吐、不报任何错。
+            # 用户侧的表现是"问退款之后什么都没发生",连报错都没有。
+            #
+            # `updates` 只用于**认 interrupt**,其余一律不外推:那是图的原始
+            # update 载荷(里面是节点返回值,可能含模型自由文本),前端不认识它。
+            async for mode, chunk in graph.astream(
+                stream_input,
                 config={"configurable": {"thread_id": session_id}},
-                stream_mode="custom",
+                stream_mode=["custom", "updates"],
             ):
+                if mode == "updates":
+                    if "__interrupt__" in chunk:
+                        # 挂起:载荷原样是 `{"frame": "order_choice", "options": [...]}`
+                        # (spec §5.2),帧名与载荷由它自己说 —— 端点只做搬运,不认
+                        # "order_choice" 这个字面量(将来多一种挂起,这里不用改)。
+                        payload = chunk["__interrupt__"][0].value
+                        suspended = True
+                        yield _frame(
+                            payload.get("frame", "interrupt"),
+                            {k: v for k, v in payload.items() if k != "frame"},
+                        )
+                    continue
+
+                payload = chunk
                 event = payload.get("frame")
                 if event == "trace":
                     # 内部证据链:折进 done 帧,不外推 —— 前端不认识这个帧。
@@ -173,11 +211,25 @@ async def chat_stream(
                     )
                 yield _frame(event, data)
 
+            if suspended:
+                # 挂起的一轮**不发 done**:done 帧自报的是"这一轮跑完了"(它带
+                # trace / intent / agent_steps),而挂起时这些全是初值 —— 发出去
+                # 是在撒谎,而且 `log_turn` 也没跑(这一轮不落库,spec §5.1)。
+                # 前端不读 done 帧,响应结束即恢复输入框。
+                return
+
             yield _frame("done", {
                 "finish_reason": "stop",
+                # `usage` **刻意写死 None**:`ChatState.usage` 只有 Agent 节点写,
+                # 而它**不在** `resolve_references` 的每轮重置清单里 —— 一旦把
+                # `state["usage"]` 接到这里,非 Agent 的那几轮(闲聊/投诉/兜底/
+                # 退款子流程)就会报**上一轮的 token 数**。今天没有任何读者
+                # (前端不读、验收脚本不读),所以先留死值;真要接,必须连
+                # 「在每轮重置里把 usage 清掉」一起做。
                 "usage": None,
                 "trace": final.get("trace") or [],
                 "intent": final.get("intent"),
+                "confidence": final.get("confidence"),
                 "gate_passed": final.get("gate_passed"),
                 "agent_steps": final.get("agent_steps") or 0,
             })

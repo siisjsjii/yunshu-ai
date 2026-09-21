@@ -129,7 +129,9 @@ def build_graph(
     )
     graph.add_node(
         "refund_expand_retrieve",
-        make_refund_expand_retrieve_node(model=model, retriever=retriever, emit=emit),
+        make_refund_expand_retrieve_node(
+            model=model, retriever=retriever, emit=emit, settings=settings
+        ),
     )
     # 判定**不新建 Agent**:同一个主力模型、一次结构化调用、不绑工具
     # (第二轮的 `bind_tools` 缺失在这里是结构保证,不是提示词约定)。

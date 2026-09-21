@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     max_agent_steps: int = Field(default=5, ge=1)
     agent_token_budget: int = Field(default=20000, ge=1)
 
+    # ch06 退款子流程。Query 扩写的条数上限(spec §9)。
+    #
+    # **`ge=1` 是硬边界,不是防呆**:实测两种越界都不报错、只静默变坏 ——
+    # `0` → `expand_queries` 返回**空列表**(检索空转,而它与「库里没有这条
+    # 知识」长得一模一样);负数更糟,`[-1]` 是 Python 的负切片语义
+    # 「去掉最后 N 条」,于是**静默少一条**,看起来完全正常。
+    # `expand_queries` 自己在 `max_queries < 1` 时直接抛(第二道),这里在
+    # **启动时**就拒(第一道)。
+    query_expansion_max_queries: int = Field(default=3, ge=1)
+
     # ---- ch03:知识库与向量检索。全部可选带默认值,检索组件懒初始化,----
     # ---- 配置有值不等于启动就连接 Milvus / 加载 BGE-M3。           ----
     embedding_model_path: str = "models/bge-m3"
