@@ -408,6 +408,7 @@
         renderChoices(ctx.bubble, payload.options || []);
         break;
       case "order_choice":
+        ctx.suspended = true;          // 本轮是挂起,不是答完 —— 见 streamInto 的说明
         renderOrderCards(ctx, payload.options || []);
         break;
       case "refund_offer":
@@ -440,6 +441,13 @@
     busy = true;
     sendEl.disabled = true;
     inputEl.disabled = true;
+    // 本轮是否「挂起」而不是「答完了」。**这个标志是必须的**:
+    // ch06 的子流程在缺订单号时会 `interrupt()`,那一轮**一个 token 帧都不发**
+    // (卡片挂在 ctx.bubble 上,不是 ctx.body)。而下面的 finally 会在 body 为空时
+    // 写一句「(没有返回内容)」—— 然后 resume 复用**同一个 ctx**、token 走 `+=`,
+    // 于是恢复后的回复前面会**永久粘着那句占位符**。
+    // 每次 streamInto 都重置:resume 那一次同样要按新的一轮重新判定。
+    ctx.suspended = false;
 
     try {
       const resp = await fetch("/api/chat/stream", {
@@ -480,7 +488,9 @@
       p.textContent = `⚠️ 连接中断(${err.message})`;
       ctx.bubble.appendChild(p);
     } finally {
-      if (!ctx.body.textContent.trim() && !ctx.failed) {
+      // 挂起的那一轮**不该**写这句:它没答完,只是在等用户点订单卡片。
+      // 写了它,resume 之后那句会粘在真正的回复前面(见 streamInto 顶部的说明)。
+      if (!ctx.body.textContent.trim() && !ctx.failed && !ctx.suspended) {
         ctx.body.textContent = "(没有返回内容)";
       }
       makeCitesClickable(ctx);
