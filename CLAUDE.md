@@ -11,6 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **ch03(知识库 + 向量检索)** 交付(分支 `ch03-kb`):`query_faq` 内部实现从关键词查 `faq` 表换成 **BGE-M3 + Milvus 的语义检索**(工具契约一字未改)。含结构感知切分、语料导入、双写幂等、对话挖知识、检索评估集、端到端验收 7 项。设计源见 ch03 spec(§12 订正最多的一章)。
 - **ch04(知识库管理台)** 交付(分支 `ch04-kb-console`):文档查看/在线上传、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。核心是 `app/kb/jobs.py`(JobStore)+ `app/kb/orchestrate.py`(后台任务:专用线程 + **自建独立 engine**)+ `app/api/kb.py`(7 端点)。
 - **ch04 增补(混合检索 + 重排 + 评估)** 交付:Milvus BM25(`text` 字段 jieba analyzer + BM25 Function)+ `hybrid_search` RRF + bge-reranker-v2-m3 重排(候选池 20,CPU 性能约束);生成 QC(自评 json_mode → 拒答落 `low_confidence_questions` 池 + `citations` 帧 + 负面知识 prompt);四策略评估 `scripts/run_eval.py`。设计源见 ch04 增补 spec §13。
+- **ch05(生产级架构:LangGraph 确定性编排 + 主力 ReAct Agent)** 已合并 `main`:把 `/api/chat/stream` 从「模型单轮选工具」换成 **确定性图骨架** —— `resolve_references → classify_intent → route_by_intent`(纯函数,写死在代码里)→ 五出口;知识类走强制预检索 + 置信度闸再进 Agent,业务类直交 Agent;Agent 是骨架里的**一个节点**(手写 ReAct,第二轮**不绑 tools** 是结构保证)。含 `POST /api/ticket`、聊天页两个独立按钮。设计源见 ch05 spec。
+- **ch06(分流器正式版)** 交付(分支 `ch06-intent-router`):把 ch05 里占位的前两个节点做成正式版 —— **八类意图**(含「其他」)+ `{intent, confidence}` 强制 JSON;**指代消解 + Query 改写**(失败原样透传);**退款退货/售后走一条确定性子流程**(取订单 → Query 扩写 + 强制检索政策 → 主力 Agent 判「这一单能不能退」→ 给退款表单或说明原因);**缺订单号时 `interrupt()` 真挂起**,前端渲染订单卡片,点选后 `Command(resume=...)` 同 thread 续跑;`POST /api/refund` + `refund_requests` 表。设计源见 ch06 spec。
 
 **ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**全程不做**:多轮 Agent Loop、认证。
 
@@ -179,6 +181,11 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - **别为自由文本写字符串断言**。`deepseek-flash` 在 `temperature=0` 下依然非确定。
 - **计数类断言必须实测能区分**:`@tool` 的参数校验发生在**函数体之外**,所以「这个工具被调用了几次」的计数器**必须放在 `ainvoke` 边界**,写在函数体里在参数非法时恒为 0、区分不出任何实现。
 - **变量名不等于语义 —— 断言一个字段之前,先去读它是怎么被赋值的(ch05 最刺眼的一处)**。ch05 的验收 5 写了 `[ "$STEPS" -ge 2 ]` 来断「ReAct 不止一步」,`STEPS` 取自 done 帧的 **`agent_steps`**。那个名字读作「步数」,但 `app/agent/nodes.py` 里它是**绑工具轮次的序号且把收敛那一轮也算进去**,**任何一次工具调用都得到 2** —— 于是这条断言在 `tool_calls >= 2` 之外**零判别力**,而且**漏得掉真回归**:把循环改成单轮、让模型在一轮里并发发两个 `tool_call`,照样绿。更刺眼的是:**计划里那段注释自己就写了「收敛那一轮也被算了一步」** —— 事实写下来了,结论却没用到它。改断 trace 里的 `agent:step2`(那个字符串**只在第 2 轮真的发了工具调用时才追加**)。
+- **「在**处理之后**注入」是本项目最高频的假绿形态 —— ch06 一章之内中了三次**。三次的形状完全一样:**测试把「已经被处理好的值」喂给被测对象,于是「处理」那一步永远不被验**。
+  - T3:API 端点测 502 时,patch 的函数**直接抛 `ToolInfrastructureError`** —— 跳过了「把 `SQLAlchemyError` 翻译成它」那一步,而**那一步正是缺陷所在**(翻译根本不存在,真故障返回 500)。
+  - T4:单测断言 `log_turn` 的帧里有 `confidence`,但它是**直接塞进 state 字典**的 —— LangGraph 全程没参与,而 `ChatState` **根本没有这个通道**,真机上写入被静默丢弃、恒为 `None`。
+  - T6:检索的「基础设施故障必须上抛」用例注入的也是**已翻译好**的错误;而 `_load_rows` 的裸 `SQLAlchemyError` 会被 `except Exception` 吞成「这条查询失败」。
+  **判据**:写这类测试前先问「我注入的这个值,**在被测对象内部还会被处理一次吗**?」——会,就注入**处理之前**的形态。对照写法见 `tests/test_api_ticket.py:151-212`(注入裸 `OperationalError`,走真分类路径)。
 - **「语言/库 X 在情况 Z 下表现 Y」这类断言,要么带可复现证据,要么显式标注「未验证」**。ch05 一个 brief 里写过 `confidence_gate:pass`,实际是 `fail`;另一处断言「修好阈值验收 5 就会稳」,实测那个题面在阈值 0 时 top-1 只有 0.089(知识库**根本没覆盖**)。**两条都是先写结论、后没跑**。裁定「这不归本章管」时同理:**不能只看文本授权,还要算这条缺陷会不会卡住本章自己的验收**。
 - **读回数据库的值要用新 session**:SQLAlchemy 身份映射持**弱引用**,同 session 重读是否打到库取决于还有没有东西引用着那个 ORM 对象 —— 会变成「靠 refcount 走运」的断言。
 - **复述类断言要对着真实来源验**:让替身**真的把密钥写进异常文本**,否则「响应里没有密钥」是恒真的。
@@ -204,6 +211,10 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - **验收断言不能直接 grep 原始 SSE 流**。回复逐 token 推送,`20240915` 会被切成三个独立帧。用 `join_tokens` 拼回后再比对。
 - **不要用 `grep '[一-龥]'` 检查中文完好性**:C locale 下 bracket expression 退化成字节区间,对真实 UTF-8 和 mojibake 全部匹配,是个恒真的假断言。脚本里的 `has_cjk` 按 Python 码点判断。
 - **起服务前先查端口**:8000 上残留的僵尸进程会让你 curl 到旧代码,从而得出「新代码坏了」的**假红**。ch02 的最终验证就差点栽在这上面。ch05 又遇到一次,且**一次开了两个 uvicorn** —— 见到多个就全部清掉再起,别猜哪个是新的。
+- **LangGraph 的两条实测硬约束(ch06,都是「报错指向别处」的类型)**:
+  - **`astream(stream_mode="custom")` 会把 `interrupt()` 整个吞掉** —— 一个帧都不吐、run 直接结束、`state.next` 停在待续节点、**不报任何错**。interrupt 只从 **`updates`** 模式浮出(`{'__interrupt__': (Interrupt(value=…),)}`)。ch06 的订单卡片差点因此「永远不出现且不报错」;端点的流模式因此是 `["custom","updates"]`。
+  - **`resume` 时节点会从头重跑**(`interrupt()` 之前的代码再执行一遍)。所以**放 `interrupt()` 的节点里不能有别的事** —— 取订单那类有副作用的活必须在它**之后**的节点。ch06 有一条「取订单恰好一次」的用例,计数器放在 **tool 的 `ainvoke` 边界**上(那正是本项目栽过的边界)。
+  - **未在 `ChatState` 里声明的通道,写入被静默丢弃**(只 `logger.warning`,不抛)。ch06 因此丢过一整个交付物:节点写了 `confidence`、通道不存在、**单测全绿而生产恒为 `None`**。加通道时**连带加它的每轮清零**(checkpointer 是进程级单例、thread_id=session_id,未写通道**保留上一轮的值**)。
 - **引用一条陷阱 ≠ 免疫于它(ch05 实测)**。ch05 的编排者在给子代理的 dispatch 里**逐字引用过**上面那条「含中文的请求体不能走 curl argv」,几分钟后**自己**用 `curl --data-binary "{\"message\":\"退货政策是什么\"}"` 发中文,拿到 `{"detail":"There was an error parsing the body"}`,12 个样本全部没有 done 帧。**结论不是「下次记得」,而是换掉通道**:含非 ASCII 的请求一律走 **httpx 这类替你处理编码的客户端**(或 stdin heredoc),不要依赖「我记得要避开 argv」。
 
 ## 工作方式要求

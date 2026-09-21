@@ -273,3 +273,38 @@ app/static/index.html     订单卡片 + 退款表单(Vibe Coding)
 ## §12 实现订正
 
 本章进行中若代码与本文偏离,**逐条记在这里**并写明原因(项目惯例,与 ch03–ch05 同)。
+
+---
+
+## §12 实现订正(2026-09-22 收尾时汇总)
+
+逐条记代码与本文的偏离及原因(项目惯例,与 ch03–ch05 同):
+
+1. **`query_expansion_max_queries` 进了 `app/config.py`,带 `Field(ge=1)`**。
+   实测边界:`0 → []`(整条契约要防的**空检索**形状)、**`-1 → ['a']`**
+   (Python 负切片**静默丢一条**,不报错)。这是本章唯一一个「不夹住就会静默走偏」的配置项。
+2. **`ToolOutcome` 加了 `error_kind`**(`not_found`/`timeout`/`invalid_args`/`tool_missing`)。
+   起因:取数节点把**每一个** `ok=False` 都当成「查无此单」,于是**超时**会让用户看到
+   「请核对订单号后再试一次」—— **服务端故障被包装成用户输入错**。
+   修法是让**唯一知道失败原因的那层**(执行器)记录原因,而不是让调用方按文案反推。
+   `app/tools/executor.py` 因此超出 T7 的 Files 块(已披露);**既有调用方一行未动**。
+3. **`app/retrieval/search.py::_load_rows` 补了错误翻译**。
+   它是该模块**唯一**未翻译的出站口,而模块 docstring 早就承诺「本模块是翻译边界…绝不降级成没搜到」
+   —— 属**对自身契约的违约**,不是新设计。不补的话,Milvus/MySQL 故障会被
+   `multi_search` 的 `except Exception` 吞成「这条查询失败」。
+4. **`POST /api/chat/stream` 对「无待续流程的 resume」返回 409**,本文原本没有这条。
+   不加的话用户会看到**裸露的 Python 键名 `'user_input'`**。
+   选 409 而非 422:请求体完全合约定,**冲突的是会话状态**(与既有的「会话忙」同族)。
+   为此把 `build_graph` 前移到响应之前(`CheckpointTuple` 无 `next` 字段,查待续状态需要编好的图)。
+5. **`resume` 载荷接受三种形状**(`str` / `{"order_no": …}` / 对象)。
+   本文只写「端点发其中一种」;实测**前端发的是 `{"order_no": …}`**,
+   只收裸字符串会让用户看到乱码「没能查到订单 {'order_no': …}」。
+6. **done 帧的 `usage` 仍写死 `None`**,未接 `ChatState.usage`。
+   接它必须**同时**把 `usage` 加进每轮清零,否则非 Agent 轮会报**上一轮**的 token 数
+   (checkpointer 进程级单例 + 未写通道保留旧值)。本章无读者,故保持写死并写明理由。
+7. **前端(规格中属 Vibe Coding)两处实现细节**:`streamInto(ctx, body)` 抽出以便 **resume 续进同一气泡**;
+   以及**挂起轮不写「(没有返回内容)」占位符** —— 否则那句会粘在 resume 后的回复前面
+   (`ctx.body` 在挂起轮恒空,而 `finally` 无条件写它)。
+8. **`refund_requests` 的 DDL 去掉 `IF NOT EXISTS`**(§6.1 已就地订正)。
+   原因是一个**静默**分歧:`create_all` 建的表没有 SQL DEFAULT,而 `IF NOT EXISTS` 让
+   `.sql` 的每次应用都是无声 no-op ⇒ 本文件成了一张**哪儿都不存在的表**的文档。
