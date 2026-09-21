@@ -1,0 +1,3 @@
+{"text": "这个能退吗", "min_queries": 2, "must_cover_any": ["退货", "退款", "无理由"]}
+{"text": "我要退货,运费谁出", "min_queries": 2, "must_cover_any": ["运费", "谁承担"]}
+{"text": "保修多久", "min_queries": 2, "must_cover_any": ["保修", "质保"]}

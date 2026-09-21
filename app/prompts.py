@@ -187,6 +187,37 @@ RESOLVE_SYSTEM_PROMPT = """你在做电商客服对话的**指代消解与问题
 """
 
 
+EXPAND_SYSTEM_PROMPT = """你要把用户的一个问题**泛化成多条侧重不同的检索查询**。
+
+输出一个 JSON 对象,**只有 queries 一个字段**,值是字符串数组。
+
+要求:
+- 每条查询从**不同角度**切入同一件事(如:政策依据 / 时效 / 费用 / 例外情况);
+- 不要复述原问题多遍,不要输出近义改写;
+- 条数不超过 {max_queries} 条;
+- 不要输出 JSON 以外的任何内容。
+"""
+
+_EXPAND_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", EXPAND_SYSTEM_PROMPT), ("human", "{text}")]
+)
+
+
+def build_expand_messages(*, text: str, max_queries: int) -> list:
+    """组装 Query 扩写的消息。
+
+    两件在别处会静默失效的事:
+
+    1. `{max_queries}` 是**模板变量**,必须在装配时渲染 —— 不渲染的话模型看到的
+       是字面量 `{max_queries}`,"条数不超过"这句要求直接失效,而输出仍然是
+       一份合法 JSON、下游也照样跑;
+    2. 这里**只放一个问题**,`user` 消息就是它。`text` 里的任何花括号都只是值,
+       不参与模板解析(与 `EXTRACT_PROMPT` 同一形状,`test_prompts.py` 的两禁
+       在这里由 `tests/test_retrieval_expand.py` 接续钉住)。
+    """
+    return _EXPAND_PROMPT.format_messages(text=text, max_queries=max_queries)
+
+
 def build_resolve_messages(*, history: Sequence[Message], user_input: str) -> list:
     """组装指代消解的消息:system + **裁剪后的历史** + 本轮原话。
 
