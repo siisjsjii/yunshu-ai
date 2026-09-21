@@ -172,6 +172,27 @@
   }
   .choice-btn:hover:not(:disabled) { background: #dcebf9; }
   .choice-btn:disabled { opacity: .6; cursor: default; }
+  .orders { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .orders-title { font-size: 12.5px; color: #5b7186; }
+  .order-card { display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    background: #fff; border: 1.5px solid #cdd9e4; border-radius: 8px;
+    padding: 8px 12px; cursor: pointer; text-align: left; font: inherit; }
+  .order-card:hover:not(:disabled) { border-color: var(--brand); background: #f2f8fd; }
+  .order-card:disabled { opacity: .55; cursor: default; }
+  .order-card.picked { border-color: var(--brand); background: #dcebf9; opacity: 1; }
+  .order-no { font-weight: 700; color: var(--ink); font-size: 13.5px; }
+  .order-meta { font-size: 12px; color: #5b7186; }
+  .refund-form { margin-top: 10px; border: 1.5px dashed #cdd9e4; border-radius: 8px;
+    padding: 10px 12px; background: #fbfdff; }
+  .refund-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
+  .refund-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .refund-reason { font: inherit; padding: 4px 6px; border: 1.5px solid #cdd9e4;
+    border-radius: 6px; background: #fff; }
+  .refund-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .refund-submit { background: var(--brand); color: #fff; border: none; border-radius: 999px;
+    padding: 6px 16px; font-size: 13px; cursor: pointer; }
+  .refund-submit:disabled { opacity: .6; cursor: default; }
+  .refund-state { font-size: 12px; color: #5b7186; }
   .row.system .bubble { background: #eef4fa; color: #5b7186; border-style: dashed; }
   .cite { color: var(--brand); text-decoration: none; font-weight: 700;
     border-bottom: 1px dashed var(--brand); cursor: pointer; padding: 0 1px; }
@@ -386,6 +407,12 @@
       case "choices":
         renderChoices(ctx.bubble, payload.options || []);
         break;
+      case "order_choice":
+        renderOrderCards(ctx, payload.options || []);
+        break;
+      case "refund_offer":
+        renderRefundForm(ctx, payload);
+        break;
       case "error":
         ctx.failed = true;
         const p = document.createElement("div");
@@ -398,18 +425,27 @@
   }
 
   async function send(text) {
+    const ctx = { ...addAssistant(), lastTool: null, failed: false };
+    await streamInto(ctx, sessionId ? { session_id: sessionId, message: text }
+                                    : { message: text });
+  }
+
+  // 从挂起点续跑(ch06):订单卡片点选后走这里。
+  // **复用同一个 ctx** —— 回复要接着流进**同一个气泡**,不是新起一条。
+  async function resumeWith(resumeBody, ctx) {
+    await streamInto(ctx, { session_id: sessionId, resume: resumeBody });
+  }
+
+  async function streamInto(ctx, body) {
     busy = true;
     sendEl.disabled = true;
     inputEl.disabled = true;
-
-    const ctx = { ...addAssistant(), lastTool: null, failed: false };
 
     try {
       const resp = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sessionId ? { session_id: sessionId, message: text }
-                                       : { message: text }),
+        body: JSON.stringify(body),
       });
 
       if (!resp.ok || !resp.body) {
@@ -572,6 +608,99 @@
       box.innerHTML = `${head}<div class="cite-answer">${esc(c.answer)}</div>
         <div class="cite-note">源文档载入失败(${esc(err.message)}),以上是命中的知识块原文。</div>`;
     }
+  }
+
+  // ── 订单选择器(ch06 退款子流程)─────────────────────
+
+  // 后端在子流程里 `interrupt()` 时发来的一帧:该填订单号了。
+  // 点选后带订单号发 resume,流程从断点接着走 —— 回复流进**同一个气泡**。
+  //
+  // 兼容两种载荷形状:后端给字符串数组(order_no)或对象数组
+  // (order_no + status/product/amount)。**不假设哪一种**,免得耦合到
+  // 后端某一版的实现细节上。
+  function renderOrderCards(ctx, options) {
+    const box = document.createElement("div");
+    box.className = "orders";
+    const title = document.createElement("div");
+    title.className = "orders-title";
+    title.textContent = "请选择要处理的订单:";
+    box.appendChild(title);
+
+    options.forEach((o) => {
+      const no = typeof o === "string" ? o : (o.order_no || "");
+      if (!no) return;
+      const meta = typeof o === "string"
+        ? ""
+        : [o.product, o.status, o.amount].filter(Boolean).join(" · ");
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "order-card";
+      card.innerHTML = `<span class="order-no">${esc(no)}</span>` +
+        (meta ? `<span class="order-meta">${esc(meta)}</span>` : "");
+      card.addEventListener("click", () => {
+        // 一次性锁定:已选过就不再让点第二张
+        box.querySelectorAll(".order-card").forEach((b) => (b.disabled = true));
+        card.classList.add("picked");
+        resumeWith({ order_no: no }, ctx);
+      });
+      box.appendChild(card);
+    });
+
+    ctx.bubble.appendChild(box);
+    scrollToEnd();
+  }
+
+  // ── 退款表单(ch06)──────────────────────────────────
+  //
+  // 类目**从帧里来**(`payload.categories`),前端**不硬编码** ——
+  // 后端 `app/refund/categories.py` 是那份清单的唯一来源,
+  // 两处各写一份迟早漂移,而漂移的表现是:表单能选,提交回 422。
+  function renderRefundForm(ctx, payload) {
+    const box = document.createElement("div");
+    box.className = "refund-form";
+    const cats = payload.categories || [];
+    const orderNo = payload.order_no || "";
+
+    box.innerHTML = `
+      <div class="refund-title">提交退款申请${orderNo ? `(订单 ${esc(orderNo)})` : ""}</div>
+      <label class="refund-row">退款原因
+        <select class="refund-reason">
+          ${cats.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="refund-actions">
+        <button type="button" class="refund-submit">提交退款单</button>
+        <span class="refund-state"></span>
+      </div>`;
+
+    const btn = box.querySelector(".refund-submit");
+    const sel = box.querySelector(".refund-reason");
+    const st = box.querySelector(".refund-state");
+
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;              // 一次性锁定:这是**非幂等写**,重复提交会出两张单
+      st.textContent = "提交中…";
+      try {
+        const r = await fetch("/api/refund", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId, order_no: orderNo, reason_category: sel.value,
+          }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        st.textContent = "已提交";
+        appendSystem(`退款单已提交:订单 ${d.order_no} · ${d.reason_category}`);
+      } catch (e) {
+        btn.disabled = false;           // 失败才放开,让用户能重试
+        st.textContent = `提交失败(${e.message})`;
+      }
+    });
+
+    ctx.bubble.appendChild(box);
+    scrollToEnd();
   }
 
   // ── 选项按钮(投诉场景)──────────────────────────────
