@@ -1,11 +1,13 @@
 """意图识别节点:解析失败/越界必须降级为「其他」,**不许抛异常**。"""
 
+import json
 import re
 
 import pytest
 from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import PydanticOutputParser
 
-from app.agent.nodes import make_classify_intent_node
+from app.agent.nodes import make_classify_intent_node, make_log_turn_node
 from app.agent.routing import OTHER
 from app.agent.state import IntentResult
 
@@ -31,8 +33,47 @@ class FakeStructuredModel:
 
 
 class _Intent:
-    def __init__(self, intent):
+    def __init__(self, intent, confidence=0.9):
         self.intent = intent
+        # 节点改读 `.confidence` 之后,替身也必须带上它:不带的话 `result.confidence`
+        # 抛 AttributeError —— 那是**替身不忠实**,不是产品缺陷,照抄旧形状的人会
+        # 把它误读成回归。
+        self.confidence = confidence
+
+
+class _FakeIntentModel:
+    """替身:「模型吐了什么 JSON」→ **真解析器** → `IntentResult`。
+
+    刻意**不**用鸭子类型。真机路径是
+    `model.with_structured_output(IntentResult, method="json_mode")`,而
+    langchain-openai 1.4.0 在 `json_mode` 分支末尾挂的是
+    `PydanticOutputParser(pydantic_object=schema)`(读源码 + 离线实测过)。这里用
+    **同一个解析器**,于是两条支路的结论都来自产品代码的解析/校验/默认值,
+    而不是替身自己编的:
+
+    - `confidence=0.87`  → 模型输出 `{"intent": ..., "confidence": 0.87}`;
+    - `confidence=None`  → 模型**压根没输出这个字段**,即真机上 `{"intent": "物流"}`
+      那一份 JSON,靠 `IntentResult.confidence` 的 `default=0.0` 兜住
+      (实测:`PydanticOutputParser.parse('{"intent": "物流"}')` 返回
+      `IntentResult(intent='物流', confidence=0.0)`,**不报错**;把 schema 的
+      `default` 拿掉同一句抛 `OutputParserException`)。
+    """
+
+    def __init__(self, intent, confidence=None):
+        self.intent = intent
+        self.confidence = confidence
+        self.parser = None
+
+    def with_structured_output(self, schema, method=None):
+        assert method == "json_mode", "抽取类出参只能用 json_mode(本项目硬约束)"
+        self.parser = PydanticOutputParser(pydantic_object=schema)
+        return self
+
+    async def ainvoke(self, messages):
+        payload = {"intent": self.intent}
+        if self.confidence is not None:
+            payload["confidence"] = self.confidence
+        return self.parser.parse(json.dumps(payload, ensure_ascii=False))
 
 
 @pytest.mark.anyio
@@ -83,10 +124,30 @@ async def test_prompt_carries_the_user_utterance():
     assert "你好呀" in model.calls[0][-1].text
 
 
+def _enumerated_labels(prompt: str) -> set[str]:
+    """取 Prompt 里**八类枚举段**的标签(冒号前的名字)。
+
+    **必须限定段落,不能整篇跑正则**:输出契约段(ch06 起)也是
+    `- intent: ...` / `- confidence: ...` 的形状,整篇扫会把 `intent`/
+    `confidence` 当成两个「标签」,于是 stale 断言在一份**完全正确**的
+    prompt 上报红(实测:stale=['confidence','intent'])—— 假红会诱人
+    去改 prompt,而真正的守卫(标签名两处对齐)反而被放过。
+
+    段落边界 = 「八类」标题 → 「**输出一个 JSON 对象」契约段标题。两个边界
+    都断言在,缺任一(改名/删段)就**显式报错**,不让守卫悄悄退化成空集
+    (空集能过 missing 与 stale 两条断言 —— 那才是恒真的假绿)。
+    """
+    _, sep, tail = prompt.partition("八类")
+    assert sep, "Prompt 里找不到「八类」段标题,标签守卫已失效"
+    body, contract, _ = tail.partition("**输出一个 JSON 对象")
+    assert contract, "Prompt 里找不到输出契约段标题,标签守卫已失效"
+    return set(re.findall(r"^\s*-\s*(.+?):", body, re.MULTILINE))
+
+
 def test_every_label_in_the_prompt_matches_the_routing_table():
     """标签名在两处各写一份,必须自动对齐。
 
-    `INTENT_SYSTEM_PROMPT` 里的七个标签是**手写**的;`INTENT_TO_ROUTE` 是代码里的
+    `INTENT_SYSTEM_PROMPT` 里的八个标签是**手写**的;`INTENT_TO_ROUTE` 是代码里的
     权威表。谁改了 `app/agent/routing.py` 的键名,模型仍会吐**旧名**,
     `nodes.py` 的越界检查把**整个桶**静默降级成「其他」—— 全部进兜底,零报错。
 
@@ -101,8 +162,7 @@ def test_every_label_in_the_prompt_matches_the_routing_table():
     from app.agent.routing import INTENT_LABELS
     from app.prompts import INTENT_SYSTEM_PROMPT
 
-    # Prompt 用 `- 标签:说明` 的形式枚举七类,取冒号前的标签名。
-    enumerated = set(re.findall(r"^\s*-\s*(.+?):", INTENT_SYSTEM_PROMPT, re.MULTILINE))
+    enumerated = _enumerated_labels(INTENT_SYSTEM_PROMPT)
 
     missing = [label for label in INTENT_LABELS if label not in enumerated]
     assert not missing, (
@@ -112,3 +172,78 @@ def test_every_label_in_the_prompt_matches_the_routing_table():
 
     stale = sorted(enumerated - set(INTENT_LABELS))
     assert not stale, f"Prompt 里枚举了不在 INTENT_TO_ROUTE 里的标签:{stale}"
+
+
+# ---- ch06 T4:confidence ----
+
+
+@pytest.mark.anyio
+async def test_confidence_is_written_to_state():
+    """confidence 必须进 state(本章只用于日志/后续降级路,不改变路由)。"""
+    node = make_classify_intent_node(model=_FakeIntentModel("物流", 0.87))
+    out = await node({"user_input": "包裹到哪了"})
+    assert out["intent"] == "物流"
+    assert out["confidence"] == pytest.approx(0.87)
+
+
+@pytest.mark.anyio
+async def test_confidence_defaults_when_model_omits_it():
+    """模型没给 confidence 时不得炸 —— 落一个保守值。
+
+    这条断的是**真机支路**:模型返回的 JSON 里没有 `confidence` 字段时,
+    `default=0.0` 兜住(替身走的是产品同款解析器,见 `_FakeIntentModel`)。
+    把 schema 里的 `default` 拿掉,本条**两个断言都会红**(解析抛异常 →
+    降级成「其他」),不是恒真式。
+    """
+    node = make_classify_intent_node(model=_FakeIntentModel("物流", None))
+    out = await node({"user_input": "包裹到哪了"})
+    assert out["intent"] == "物流"
+    assert out["confidence"] == 0.0
+
+
+@pytest.mark.anyio
+async def test_parse_failure_also_carries_zero_confidence():
+    """解析失败的降级路也要带 confidence —— 少了它下游 `state["confidence"]` 直接 KeyError。"""
+    model = FakeStructuredModel(error=OutputParserException("模型输出不是 JSON"))
+    node = make_classify_intent_node(model=model)
+    out = await node({"user_input": "x"})
+    assert out["intent"] == OTHER
+    assert out["confidence"] == 0.0
+
+
+class _RecordingSession:
+    """`append_turn` 只用到 `add` + `commit`。"""
+
+    def __init__(self):
+        self.added = []
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        pass
+
+
+@pytest.mark.anyio
+async def test_log_turn_trace_frame_carries_confidence():
+    """spec §4.2:confidence 要进 done 帧(T8 透传);T4 这半是**进 `trace` 帧**。
+
+    没有这条,把 `"confidence"` 从那个帧载荷里删掉**没有任何测试会红** ——
+    state 里有、帧里没有,而 `classify_intent` 那几条断言照样绿。
+    """
+    frames = []
+    node = make_log_turn_node(session=_RecordingSession(), emit=frames.append)
+    await node(
+        {
+            "conversation_id": "conv-1",
+            "user_input": "包裹到哪了",
+            "reply": "已发货",
+            "intent": "物流",
+            "confidence": 0.87,
+            "gate_passed": None,
+            "agent_steps": 0,
+            "trace": ["resolve_references", "classify_intent:物流"],
+        }
+    )
+    payload = next(f for f in frames if f["frame"] == "trace")
+    assert payload["confidence"] == pytest.approx(0.87)

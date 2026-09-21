@@ -23,11 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 def make_classify_intent_node(*, model):
-    """意图识别:一次 LLM(json_mode),输出七类之一。
+    """意图识别:一次 LLM(json_mode),输出八类之一。
 
     解析失败或越界一律降级为「其他」 —— **不抛异常**。理由:意图识别是骨架
     的第一步,它失败时整轮对话不该跟着崩;降级后由 `route_by_intent` 送进
     兜底出口,用户至少能拿到一句「请再说具体些」。
+
+    `confidence` 同样出参,但本章**不参与路由** —— 它只进 state、进 `log_turn`
+    的 `trace` 帧(spec §4.2 要求它最终进 done 帧),留给后面的降级路。
     """
     chain = model.with_structured_output(IntentResult, method="json_mode")
 
@@ -35,13 +38,24 @@ def make_classify_intent_node(*, model):
         try:
             result = await chain.ainvoke(build_intent_messages(state["user_input"]))
             intent = result.intent
+            # `getattr` 而不是直接取属性:confidence 只是**日志字段**,出参形状
+            # 不合预期时不该把整轮打成 500 —— 本节点的契约就是「降级,不抛异常」
+            # (brief 原文 `result.confidence` 会让 3 处鸭子类型替身全炸,
+            # 而它们只是没跟着补新字段)。同文件读模型输出处
+            # (`acc.tool_calls`、`chunk.usage_metadata`)用的是同一种写法。
+            confidence = float(getattr(result, "confidence", 0.0) or 0.0)
         except (OutputParserException, ValidationError) as exc:
             logger.warning("意图识别解析失败,降级为「其他」:%s", exc)
             intent = OTHER
+            confidence = 0.0
 
         if intent not in INTENT_TO_ROUTE:
             intent = OTHER
-        return {"intent": intent, "trace": [f"classify_intent:{intent}"]}
+        return {
+            "intent": intent,
+            "confidence": confidence,
+            "trace": [f"classify_intent:{intent}"],
+        }
 
     return classify_intent
 
@@ -359,7 +373,10 @@ def make_log_turn_node(*, session, emit):
         )
         emit({"frame": "trace", "trace": full_trace,
               "intent": state.get("intent"), "gate_passed": state.get("gate_passed"),
-              "agent_steps": state.get("agent_steps") or 0})
+              "agent_steps": state.get("agent_steps") or 0,
+              # spec §4.2:confidence 要进 done 帧(端点透传,本章只用于日志)。
+              # 端点那一半在 T8;**不进这一帧的话,state 里的值没有出口**。
+              "confidence": state.get("confidence")})
         await append_turn(
             session=session,
             conversation_id=state["conversation_id"],

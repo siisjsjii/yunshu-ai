@@ -20,6 +20,12 @@ class IntentResult(BaseModel):
         description="物流 / 订单 / 商品咨询 / 退款退货 / 售后 / 投诉 / 闲聊 之一;"
         "无法归入任何一类时为「其他」。"
     )
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="对本次判断的把握程度。**本章只用于日志**,不改变路由结果。",
+    )
 
 
 class ChatState(TypedDict):

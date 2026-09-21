@@ -10,6 +10,7 @@ from app.agent.routing import (
     INTENT_LABELS,
     INTENT_TO_ROUTE,
     KNOWLEDGE,
+    OTHER,
     route_by_intent,
 )
 
@@ -21,21 +22,24 @@ CASES = [
     ("售后", BUSINESS),
     ("投诉", COMPLAINT),
     ("闲聊", CHITCHAT),
+    # ch06 起「其他」是**显式标签**(spec §3.2):它本来就落 `.get()` 的默认值,
+    # 进表是为了让 `INTENT_LABELS` 带得上它 —— 提示词的标签表与这张表同源。
+    (OTHER, FALLBACK),
 ]
 
 
 @pytest.mark.parametrize("intent,expected", CASES)
-def test_seven_intents_map_to_their_outlets(intent, expected):
+def test_every_intent_maps_to_its_outlet(intent, expected):
     assert route_by_intent({"intent": intent}) == expected
 
 
-def test_all_seven_intents_are_covered():
-    """七类一个不漏 —— 少一类会静默落进兜底,而兜底不调模型,问题就永远答不上。"""
+def test_every_intent_is_covered():
+    """八类一个不漏 —— 少一类会静默落进兜底,而兜底不调模型,问题就永远答不上。"""
     assert set(INTENT_TO_ROUTE) == {c[0] for c in CASES}
     assert INTENT_LABELS == tuple(INTENT_TO_ROUTE)
 
 
-@pytest.mark.parametrize("bad", ["其他", "", "投诉 ", "COMPLAINT", "退款退货 "])
+@pytest.mark.parametrize("bad", ["", "投诉 ", "COMPLAINT", "退款退货 "])
 def test_unknown_or_malformed_intent_falls_back(bad):
     """越界/空串/带空格一律兜底 —— 不是 schema 校验,是**走向**的兜底。"""
     assert route_by_intent({"intent": bad}) == FALLBACK
