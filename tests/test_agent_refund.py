@@ -24,6 +24,7 @@
    文案断言一律用**字面量**。
 """
 
+import asyncio
 import json
 
 import pytest
@@ -201,19 +202,24 @@ class RecordingSession:
         pass
 
 
-def _order_tool(*, calls, fail=None):
+def _order_tool(*, calls, fail=None, delay=0.0):
     """`query_order` 的替身。
 
     **必须是真 `@tool`**:`execute_tool` 走的是 `BaseTool.ainvoke(tool_call)`,
     参数校验与 `{"type": "tool_call"}` 那一套语义只有真工具才有(MagicMock
     会把整条链变成「替身自己跟自己玩」)。名字也必须叫 `query_order` ——
     注册表按名字查。
+
+    `delay` 用来制造**超时**(执行器按 `settings.tool_timeout_seconds` 掐);
+    计数照旧在进函数体时先记 —— 被取消之前它已经进来过了。
     """
 
     @tool
     async def query_order(order_id: str) -> str:
         """查询订单详情:状态、商品、金额、下单时间。"""
         calls.append(order_id)
+        if delay:
+            await asyncio.sleep(delay)
         if fail is not None:
             raise fail
         return json.dumps(
@@ -291,8 +297,9 @@ def _settings(**over):
 
 
 def _build_refund_graph(*, intent="退款退货", judgement=None, order_fail=None,
-                        retriever=None, history=(), queries=("退款政策", "退货时效"),
-                        resolve_text=None):
+                        order_delay=0.0, retriever=None, history=(),
+                        queries=("退款政策", "退货时效"), resolve_text=None,
+                        settings=None, registry=None):
     calls: list[str] = []
     frames: list[dict] = []
     session = RecordingSession()
@@ -301,12 +308,17 @@ def _build_refund_graph(*, intent="退款退货", judgement=None, order_fail=Non
     # 而「扩写出来的几条查询都真的搜了」那条断言会因为「拿到的是另一个对象」
     # 而看起来像绿的。
     retriever = FakeRetriever([CHUNK]) if retriever is None else retriever
+    # `registry=None` 才用默认那份;显式传 `{}` 要保留(那是「注册表里没有
+    # query_order」这个接线 bug 的探针,`registry or {...}` 会把它换掉)。
+    if registry is None:
+        registry = {"query_order": _order_tool(calls=calls, fail=order_fail,
+                                               delay=order_delay)}
     graph = build_graph(
         model=model,
         intent_model=IntentModel(intent),
         tools=[],
-        registry={"query_order": _order_tool(calls=calls, fail=order_fail)},
-        settings=_settings(),
+        registry=registry,
+        settings=settings or _settings(),
         retriever=retriever,
         session=session,
         conversation_id=CONV,
@@ -418,6 +430,22 @@ async def test_context_already_has_order_no_does_not_interrupt():
 
 
 @pytest.mark.anyio
+async def test_raw_user_input_outranks_the_rewrite_when_both_carry_a_number():
+    """两段语料**各带一个号码**时,用**原话**那个(次序即优先级)。
+
+    上一条只证明原话**被包含进**语料,证不了次序 —— 把语料顺序倒过来
+    (`[raw, resolved]`),上一条照样绿,而这里会是 `[IN_HISTORY]`。
+    """
+    h = _build_refund_graph(judgement=_Judgement(True, YES_REPLY),
+                            resolve_text=f"订单 {IN_HISTORY} 能退吗")
+    got = await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-19")
+
+    assert got == []
+    assert h.calls == [IN_CONTEXT]        # 原话那个
+    assert IN_HISTORY not in h.calls      # 改写稿那个**没有**被用
+
+
+@pytest.mark.anyio
 async def test_raw_user_input_wins_over_a_rewrite_that_drops_the_order_no():
     """改写**可能把订单号改掉**(消解是自由文本,模型随时可能顺手"润色")。
 
@@ -463,8 +491,11 @@ async def test_fetch_runs_exactly_once_across_resume():
     - `calls == []`(挂起后)**证不了**「取数在下游」:把取数放进 pick 节点里,
       第一次跑就会查一次 —— 那时它已经非空了。所以这条断的是
       「**interrupt 之前**没干过任何事」;
-    - `calls == [PICKED]`(续跑后)才是「恰好一次」:取数若在 pick 节点里,
-      节点重跑会执行**第二遍**,这里是 2。
+    - `calls == [PICKED]`(续跑后)才是「恰好一次」:取数若在 pick 节点里、
+      且摆在 `interrupt()` **之前**,节点重跑会执行**第二遍**,这里是 2。
+      (摆在 interrupt **之后**的取数本来就是单次 —— 那种摆法不是 F3 那个故障,
+      本条断言因此**管不着**它;本节点真正的规矩是「除了 interrupt 什么都不干」,
+      比「别执行两遍」更严。)
 
     实测本机 langgraph 1.2.11:resume 时 `interrupt()` 之前的代码确实会再执行
     一遍(探针里 `[pick] top` 打印了两次),而 `interrupt()` **之后**的节点
@@ -528,7 +559,7 @@ async def test_order_not_found_is_reported_and_never_judged():
     """查不到单不是「不能退」—— 不许进判定,也不许给退款入口。"""
     h = _build_refund_graph(
         judgement=_Judgement(True, YES_REPLY),
-        order_fail=ToolNotFound("未找到订单 x,请核对订单号后重试"),
+        order_fail=ToolNotFound("未找到订单 x,请如实告知用户,不要自行编造"),
     )
     got = await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-7")
 
@@ -538,10 +569,54 @@ async def test_order_not_found_is_reported_and_never_judged():
     text = h.tokens()
     assert IN_CONTEXT in text                         # 点出是哪个号查不到
     assert "人工" in text                             # 给出去处
+    # 面向用户的话术是**我们自己写的**,不是工具那句话的复读:工具的 `ToolNotFound`
+    # 文案是写给**模型**看的(同族的 query_logistics 那条里写着「不要自行编造物流
+    # 信息」),原样吐出来就是把提示词漏给用户。替身里那句哨兵因此必须不出现。
+    assert "不要自行编造" not in text
     # 如实报告 → 这一轮照样落库(不是挂起)。
     assert h.session.added
     # 判定的载荷里不该出现"能不能退"的结论。
     assert (await h.state(thread="t-refund-7"))["refund_decision"] is False
+
+
+@pytest.mark.anyio
+async def test_lookup_timeout_is_not_reported_as_a_missing_order():
+    """**超时不是「你的订单号查不到」。**
+
+    这条是本节点最容易犯的错:`execute_tool` 在**超时**时也返回 `ok=False`,
+    照单全收就会把 MySQL 卡住说成「请核对订单号」—— 拿服务端的故障指责用户
+    输入,而这正是 `ToolInfrastructureError` 那条边界要防的事。
+    """
+    h = _build_refund_graph(
+        judgement=_Judgement(True, YES_REPLY),
+        order_delay=0.5,
+        settings=_settings(tool_timeout_seconds=0.01, tool_retry_attempts=0),
+    )
+    got = await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-17")
+
+    assert got == []
+    assert h.calls == [IN_CONTEXT]                    # 确实试过(且只试了一次)
+    text = h.tokens()
+    assert "稍后再试" in text                          # 不指责用户的说法
+    assert "核对订单号" not in text                     # ← 真正的判别点
+    assert h.frames_of("refund_offer") == []
+    assert (await h.state(thread="t-refund-17"))["refund_decision"] is False
+
+
+@pytest.mark.anyio
+async def test_registry_miss_raises_instead_of_blaming_the_user():
+    """注册表里没有 `query_order` = **接线 bug**,不是「查无此单」。
+
+    这个工具名是本文件写死的,所以它只会因为**我们自己**改了名字/注册表而落空。
+    编一句面向用户的「没能查到订单」会让一次接线错误伪装成用户报错了号码 ——
+    而谁都查不出来。上抛 → 端点 502 + 固定文案。
+    """
+    h = _build_refund_graph(judgement=_Judgement(True, YES_REPLY), registry={})
+    with pytest.raises(ToolInfrastructureError):
+        await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-18")
+
+    assert h.calls == []                              # 工具压根没被调
+    assert h.frames == []                             # 一句面向用户的话都没说出去
 
 
 # ---- 7. 判定 ---------------------------------------------------------------
@@ -625,6 +700,36 @@ async def test_no_evidence_still_reaches_a_verdict_path():
     assert h.model.calls["judge"] == 1
     assert h.frames_of("citations") == []          # 没有命中就不发引用帧
     assert h.session.added
+    # 空证据**不能**渲染成「以下是知识库中与该问题相关的资料:」后面跟着空白 ——
+    # 那句邀请标注编号的话还在,模型就会凭空编一条 [1] 出来。所以断言两件事:
+    # 说明句在,邀请句不在。(只断前一句的话,把 `if evidence else NO_CLAUSE_NOTE`
+    # 换成无条件 `render_evidence(evidence)` 照样绿。)
+    rendered = "\n".join(str(m.content) for m in h.model.judge_messages[-1])
+    assert "没有检索到" in rendered
+    assert "以下是知识库中" not in rendered
+
+
+@pytest.mark.anyio
+async def test_empty_judge_reply_falls_back_to_a_fixed_line_on_the_offer_path():
+    """判定只填了 can_refund、话术是空串 → 必须有一句固定话术兜住。
+
+    前端是「累积 token 画气泡」的:没有 token 帧 = 一个**空气泡**,而退款表单
+    会单独出现在下面(看起来像坏了)。
+    """
+    h = _build_refund_graph(judgement=_Judgement(True, ""))
+    await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-20")
+
+    assert "请选择退款原因后提交" in h.tokens()
+    assert h.frames_of("refund_offer")
+
+
+@pytest.mark.anyio
+async def test_empty_judge_reply_falls_back_to_a_fixed_line_on_the_explain_path():
+    h = _build_refund_graph(judgement=_Judgement(False, "   "))
+    await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-21")
+
+    assert "建议联系人工客服进一步核实" in h.tokens()
+    assert h.frames_of("refund_offer") == []
 
 
 # ---- 9. 基础设施故障:一路抛出去,绝不伪装 --------------------------------

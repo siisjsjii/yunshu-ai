@@ -9,7 +9,14 @@ from sqlalchemy.exc import OperationalError
 
 from app.config import Settings
 from app.tools.errors import ToolInfrastructureError, ToolNotFound
-from app.tools.executor import RETRYABLE_TOOLS, execute_tool
+from app.tools.executor import (
+    ERROR_INVALID_ARGS,
+    ERROR_NOT_FOUND,
+    ERROR_TIMEOUT,
+    ERROR_TOOL_MISSING,
+    RETRYABLE_TOOLS,
+    execute_tool,
+)
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -213,6 +220,65 @@ async def test_unexpected_exception_is_fatal():
             registry={"query_order": query_order},
             settings=_settings(),
         )
+
+
+@pytest.mark.anyio
+async def test_failure_kind_tells_the_caller_whom_to_blame():
+    """`ok=False` 只说明「没成功」;四种来源对调用方是**四件不同的事**。
+
+    取数节点(`app/agent/refund_nodes.py`)按这个字段分三种话说:业务性未找到 →
+    如实转述给用户;超时 → 「稍后再试」(**不**指责用户报的号码);
+    其余(工具名不在注册表 / 参数不合 schema)→ 上抛,绝不产出面向用户的
+    「查无此单」。所以四个值必须**分别**钉住 —— 少一个,调用方就会把
+    服务端或接线的问题说成「你要的东西不存在」。成功时它必须是 `None`。
+    """
+    @tool
+    async def query_order(order_id: str) -> str:
+        """替身。"""
+        return "ok"
+
+    @tool
+    async def not_found_tool(order_id: str) -> str:
+        """替身。"""
+        raise ToolNotFound("没有匹配的条目")
+
+    @tool
+    async def slow_tool(order_id: str) -> str:
+        """替身。"""
+        await asyncio.sleep(5)
+        return "never"
+
+    settings = _settings()
+
+    ok = await execute_tool(
+        tool_call=_tc("query_order", {"order_id": "1001"}),
+        registry={"query_order": query_order}, settings=settings,
+    )
+    assert (ok.ok, ok.error_kind) == (True, None)
+
+    missing = await execute_tool(
+        tool_call=_tc("nope", {}), registry={}, settings=settings
+    )
+    assert (missing.ok, missing.error_kind) == (False, ERROR_TOOL_MISSING)
+
+    invalid = await execute_tool(
+        tool_call=_tc("query_order", {}),          # 缺 order_id
+        registry={"query_order": query_order}, settings=settings,
+    )
+    assert (invalid.ok, invalid.error_kind) == (False, ERROR_INVALID_ARGS)
+
+    not_found = await execute_tool(
+        tool_call=_tc("not_found_tool", {"order_id": "1001"}),
+        registry={"not_found_tool": not_found_tool}, settings=settings,
+    )
+    assert (not_found.ok, not_found.error_kind) == (False, ERROR_NOT_FOUND)
+
+    timed_out = await execute_tool(
+        tool_call=_tc("slow_tool", {"order_id": "1001"}),
+        registry={"slow_tool": slow_tool},
+        settings=_settings(tool_timeout_seconds=0.05, tool_retry_attempts=0),
+    )
+    assert (timed_out.ok, timed_out.error_kind) == (False, ERROR_TIMEOUT)
 
 
 @pytest.mark.anyio

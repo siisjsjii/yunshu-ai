@@ -52,7 +52,12 @@ from app.refund.orders import candidate_orders
 from app.retrieval.expand import expand_queries, multi_search
 from app.schemas import Message
 from app.tools.business import _order_record
-from app.tools.executor import execute_tool
+from app.tools.errors import ToolInfrastructureError
+from app.tools.executor import (
+    ERROR_NOT_FOUND,
+    ERROR_TIMEOUT,
+    execute_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,16 @@ _NOT_FOUND_TEMPLATE = (
     "如果号码没错,我可以帮您转人工客服核实。"
 )
 
+#: 取数**超时**时的话术。**一个字都不许提订单号对不对**:超时是服务端没在
+#: 时限内返回,与用户报的号码无关 —— 说成「请核对订单号」就是拿我们自己的
+#: 故障指责用户输入(审查实测指出过这条)。
+_TIMEOUT_TEMPLATE = "订单查询暂时没有返回,请稍后再试一次;也可以让我帮您转人工客服。"
+
+#: 取数失败、但**不是**业务性未找到(工具名不在注册表 / 参数不合 schema)时
+#: 上抛的固定文案。这是接线 bug,对用户只能交代「服务端出问题」,不能交代成
+#: 「你的订单号查不到」。文案与 `app/tools/executor.py` 的服务端故障同一族。
+_FETCH_WIRING_FAILURE = "订单查询服务暂时不可用"
+
 #: 判定出参解析不出来时的话术。**如实说判不了** —— 不许猜。
 #: (`refund_decision` 同时留 `None`:它既不是「能退」也不是「不能退」。)
 JUDGE_FAILED_REPLY = "抱歉,我暂时判断不了这一单能不能退,建议联系人工客服核实。"
@@ -87,32 +102,40 @@ EXPLAIN_FALLBACK = "这一单暂时不能直接退款,建议联系人工客服�
 # ---- 纯函数:槽位与卡片 ------------------------------------------------
 
 
+def _corpus(state) -> list[Message]:
+    """订单号扫描用的语料:**历史 + 本轮两段文本**。
+
+    本轮**原话排在最后** = 被 `_scan` 先扫到(`candidate_orders` 的
+    `reversed(history)` 语义)。它比 `resolved_input` 权威:改写理论上可能把
+    订单号改掉或整段吃掉,而用户的原话不会。
+    """
+    return [
+        *(state.get("history") or []),
+        Message(role="user", content=state.get("resolved_input") or ""),
+        Message(role="user", content=state.get("user_input") or ""),
+    ]
+
+
+def _candidates(state) -> list[str]:
+    """候选订单号 —— **槽位与卡片共用这一个入口**。
+
+    正则不在本文件重写(T1 的 `candidate_orders` 是那份规则的唯一实现:
+    两份正则迟早漂移,而漂移的表现是「卡片上出现一个查无此单的号」)。
+    槽位与卡片**共用**同一份候选,是为了不让「候选从哪来」这件事出现第二种说法。
+    """
+    return candidate_orders(_corpus(state), state.get("conversation_id") or "")
+
+
 def _slot_from_context(state) -> str:
     """订单号槽位来源①②(spec §3.3):**本轮问题里**含合法订单号 → 直接用;
-    历史里出现过 → 用最近一个(candidate_orders 已按由近及远取)。
-
-    两段语料合起来交给 `candidate_orders`(T1 的实现,**不在本文件重写一遍
-    正则** —— 两份正则迟早漂移,而漂移的表现是「卡片上出现一个查无此单的号」):
-
-    - 本轮原话**排在最后** = 被 `_scan` 先扫到。它比 `resolved_input` 权威:
-      改写理论上可能把订单号改掉或整段吃掉,而用户的原话不会。
-    - 顺序即优先级:① 盖过 ②,与 spec 的「来源顺序」一致。
+    历史里出现过 → 用最近一个(`candidate_orders` 已按由近及远取)。
 
     **`candidate_orders` 在什么都没找到时会回落到演示订单池**,所以判据不能是
-    「返回非空」—— 那会让每一个缺号的退款请求都跳过卡片。这里逐条回原文里
+    「返回非空」—— 那会让每一个缺号的退款请求都跳过卡片。这里逐条回语料里
     **对一遍**:演示池里的号码不在语料里,自然被排除。
     """
-
-    def corpus() -> list[Message]:
-        history = state.get("history") or []
-        return [
-            *history,
-            Message(role="user", content=state.get("resolved_input") or ""),
-            Message(role="user", content=state.get("user_input") or ""),
-        ]
-
-    messages = corpus()
-    for no in candidate_orders(messages, state.get("conversation_id") or ""):
+    messages = _corpus(state)
+    for no in _candidates(state):
         if any(no in (m.content or "") for m in messages):
             return no
     return ""
@@ -120,6 +143,12 @@ def _slot_from_context(state) -> str:
 
 def _card_options(state) -> list[dict]:
     """卡片候选:订单号 + 状态/商品/金额(spec §5.2 的形状)。
+
+    走到这里时**候选必然来自演示池**:只要语料里给出过任何号码,`_slot_from_context`
+    已经填了槽位、根本不会弹卡片。所以「历史那一支」在**今天**不可达 ——
+    但仍然照常传完整语料(见 `_candidates`):把它改成只传空历史,就等于让
+    「候选从哪来」在槽位与卡片两处各有一份说法,而那份说法只在**将来**
+    槽位的判据变动时才分叉(那时卡片会悄悄变成另一批号码)。
 
     详情借 `app/tools/business.py` 的 `_order_record`(**私有**,同模块的
     `query_order` 也用它):它是**纯函数、无 IO**,所以放在 `interrupt()` 之前
@@ -131,8 +160,7 @@ def _card_options(state) -> list[dict]:
     """
     return [
         {"order_no": no, **_pick_record(_order_record(no))}
-        for no in candidate_orders(state.get("history") or [],
-                                   state.get("conversation_id") or "")
+        for no in _candidates(state)
     ]
 
 
@@ -201,9 +229,14 @@ def _picked_order_no(picked) -> str:
 def make_refund_pick_order_node():
     """订单号槽位闸。**`interrupt()` 之外不干任何事。**
 
-    实测(F3):resume 时节点**从头重跑**。把这个节点里放进「取订单数据」,
-    那笔查询就会执行两遍(`tests/test_agent_refund.py::
-    test_fetch_runs_exactly_once_across_resume` 钉着这条)。
+    实测(F3):resume 时节点**从头重跑**。把「取订单数据」放进本节点、且摆在
+    `interrupt()` **之前**,那笔查询就会执行两遍
+    (`tests/test_agent_refund.py::test_fetch_runs_exactly_once_across_resume`
+    钉着这条:挂起后 `calls == []`、续跑后 `calls == [...]`)。
+    (摆在 `interrupt()` **之后**的取数**不会**执行两遍 —— 那种摆法不是 F3
+    那个故障;但本条的要求是「这个节点里除了 interrupt 什么都不干」,
+    它比「别执行两遍」更严:一个节点只该有一件事,别让人去分辨自己这句代码
+    站在 interrupt 的哪一侧。)
 
     resume 的返回值就是选中的订单号:本节点在挂起时**还没**写过 state,
     所以重跑时 `order_no` 仍是空 → 再次走到 `interrupt()`,而这一次它
@@ -243,11 +276,23 @@ def make_refund_fetch_order_node(*, registry, settings):
     `ToolInfrastructureError` —— 这些语义全都只在执行器里。直接 `ainvoke`
     等于把「数据库挂了」和「这个单号查不到」混成一件事。
 
-    查不到单 → `order_data` 留空 dict + `refund_decision=False`
-    (路由据此走 `refund_explain`,**不进判定**):「查不到这一单」不是
-    「这一单不能退」,对用户说的话完全不同。
+    **失败要分三种说**(`outcome.error_kind`,执行器带出来的):
 
-    基础设施故障**不接** —— 它必须一路抛到端点变 502(端点在 T8)。
+    | 种类 | 这是谁的问题 | 这里怎么办 |
+    |---|---|---|
+    | `ERROR_NOT_FOUND` | 用户给的号码(或那单真的不存在) | 如实告知 + 请核对(`refund_explain`) |
+    | `ERROR_TIMEOUT` | **服务端**:查询没在时限内返回 | 说「稍后再试」,**不指责用户** |
+    | 其余(工具名不在注册表 / 参数不合 schema / 种类未知) | **我们自己**(接线或代码 bug) | `ToolInfrastructureError` 上抛,绝不产出面向用户的「查无此单」 |
+
+    最后一行是本节点最容易犯的错,也是它存在的理由:`ok=False` 只说明「没成功」,
+    而**超时与接线 bug 都不等于「你要的东西不存在」**。把 MySQL 卡住说成
+    「请核对订单号」,就是拿服务端的故障指责用户输入 —— 与
+    `app/tools/errors.py` 里 `ToolInfrastructureError` 那条注释同一件事。
+
+    真正的业务性未找到(以及超时)都**不是**异常:`order_data` 留空 dict +
+    `refund_decision=False`,路由据此走 `refund_explain`,**不进判定**
+    (「查不到这一单」不是「这一单不能退」)。而基础设施异常
+    (`SQLAlchemyError`/意外异常)在 `execute_tool` 里就已经上抛了。
     """
 
     async def refund_fetch_order(state) -> dict:
@@ -266,6 +311,25 @@ def make_refund_fetch_order_node(*, registry, settings):
         if not outcome.ok:
             # 回显截断:`order_no` 来自客户端(resume 载荷),长度不受我们控制。
             no = order_no[:32]
+            if outcome.error_kind == ERROR_TIMEOUT:
+                logger.warning("退款子流程:取订单 %s 超时", no)
+                return {
+                    "order_data": {},
+                    "refund_decision": False,
+                    "reply": _TIMEOUT_TEMPLATE,
+                    "trace": ["refund:fetch timeout"],
+                }
+            if outcome.error_kind != ERROR_NOT_FOUND:
+                # 注册表里没有 `query_order`、或参数不合 schema、或执行器将来
+                # 加了新的失败种类:都是**我们的** bug,不是用户输入的问题。
+                # 上抛(端点变 502 + 固定文案),而不是编一句「查无此单」——
+                # 后者会让一次接线错误伪装成用户的订单号打错了,而**谁都不会
+                # 去查**。日志里带上注册表,省得下次还要猜。
+                logger.error(
+                    "退款子流程:取数失败且非业务性未找到(kind=%s):%s;注册表=%s",
+                    outcome.error_kind, outcome.summary, sorted(registry),
+                )
+                raise ToolInfrastructureError(_FETCH_WIRING_FAILURE)
             logger.info("退款子流程:订单 %s 查不到(%s)", no, outcome.summary)
             return {
                 "order_data": {},
@@ -385,9 +449,11 @@ def make_refund_judge_node(*, model):
             }
 
         can_refund = bool(result.can_refund)     # 字段名由 pydantic 保证,不 getattr 兜底
-        reply = (result.reply or "").strip() or (
-            OFFER_FALLBACK if can_refund else EXPLAIN_FALLBACK
-        )
+        # 空话术**不在这里兜底**:两个出口节点各自知道自己该说什么(能退 / 不能退),
+        # 兜底文案归它们。这里再兜一次 = 同一条规则写两遍,改一处就分叉 ——
+        # 而变异实测显示这一份**根本不可达**(去掉它没有任何用例变红,因为出口
+        # 那层原样接住了)。测试钉在出口那层:`test_empty_judge_reply_...` 两条。
+        reply = (result.reply or "").strip()
         return {
             "refund_decision": can_refund,
             "reply": reply,
