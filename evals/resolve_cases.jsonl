@@ -1,0 +1,6 @@
+{"history": [{"role": "user", "content": "我买的猫砂盆不想要了"}, {"role": "assistant", "content": "好的,请问是哪一张订单?"}], "input": "它能退吗", "must_contain": "猫砂盆"}
+{"history": [{"role": "user", "content": "订单 20240915 什么时候发货"}], "input": "那它现在到哪了", "must_contain": "20240915"}
+{"history": [], "input": "退货政策是怎么规定的", "must_contain": "退货政策"}
+{"history": [{"role": "user", "content": "智能猫砂盆 Pro 怎么样"}, {"role": "assistant", "content": "这款智能猫砂盆 Pro 售价 1299 元,支持七天无理由退货"}], "input": "这个多少钱来着", "must_contain": "猫砂盆"}
+{"history": [{"role": "user", "content": "订单 20240915 到哪了"}, {"role": "assistant", "content": "订单 20240915 已发货,预计明天送达"}, {"role": "user", "content": "谢谢"}, {"role": "assistant", "content": "不客气~还有其他可以帮您的吗?"}], "input": "它明天真能到吗", "must_contain": "20240915"}
+{"history": [{"role": "user", "content": "订单 20240915 发货了吗"}, {"role": "assistant", "content": "订单 20240915 今天已经发货了,预计明天送达"}], "input": "多久到", "must_contain": "20240915"}

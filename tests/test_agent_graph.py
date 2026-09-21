@@ -1,6 +1,7 @@
 """整图行为:五条出口各走一遍,断言 trace(验收 1/5 的可检查性来源)。"""
 
 import pytest
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.emit import make_emitter
@@ -65,6 +66,40 @@ class ScriptedModel:
             yield chunk
 
 
+class _EchoModel:
+    """消解那一步的替身:回显用户这一轮的原话。
+
+    回显 = 「这句本来就完整,原样输出」那一类回答 ⇒ `resolved_input == user_input`,
+    于是本文件既有的断言(如「检索器收到的 query 就是用户那句话」)仍然在问同一件事。
+    """
+
+    async def ainvoke(self, messages):
+        return AIMessage(content=messages[-1].content)
+
+
+class _EchoOnAinvoke(_EchoModel):
+    """把 `ainvoke`(消解)与 `bind_tools`/`astream`(Agent)分给两个入口的替身。
+
+    ch06 T5 起 `resolve_references` **每轮都会** `ainvoke` 一次,而本文件的脚本
+    是按 Agent 的 `astream` 批次排的:消解若也去 pop 批次,`rounds=[]` 的探针
+    会以 `IndexError: pop from empty list` 红在半路,有脚本的那些则被**错位消费**
+    —— 两种红法指向的都是脚手架,不是实现。
+
+    (真实模型两种入口都有,所以这里**不是**在替实现兜底:
+    `graph.build_graph` 给消解传的就是同一个 model 实例。)
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def bind_tools(self, tools):
+        return self._inner.bind_tools(tools)
+
+    async def astream(self, messages):
+        async for chunk in self._inner.astream(messages):
+            yield chunk
+
+
 class FakeRetriever:
     def __init__(self, chunks=()):
         self.chunks = list(chunks)
@@ -100,7 +135,9 @@ def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None,
     # rounds is None 才用默认;显式传 [] 要保留成空脚本 ——
     # 那是「碰模型就炸」的探针,`rounds or [...]` 会把空列表换掉、探针失效。
     graph = build_graph(
-        model=ScriptedModel(rounds if rounds is not None else [[FakeChunk("模型回复")]]),
+        model=_EchoOnAinvoke(
+            ScriptedModel(rounds if rounds is not None else [[FakeChunk("模型回复")]])
+        ),
         intent_model=ScriptedModel([[_Intent(intent, confidence)]]),
         tools=[], registry={}, settings=settings or _settings(),
         retriever=retriever or FakeRetriever(),
@@ -174,7 +211,15 @@ async def test_business_route_skips_retrieval_and_gate():
 
 @pytest.mark.anyio
 async def test_chitchat_returns_fixed_copy_and_never_calls_the_model():
-    graph, _ = _graph("闲聊", rounds=[])     # 脚本为空:碰模型就会 IndexError
+    """闲聊出口的答复是**固定话术**:不调模型。
+
+    ⚠️ ch06 T5 起,这个 `rounds=[]` 探针的射程**收窄了**:探针本身是替身里的
+    `astream`/`bind_tools` 那条路,而 `resolve_references` 每轮都会先 `ainvoke`
+    一次(走的是 `_EchoOnAinvoke` 的回显,不消费批次)。所以它现在断言的是
+    「**Agent 那一步**没被调用」,不再是「整轮一次模型都没调」——
+    后者从 T5 起就不成立了(消解本身要调一次)。
+    """
+    graph, _ = _graph("闲聊", rounds=[])     # 脚本为空:Agent 那一步碰模型就会 IndexError
     out = await _run(graph, "你好")
     assert "客服小猫" in out["reply"]
     assert "classify_intent:闲聊" in out["trace"]
@@ -284,7 +329,7 @@ async def test_second_turn_on_same_thread_reports_only_its_own_turn():
     frames = []
     session = RecordingSession()
     graph = build_graph(
-        model=ScriptedModel([[FakeChunk("模型回复")]]),
+        model=_EchoOnAinvoke(ScriptedModel([[FakeChunk("模型回复")]])),
         # 意图替身按**调用顺序**回放(ainvoke 是 rounds.pop(0)):第 1 轮知识类,
         # 第 2 轮闲聊 —— 两轮走**不同分支**,残留才看得见。
         intent_model=ScriptedModel([
@@ -345,7 +390,7 @@ async def test_resolve_references_resets_every_per_turn_channel():
 
     两轮整图用例(闲聊轮)盖不住它:闲聊不读 `evidence`。
     """
-    node = make_resolve_references_node()
+    node = make_resolve_references_node(model=_EchoModel())
     out = await node({
         "user_input": "在吗",
         "evidence": [{"answer": "上一轮的旧知识"}],
@@ -380,7 +425,7 @@ async def test_emitter_sends_frames_through_astream_custom_mode():
     emit = make_emitter(collected.append)
     session = RecordingSession()
     graph = build_graph(
-        model=ScriptedModel([]),
+        model=_EchoOnAinvoke(ScriptedModel([])),
         intent_model=ScriptedModel([[_Intent("投诉", 0.95)]]),
         tools=[], registry={}, settings=_settings(), retriever=FakeRetriever(),
         session=session, conversation_id="conv-emit", emit=emit,

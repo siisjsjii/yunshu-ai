@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
-from app.prompts import build_intent_messages, build_messages
+from app.prompts import build_intent_messages, build_messages, build_resolve_messages
 from app.schemas import Message
 from app.services.history import append_turn
 from app.tools.executor import execute_tool
@@ -302,11 +302,22 @@ def make_agent_node(*, model, tools, registry, settings, emit):
 # ---- 骨架的首尾两步 ----
 
 
-def make_resolve_references_node():
-    """指代消解:**本章原样透传**,正式版留给下一步(用户点名)。
+def make_resolve_references_node(*, model):
+    """指代消解 + Query 改写:把「它能退吗」补全成「猫砂盆能退吗」(ch06)。
 
-    节点本身先立在这里,是为了把「骨架的第一步」这个位置固定下来 ——
-    正式版换实现时,图的拓扑一行都不用动。
+    一次纯文本模型调用,出参是**一句改写后的问法**,写进 `resolved_input` ——
+    下游(检索、闸、Agent)一律读这个通道,所以「改写」在这里是一次性动作,
+    不是给每一处各加一层。
+
+    **失败一律原样透传**:消解是**增强**,不是必需品。ch05 的实现就是原样透传,
+    所以「没消解成」的退路与本项目既有行为完全一致 —— 用户最多是少了一点上下文,
+    绝不会因为改写失败而答不出话。接的是 `OutputParserException`
+    (同文件 `classify_intent` 那一族「模型出参不可用」),**不是裸 `Exception`**:
+    后者会把 `AttributeError` 这类**实现缺陷**也伪装成「这轮没改写」,而本仓
+    已经吃过太多次「静默降级」。上游故障(超时/401/限流)同样**不接** ——
+    与 `classify_intent` 一致,它们该一路抛到端点的 error 帧。
+    **空输出也算失败**(模型真会吐空串):不判的话 `resolved_input` 会变成空串,
+    整轮对话的输入就没了。
 
     它同时承担**每轮重置**:图是每请求现编译的,但 checkpointer 是**进程级**
     单例(`get_checkpointer` 的 lru_cache),而 thread_id = session_id ——
@@ -317,14 +328,42 @@ def make_resolve_references_node():
 
     为什么放在这个节点:它是**每轮第一个**执行节点(START 的唯一出边),
     放这儿等于「每轮开头清一次」,不依赖任何调用方记得播种初值。
+    **重置写在 `try` 之外** —— 消解失败时同样要清,不能整段跳过。
 
     `trace` 通道不在此列 —— 它是 `operator.add` 归约通道,写 `[]` 等于没写,
     清不掉;**它靠 `log_turn` 切片取当轮**(见下)。
+
+    **这里返回的每个 key 都必须在 `ChatState` 里声明过**:通道集合由
+    `StateGraph(ChatState)` 的注解决定,LangGraph 对未声明通道的写入是
+    **静默丢弃**的(T4 的 Critical 就是它)。T7 的 `order_no` / `order_data` /
+    `refund_decision` 三个通道**连同它们的清零一起**在 T7 落地(计划 PF-2)。
     """
 
     async def resolve_references(state) -> dict:
+        user_input = state["user_input"]
+        resolved = user_input
+        try:
+            result = await model.ainvoke(
+                build_resolve_messages(
+                    history=state.get("history") or [], user_input=user_input
+                )
+            )
+            # `.text` 是属性(1.x;`.text()` 已废弃)。不用 `getattr` 兜底:
+            # 模型出参没有 `.text` 是**替身/调用形状不对**,不是模型行为 ——
+            # 替身不忠实正是 T4 那条 Critical 溜过去的原因,别再纵容。
+            rewritten = result.text.strip()
+            if not rewritten:
+                # 真机上可达的那种失败:模型吐了空串。**不要**把空串写进
+                # resolved_input —— 那等于把这一轮的输入清空。
+                logger.warning("指代消解输出为空,原样透传:%r", user_input)
+        except OutputParserException as exc:
+            logger.warning("指代消解失败,原样透传:%s", exc)
+            rewritten = ""
+        if rewritten:
+            resolved = rewritten
+
         return {
-            "resolved_input": state["user_input"],
+            "resolved_input": resolved,
             "trace": ["resolve_references"],
             # 每轮归零的**逐轮**通道:它们描述的是「这一轮」,不是「这段会话」。
             "gate_passed": None,

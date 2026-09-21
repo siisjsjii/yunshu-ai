@@ -172,3 +172,38 @@ _INTENT_PROMPT = ChatPromptTemplate.from_messages(
 def build_intent_messages(text: str) -> list:
     """组装意图识别的消息。"""
     return _INTENT_PROMPT.format_messages(text=text)
+
+
+RESOLVE_SYSTEM_PROMPT = """你在做电商客服对话的**指代消解与问题改写**。
+
+给你对话历史和用户这一轮的原话,输出**一句不依赖上下文也能看懂的完整问题**。
+
+规则:
+1. 「它能退吗」「这个多少钱」这类带**指代**的话,从历史里找出「它/这个」指的是什么,
+   补全成完整问题;
+2. 口语、模糊的问法**归一成标准问法**(如「多久能到」→「发货后多久能送达」);
+3. **问题本身已经完整、指代已经明确的,原样输出,不要强行改写**;
+4. 只输出改写后的那句话,**不要解释、不要加引号、不要输出 JSON**。
+"""
+
+
+def build_resolve_messages(*, history: Sequence[Message], user_input: str) -> list:
+    """组装指代消解的消息:system + **裁剪后的历史** + 本轮原话。
+
+    与 `build_messages` 同一形状(system 打头、历史转 LangChain 消息、本轮原话
+    压尾),因此这里也走 `to_lc_messages` —— 它是 Message → BaseMessage 的
+    **唯一**转换点,另起一套就等于把「历史里的 tool_calls/tool_call_id 怎么转」
+    这件事复制成两份。
+
+    本轮原话是**最后一条 human 消息**:模型据此知道「要改写的是哪一句」,
+    历史里的那些 user 消息只是原料。历史为空(会话第一句)是正常情况。
+
+    顺便一句**没有**做的事:这里不把输出约束成 JSON。本项目的
+    `method="json_mode"` 只用在抽取/意图那类**结构化出参**上;消解的出参是一句
+    自然语言,套 JSON 只会把「模型多吐了一个引号」变成一次解析失败 —— 而失败
+    的代价是整轮**不消解**(见节点里的透传)。
+    """
+    messages = [SystemMessage(RESOLVE_SYSTEM_PROMPT)]
+    messages.extend(to_lc_messages(history))
+    messages.append(HumanMessage(user_input))
+    return messages

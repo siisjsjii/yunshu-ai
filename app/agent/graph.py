@@ -67,7 +67,11 @@ def build_graph(
     """组装本请求的图并编译。"""
     graph = StateGraph(ChatState)
 
-    graph.add_node("resolve_references", make_resolve_references_node())
+    # 消解用**主力模型**(与 Agent 同一个):它要读的是完整对话,不是结构化出参。
+    # 代价是这一步走 `chat_temperature`(0.7),改写措辞每次可能不同 ——
+    # 评估集(`scripts/run_resolve_eval.py`,extract 温度 0)与它在温度上不完全同源,
+    # 已在 T5 报告里记账。
+    graph.add_node("resolve_references", make_resolve_references_node(model=model))
     graph.add_node("classify_intent", make_classify_intent_node(model=intent_model))
     graph.add_node(
         "retrieve_knowledge",

@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from langchain.tools import tool
+from langchain_core.messages import AIMessage
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql.elements import BinaryExpression
 
@@ -63,6 +64,26 @@ class FakeChunk:
         )
 
 
+class _EchoAinvoke:
+    """补上 `ainvoke`(消解)那半边入口。
+
+    ch06 T5 起 `resolve_references` **每轮请求都会** `ainvoke` 一次,而本文件的
+    替身原先只有 Agent 走的 `astream`/`bind_tools` 半边 —— 少了这一行,
+    端点里的 `AttributeError` 会被 `generate()` 的 `except Exception` 收成
+    **error 帧**,于是一整批用例红在「本该 done 却 error」上,指向的还是脚手架。
+
+    回显用户这一轮的原话(=「这句本来就完整,原样输出」那一类回答):
+    `resolved_input` 因此等于 `user_input`,既有的
+    「模型收到的最后一条 human 消息」等断言仍在问同一件事。
+
+    真实模型(`app.llm.create_chat_model` → `ChatOpenAI`)两种入口都有 ——
+    这不是给实现兜底,是把替身补齐到生产形状。
+    """
+
+    async def ainvoke(self, messages):
+        return AIMessage(content=messages[-1].content)
+
+
 class _BoundModel:
     def __init__(self, inner):
         self._inner = inner
@@ -73,7 +94,7 @@ class _BoundModel:
             yield chunk
 
 
-class ScriptedModel:
+class ScriptedModel(_EchoAinvoke):
     """按顺序回放预置 chunk 批次的替身。
 
     记录每次 astream 走的是**绑了工具**还是**未绑工具**的入口,以及
@@ -445,7 +466,10 @@ def test_upstream_error_becomes_sse_error_event(client_factory):
     成立的(`log_turn` 是唯一写方且在下游),但零断言,所以在这里补上。
     """
 
-    class ExplodingModel:
+    class ExplodingModel(_EchoAinvoke):
+        """`ainvoke`(消解)照常应答,**`astream`(Agent)炸** —— 正是本用例要的:
+        炸在 Agent 那一步,于是「失败不落库」这条断言仍在问原问题。"""
+
         def bind_tools(self, tools):
             return self
 
@@ -473,7 +497,7 @@ def test_error_event_does_not_echo_the_configured_key(client_factory):
     若断言的是"响应里没有 sk-test"而异常文本里根本没有它,那条断言恒真。
     """
 
-    class LeakyModel:
+    class LeakyModel(_EchoAinvoke):
         def bind_tools(self, tools):
             return self
 
@@ -504,8 +528,12 @@ async def test_concurrent_same_session_second_request_times_out_with_409(client_
     是同步的,两个线程里跑同一事件循环会带来额外的调度不确定性。
     """
 
-    class SlowModel:
-        """持有锁约 0.8s:远长于 0.15s 的等锁超时。"""
+    class SlowModel(_EchoAinvoke):
+        """持有锁约 0.8s:远长于 0.15s 的等锁超时。
+
+        慢的是 `astream`(**持锁的那一段**)。消解的 `ainvoke` 照常立刻返回 ——
+        它也在锁内,但它不是本用例要制造的延迟来源。
+        """
 
         def bind_tools(self, tools):
             return self
