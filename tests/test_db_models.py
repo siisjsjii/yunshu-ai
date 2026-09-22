@@ -446,8 +446,9 @@ async def _cleanup_summary_rows() -> None:
 async def test_conversation_anchor_columns_default_to_zero():
     """两个锚点列存在、且有默认值 0 —— 这是「还没压过」的哨兵。
 
-    ⚠️ 这两列**只在 db/ch07.sql 里加**(`ALTER TABLE`),`Base.metadata.create_all`
-    只建表不改表。所以本用例红,最可能的原因是 ch07.sql 没跑到那个库上。
+    ⚠️ 在**已有**的 `conversations` 上,这两列只能靠 db/ch07.sql 的 `ALTER TABLE`:
+    `Base.metadata.create_all` 只建表、**不改表**(全新库上它会把两列一并建出来,
+    但任何既有的库都不会)。所以本用例红,最可能的原因是 ch07.sql 没跑到那个库上。
     """
     await _cleanup_summary_rows()
     async with get_sessionmaker()() as session:
@@ -475,9 +476,14 @@ async def test_anchor_columns_have_a_table_level_default_not_only_an_orm_one():
     记过多次的假绿形态:被断言的值恰好等于兜底值填出来的那个)。
 
     这条把 ORM 摘掉再插,表没有 DEFAULT 时 MySQL 直接以 1364
-    「Field doesn't have a default value」拒掉 —— 而那个形状正是
-    `create_all` 建的库(没有 db/ch07.sql 的 `DEFAULT 0`)与
-    `db/ch07.sql` 建的库**形状不同**的落点。
+    「Field doesn't have a default value」拒掉。判别力是**实测的**:在活库上
+    `ALTER TABLE conversations ALTER COLUMN summary_upto_msg_id DROP DEFAULT` 之后,
+    本用例红、而上面那条走 ORM 的用例**照样绿**(这正是要分开两条的理由)。
+
+    现状(2026-09-22):两条建库路径**都**带这个 DEFAULT —— DDL 里是 `DEFAULT 0`,
+    ORM 里是 `server_default="0"`(实测 create_all 建出的 `conversations`,
+    两个锚点列都是 `DEFAULT '0'`)。所以本用例是**防回归的哨兵**,
+    而不是「现在有一条路径是坏的」的证据。
     """
     await _cleanup_summary_rows()
     async with get_sessionmaker()() as session:
@@ -507,13 +513,16 @@ async def test_summary_rows_roundtrip_and_seq_is_unique_per_conversation():
     """中文往返 + `(conversation_id, seq)` 唯一键真的在拦人。
 
     唯一键这条**必须实测**:它是并发保护的第二道,而「我以为建了唯一键」
-    与「真建了」在并发出问题之前完全没有区别。
+    与「真建了」在并发出问题之前完全没有区别。判别力实测过:在活库上
+    `ALTER TABLE conversation_summaries DROP INDEX uk_conv_seq` 之后本用例红。
 
-    ⚠️ 唯一键在 ORM 里**没有对应声明**(`ConversationSummary` 只声明了
-    `index=True`),`create_all` 建出的表**没有它**。所以这条同时是「这张表
-    是 db/ch07.sql 建的、不是 create_all 建的」的判别器 —— 而 DDL 用的是
-    `CREATE TABLE IF NOT EXISTS`:若 create_all 先建了表,这份 DDL 会**静默
-    跳过**,唯一键就永远补不上。本用例正是那个静默失败的哨兵。
+    ⚠️ 本用例跑在**已经建好的库**上,所以它只证明「这个库里有这道约束」——
+    「**两条**建库路径(create_all / db/ch07.sql)是否都声明了它」是
+    `tests/test_orm_shape.py`(纯单测,读 ORM 元数据)的活,两条合起来才盖得住。
+    2026-09-22 之前 ORM 侧确实没有这个约束、而 DDL 写着
+    `CREATE TABLE IF NOT EXISTS`:create_all 抢建之后那句静默跳过,
+    **唯一键永远不存在而没有任何东西报错**。现已两侧都声明
+    (同类教训:`RefundRequest.status` 的 default / server_default 两侧都要)。
     """
     from sqlalchemy.exc import IntegrityError
 
