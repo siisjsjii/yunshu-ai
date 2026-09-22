@@ -351,13 +351,21 @@ def test_skip_reasons_separate_empty_range_from_blank_model_output(monkeypatch, 
 # --------------------------------------------------------------- 失败不冒泡
 
 
-def test_task_never_raises_into_the_caller(monkeypatch):
+def test_task_never_raises_into_the_caller(monkeypatch, caplog):
     """后台任务失败**不冒泡到请求路径** —— 它在**自己的线程**里。
 
     失败只留日志(spec §7.6 的 `summary fail`),边界不动。
     这条形状本身就保证了不冒泡(线程里抛不会传到请求),所以真正的断言是
     **`_run_body` 内部把它接住了** —— 否则线程会打一条
     `Exception in thread` 的噪音,而那是「没人处理」的样子。
+
+    ⚠️ 第二条断言**曾经**是 `assert "c1" not in tasks._INFLIGHT`,它**什么都没断**:
+    ①注释说「锚点没有被推进」而断的是在跑标记(变量名与语义不符);
+    ②它恒真 —— `_INFLIGHT` 只在 `run_summary_in_background` 里登记,`_run_body`
+    根本不碰它;③真抛了的话用例在到达那行之前就 error 了,所以那行**不可能是红的**。
+    (计划文本里就是这么写的,照抄等于把一条零判别力的断言焊进来。)
+    现在断的是**这次运行确实走到了失败那条路** —— 反过来,一个把 `_run_body`
+    整个注释掉、或者压根不记 `summary fail` 的实现会当场变红。
     """
     async def _boom(**kwargs):
         raise RuntimeError("上游炸了")
@@ -368,11 +376,14 @@ def test_task_never_raises_into_the_caller(monkeypatch):
     monkeypatch.setattr(tasks, "summarize_range", _boom)
     monkeypatch.setattr(tasks, "_reload_state", _reload)
 
-    tasks._run_body(conversation_id="c1", settings=_settings(),
-                    model_factory=lambda s: None)   # ← **不抛**才算过
+    with caplog.at_level(logging.INFO):
+        tasks._run_body(conversation_id="c1", settings=_settings(),
+                        model_factory=lambda s: None)   # ← **不抛**才算过
 
-    # 并且锚点**没有被推进**(它只在成功后推)
-    assert "c1" not in tasks._INFLIGHT
+    fails = _payloads(caplog, "summary fail ")
+    assert [p["conversation_id"] for p in fails] == ["c1"]
+    # 这条路径上确实**没写进去**(炸在读库/模型那一步,早于落库)⇒ 如实说没动
+    assert fails[0]["anchors_advanced"] is False
 
 
 def test_anchor_query_failure_is_caught_too(monkeypatch):
@@ -420,13 +431,20 @@ def test_fail_log_redacts_the_api_key(monkeypatch, caplog):
 
 
 class _FakeEngine:
-    """只记 `dispose` —— 「engine 有没有被释放」在本模块的观测面就这一个。"""
+    """只记 `dispose` —— 「engine 有没有被释放」在本模块的观测面就这一个。
 
-    def __init__(self):
+    `dispose_boom=True` 时 `dispose` 会抛:那是「写**之后**才失败」那条路径的
+    最小形态(见 `test_fail_after_the_write_says_the_anchors_already_moved`)。
+    """
+
+    def __init__(self, *, dispose_boom: bool = False):
         self.dispose_calls = 0
+        self.dispose_boom = dispose_boom
 
     async def dispose(self):
         self.dispose_calls += 1
+        if self.dispose_boom:
+            raise RuntimeError("连接已经断了")
 
 
 class _FakeSession:
@@ -499,6 +517,39 @@ def test_engine_is_disposed_when_the_body_fails(monkeypatch):
                     model_factory=lambda s: None)
 
     assert engine.dispose_calls == 1
+
+
+def test_fail_after_the_write_says_the_anchors_already_moved(monkeypatch, caplog):
+    """**写之后**才抛的异常,`summary fail` 必须如实说「锚点已经推进了」。
+
+    最现实的一条:`summarize_range` 已经成功落库(那一段**永久取代了原文**),
+    紧接着 `finally` 里的 `engine.dispose()` 抛了(连接断了/网络抽风)。
+    若这行日志照旧声称「锚点未推进」,运维会以为那段历史还没被覆盖 ——
+    **而这个字段存在的全部意义就是回答那个问题**,答反了比不写更糟。
+
+    这条同时是「字段不是常量」的判据:把它写死成 `False` 的实现会在这里红。
+    """
+    engine = _FakeEngine(dispose_boom=True)
+    _patch_engine(monkeypatch, engine)
+
+    async def _reload(engine_, conversation_id):
+        return (0, 5, _HISTORY())
+
+    async def _ok(**kwargs):
+        return (FAKE_SEQ, "梗概")
+
+    monkeypatch.setattr(tasks, "_reload_state", _reload)
+    monkeypatch.setattr(tasks, "summarize_range", _ok)
+
+    with caplog.at_level(logging.INFO):
+        tasks._run_body(conversation_id="c1", settings=_settings(),
+                        model_factory=lambda s: None)      # ← 仍然**不抛**给调用方
+
+    fails = _payloads(caplog, "summary fail ")
+    assert len(fails) == 1
+    assert fails[0]["anchors_advanced"] is True    # ← 那一段已经写进去了,如实说
+    # 这次失败**不是**摘要步骤的失败:压完了(done 已经打过),炸的是收尾
+    assert len(_payloads(caplog, "summary done ")) == 1
 
 
 # --------------------------------------------------------------- 生命周期日志

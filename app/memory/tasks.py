@@ -44,6 +44,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -82,6 +83,23 @@ SKIP_BLANK_MODEL_OUTPUT = "blank_model_output"
 #: 「这次没东西可压」(那是正常),也不是「已有任务在跑」(那说明上一轮还在跑),
 #: 而是**进程本身出问题了** —— 三者混成一个 skip,读日志的人分不出该不该动手。
 SKIP_THREAD_NOT_STARTED = "thread_not_started"
+
+
+@dataclass
+class _RunState:
+    """跨 `_run` / `_run_body` 的**事实**:这一段到底写进去了没有。
+
+    **不能靠「异常抛在写之前」来推断。** `_run` 里在写**之后**才抛的异常同样会走到
+    `summary fail` 那一行 —— 最现实的一条是 `finally` 里的 `engine.dispose()`
+    (连接已断/网络抽风);此外 session 上下文退出时抛也一样。那时**那一段已经提交、
+    `summary_upto_msg_id` 已经推过去了**,若日志照旧声称「锚点未推进」,运维会以为
+    这段历史还没被覆盖(去重压一遍,或者以为丢了)。
+
+    这个字段存在的**全部意义**就是回答「这段历史被覆盖了没有」—— 答反了比不写更糟。
+    所以它由**真的执行到哪一步**决定(`_run` 里落库成功后置位),而不是靠代码位置猜。
+    """
+
+    anchors_advanced: bool = False
 
 
 def _emit(event: str, *, conversation_id: str, level: int = logging.INFO, **fields) -> None:
@@ -196,12 +214,14 @@ def _run_body(*, conversation_id: str, settings: Settings, model_factory) -> Non
     `summary fail` 那条观测面就没了,而它是排查“为什么梗概一直不更新”的唯一入口。
     接住之后**什么都不做**:不重试(spec §8「留日志,不重试,边界不动」)。
     """
+    state = _RunState()
     try:
         asyncio.run(
             _run(
                 conversation_id=conversation_id,
                 settings=settings,
                 model_factory=model_factory,
+                state=state,
             )
         )
     except Exception as exc:                      # noqa: BLE001 —— 见 docstring
@@ -212,15 +232,19 @@ def _run_body(*, conversation_id: str, settings: Settings, model_factory) -> Non
             # 异常文本常常就是**上游响应体原文**(openai 的 401 把 key 原样写在
             # 里面),所以出站前一律过 redact_api_key(本仓硬规矩)。
             error=redact_api_key(str(exc), settings.openai_api_key),
-            # 结构性的常量:推进边界的唯一途径是 summarize_range 里的原子落库,
-            # 而它只在成功之后被调 ⇒ 走到这一行时边界**必然**没动。写出来是因为
-            # 这正是 `summary fail` 要告诉运维的那件事(spec §7.6)。
-            anchors_advanced=False,
+            # 走到这一步时边界动了没有 —— **问 `_RunState`,不问代码位置**。
+            # (落库成功过 ⇒ 那一段已经永久取代了原文,即使失败发生在它之后。)
+            anchors_advanced=state.anchors_advanced,
         )
 
 
-async def _run(*, conversation_id: str, settings: Settings, model_factory) -> None:
-    """一次摘要任务的完整流程。engine 在这里建、在 `finally` 里释放。"""
+async def _run(
+    *, conversation_id: str, settings: Settings, model_factory, state: _RunState
+) -> None:
+    """一次摘要任务的完整流程。engine 在这里建、在 `finally` 里释放。
+
+    `state` 是**回填事实**用的(见 `_RunState`):走到哪一步了,不是靠位置猜。
+    """
     started = time.monotonic()
     engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     try:
@@ -289,6 +313,11 @@ async def _run(*, conversation_id: str, settings: Settings, model_factory) -> No
                 no_backoff=True,
             )
             return
+
+        # 走到这里 = `summarize_range` 正常返回 = 那次**原子落库已经提交**
+        # (落库与推锚点共用一个事务)。**此后任何异常都必须如实说「锚点已经动了」**
+        # —— `finally` 里的 dispose、session 上下文退出,都可能在这里之后才抛。
+        state.anchors_advanced = True
 
         # 段号是**落库那一步自己算出来的**,一路原样带到这里(spec §7.6 的
         # 「第 N 段」)—— 在这里重算或写死都不是同一个事实。
