@@ -1302,6 +1302,26 @@ git commit -m "refactor(ch08): 五个工具迁进 builtin/ 包 + 包内自动发
 ⚠️ 本文件的**关键写法**:注入的是**未加工的输入**(裸 args、裸异常),
 不是「已经被处理好的值」—— 本仓栽过三次的那类假绿就是
 「测试把处理之后的形态喂给被测对象,于是处理那一步永远不被验」。
+
+⚠️ **两处初稿缺陷,实现者实测后订正(T4 报告 §2/§3),照抄会红:**
+
+1. **每条 `tool_call` dict 都必须带 `"type": "tool_call"`。** 初稿全部漏了 ——
+   而 `BaseTool.ainvoke` 判「这是不是一次工具调用」**只看这个键**,缺键时它把
+   整个 dict 当成**参数**去校验工具 schema,于是每次调用都返回一条「参数不合法」的
+   **可恢复**失败。症状是「闸全对、工具一次没跑起来」,报错却指向 pydantic 的
+   `Field required`,与真正的原因毫无相似之处(CLAUDE.md 的硬约束)。
+   实测 **6 条用例**红在那里。**用下面这个 helper,不要内联 dict:**
+   ```python
+   def _tc(name: str, args: dict) -> dict:
+       return {"name": name, "args": args, "id": "c1", "type": "tool_call"}
+   ```
+2. **`_spec` 不给 `schema` 时要**从 `tool` 派生**(与 `registry._spec_from_tool`
+   同款:`tool.args_schema.model_json_schema()`)。初稿是个固定要求字段 `x` 的兜底
+   schema —— 于是「工具的入参」与「校验用的 schema」说的是两件事:
+   `test_invalid_args_*` 断的「文案点名到字段」会点在 `x` 上(而不是 `order_id`),
+   而 `test_approved_write_is_executed_once` / `test_first_try_success_reports_zero_retries`
+   这类会**先**被校验闸拦下,以「工具一次没被调用」的样子红 —— 那种红与它们真正要验的
+   闸(权限、重试)**毫无关系**,又是「报错指向别处」。
 """
 
 import asyncio
@@ -1310,6 +1330,7 @@ import pytest
 from langchain_core.tools import tool
 
 from app.tools import executor
+from app.tools.errors import ToolInfrastructureError, TransientToolError
 from app.tools.executor import (
     ERROR_CONFIRMATION_REQUIRED,
     ERROR_INVALID_ARGS,
@@ -1603,6 +1624,61 @@ async def test_first_try_success_reports_zero_retries(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_transient_failure_succeeds_on_retry():
+    """**暂时性故障是本任务新增的那一类可重试故障**(spec §6.3)。
+
+    这一条双向都钉住:① 它**真的重试了**(`retry_count == 1`);
+    ② 第二次成功就是成功,不会因为「它抖过」而把结果也丢掉。
+    """
+    calls = []
+
+    @tool
+    async def query_order(order_id: str) -> str:
+        """查订单。"""
+        calls.append(order_id)
+        if len(calls) < 2:
+            raise TransientToolError("connection refused")
+        return '{"ok": true}'
+
+    spec = _spec(name="query_order", tool=query_order)
+    outcome = await execute_tool(
+        tool_call={"name": "query_order", "id": "c1", "args": {"order_id": "1002"}},
+        registry={"query_order": spec},
+        settings=_Settings(),
+        conversation_id="c1",
+    )
+    assert outcome.ok is True
+    assert outcome.retry_count == 1
+    assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_transient_exhausted_raises_infrastructure_error():
+    """三次都不成 ⇒ **上抛 502**,不是回灌一句「工具暂时不可用」。
+
+    重试用尽之后那个故障就不叫暂时性了;推一句软话给模型等于把基础设施故障
+    伪装成一次普通的工具失败 —— 与「数据库挂了不许伪装成你的订单查不到」同一条规矩。
+    """
+    calls = []
+
+    @tool
+    async def query_order(order_id: str) -> str:
+        """查订单。"""
+        calls.append(order_id)
+        raise TransientToolError("connection refused")
+
+    spec = _spec(name="query_order", tool=query_order)
+    with pytest.raises(ToolInfrastructureError):
+        await execute_tool(
+            tool_call={"name": "query_order", "id": "c1", "args": {"order_id": "1002"}},
+            registry={"query_order": spec},
+            settings=_Settings(),
+            conversation_id="c1",
+        )
+    assert len(calls) == 3, "暂时性故障必须真的重试到用尽(1 次原始 + 2 次重试)"
+
+
+@pytest.mark.anyio
 async def test_unknown_tool_is_not_audited(monkeypatch):
     """接线 bug 不是一次调用 —— 它该响亮地暴露,不该混进审计流水。"""
     seen: list[dict] = []
@@ -1839,8 +1915,11 @@ async def execute_tool(
             if attempt + 1 < attempts:
                 await asyncio.sleep(settings.tool_retry_delay_seconds)
         except TransientToolError as exc:
-            # **暂时性**故障(网络抖动)—— 唯一「值得再试」的那一类。
+            # **暂时性**故障(网络抖动)—— 本章新增的那一类可重试故障(spec §6.3)。
             # 重试用尽后仍失败 ⇒ 三次都不成,不叫暂时性了,按基础设施故障上抛。
+            # ⚠️ 这一支**要么重试、要么上抛**,永远不会走到循环底部 ⇒
+            # 下面那行赋值是**不可达**的。实现者可以删掉它(更干净),
+            # 也可以留着当防御 —— 两者都不算缺陷。
             last_kind = ERROR_TIMEOUT
             last_message = f"工具 {name} 暂时不可用:{exc}"
             logger.warning(
@@ -1938,6 +2017,13 @@ tools = [spec.tool for spec in registry.values()]
 ```
 
 `evals/run_tool_selection_eval.py` **不动**(它用的是 `build_tools`,本任务保留了)。
+
+**⚠️ 第五个调用点,初稿漏了:`app/api/chat.py` 的 `POST /api/ticket`(约 :555)。**
+它是 ch05 投诉流程里「点按钮建工单」那条路,而它**是**一次 `execute_tool` 调用
+—— 本节新增的权限闸一落地,它就**必然**被拦(拿到 `confirmation_required` → 502,
+症状与「服务挂了」一模一样)。spec §5.4 初稿说它「不是工具调用、一行不动」是**错的**,
+已订正。**改法:该调用点显式传 `write_decision=APPROVED`** ——
+按钮点击**就是**用户确认,那一行只是把这个已有的语义告诉闸。
 
 **Step 5b:把 `builtin/tickets.py` 那条重试注释改成新机制(T3 挪过来的)**
 
