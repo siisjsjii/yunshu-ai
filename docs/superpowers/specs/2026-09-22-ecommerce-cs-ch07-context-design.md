@@ -323,8 +323,14 @@ messages 表(按 id 升序)
 
 ### 6.1 `db/ch07.sql` — 新表 `conversation_summaries`
 
+**⚠️ 约束必须在 ORM 与 DDL 两侧都声明**,且 DDL **不加 `IF NOT EXISTS`**:
+建库有两条路径(`scripts/init_db.py` 的 `create_all` 与手工执行 `db/ch07.sql`),
+只在一侧声明唯一键,两条路径建出来的表**形状不同** —— 行为变成「看谁建的库」,
+而没有任何东西报错。加 `IF NOT EXISTS` 更糟:`create_all` 先跑时这一句**静默跳过**,
+唯一键永远不存在。(同类教训:`RefundRequest.status` 的 `default`/`server_default` 两处都要。)
+
 ```sql
-CREATE TABLE IF NOT EXISTS conversation_summaries (
+CREATE TABLE conversation_summaries (
   id             BIGINT       NOT NULL AUTO_INCREMENT,
   conversation_id VARCHAR(32) NOT NULL,
   seq            INT          NOT NULL COMMENT '第 N 段,从 1 起,只增不改',

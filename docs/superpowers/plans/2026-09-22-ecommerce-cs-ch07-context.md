@@ -497,7 +497,12 @@ git commit -m "refactor(ch07): prepare_turn 改用窗口倒推的预算,退役�
 -- `Base.metadata.create_all`,它只建不存在的**表**,不改已有表 ——
 -- 靠它加列会静默什么也不做,而代码里已经在读那两列。
 
-CREATE TABLE IF NOT EXISTS conversation_summaries (
+-- **裸 CREATE TABLE,不加 IF NOT EXISTS** —— 与 ch03/04/06 一致。
+-- 加了它的后果很具体:`scripts/init_db.py` 的 `create_all` 会先按 ORM 建表,
+-- 那时这句**静默跳过**,而 ORM 若没声明 `uk_conv_seq`,唯一键就**永远不存在**
+-- 且不报错。裸语句再跑一次会响亮地报错(与后面的 ALTER 一样本来就不幂等),
+-- 那是更诚实的失败。
+CREATE TABLE conversation_summaries (
   id              BIGINT       NOT NULL AUTO_INCREMENT,
   conversation_id VARCHAR(32)  NOT NULL,
   seq             INT          NOT NULL COMMENT '第 N 段,从 1 起,只增不改',
