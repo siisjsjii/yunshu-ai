@@ -502,20 +502,27 @@ def test_missing_message_is_rejected(client_factory):
     assert resp.status_code == 422
 
 
-def test_oversized_input_returns_400_before_streaming(client_factory):
+def test_insufficient_budget_returns_400_before_streaming(client_factory):
     """预算不足必须在响应开始前报错。
 
     SSE 一旦 yield 过首帧,响应头就发出去了,状态码再也改不了 ——
     所以这里既要看 400,也要看它根本不是一条 SSE 流,且没有调用模型。
+
+    ch07 换了判据的**来源**(用例原名 `test_oversized_input_...`,改名是因为
+    它说的不再是要测的那件事):不再是「本轮输入顶穿 `context_budget_tokens`」,
+    而是「从窗口倒推出来的历史预算为负」。于是这里的配置换成把窗口压到
+    `ge=1024` 的下界 —— 默认的固定开销 + 单轮峰值远超它,任何输入都会 400。
+    输入刻意用**短句**:长输入会让这条路径的触发点变成「输入超
+    `max_user_input_tokens`」那条端点校验(spec §8,归 T10),那时它红/绿都
+    不再说明历史预算这条路还在。
     """
     client, _ = client_factory(
         batches=[[FakeChunk("不会走到这里")]],
-        context_budget_tokens=200,
-        reserved_output_tokens=0,
+        model_context_window=1024,
         safety_margin_tokens=0,
     )
     with client as c:
-        resp = c.post("/api/chat/stream", json={"message": "退" * 5000})
+        resp = c.post("/api/chat/stream", json={"message": "在吗"})
 
     assert resp.status_code == 400
     assert "tokens" in resp.text
@@ -533,18 +540,22 @@ def test_overflow_400_releases_lock_so_the_session_stays_usable(client_factory):
     测试(test_validation_failure_releases_lock / test_tool_build_failure_releases_lock),
     唯独这条没有。
 
-    断言取"第二个超大请求仍然拿到 400 而不是 409"(会话仍可用)—— 这才是
+    断言取"第二个同样超预算的请求仍然拿到 400 而不是 409"(会话仍可用)—— 这才是
     真正要守的性质;等锁超时调成 0.15s,漏放锁时第二次请求会在 0.15s 内变红,
     而不是用默认 60s 把测试挂死。顺带断一次锁对象本身,便于定位。
+
+    ch07:造 400 的配置换成「窗口压到 `ge=1024` 的下界」(判据的来源从
+    「输入顶穿预算」变成「倒推出来的历史预算为负」);消息本身刻意用短句,
+    理由同上一条 —— 长输入会把触发点换成端点那条 `max_user_input_tokens`
+    校验(spec §8),这条用例就不再守着 `ContextOverflowError` 的放锁路径了。
     """
     client, _ = client_factory(
         batches=[],
-        context_budget_tokens=200,
-        reserved_output_tokens=0,
+        model_context_window=1024,
         safety_margin_tokens=0,
         session_lock_timeout_seconds=0.15,
     )
-    body = {"session_id": "s1", "message": "退" * 5000}
+    body = {"session_id": "s1", "message": "在吗"}
 
     with client as c:
         first = c.post("/api/chat/stream", json=body)

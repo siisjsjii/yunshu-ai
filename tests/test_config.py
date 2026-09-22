@@ -21,8 +21,6 @@ def test_optional_fields_have_defaults():
     settings = Settings(_env_file=None, **REQUIRED)
     assert settings.chat_temperature == 0.7
     assert settings.extract_temperature == 0.0
-    assert settings.context_budget_tokens == 8192
-    assert settings.reserved_output_tokens == 1024
     assert settings.safety_margin_tokens == 512
     assert settings.session_ttl_seconds == 1800
     assert settings.max_sessions == 1000

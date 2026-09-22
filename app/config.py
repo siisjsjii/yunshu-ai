@@ -22,8 +22,6 @@ class Settings(BaseSettings):
     # 可选:有默认值
     chat_temperature: float = 0.7
     extract_temperature: float = 0.0
-    context_budget_tokens: int = 8192
-    reserved_output_tokens: int = 1024
     safety_margin_tokens: int = 512
     # 会话存储的两个数都必须为正,否则 `SessionStore` 会**静默**失去互斥:
     # max_sessions<=0 时 lock_for 刚建的锁会在同一次调用里被容量淘汰掉,
@@ -100,10 +98,11 @@ class Settings(BaseSettings):
 
     # ---- ch07:上下文管理。全部带界 —— 写错要在启动时炸,不能等运行时 ----
     #
-    # `model_context_window` / `max_output_tokens` **取代**了本章之前的
+    # `model_context_window` / `max_output_tokens` **取代并已删除**了本章之前的
     # `context_budget_tokens` / `reserved_output_tokens`:旧的两个数是「直接给一个
-    # 预算」,新的口径是「从模型窗口倒推」,而两者同时存在就是两个含义重叠的旋钮
-    # —— 本项目已经吃过这个亏(`reranker_use_fp16` 在 GPU 分支落地后无人读,已删)。
+    # 预算」,新的口径是「从模型窗口倒推」。两套并存时它们就是两个含义重叠的旋钮
+    # —— 本项目已经吃过这个亏(`reranker_use_fp16` 在 GPU 分支落地后无人读,已删),
+    # 所以这次是把旧的两个**删掉**,而不是留着「以防万一」。
     model_context_window: int = Field(default=18000, ge=1024)
     max_output_tokens: int = Field(default=2000, ge=1)
     max_user_input_tokens: int = Field(default=2000, ge=1)

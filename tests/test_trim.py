@@ -1,7 +1,6 @@
 from app.memory.trim import (
     ContextOverflowError,
     _to_rounds,
-    compute_available_tokens,
     count_tokens,
     select_history,
 )
@@ -25,28 +24,32 @@ def test_count_tokens_grows_with_length():
     assert count_tokens("退货退款流程是什么" * 5) > count_tokens("退货退款流程是什么")
 
 
-def test_available_tokens_subtracts_all_three_terms():
-    available = compute_available_tokens(
-        system_prompt="x" * 10,
-        user_input="y" * 10,
-        context_budget_tokens=1000,
-        reserved_output_tokens=100,
-        safety_margin_tokens=50,
-    )
-    expected = 1000 - 100 - 50 - count_tokens("x" * 10) - count_tokens("y" * 10)
-    assert available == expected
+def test_budget_leaves_no_room_for_history_when_overhead_eats_the_window():
+    """原来由 compute_available_tokens 直接覆盖的语义:预算可以是负的。
 
+    删掉旧函数不等于删掉这条不变量 —— 它现在由 budget.derive 承担,
+    而「负预算」正是端点返回 400 的判据,不能没有覆盖。
 
-def test_available_tokens_can_go_negative():
-    """单轮输入超预算时返回负数,由调用方决定抛错。"""
-    available = compute_available_tokens(
-        system_prompt="",
-        user_input="啊" * 5000,
-        context_budget_tokens=1000,
-        reserved_output_tokens=0,
-        safety_margin_tokens=0,
+    判别力:把 `history_budget` **夹到 0**(例如 `max(0, …)`)或者只留
+    `keep_rounds × per_round_steady` 那一支,这条都会变红 —— 而 400 那条
+    路径正是在这两种改法下静默消失的(端点再也等不到负预算)。
+    逐项算术的敏感性由 `tests/test_memory_budget.py` 单独钉住,这里只钉符号。
+    """
+    from app.config import Settings
+    from app.memory import budget
+
+    s = Settings(
+        _env_file=None,
+        openai_base_url="https://example.invalid/v1",
+        openai_api_key="sk-test",
+        openai_model="m",
+        database_url="mysql+asyncmy://u:p@127.0.0.1:3306/x",
+        model_context_window=1024,
+        max_output_tokens=2000,
+        tool_def_tokens=5000,
     )
-    assert available < 0
+    b = budget.derive(settings=s, system_prompt="你是客服。")
+    assert b.history_budget < 0
 
 
 def test_select_history_returns_empty_when_budget_is_zero():

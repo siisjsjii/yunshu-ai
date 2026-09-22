@@ -38,10 +38,20 @@ async def test_prepare_turn_returns_trimmed_history():
 
 
 def test_prepare_turn_raises_when_budget_is_exhausted():
-    """预算不足仍然抛 ContextOverflowError —— 端点靠它在流开始前返回 400。"""
-    huge = "字" * 100_000
+    """预算不足仍然抛 ContextOverflowError —— 端点靠它在流开始前返回 400。
+
+    ch07 换了判据的**来源**:不再是「system prompt + 本轮输入超过
+    `context_budget_tokens`」,而是「从窗口倒推出来的历史预算为负」。
+    所以这条用例不再靠一个超长输入去顶穿预算 —— 新口径下输入长度**不参与**
+    这个判据(见 `prepare_turn` 的 docstring);改成把窗口压到 `ge=1024` 的下界,
+    默认的固定开销与单轮峰值加起来远超它,`history_budget` 必然为负。
+    输入刻意用短句:长输入会把这条用例的触发点换成「输入超
+    `max_user_input_tokens`」那条(T10 在端点接线,spec §8)。
+    """
     with pytest.raises(ContextOverflowError):
-        prepare_turn(settings=_settings(), history=[], user_input=huge)
+        prepare_turn(
+            settings=_settings(model_context_window=1024), history=[], user_input="在吗"
+        )
 
 
 def test_prepare_turn_applies_the_budget_to_the_history():
@@ -49,19 +59,22 @@ def test_prepare_turn_applies_the_budget_to_the_history():
 
     与上面两条互补:第一条的历史**放得下**(裁不裁都是那两条),第二条根本不
     返回历史。只有这一条问「`select_history` 到底有没有被调用、算出来的
-    available 有没有真的用上」—— 把 `return trim.select_history(history,
-    available)` 改成 `return list(history)`,只有它变红。
+    历史预算有没有真的用上」—— 把 `return trim.select_history(history,
+    history_budget)` 改成 `return list(history)`,只有它变红。
+
+    ch07 的「预算极小」怎么造:旧口径是 `context_budget_tokens=1000` 直接给小
+    预算,新口径下历史预算取 `min(keep_rounds × per_round_steady, 窗口匀得出来
+    的)`。这里把**按轮数估的那一支**压到 1(`keep_rounds=1` × `per_round_steady=1`
+    = 1 token),窗口那一支按默认值算远大于 1,于是 `history_budget == 1`。
+    刻意不写「窗口 = 某个刚好勉强够的数」:那要按 system prompt 当前的
+    token 数倒推(实测 701),提示词一改这条用例就红在一个与它无关的原因上。
     """
     history = [
         Message(role="user", content="退" * 2000),
         Message(role="assistant", content="好" * 2000),
     ]
     kept = prepare_turn(
-        settings=_settings(
-            context_budget_tokens=1000,
-            reserved_output_tokens=0,
-            safety_margin_tokens=0,
-        ),
+        settings=_settings(keep_rounds=1, per_round_steady=1),
         history=history,
         user_input="在吗",
     )

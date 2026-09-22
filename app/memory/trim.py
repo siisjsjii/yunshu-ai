@@ -23,18 +23,10 @@ def count_tokens(text: str) -> int:
     return len(_ENCODING.encode(text))
 
 
-def compute_available_tokens(
-    *,
-    system_prompt: str,
-    user_input: str,
-    context_budget_tokens: int,
-    reserved_output_tokens: int,
-    safety_margin_tokens: int,
-) -> int:
-    """算出历史消息可用的 token 预算。可以为负,由调用方决定如何处置。"""
-    budget = context_budget_tokens - reserved_output_tokens - safety_margin_tokens
-    used = count_tokens(system_prompt) + count_tokens(user_input)
-    return budget - used
+# 「历史能用多少 token」这件事**不在本模块算**了(ch07):推导在
+# `app/memory/budget.py`(`窗口 - 固定开销 - 单轮峰值`,再与
+# `keep_rounds × per_round_steady` 取小)。本模块只做后半截 ——
+# 给定预算,裁到能放下。
 
 
 def select_history(
