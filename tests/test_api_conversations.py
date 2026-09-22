@@ -18,6 +18,7 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.sql.elements import BinaryExpression
 
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
@@ -70,20 +71,58 @@ class _StubSession:
         cols = stmt.column_descriptions
         entity = cols[0]["entity"]
         if entity is Conversation:
-            # 有 where 子句 = 按 id 查单条(→ 404 那条路);没有 = 列表查询。
+            # 两种查询形态,**按比较的是哪一列**区分,不能只看「有没有 where」:
+            #   `Conversation.id == <id>`   → 按 id 查单条(→ 404 那条路)
+            #   `Conversation.user == <u>`  → 列表查询(还有可能什么都没有)
             # **不要把这两种混成一种**:混了之后「列表接口串了另一个用户的会话」
             # 与「详情接口查不到就 404」两条断言会互相掩盖。
-            if stmt.whereclause is not None:
-                cid = stmt.whereclause.right.value
-                row = self.conversations.get(cid)
+            #
+            # 列表这一支**要真按 user 过滤**:替身自己筛,端点漏了 `.where()`
+            # 就会把别人的会话带出来(见 `_where_column`)。写成「端点筛不筛都行」
+            # 的替身,等于让那条断言恒真。
+            clause = _where_clause(stmt)
+            if clause is not None and _where_column(clause) == "id":
+                row = self.conversations.get(clause.right.value)
                 return _Result([row] if row is not None else [])
             rows = list(self.conversations.values())
+            if clause is not None:
+                column = _where_column(clause)
+                if column != "user":
+                    raise AssertionError(f"替身不支持的列表过滤列:{column}")
+                rows = [c for c in rows if c.user == clause.right.value]
+            # ⚠️ 这一句 `sorted` 让「端点有没有写 ORDER BY」在本文件里**不可观测**
+            # (替身替它排好了)—— 顺序改由 db 用例钉,见
+            # `tests/test_api_conversations_db.py`。
             return _Result(sorted(rows, key=lambda c: c.created_at, reverse=True))
         if entity is MessageRecord:
-            cid = stmt.whereclause.right.value
+            cid = _where_clause(stmt).right.value
+            if _where_column(_where_clause(stmt)) != "conversation_id":
+                raise AssertionError("替身只支持按 conversation_id 查消息")
             rows = [m for m in self.messages if m.conversation_id == cid]
             return _Result(sorted(rows, key=lambda m: m.id))
         raise AssertionError(f"替身不支持的实体:{entity}")
+
+
+def _where_clause(stmt):
+    """取 `select(...).where(col == 值)` 的那个子句;没有 where 就是 None。
+
+    **取不出来时直接抛**,不退化成「返回全部」—— 忽略 where 的替身会让
+    「列表读到了别人的会话 / 详情读到了不存在的会话」这类缺陷无从观测。
+    """
+    clause = stmt.whereclause
+    if clause is None:
+        return None
+    if not isinstance(clause, BinaryExpression):
+        raise AssertionError(f"替身不支持的查询形态:{stmt}")
+    return clause
+
+
+def _where_column(clause):
+    """这个 where 比的是哪一列(`Conversation.id` / `Conversation.user` / …)。"""
+    key = getattr(getattr(clause, "left", None), "key", None)
+    if key is None:
+        raise AssertionError(f"替身取不出被比较的列:{clause}")
+    return key
 
 
 class _Result:
@@ -139,8 +178,9 @@ def test_list_filters_by_demo_user_and_orders_newest_first(conv_client):
     ——「忘了过滤」与「过滤了但顺序反了」—— 的观测值因此不同)。
 
     ⚠️ 「新在前」这一半在本文件里**没有判别力**:替身的 LIST 分支自己就按
-    `created_at` 倒序排(照 brief 原样保留),端点哪怕不写 `ORDER BY` 也照样绿。
-    要真验它得让替身**按插入序**返回,那属于改契约,不在本任务范围内 —— 如实记账。
+    `created_at` 倒序排,端点哪怕不写 `ORDER BY` 也照样绿 —— 替身替端点把事做了。
+    顺序与 SQL 侧的过滤改由 `tests/test_api_conversations_db.py` 在**真实库**上钉
+    (那边两个都会红:把 `order_by` 反过来、把 `.where()` 删掉)。
     """
     convs = {
         CONV_A: _conv(CONV_A, "demo-user", T0),

@@ -59,26 +59,36 @@ async def _preview(session: AsyncSession, conversation_id: str) -> str:
 async def list_conversations(session: AsyncSession = Depends(get_session)) -> dict:
     """侧栏列表:`{"items": [{id, created_at, preview, summarized}]}`,新在前。
 
-    **过滤在 Python 侧、不在 SQL 的 `WHERE`**(spec §5.1 写的是
-    `WHERE user = 'demo-user'`)—— 这是与替身的契约:那个替身把「`Conversation`
-    上有 where 子句」定义为**按 id 查单条**(→ 404 那条路),列表查询必须是
-    **不带 where** 的那一种(见 `tests/test_api_conversations.py:_StubSession`)。
-    两者在真实库上等价(逐行判 user 而已),代价是全表读进内存 ——
-    演示规模(不分页,spec §5.1)下可接受;表长大到那个代价不可接受时,
-    要改的是替身与这里**一起**,否则「列表串了别人的会话」会重新变得不可观测。
+    过滤与排序都在 **SQL** 里(`WHERE user = 'demo-user' ORDER BY created_at DESC`,
+    spec §5.1 的字面)。`DEMO_USER` 与会话端点 `request.user_id or "demo-user"`
+    的默认值**同一个字面量**:两边不一致的话,前端建出来的会话一个都不会出现在
+    列表里,而两边都不报错。
+
+    ⚠️ **「过滤对不对」与「顺序对不对」这两件事,替身验不出来** ——
+    `tests/test_api_conversations.py` 的替身自己就会按 `created_at` 倒序排、
+    也可以选择自己把 user 筛掉,于是端点把整个 `.where()` / `.order_by()`
+    删掉照样绿(替身替它把事做了)。那两条语义因此改由
+    `tests/test_api_conversations_db.py` 在**真实库**上钉(造出顺序与过滤
+    都能被观测的输入)。
+
+    **不分页**(spec §5.1:演示规模,与会话数的量级匹配;不是分页接口,别按分页
+    写前端)。真实库上这个列表实测有 322 条(历次验收累积)—— 仍然全量返回。
+
+    **`preview` 是 N+1 次查询**(每条会话一次,见 `_preview`)。演示规模下这个
+    代价可接受(百条量级、一次请求一串主键索引点查);真要收成一条 SQL,得按
+    会话分组取每组第一条 user 消息(窗口函数),而那时「不分页」这条决定也要
+    一起重估 —— 两件事的前提是同一个(会话数还小)。
     """
     rows = (
         await session.execute(
-            select(Conversation).order_by(Conversation.created_at.desc())
+            select(Conversation)
+            .where(Conversation.user == DEMO_USER)
+            .order_by(Conversation.created_at.desc())
         )
     ).scalars().all()
 
     items = []
     for conv in rows:
-        if conv.user != DEMO_USER:
-            # 不是本用户的会话**根本不进结果** —— 不是「标记出来让前端自己滤」:
-            # 无认证的演示里,列表就是唯一的数据边界。
-            continue
         items.append(
             {
                 "id": conv.id,
