@@ -3834,12 +3834,36 @@ git commit -m "feat(ch08): 建工单确认流的两个节点 + ChatState 两个�
 2. **少回灌一个 tool 结果就是上游 400** —— 同一轮里若还有别的工具调用,
    它们必须照常执行并回灌。
 
-**第三条:T8 的实现者报上来的接缝,归本任务守。**
+**第三条:T8 的实现者报上来的接缝,归本任务守 —— 而且要守在节点里,不只守路由。**
+
 `apply_write_decision` 在 **`pending_write` 为空**时会照样跑完,并产出一条
 **`tool_call_id=""`** 的 ToolMessage —— 那构成「有 tool result、没有对应 tool_call」,
-上游同样直接 **400**。⇒ **那个节点只在 `pending_write` 非空时才该被到达**,
-`route_after_agent` 现在恰好是这么写的,**补一条测试钉住它**,
-别让它只靠「现在恰好如此」。
+上游同样直接 **400**。
+
+**两处都要做:**
+
+1. **路由侧**:`route_after_agent` 只在 `pending_write` 非空时才导出到那个节点。
+   **补一条测试钉住它**,别让它只靠「现在恰好如此」。
+2. **节点侧**(T8 复审的旁注指出来的,采纳):**`apply_write_decision` 自己也要拒**。
+   在它入口判一次 —— `pending_write` 为空 ⇒ **上抛**(那是接线 bug:
+   节点在没有待确认写调用时被到达了),**不要**产出那条 `tool_call_id=""` 的消息。
+   理由:本仓的元教训是「**不变量要放在唯一写口上,不要靠每个调用方自觉**」——
+   只守路由等于把不变量寄存在调用方的记忆里,而 T9 之后还会有别的入口
+   (续跑、将来的第四条出口)。
+
+**第四条(三条同文件的小清理,一并做掉 —— 都在 T8 的产物里,不值得单开一轮):**
+
+- `tests/test_agent_confirm.py` 里三处 `monkeypatch.setattr(..., raising=False)`:
+  **把 `raising=False` 删掉**。它正是本轮那个缺陷**静默**的原因 ——
+  目标哪天被改名或挪走,patch 就悄悄退化成空操作,而这个文件又开始往
+  **验收 5 要读的那张表**写行、没有任何信号。删掉之后那种漂移会变成
+  patch 时刻的 `AttributeError`,**响亮**。
+- `tests/test_agent_confirm.py` 里的 `_Registry` 是**死代码**(从不实例化;
+  `execute_tool` 收的是普通 dict)。**删掉**,它只会诱使后来人养着它。
+- `_state` 把 `args` 与 `preview` 设成**相等**的 dict ⇒
+  `test_confirm_write_payload_carries_the_preview` 分不出
+  `pending.get("preview")` 与 `pending.get("args")`。**让它们不等**
+  (给 `preview` 多一个键),那条断言才有牙齿。
 
 - [ ] **Step 1: 写失败测试**
 
