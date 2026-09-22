@@ -81,8 +81,38 @@ def test_database_url_is_read_from_settings():
 def test_tool_defaults():
     settings = Settings(_env_file=None, **REQUIRED)
     assert settings.tool_timeout_seconds == 10.0
-    assert settings.tool_retry_attempts == 1
     assert settings.tool_retry_delay_seconds == 0.3
+
+
+def test_tool_retry_attempts_default_is_two():
+    """ch08 拍板值。改它要连着 spec §6.2 一起改(跨章行为变更)。
+
+    ⚠️ 这一条**从 `test_tool_defaults` 里拆出来**是刻意的:`1 → 2` 是跨章行为
+    变更(ch03–ch07 的耗时一并变了),它不是「顺手改一个数」,而是一个需要
+    被看见的决定。混在三条断言里改,读 diff 的人只看到一行 `1` 变 `2`。
+    """
+    assert Settings(_env_file=None, **REQUIRED).tool_retry_attempts == 2
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_mcp_discovery_timeout_must_be_positive(bad):
+    """发现超时挂在**请求路径**上(每请求现问现拿),0 或负数会让每个请求都卡住
+    —— 必须启动即拒。"""
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, mcp_discovery_timeout_seconds=bad, **REQUIRED)
+    assert "mcp_discovery_timeout_seconds" in str(exc.value)
+
+
+def test_mcp_urls_have_local_defaults():
+    """两个 URL 的默认端口必须与 `mcp_servers/` 里那两张表一致。
+
+    写错的话**不报错**:`discover_mcp_specs` 连不上就跳过该 Server(spec §8.5),
+    表现是「模型说没有这个工具」—— 与本章任何一条断言都不冲突,只是工具少了一半。
+    """
+    s = Settings(_env_file=None, **REQUIRED)
+    assert s.mcp_logistics_url == "http://127.0.0.1:8101/mcp"
+    assert s.mcp_aftersales_url == "http://127.0.0.1:8102/mcp"
+    assert s.mcp_discovery_timeout_seconds == 5.0
 
 
 def test_negative_retry_attempts_is_rejected():

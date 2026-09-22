@@ -35,7 +35,11 @@ class Settings(BaseSettings):
     # 工具执行。三个数都加了界:配置写错要在启动时炸,不能等到运行时
     # 变成"重试循环一次都不跑、空错误文案交给模型"这种静默故障。
     tool_timeout_seconds: float = Field(default=10.0, gt=0)
-    tool_retry_attempts: int = Field(default=1, ge=0)
+    # ch08 把默认值从 1 提到 2(共 3 次尝试,最坏 20.3s → 30.3s)。
+    # **这是跨章行为变更** —— 它是全局旋钮,ch03–ch07 的耗时一并变了。
+    # 一句话回退:`.env` 里 `TOOL_RETRY_ATTEMPTS=1`。
+    # ⚠️ 写操作**永不重试**是结构保证(由 kind 推出),不受这个数影响。
+    tool_retry_attempts: int = Field(default=2, ge=0)
     tool_retry_delay_seconds: float = Field(default=0.3, ge=0)
 
     # ch05 编排。两个数都加了界:写错要在启动时炸,不能等运行时变成
