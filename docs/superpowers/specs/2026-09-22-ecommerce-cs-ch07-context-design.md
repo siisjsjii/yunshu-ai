@@ -516,9 +516,26 @@ state["messages"] 非空  → 不播种          ← 这条是防重复追加的
 判据是 `graph.aget_state(...)` 快照里的 `messages` 是否为空 —— 端点**已经**在用
 `aget_state` 做待续检查(ch06),复用同一次调用,不额外加一次。
 
-**同一次快照里顺带派生精简版**:端点拿到快照后,用快照里的 `messages`
-(空则用刚从 MySQL 读的全量)走 §7.2 的预算推导与降级、再走 `layers.split`,
-把结果作为 `history` 一起播种。**因此端点每轮只取一次快照,不额外加 IO。**
+**精简版从 MySQL 的 `load_history` 派生,不从 `state["messages"]` 派生。**
+
+这条是 **2026-09-22 订正的**。原先这里写「用快照里的 `messages` 派生精简版」,
+**它做不到**:`layers.split` 是按 **`messages.id`(MySQL 主键)** 切的,
+而快照里的 `messages` 是 LangChain 消息 —— **只有播种进来那一批带稳定 id**
+(`to_lc_messages` 用 `str(row.id)`),**此后每一轮新增的消息拿到的是 `add_messages`
+现赋的 uuid4**,与两个锚点**不可比**。要在 state 上分层,就得把新消息的 MySQL 主键
+写回 state —— 而 `append_turn` 的返回值(T3 加)至今**没有写入者**,
+那条路今天不存在。
+
+所以:**端点用它在 `prepare_turn` 时已经读过的 `load_history` 结果做分层**
+(那一份**本来就带 id**),`.sql` 与 `layers` 都吃 `schemas.Message`。
+`messages` 通道的读边是**播种判据本身**(`if not seeded`),加上需求 5 要的
+「完整历史随 State 贯穿、靠 checkpoint 留着」——
+**它不是一个内容消费者,这一点如实记在这里**,免得日后有人以为有个读者而去找。
+
+> 记账:这条错误让 T5 的实现者白写了一段「从快照派生」的说明性文字,
+> 并在 T10 之前被发现。**发现方式是审查者标了一条 ⚠️**
+> (「`append_turn` 的 id 返回值仍无写入者」)—— 即**一条被搁置的观察牵出了
+> 一处设计矛盾**。
 
 **重启自愈**:`InMemorySaver` 进程内,**服务重启后 checkpoint 全空** ⇒
 下一次请求 `messages` 为空 ⇒ 自动从 MySQL 重新播种。这正是 §2.2「MySQL 是权威源」
