@@ -140,7 +140,15 @@ async def execute_tool(
             message = f"工具 {name} 是写操作,需要用户确认后才能执行。"
             return ToolOutcome(
                 tool_call_id, name, False, message, _summarize(message),
-                ERROR_CONFIRMATION_REQUIRED, preview=dict(args), source=spec.source,
+                ERROR_CONFIRMATION_REQUIRED,
+                # ⚠️ **不能写成 `dict(args)`**:`args` 不是 dict 时它当场抛
+                # `ValueError`/`TypeError`,而这里没有任何 handler 罩着 ——
+                # 异常会**逃出** `execute_tool`,于是这套分类学承诺的
+                # 可恢复 `invalid_args` 变成一次 500。偏偏「畸形 args 的写调用」
+                # 是唯一绕开 `validate_args` 那条宽容路径的地方(它在闸**之后**)
+                # —— 实测出来的正是这个组合。
+                preview=args if isinstance(args, dict) else {"_raw": args},
+                source=spec.source,
             )
         if write_decision == DENIED:
             message = f"用户取消了 {name} 的调用,未执行。"
@@ -153,6 +161,26 @@ async def execute_tool(
             return ToolOutcome(
                 tool_call_id, name, False, message, _summarize(message),
                 ERROR_PERMISSION_DENIED, source=spec.source,
+            )
+        if write_decision != APPROVED:
+            # 走到这里说明决议取值**认不出来** —— 那是**接线 bug**,不是用户动作。
+            #
+            # 说白了就是:**只有 `APPROVED` 能往下走**。闸若写成「`== PENDING` 拦、
+            # `== DENIED` 拦、**其余一律放行**」,那么 `"Approved"` / `None` 这类
+            # 拼错或半接线的取值都会**无确认、无审计地执行一次不可逆的写**。
+            #
+            # **不许**改成「`!= APPROVED` 就按 `permission_denied` 处理」:那会在
+            # `tool_audit_logs` 里写一条「**用户**点了取消」,而那张表**正是验收 5
+            # 读的表**。用一个 bug 去谎报用户行为,是在污染唯一的事实来源 ——
+            # 比失败开放好,但仍然是假的。
+            #
+            # 也**不审计**:没有任何真实调用发生过,这条不是一次调用。
+            # **响亮地抛**(端点 → 502),与 `tool_missing` 同族的
+            # 「接线 bug 要暴露、不许伪装成一次正常结果」。
+            #
+            # 写操作是本章唯一**不该猜**的地方:猜错的代价是一次不可逆的写。
+            raise ToolInfrastructureError(
+                f"写操作的决议取值不合法:{write_decision!r}"
             )
 
     # ---- 闸 2:参数校验(**在 ainvoke 之前**)-------------------------

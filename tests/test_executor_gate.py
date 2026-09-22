@@ -6,6 +6,8 @@
 """
 
 import asyncio
+import dataclasses
+import json
 
 import pytest
 from langchain_core.tools import tool
@@ -89,6 +91,36 @@ async def _collect(sink, kwargs):
     sink.append(kwargs)
 
 
+class _CountingTool:
+    """计次壳:把「执行器**尝试**了几次」记在 **`ainvoke` 边界**上。
+
+    ⚠️ **计数绝不能写在工具体里**(CLAUDE.md 的硬约束,本仓栽过):
+    `@tool` 包装后的 pydantic 校验发生在函数体**之前** —— 参数不合法时函数体
+    根本不进入,按函数体计数恒为 0。于是「有前置校验闸」与「没有前置闸、
+    靠循环里 `except ValidationError` 兜底」这两种实现给出**同一个观测值**,
+    断言零判别力(初稿就是这么写的,审查者指出后订正)。
+
+    计在 `ainvoke` 上才问得出那个真问题:**校验闸到底在 `ainvoke` 之前还是之后?**
+    """
+
+    def __init__(self, inner, counter: dict):
+        self._inner = inner
+        self._counter = counter
+
+    async def ainvoke(self, tool_call):
+        self._counter["n"] += 1
+        return await self._inner.ainvoke(tool_call)
+
+
+def _with_counter(spec, counter: dict) -> ToolSpec:
+    """照 `spec` 造一份、只把 `tool` 换成计次壳。
+
+    **先建 spec 再替换** —— `_spec` 要从真工具派生 `input_schema`
+    (`args_schema`),而计次壳没有那个属性。
+    """
+    return dataclasses.replace(spec, tool=_CountingTool(spec.tool, counter))
+
+
 # ---- 闸 1:权限 ---------------------------------------------------------
 
 
@@ -153,6 +185,36 @@ async def test_pending_write_is_not_audited(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("raw", ["坏了", ["a"], 42])
+async def test_pending_write_with_malformed_args_still_returns_recoverably(raw):
+    """**畸形 `args` 不许把 `execute_tool` 炸穿。**
+
+    写操作 + 待确认是唯一一条**根本走不到 `validate_args`** 的路径(校验闸在
+    权限闸**之后**),于是它是这套分类学唯一的裸露面:`preview=dict(args)` 在
+    `args` 不是 dict 时当场抛 `ValueError`/`TypeError`,而那个位置没有任何
+    handler 罩着 ⇒ 异常逃出 `execute_tool` ⇒ 500,而不是一条可恢复结果。
+
+    ⚠️ 断言的是「**正常返回**一条 `confirmation_required`」,**不是**「抛不抛」
+    —— 后者写成 `pytest.raises(Exception)` 会把一个真 bug 也算过。
+    """
+    spec = _spec(name="create_ticket", kind=WRITE)
+    outcome = await execute_tool(
+        tool_call={"name": "create_ticket", "id": "c1",
+                   "args": raw, "type": "tool_call"},
+        registry={"create_ticket": spec},
+        settings=_Settings(),
+        conversation_id="c1",
+        write_decision=PENDING,
+    )
+    assert outcome.ok is False
+    assert outcome.error_kind == ERROR_CONFIRMATION_REQUIRED
+    # 预览载荷必须是**能 JSON 序列化的 dict**(前端要拿它渲染卡片):
+    # 原样塞一个 list/str 进去,坏在客户端而不是这里。
+    assert isinstance(outcome.preview, dict)
+    json.dumps(outcome.preview, ensure_ascii=False)
+
+
+@pytest.mark.anyio
 async def test_denied_write_is_not_executed_but_is_audited(monkeypatch):
     """取消:不执行 + **落 `permission_denied`**(验收 5 断的就是它)。"""
     calls = []
@@ -176,6 +238,50 @@ async def test_denied_write_is_not_executed_but_is_audited(monkeypatch):
     assert calls == []
     assert outcome.error_kind == ERROR_PERMISSION_DENIED
     assert [s["status"] for s in seen] == ["permission_denied"]
+
+
+@pytest.mark.parametrize("bad", ["Approved", "approve", "yes", "ON", None, 1])
+@pytest.mark.anyio
+async def test_unknown_write_decision_raises_instead_of_executing(monkeypatch, bad):
+    """**认不出的决议 ⇒ 响亮地抛,不当成「拒绝」也不执行。**
+
+    闸 1 若写成「`== PENDING` 拦、`== DENIED` 拦、**其余一律放行**」,那么
+    任何既不是 `"pending"` 也不是 `"denied"` 的值(拼错的 `"Approved"`、
+    半接线调用方传的 `None`)都会**无确认、无审计地执行一次不可逆的写**。
+    写操作是本章唯一不该猜的地方。
+
+    ⚠️ 也**不许**改成「`!= APPROVED` 就按 `permission_denied` 处理」——
+    那是把一个**编程错误**写成一条「**用户**点了取消」的审计行,而
+    `tool_audit_logs` 正是验收 5 读的表。所以下面两条断言缺一不可:
+    **工具没被调用**(`calls == []`)**且审计是空的**(`seen == []`)。
+
+    ⚠️ **参数化的值必须真的是认不出来的那些。** 别拿 `"approved"` 当反例 ——
+    它**就是** `executor.APPROVED` 的取值(`APPROVED = "approved"`,spec §5.3
+    的小写口径),拿它当「拼错的决议」会让这条测试恒绿。真正的风险形态是
+    **大小写**搞错(`"Approved"`)、**半接线调用方**传 `None`,以及一小撮
+    真值(`1`)。下面是这一族,不是随手凑的数。
+    """
+    calls = []
+    seen: list[dict] = []
+
+    @tool
+    async def create_ticket(description: str) -> str:
+        """建单。"""
+        calls.append(description)
+        return "ok"
+
+    spec = _spec(name="create_ticket", kind=WRITE, tool=create_ticket)
+    monkeypatch.setattr(executor, "record_audit", lambda **kw: _collect(seen, kw))
+    with pytest.raises(ToolInfrastructureError):
+        await execute_tool(
+            tool_call=_tc("create_ticket", {"description": "坏了"}),
+            registry={"create_ticket": spec},
+            settings=_Settings(),
+            conversation_id="c1",
+            write_decision=bad,
+        )
+    assert calls == [], "决议认不出来却把不可逆的写执行了"
+    assert seen == [], "接线 bug 被写成了「用户点了取消」——污染验收 5 读的那张表"
 
 
 @pytest.mark.anyio
@@ -210,16 +316,15 @@ async def test_invalid_args_are_caught_before_the_tool_runs(monkeypatch):
     本仓栽过三次的假绿形态就是「注入已经被处理好的值」:那样
     「把校验错误翻成给模型看的话」这一步永远不被验。
     """
-    calls = []
+    calls = {"n": 0}
     seen: list[dict] = []
 
     @tool
     async def query_order(order_id: str) -> str:
         """查订单。"""
-        calls.append(order_id)
         return "{}"
 
-    spec = _spec(name="query_order", tool=query_order)
+    spec = _with_counter(_spec(name="query_order", tool=query_order), calls)
     monkeypatch.setattr(executor, "record_audit", lambda **kw: _collect(seen, kw))
     outcome = await execute_tool(
         tool_call=_tc("query_order", {}),                # 缺必填
@@ -227,7 +332,10 @@ async def test_invalid_args_are_caught_before_the_tool_runs(monkeypatch):
         settings=_Settings(),
         conversation_id="c1",
     )
-    assert calls == [], "参数不合法却把工具跑起来了"
+    # 判别式在 `ainvoke` 计次上(见 `_CountingTool`):**没有前置闸**的实现会
+    # 先调进 `ainvoke`、再由循环里的 `ValidationError` 兜成 invalid_args ——
+    # 那一步会让这条变红,而按工具体计数的话它恒为 0、两种实现分不开。
+    assert calls["n"] == 0, "参数不合法却把工具跑起来了(校验闸在 ainvoke 之后)"
     assert outcome.error_kind == ERROR_INVALID_ARGS
     assert "order_id" in outcome.content, "回灌文案必须点名到字段"
     assert [s["status"] for s in seen] == ["invalid_args"]
