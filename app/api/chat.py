@@ -199,6 +199,12 @@ async def chat_stream(
             trimmed = got.layer2 + select_layer1(
                 got.layer1, max_tokens=context_budget.layer1_budget
             )
+            # 梗概在**起任务之后**读,与 spec §7.6 的接线顺序一致。理论上这中间
+            # 有一个窗口:后台任务(几秒的模型往返)若赶在这次读之前落了库,
+            # 这一轮就会同时看到层 2 的原文与它的梗概。**这个窗口无害**:
+            # 梗概覆盖的正是本轮展示的那段层 2,而下一轮锚点已经推过去、
+            # 层 2 为空,重复自然消失。(真要让本轮完全自洽,把这次读提到
+            # 起任务之前即可 —— 代价是与 §7.6 的顺序不一致,收益为零。)
             summaries = await load_summaries(
                 session=session, conversation_id=session_id
             )
