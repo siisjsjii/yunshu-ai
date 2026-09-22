@@ -19,9 +19,14 @@ class ToolSpec:
     - 内置那份从 `tool.args_schema.model_json_schema()` 派生;
     - MCP 那份从 Server 的 `inputSchema` **原样取**(spec §3.3)。
 
-    后者刻意**不经 adapters 的 pydantic 转换** —— 转换会削平
-    `minimum` / `maxLength` / `enum` 这类约束,于是「统一按 JSON Schema 校验」
-    退化成「只查必填和类型」,闸看起来在工作、实际漏掉一半。
+    后者取原始 `inputSchema` 是**今天就在承重的**,不只是「将来更稳」:
+    `app/tools/registry.py::_spec_from_tool` 那行是
+    `tool.args_schema.model_json_schema()`,而 **MCP 工具的 `args_schema` 就是
+    一个 dict** —— 对 dict 调 `.model_json_schema()` 当场 `AttributeError`。
+    (早先这里写的理由是「adapters 的 pydantic 转换会削平
+    `minimum` / `maxLength` / `enum`」,那条**已被证伪**:本栈上那个转换根本
+    不存在 —— `langchain_mcp_adapters` 把 `args_schema=tool.inputSchema`
+    原样传下去,`langchain_core` 对 dict 形状的 `args_schema` 也原样返回。)
 
     `tool` 是绑给模型的那份 `BaseTool`;执行时才用它。
     """

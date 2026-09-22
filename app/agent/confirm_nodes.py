@@ -1,0 +1,111 @@
+"""建工单确认流的两个节点。
+
+**为什么拆成两个**(spec §9.1):ch06 实测过 —— **`resume` 时节点从头重跑**,
+`interrupt()` **之前**的代码会再执行一遍。所以:
+
+| 节点 | 做什么 | 有模型? | 有 `interrupt()`? |
+|---|---|---|---|
+| `confirm_write` | **只有 `interrupt()`** | 没有 | 有 |
+| `apply_write_decision` | 执行或拒绝那次写调用 | 没有 | 没有 |
+
+真正写 `tickets` 表的动作在 `apply_write_decision` 里,它在 resume **之后**
+只跑一次 —— 两个节点合起来才保证「**副作用恰好一次**」。
+
+**为什么不把 `interrupt()` 放进 `agent`**(最省事的那种写法):`agent` 里有模型
+调用(`chat_temperature=0.7`),续跑会把模型再问一遍 —— 已推给前端的文本
+**再推一遍**,而第二次的工具调用序列**可能与第一次不同** ⇒ 卡片上的预览与
+真正落库的工单**对不上**。这是「看起来能跑、只在真实点击时错」的一类故障。
+"""
+
+from langchain_core.messages import ToolMessage
+from langgraph.types import interrupt
+
+from app.tools.executor import APPROVED, DENIED, execute_tool
+
+
+def _decision(value) -> str:
+    """resume 载荷 → 三态决议。**失败关闭。**
+
+    只认 `{"approved": True}` 这一种形状是**刻意的**:前端一个形状写错
+    (比如传了字符串 `"true"`)就会被判成取消,而不是**直接建出工单**。
+    写操作不可逆 —— 认不出来的一律不放行。
+    """
+    if isinstance(value, dict):
+        approved = value.get("approved")
+    else:
+        approved = getattr(value, "approved", None)
+    return APPROVED if approved is True else DENIED
+
+
+def make_confirm_write_node():
+    """工单预览闸。**`interrupt()` 之外不干任何事。**
+
+    载荷里的 `frame` 由**它自己**说,端点只做搬运 —— 所以本章
+    **一行端点代码都不用改**(ch06 那处设计的直接回报)。
+    """
+
+    async def confirm_write(state) -> dict:
+        pending = state.get("pending_write") or {}
+        decision = interrupt(
+            {
+                "frame": "ticket_confirm",
+                "preview": pending.get("preview") or {},
+            }
+        )
+        return {
+            "write_decision": _decision(decision),
+            "trace": ["confirm_write"],
+        }
+
+    return confirm_write
+
+
+def make_apply_write_decision_node(*, registry, settings):
+    """决议落地:批准就执行一次,取消就落一条「权限拒绝」审计。
+
+    **两条路都往本轮消息里追加一条 ToolMessage** —— 因为那条带 `tool_calls`
+    的 AIMessage 已经在 `turn_messages` 里了,**少回灌一个 tool 结果就构成
+    「有 tool_calls 没有对应 tool 消息」,上游直接 400**(CLAUDE.md 的硬约束)。
+    """
+
+    async def apply_write_decision(state) -> dict:
+        pending = state.get("pending_write") or {}
+        # ⚠️ **不要写 `or DENIED`。** 空决议说明 `confirm_write` 没跑、或它没写进通道,
+        # 那是接线 bug;按 DENIED 处理会在审计表里**谎报一次用户取消** ——
+        # 与执行器那条 `!= APPROVED` 闸上抛的理由完全相同,只是层数更高一层。
+        # 空串会落进那一支,响亮地抛。
+        decision = state.get("write_decision") or ""
+        # ⚠️ **`"type": "tool_call"` 这个键必须在。** `BaseTool.ainvoke` 判
+        # 「这是不是一次工具调用」**只看它** —— 缺键时它把整个 dict 当成**参数**去
+        # 校验工具 schema,于是这次调用退化成一条「参数不合法」的**可恢复**失败:
+        # **工单永远不会被建出来**,而调用方看起来一切正常。
+        # (T4 的实现者在测试初稿上撞过同一件事,6 条用例红在 pydantic 的
+        #  `Field required` 上 —— 那是**测试**;在这里它是**生产**。)
+        call = {
+            "name": pending.get("name", ""),
+            "id": pending.get("tool_call_id", ""),
+            "args": pending.get("args") or {},
+            "type": "tool_call",
+        }
+        outcome = await execute_tool(
+            tool_call=call,
+            registry=registry,
+            settings=settings,
+            conversation_id=state["conversation_id"],
+            write_decision=decision,
+        )
+        tool_msg = ToolMessage(content=outcome.content, tool_call_id=call["id"])
+        # ⚠️ `turn_messages` 是**覆写**通道,承载「本轮产生的**全部**消息」。
+        # 这里只返回 `[tool_msg]` 的话,那条带 `tool_calls` 的 AIMessage
+        # 会被丢掉 —— 落库的历史里助手消息凭空少一条,而回复看起来完全正常。
+        existing = list(state.get("turn_messages") or [])
+        return {
+            "messages": [tool_msg],
+            "turn_messages": existing + [tool_msg],
+            "pending_write": {},
+            "trace": [
+                "write:approved" if decision == APPROVED else "write:denied"
+            ],
+        }
+
+    return apply_write_decision

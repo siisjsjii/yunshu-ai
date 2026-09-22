@@ -503,6 +503,9 @@ def make_resolve_references_node(*, model):
             "order_no": "",
             "order_data": {},
             "refund_decision": None,
+            # ch08:建工单确认流的两个槽位。**同处一地**(见 state.py 的说明)。
+            "pending_write": {},
+            "write_decision": "",
         }
 
     return resolve_references

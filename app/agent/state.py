@@ -110,6 +110,22 @@ class ChatState(TypedDict):
     #: 否则「这轮没产生消息」的路径会原样继承上一轮的值,上一轮的回复被再写一遍。
     turn_messages: list[AnyMessage]
 
+    # ---- 建工单确认流(ch08)----
+    # ⚠️ **必须在 `ChatState` 里声明**:通道集合由 `StateGraph(ChatState)` 的注解决定,
+    # 写没声明的通道 LangGraph **静默丢弃**(只 warning 不抛)—— ch06 的
+    # `confidence` 就是这么丢的(T4 的 Critical)。
+    #
+    # 两个都**连同它们的每轮清零一起落地**(清零在 `nodes.make_resolve_references_node`,
+    # ch05–ch07「通道与它的清零必须同处一地」的第四次应用)。漏了清零的后果是
+    # **跨轮串味**:checkpointer 是进程级单例、thread_id = session_id,
+    # 未写的通道保留上一轮的值 —— 于是**上一轮批准过的写操作,这一轮自动放行**。
+    #
+    # 注意:**不需要在端点播种**。它们都在**一轮的中途**被写(`agent` 写
+    # `pending_write`、`confirm_write` 写 `write_decision`),而续跑路径不重跑
+    # `resolve_references` —— 续跑续的是**同一轮**,清零不该发生。
+    pending_write: dict          # 空 dict = 没有待确认的写操作
+    write_decision: str          # "" = 未决议;APPROVED / DENIED
+
     # ---- 指代消解 ----
     resolved_input: str           # 本章 = user_input 原样
 
