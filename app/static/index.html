@@ -270,8 +270,12 @@
   .ticket-label { flex: 0 0 64px; color: #7b8a99; }
   .ticket-value { flex: 1; color: #22303c; word-break: break-all; }
   .ticket-actions { display: flex; gap: 8px; margin-top: 10px; }
-  .choice-btn.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
-  .choice-btn.primary:hover:not(:disabled) { background: #1668d0; }
+  /* 主色走 `--brand`,与 `#send` / 用户气泡同一档 —— 不再写死另一个蓝。 */
+  .choice-btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+  /* 悬停**照本页已有的做法**(`#send:hover:not(:disabled)`,同一条形状:
+     实心主色按钮):换 `--brand-dim`,不用 `filter: brightness()` —— 后者会
+     连着把白字一起压暗,而且本页没有第二处这样写。 */
+  .choice-btn.primary:hover:not(:disabled) { background: var(--brand-dim); }
   .refund-form { margin-top: 10px; border: 1.5px dashed #cdd9e4; border-radius: 8px;
     padding: 10px 12px; background: #fbfdff; }
   .refund-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
