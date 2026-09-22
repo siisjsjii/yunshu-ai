@@ -1427,6 +1427,30 @@ from langgraph.graph.message import add_messages
 
 (这是 ch05–ch06「**通道与它的清零必须同处一地**」的第三次应用。)
 
+**同一个节点还要多做一件事:把本轮的 user 消息吐进 `messages`。**
+
+漏了它的后果**完全静默**:`messages` 里只有播种进来那一段历史 + 本轮新增的
+assistant/tool,**而每一轮的用户原话都不进去** ⇒ 从第二轮起 `messages` 与 MySQL 分叉,
+spec §7.4 承诺的读边(「端点用快照里的 `messages` 派生精简版」)**兑现不了**,
+派生出来的精简版会**缺掉每一轮的提问** —— 而每轮回复正常、落库正常、现有断言全绿。
+
+```python
+        return {
+            "resolved_input": resolved,
+            # 本轮的用户原话进完整历史。
+            # **只在这里加**:它是每轮第一个执行节点(START 的唯一出边),
+            # 而 resume 路径**不会重跑它**(图从挂起的那个节点继续),
+            # 所以续跑不会凭空多出一条 user 消息 —— 而那正是想要的:
+            # 续跑续的是**同一轮**,不是新的一轮。
+            "messages": [HumanMessage(user_input)],
+            "trace": ["resolve_references"],
+            ...(其余通道原样)
+        }
+```
+
+**不要**改成在端点里塞进 `stream_input`:需求 5 的原话是「**各节点只管吐新消息**、
+框架自动按顺序并入」,这正是那个形状;放进端点会让「谁负责往里加」有两处答案。
+
 - [ ] **Step 5: 改 `app/agent/nodes.py::make_agent_node`**
 
 `msgs` 的组装改为**从 state 取**(`state.get("history")` 仍是精简版,见 T10;
