@@ -17,3 +17,6 @@ __pycache__/
 # 评估集运行产物
 evals/results/
 models/
+
+# ch07 日志落盘产物(setup_logging 的默认目录;轮转文件,不入库)
+log/

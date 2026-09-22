@@ -20,7 +20,7 @@ from sqlalchemy.sql.elements import BinaryExpression
 from app.agent.state import RefundJudgement
 from app.api import chat as chat_api
 from app.config import Settings, get_settings
-from app.db.models import Conversation, MessageRecord
+from app.db.models import Conversation, ConversationSummary, MessageRecord
 from app.db.session import get_session
 from app.main import app
 from app.memory.store import SessionStore
@@ -302,6 +302,10 @@ class FakeSession:
     def __init__(self):
         self.conversations: dict[str, Conversation] = {}
         self.messages: list[MessageRecord] = []
+        #: ch07 T7 起端点在流开始前读一次梗概(`load_summaries`)打 `history_ctx`。
+        #: 替身不认识 `ConversationSummary` 的话,**每一条**非续跑用例都会红在
+        #: 「替身不支持的实体」上 —— 而那指向脚手架、不指向实现。
+        self.summaries: list[ConversationSummary] = []
         self.commits = 0
         self._next_id = 1
 
@@ -332,6 +336,9 @@ class FakeSession:
         if entity is MessageRecord:
             rows = [m for m in self.messages if m.conversation_id == value]
             return _Result(sorted(rows, key=lambda m: m.id))
+        if entity is ConversationSummary:
+            rows = [s for s in self.summaries if s.conversation_id == value]
+            return _Result(sorted(rows, key=lambda s: s.seq))
         raise AssertionError(f"替身不支持的实体:{entity}")
 
     def add(self, obj):
@@ -341,6 +348,8 @@ class FakeSession:
             obj.id = self._next_id
             self._next_id += 1
             self.messages.append(obj)
+        elif isinstance(obj, ConversationSummary):
+            self.summaries.append(obj)
         else:
             raise AssertionError(f"替身不支持的实体:{type(obj)}")
 
@@ -995,7 +1004,14 @@ def test_ensure_conversation_runs_under_the_lock(client_factory, monkeypatch):
     async def spy(*, session, session_id, user_id):
         # 用同一个 store 问一次:此刻锁是否已被本请求持有。
         seen["locked"] = client.store.lock_for(session_id).locked()
-        return None
+        # 返回值必须**与生产形状一致**:`ensure_conversation` 从不返回 None,
+        # 而 ch07 T7 起端点在它之后读两个锚点(打 `history_ctx`)。
+        # 返回 None 会让这条用例红在一个与「锁」毫无关系的地方 ——
+        # 与 T3 给替身补 `flush` 是同一条理由:补替身,不是给实现加兜底。
+        return Conversation(
+            id=session_id, user=user_id, status="active",
+            summary_upto_msg_id=0, layer1_from_msg_id=0,
+        )
 
     monkeypatch.setattr(chat_api, "ensure_conversation", spy)
 

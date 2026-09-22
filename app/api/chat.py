@@ -12,13 +12,14 @@ from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
 from app.db.session import get_session
 from app.llm import create_chat_model, create_extract_model
+from app.memory import budget, journal
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
-from app.prompts import to_lc_messages
+from app.prompts import render_system_prompt, to_lc_messages
 from app.sanitize import redact_api_key
 from app.schemas import ChatRequest, TicketRequest
 from app.services.chat import prepare_turn
-from app.services.history import ensure_conversation, load_history
+from app.services.history import ensure_conversation, load_history, load_summaries
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import execute_tool
 from app.tools.registry import build_retriever, build_tools, registry_for
@@ -109,7 +110,7 @@ async def chat_stream(
         # ensure_conversation 必须在**持锁之后**。它在锁外有个建会话竞态:
         # 两个并发的首请求都看不到行,其中一个 INSERT 撞主键抛 IntegrityError。
         # 持锁跨过"检查 + 插入"把窗口关掉 —— 这看着像偶然细节,不是。
-        await ensure_conversation(
+        conversation = await ensure_conversation(
             session=session, session_id=session_id, user_id=user_id
         )
         if request.resume is None:
@@ -118,6 +119,34 @@ async def chat_stream(
             # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
             history = prepare_turn(
                 settings=settings, history=history, user_input=request.message
+            )
+            # ch07 §7.6:指代消解 / 意图识别共用的那份上下文,**每轮必打**。
+            # 位置有两重意义:① 在 `resolve_references` **之前**(它就是这个
+            # 上下文最早的两个消费者);② 在**路由之前** —— 闲聊/投诉/兜底/
+            # 退款子流程那几轮不进 Agent,而它们恰恰最容易「看起来正常、
+            # 其实上下文是错的」。写进 `generate()` 里就漏掉整个这一类。
+            #
+            # `resume` 分支**不打**:续跑不是新的一轮(spec §5.1),它从
+            # checkpoint 还原上下文,`resolve_references` 也不会重跑 ——
+            # 这里再打一行会是一条与事实不符的日志。
+            journal.history_ctx(
+                conversation_id=session_id,
+                summaries=await load_summaries(
+                    session=session, conversation_id=session_id
+                ),
+                history=history,
+                budget=budget.derive(
+                    settings=settings,
+                    system_prompt=render_system_prompt(settings.brand_name),
+                ),
+                # 新建的会话两个锚点取 0,与 `Layers` 的「`0` = 尚无梗概 /
+                # 层 1 起于最早」同一套语义。**实测**:真实库上
+                # `ensure_conversation` 建完读回来就是 `0 / 0`(标量默认值在
+                # INSERT 时落到属性上);`or 0` 只归一**替身**会话那个没跑过
+                # flush、属性还是 None 的形状 —— 否则日志里会出现一个
+                # 无意义的 `null`,而读日志的人没法把它与「锚点真的没推」分开。
+                summary_upto_msg_id=conversation.summary_upto_msg_id or 0,
+                layer1_from_msg_id=conversation.layer1_from_msg_id or 0,
             )
         # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
         # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
