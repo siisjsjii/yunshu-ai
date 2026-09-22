@@ -37,15 +37,94 @@
 
   .app {
     width: 100%;
-    max-width: 720px;
+    /* ch07:横排 = 左侧栏 + 右聊天区。上限从 720 抬到 980,
+       好让**聊天区**自己仍然是原来的 ~720 —— 加侧栏不该把气泡挤窄。 */
+    max-width: 980px;
     height: min(88vh, 860px);
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     background: var(--bg);
     border: 3px solid var(--brand);
     border-radius: 4px;
     box-shadow: 8px 8px 0 rgba(47, 111, 176, .18);
     overflow: hidden;
+  }
+
+  /* ── 历史会话侧栏(ch07)── */
+  #sidebar {
+    flex: 0 0 220px;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: #f4f9fe;
+    border-right: 2px solid var(--brand);
+  }
+  .sb-head {
+    flex: 0 0 auto;
+    padding: 10px 12px;
+    font-size: 12px;
+    letter-spacing: 1px;
+    color: #5b7186;
+    border-bottom: 1.5px dashed var(--bg-line);
+  }
+  #sb-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .sb-item {
+    font: inherit;
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 8px 10px;
+    background: #fff;
+    border: 1.5px solid #cdd9e4;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .sb-item:hover { border-color: var(--brand); background: #f2f8fd; }
+  .sb-item.active { border-color: var(--brand); background: #dcebf9; }
+  .sb-preview {
+    font-size: 13px;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sb-preview.empty { color: #93a6b8; }
+  .sb-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 3px;
+    font-size: 11px;
+    color: #5b7186;
+  }
+  .sb-tag {
+    color: var(--brand);
+    background: #dcebf9;
+    border-radius: 999px;
+    padding: 0 6px;
+    font-size: 10.5px;
+  }
+  .sb-empty { padding: 10px; font-size: 12px; color: #93a6b8; }
+
+  /* 聊天区(顶栏 + 对话 + 底栏)依旧是原来的纵向布局 */
+  .chat {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  /* 窄屏:侧栏让位。不做的话 360px 屏上聊天区只剩 ~140px,等于不能用。 */
+  @media (max-width: 700px) {
+    #sidebar { flex-basis: 150px; }
+    .sb-preview { font-size: 12px; }
   }
 
   /* ── 顶栏 ── */
@@ -257,41 +336,74 @@
 </head>
 <body>
 <div class="app">
-  <header>
-    <div class="avatar">🐱</div>
-    <div>
-      <div class="title">小喵 · 智能客服</div>
-      <div class="subtitle">ONLINE · 云枢</div>
-    </div>
-    <div class="spacer"></div>
-    <a href="/admin.html" style="font:inherit;font-size:13px;padding:7px 14px;color:#fff;
-       text-decoration:none;border:2px solid #fff;border-radius:3px;">知识库</a>
-    <button id="new-chat" type="button">＋ 新对话</button>
-  </header>
+  <!-- ch07 会话侧栏。**纯增强**:它自己加载失败只留 console 警告,聊天照常。 -->
+  <aside id="sidebar">
+    <div class="sb-head">历史会话</div>
+    <div id="sb-list"></div>
+  </aside>
 
-  <main id="log"></main>
+  <div class="chat">
+    <header>
+      <div class="avatar">🐱</div>
+      <div>
+        <div class="title">小喵 · 智能客服</div>
+        <div class="subtitle">ONLINE · 云枢</div>
+      </div>
+      <div class="spacer"></div>
+      <a href="/admin.html" style="font:inherit;font-size:13px;padding:7px 14px;color:#fff;
+         text-decoration:none;border:2px solid #fff;border-radius:3px;">知识库</a>
+      <button id="new-chat" type="button">＋ 新对话</button>
+    </header>
 
-  <footer>
-    <div class="composer">
-      <textarea id="input" rows="1"
-        placeholder="输入消息,和小喵聊聊吧~(回车发送 / Shift+回车换行)"></textarea>
-      <button id="send" type="button" aria-label="发送">➤</button>
-    </div>
-    <p class="footnote">小喵是 AI 助手,涉及具体订单会为你转接人工核实</p>
-  </footer>
+    <main id="log"></main>
+
+    <footer>
+      <div class="composer">
+        <textarea id="input" rows="1"
+          placeholder="输入消息,和小喵聊聊吧~(回车发送 / Shift+回车换行)"></textarea>
+        <button id="send" type="button" aria-label="发送">➤</button>
+      </div>
+      <p class="footnote">小喵是 AI 助手,涉及具体订单会为你转接人工核实</p>
+    </footer>
+  </div>
 </div>
 
 <script>
 (() => {
   "use strict";
 
-  const logEl   = document.getElementById("log");
-  const inputEl = document.getElementById("input");
-  const sendEl  = document.getElementById("send");
-  const newEl   = document.getElementById("new-chat");
+  const logEl    = document.getElementById("log");
+  const inputEl  = document.getElementById("input");
+  const sendEl   = document.getElementById("send");
+  const newEl    = document.getElementById("new-chat");
+  const sbListEl = document.getElementById("sb-list");
 
-  let sessionId = null;   // 由首帧 meta 回传,后续轮次复用
-  let busy      = false;
+  // ── 会话 id:全局唯一的一份真相 ─────────────────────────
+  //
+  // ch07 之前它只活在这个变量里,**刷新即丢** —— 而有了侧栏之后这就成了一个
+  // 无法向用户解释的状态:侧栏列着一堆会话,当前那个每次刷新都变成新的。
+  // 所以给它加一层 localStorage,但**仍然只有 `sessionId` 这一个变量** ——
+  // 所有读写(meta 帧、新对话、侧栏切换)都走下面这对函数,不允许有第二处
+  // 直接 `localStorage.setItem` 或第二个「当前会话」变量。
+  const SID_KEY = "mewhelp.session_id";
+
+  // 初值:上次访问的会话。localStorage 在隐私模式/被禁用时**会抛**(不是返回
+  // null),所以这里是 try —— 不 try 的话异常会掀掉整个 IIFE,整个页面全瞎。
+  let sessionId = (() => {
+    try { return localStorage.getItem(SID_KEY) || null; }
+    catch (e) { console.warn("本地会话记录不可读(不影响聊天):", e); return null; }
+  })();
+  let busy = false;
+
+  function setSessionId(id) {
+    sessionId = id || null;
+    try {
+      if (sessionId) localStorage.setItem(SID_KEY, sessionId);
+      else localStorage.removeItem(SID_KEY);
+    } catch (e) {
+      console.warn("本地会话记录不可写(不影响聊天):", e);
+    }
+  }
 
   // ── 渲染 ──────────────────────────────────────────────
 
@@ -389,7 +501,10 @@
 
     switch (event) {
       case "meta":
-        if (payload.session_id) sessionId = payload.session_id;
+        // 新会话的 id 只在这里诞生 ⇒ 落 localStorage 也在这里。
+        // markActive() 是给「首轮就拿到 id」准备的:那一瞬侧栏里还没有这条,
+        // 高亮为空,等本轮结束的 loadSidebar() 把它补进来时自然就亮上了。
+        if (payload.session_id) { setSessionId(payload.session_id); markActive(); }
         break;
       case "tool_call":
         addBadge(ctx.badges, payload.name);
@@ -498,6 +613,10 @@
       sendEl.disabled = false;
       inputEl.disabled = false;
       inputEl.focus();
+      // 本轮结束后刷一次侧栏:新会话这时才出现在列表里,首问预览也才有内容;
+      // 后台摘要跑完后 `summarized` 标记同样靠它才亮起来。
+      // 不 await —— 它是增强,慢一点不该拖住输入框重新可用。
+      void loadSidebar();
     }
   }
 
@@ -777,6 +896,121 @@
     scrollToEnd();
   }
 
+  // ── 会话侧栏(ch07)────────────────────────────────────
+  //
+  // 数据源是两个只读端点(见 `app/api/conversations.py`),前端**不筛不排**:
+  // 列表已经是「demo-user 的、新在前」,消息已经是「用户看见过的、升序」。
+  // 侧栏再滤一遍就多出一份口径,而两份口径漂移的表现是「少了一条」,
+  // 不报错。这里只负责画。
+
+  function fmtTime(iso) {
+    // "2026-09-22T10:00:00" → "09-22 10:00"。**按字符串切,不用 new Date()** ——
+    // 后者把不带时区的 ISO 串按本地时区解释,同一台机器上换浏览器就可能差一天。
+    const s = String(iso || "");
+    return s.length >= 16 ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : s;
+  }
+
+  function renderSidebar(items) {
+    sbListEl.replaceChildren();
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "sb-empty";
+      empty.textContent = "还没有历史会话";
+      sbListEl.appendChild(empty);
+      return;
+    }
+    items.forEach((it) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "sb-item";
+      btn.dataset.id = it.id;
+      if (it.id === sessionId) btn.classList.add("active");
+
+      const p = document.createElement("div");
+      p.className = it.preview ? "sb-preview" : "sb-preview empty";
+      p.textContent = it.preview || "(无提问记录)";
+      btn.appendChild(p);
+
+      const meta = document.createElement("div");
+      meta.className = "sb-meta";
+      const t = document.createElement("span");
+      t.textContent = fmtTime(it.created_at);
+      meta.appendChild(t);
+      if (it.summarized) {
+        // 只标「已摘要」,不回载梗概 —— 回载的一律是原文(§5.2)。
+        // 这个标记的作用是让「为什么这句回复像是忘掉了前面」有个可见的解释。
+        const tag = document.createElement("span");
+        tag.className = "sb-tag";
+        tag.textContent = "已摘要";
+        tag.title = "该会话较早的历史已被压缩成梗概;回载的仍是原话";
+        meta.appendChild(tag);
+      }
+      btn.appendChild(meta);
+
+      btn.addEventListener("click", () => switchTo(it.id));
+      sbListEl.appendChild(btn);
+    });
+  }
+
+  // 高亮跟着 sessionId 走,不依赖列表重画 —— 新会话首轮拿到 id 时,
+  // 列表里往往还没有这一条。
+  function markActive() {
+    sbListEl.querySelectorAll(".sb-item").forEach((el) => {
+      el.classList.toggle("active", el.dataset.id === sessionId);
+    });
+  }
+
+  // 侧栏是**增强**:失败只留一条 console 警告,不弹错、不挡聊天区。
+  // 这里吞掉全部异常(含 JSON 解析),调用方不需要再 catch。
+  async function loadSidebar() {
+    try {
+      const r = await fetch("/api/conversations");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      renderSidebar(Array.isArray(d.items) ? d.items : []);
+    } catch (e) {
+      console.warn("历史会话列表加载失败(聊天不受影响):", e);
+    }
+  }
+
+  // 回载:把该会话**用户看见过的原文**重新画一遍。
+  // 助手行走 `appendAssistantText`(= 直播路径收尾时的同一形态),不是手搓
+  // 标记:两条路径画出来的气泡必须一模一样,否则侧栏切回来的和刚流出来的
+  // 会长得不一样 —— 而这种漂移不截图对比是看不出来的。
+  function renderHistory(items) {
+    logEl.replaceChildren();
+    items.forEach((m) => {
+      if (m.role === "user") addUser(m.content);
+      else appendAssistantText(m.content);   // 端点只回 user/assistant 两种
+    });
+    scrollToEnd();
+  }
+
+  async function switchTo(id) {
+    if (busy) return;      // 流式进行中不切:回载会 replaceChildren,把那口气泡抽走
+    let items;
+    try {
+      const r = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages`);
+      if (r.status === 404) {
+        // 这个会话已经不在库里(清过库/被删)。**只有它正是当前会话时才退**,
+        // 否则点一条坏条目会把用户正在聊的会话一起清掉。
+        console.warn("会话不存在,已忽略:", id);
+        if (sessionId === id) { setSessionId(null); logEl.replaceChildren(); markActive(); }
+        return;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      items = (await r.json()).items || [];
+    } catch (e) {
+      // 切换失败**保持原样**:当前会话、当前消息区都不动。聊天是主功能。
+      console.warn("会话回载失败,保持当前会话:", e);
+      return;
+    }
+    setSessionId(id);
+    renderHistory(items);
+    markActive();
+    inputEl.focus();
+  }
+
   // ── 交互 ──────────────────────────────────────────────
 
   function submit() {
@@ -804,12 +1038,31 @@
 
   newEl.addEventListener("click", () => {
     if (busy) return;
-    sessionId = null;
+    // 「新对话」= 丢掉当前 id,**不动侧栏** —— 旧会话留在列表里,随时点得回去。
+    // (新会话要等第一条消息发出去、后端回 meta 帧才真正存在,所以此刻
+    //  侧栏里本来也不该多出任何东西。)
+    setSessionId(null);
     logEl.replaceChildren();
+    markActive();
     inputEl.focus();
   });
 
-  inputEl.focus();
+  // ── 启动 ──────────────────────────────────────────────
+
+  async function boot() {
+    // stored **在 await 之前取**:322 条会话的列表要跑一会儿,而用户完全可能
+    // 在这个窗口里就打出一句话发出去了。那种情况下 sessionId 已经被 meta 帧
+    // 改成了新会话,此时再拿「读列表之后才取的初值」去切换,就会把用户刚
+    // 开的会话换掉。取值在 await 前 + 下面那道相等闸,两处一起把这个窗口关掉。
+    const stored = sessionId;             // 初值就是 localStorage 里那个
+    await loadSidebar();                  // 它自己会吞异常
+    // 用户已经动过了(新会话拿到了 id / 点了侧栏)→ 不覆盖他的选择。
+    // 流式正在进行时 switchTo 自己也会早退,这里再挡一道。
+    if (stored && sessionId === stored) await switchTo(stored);  // 404 时内部退回新会话
+    inputEl.focus();
+  }
+
+  boot().catch((e) => console.warn("初始化失败(聊天不受影响):", e));
 })();
 </script>
 </body>
