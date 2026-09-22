@@ -34,6 +34,32 @@ class _Settings:
     tool_retry_delay_seconds = 0.0
 
 
+async def _no_audit(**_kwargs) -> None:
+    """`record_audit` 的哨兵替身:什么都不做,**一行都不落库**。
+
+    ⚠️ **必须是 `async def`,不能是 `lambda **kw: None`。**
+    `execute_tool` 里那处是 `await record_audit(...)` —— 一个返回 `None` 的
+    普通函数会当场 `TypeError: object NoneType can't be used in 'await'
+    expression`,而它落在执行器那个 `except Exception` 里,于是被翻译成
+    `ToolInfrastructureError("工具执行失败")`:测试红在一个**与被测行为
+    毫无关系**的地方,报错指向「工具执行失败」而不是「你的替身不可 await」。
+    (这正是「patch 目标修对了之后才浮出来」的那类故障:目标错着的时候
+    替身**根本不被调用**,不可 await 这件事被完全掩盖。)
+
+    **三处写路径共用这一个**(批准 / 取消 / 追加消息各一条):
+    只 patch 其中一条的话,另外两条照样往 `tool_audit_logs` 写 ——
+    而那张表是**验收 5 读的表**,测试残留会让那条验收从「唯一事实」
+    退化成「其中一行是」。
+    """
+
+
+#: `execute_tool` 在**这个模块里**按这个名字查找它(模块顶层
+#: `from app.tools.audit import record_audit`),所以 patch 的必须是
+#: `app.tools.executor.record_audit` —— 不是 `app.agent.confirm_nodes.record_audit`
+#: (那个模块从不 import 它,配上 `raising=False` 就是一条**静默失效的空操作**)。
+_AUDIT_TARGET = "app.tools.executor.record_audit"
+
+
 def _state(**over):
     base = {
         "conversation_id": "c1",
@@ -125,9 +151,14 @@ async def test_approved_writes_once_and_appends_the_tool_message(monkeypatch):
 
     spec = _Spec()
     spec.tool = _Tool()
-    monkeypatch.setattr(
-        "app.agent.confirm_nodes.record_audit", lambda **kw: None, raising=False
-    )
+    # ⚠️ **要 patch 的是 `app.tools.executor.record_audit`,不是
+    # `app.agent.confirm_nodes.record_audit`。** 后者在 `confirm_nodes` 里
+    # **根本不存在**(那个模块从不 import 它),配上 `raising=False` 就是一条
+    # **静默失效的空操作** —— 真实写入照跑,这个文件每轮往
+    # **验收 5 要读的那张表**写 3 行。一个看起来在隔离、其实什么都没隔离的装置,
+    # 比不写它还糟。(T8 的实现者实测上报;`executor` 才是
+    # `execute_tool` 查找那个名字的地方。)
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
@@ -148,6 +179,8 @@ async def test_denied_does_not_write(monkeypatch):
 
     spec = _Spec()
     spec.tool = _Tool()
+    # 取消这条**也会**落审计(`permission_denied`)—— 同一条写路径,同样要挡。
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
@@ -179,6 +212,7 @@ async def test_turn_messages_are_appended_not_replaced(monkeypatch):
 
     spec = _Spec()
     spec.tool = _Tool()
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
