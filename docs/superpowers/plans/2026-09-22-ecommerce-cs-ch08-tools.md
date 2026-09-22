@@ -4451,8 +4451,11 @@ git commit -m "feat(ch08): agent 撞到未确认写调用时停循环,决议后�
   .ticket-label { flex: 0 0 64px; color: #7b8a99; }
   .ticket-value { flex: 1; color: #22303c; word-break: break-all; }
   .ticket-actions { display: flex; gap: 8px; margin-top: 10px; }
-  .choice-btn.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
-  .choice-btn.primary:hover:not(:disabled) { background: #1668d0; }
+  /* ⚠️ **用本页的品牌色 token,不要写死一个蓝。** 初稿写的是 `#1a73e8`,
+     而本页的 `--brand` 是 `#2f6fb0` —— T10 的实现者上报后订正(它按 brief
+     逐字落地、没有自行改,这是对的:计划错了就该在计划里改)。 */
+  .choice-btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .choice-btn.primary:hover:not(:disabled) { filter: brightness(0.92); }
 ```
 
 - [ ] **Step 3: 手工验一遍(唯一能验的方式)**
