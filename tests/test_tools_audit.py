@@ -106,6 +106,27 @@ async def test_overlong_fields_are_truncated_not_raised(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_overlong_status_is_also_truncated(monkeypatch):
+    """`status` 与上面三列的**不同**在于它是本模块自己的常量,不是模型的自由文本。
+
+    所以这是一条**防回归的哨兵**,而不是「现在有一条路径是坏的」的证据 ——
+    实测过执行器会写进去的 8 个状态值最长 21 字符(`permission_denied`),
+    离列宽 32 还有余量,**这条用例今天在真实链路上触发不到**。
+
+    仍然要守,因为漏夹的后果与上面三列一样重:`DataError` → 被 `except` 吞掉
+    → **整行审计静默消失**,而那时它记的是一次**不可逆的写操作**。
+    判别力是实测的:`status` 改回不夹,本用例红(43 字符 > 32)。
+    """
+    rows: list = []
+    _patch(monkeypatch, rows)
+    await audit.record_audit(
+        conversation_id="c1", tool_call_id="c1", tool_name="t", source="builtin",
+        args={}, result_summary="", status="x" * 43,
+    )
+    assert len(rows[0].status) <= 32
+
+
+@pytest.mark.anyio
 async def test_write_failure_is_swallowed(monkeypatch, caplog):
     """**写审计失败不许反过来拦工具执行**(要求 5 明写)。
 

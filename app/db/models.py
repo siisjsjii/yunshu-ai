@@ -234,16 +234,28 @@ class ToolAuditLog(Base):
 
     __tablename__ = "tool_audit_logs"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # BigInteger 不是 Integer —— 与 db/ch08.sql 的 `BIGINT` 对齐。写 `Integer`
+    # 的话两条建库路径建出来的表**形状不同**(create_all 版是 INT),
+    # 行为变成「看谁建的库」(同 `RefundRequest.status` / `ConversationSummary`
+    # 那两处的教训)。`CreateTable(...)` 编译出来逐列比对过。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     # 不是 ForeignKey —— 见类 docstring。
     conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
     tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
+    # `args` 与 `status` **刻意不给 `server_default`** —— db/ch08.sql 里这两列
+    # 本来就没有 `DEFAULT`,照抄。多给一个会让两条路径又不一样。
     args: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    result_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    # 这两列在 DDL 里写着 `DEFAULT ''`,所以**两侧都要**(与 retry_count 同款理由):
+    # 只留 Python 侧 `default` 的话,create_all 建出的表缺 DEFAULT。
+    result_summary: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    error_detail: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    error_detail: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
     # 两侧默认值都要:与 Conversation 的两个锚点同款理由 ——
     # 只留 `default` 会让 create_all 建的表与 db/ch08.sql 建的表**形状不同**。
     retry_count: Mapped[int] = mapped_column(
@@ -252,6 +264,9 @@ class ToolAuditLog(Base):
     duration_ms: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # `index=True` 对应 db/ch08.sql 的 `KEY idx_created`(验收 5/6 都是
+    # 「查最近这几条」)。索引名与 DDL 不同(SQLAlchemy 自动生成
+    # `ix_tool_audit_logs_created_at`)—— 那处是**已知差异**,不影响行为。
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now()
+        DateTime, nullable=False, server_default=func.now(), index=True
     )
