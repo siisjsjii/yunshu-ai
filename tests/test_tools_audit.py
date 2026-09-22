@@ -110,8 +110,12 @@ async def test_overlong_status_is_also_truncated(monkeypatch):
     """`status` 与上面三列的**不同**在于它是本模块自己的常量,不是模型的自由文本。
 
     所以这是一条**防回归的哨兵**,而不是「现在有一条路径是坏的」的证据 ——
-    实测过执行器会写进去的 8 个状态值最长 21 字符(`permission_denied`),
-    离列宽 32 还有余量,**这条用例今天在真实链路上触发不到**。
+    执行器里 `record_audit` 的 4 个调用点能传进来的状态值共 5 个
+    (`success` / `failed` / `timeout` / `invalid_args` / `permission_denied`),
+    最长 17 字符(`permission_denied`),离列宽 32 还有余量,
+    **这条用例今天在真实链路上触发不到**。
+    (`confirmation_required` 21 字符**不会到达 `record_audit`** —— 待确认路径在
+    写审计之前就返回了,别把它算进来。)
 
     仍然要守,因为漏夹的后果与上面三列一样重:`DataError` → 被 `except` 吞掉
     → **整行审计静默消失**,而那时它记的是一次**不可逆的写操作**。

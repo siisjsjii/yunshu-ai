@@ -34,8 +34,13 @@ _STATUS_MAX = 32            # status          VARCHAR(32)
 
 #: `status` 那一行值得单独说一句:它是全表**唯一**一个「值**不受本模块控制**
 #: 却按列宽硬存」的串 —— 其余几列都是模型的自由文本,唯独它来自执行器的状态常量。
-#: 今天实测会写进去的取值共 8 个,最长 21 字符(`permission_denied`),离 32
-#: 还有余量 ⇒ **这条现在触发不到**,它是防「将来加一个长状态名」的哨兵。
+#: `record_audit` 全仓只有 **4 个调用点**(都在 `app/tools/executor.py`),能传进来的
+#: 取值共 **5 个**:`success` / `failed` / `timeout` / `invalid_args` / `permission_denied`
+#: —— 最长的是 `permission_denied`,**17** 字符,离 32 还有余量
+#: ⇒ **这条现在触发不到**,它是防「将来加一个长状态名」的哨兵。
+#: ⚠️ `confirmation_required`(21 字符)**永远不会到达 `record_audit`** —— 待确认那条
+#: 路径在写审计**之前**就返回了(executor 闸 1 的 `PENDING` 分支,且刻意不审计)。
+#: 一度把它算进了「会写进去的取值」,两处口径(个数与最长值)因此都是错的。
 #: 仍要守的理由与上面一致:漏夹 ⇒ `DataError` ⇒ 被 `except` 吞掉 ⇒ 整行消失,
 #: 而那时它记的已经是一次**不可逆的写操作**。
 #: (`conversation_id` 的 32 不在这里 —— 它是直接切片的,见 `conversation_id[:32]`。)

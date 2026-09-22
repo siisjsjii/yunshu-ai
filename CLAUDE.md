@@ -54,8 +54,9 @@ bash scripts/acceptance_ch07.sh                                 # ch07 验收 1�
 #    ⚠️ `db/ch08.sql` 在**全新**库上会响亮地报 `ERROR 1050`(表已存在)—— 因为 ORM 侧有
 #    同名模型,`init_db.py` 的 create_all 已经顺带把这张表建了出来。**这是刻意的**,
 #    与 `db/ch06.sql` 的 refund_requests 是同一个已知取舍,不是脏库。但两条路径建出来的
-#    表**形状不同**(create_all 版:`id` 是 INT 不是 BIGINT、三个字符串列没有 `DEFAULT ''`、
-#    没有 `idx_created`、没有 COMMENT),所以新库上应当**让 DDL 建表**:要么先跑
+#    表**形状不同**,但 T5 修复轮之后**只剩两处**:两个索引名(`idx_conv` / `idx_created`
+#    对 SQLAlchemy 自动生成的 `ix_tool_audit_logs_*`)与表的 COMMENT —— `id` 的 INT/BIGINT、
+#    三个字符串列的 `DEFAULT ''`、`idx_created` 都已对齐。所以新库上仍然应当**让 DDL 建表**:要么先跑
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
 #    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`。
