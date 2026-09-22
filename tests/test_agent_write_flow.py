@@ -383,8 +383,8 @@ class _Session:
 
 
 class _Retriever:
-    async def search(self, query):        # 售后走 BUSINESS,不预检索 —— 调到就是走错了路
-        raise AssertionError("售后类不该走检索")
+    async def search(self, query):        # `订单` → BUSINESS,不预检索 —— 调到就是走错了路
+        raise AssertionError("业务数据类不该走检索")
 
 
 def _live_graph(*, calls, rounds, session):
@@ -446,7 +446,8 @@ async def test_write_is_executed_exactly_once_across_suspend_and_resume():
         "id": "call_1", "type": "tool_call",
     }])
     round2 = AIMessageChunk(content="已为您建单:T-1")
-    graph = _live_graph(calls=calls, rounds=[round1, round2], session=_Session())
+    session = _Session()
+    graph = _live_graph(calls=calls, rounds=[round1, round2], session=session)
 
     interrupts = await _drive(
         graph,
@@ -461,10 +462,18 @@ async def test_write_is_executed_exactly_once_across_suspend_and_resume():
     assert interrupts[0]["preview"] == {"description": "耳机坏了"}
     # 2) **挂起那一刻写调用一次都没发生**
     assert calls == [], "用户还没确认,写调用就执行了"
+    # 2b) **挂起那一轮一行都没落库**(spec §5.1)。
+    #     这条同时是 `_OUTLETS` 去掉 `"agent"` 的端到端守卫:把 `agent` 也
+    #     无条件连上 `log_turn` 的话,挂起路径会**在 `confirm_write` 之前**
+    #     先把这半轮写进库(一半写库、一半没写)。
+    assert session.added == [], "挂起的那一轮不该落库"
 
     # 3) 决议 → 续跑
     await _drive(graph, Command(resume={"approved": True}), thread="t-write")
     assert len(calls) == 1, "`create_ticket` 在挂起/续跑之间**执行次数不为 1**"
+    # 3b) resume 走完才落库,且 ReAct 往返完整落进历史:
+    #     user + assistant(带 tool_calls) + tool(配对结果)+ assistant(收尾)。
+    assert [r.role for r in session.added] == ["user", "assistant", "tool", "assistant"]
 
     snapshot = await graph.aget_state({"configurable": {"thread_id": "t-write"}})
     state = snapshot.values
