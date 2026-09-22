@@ -14,7 +14,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **ch05(生产级架构:LangGraph 确定性编排 + 主力 ReAct Agent)** 已合并 `main`:把 `/api/chat/stream` 从「模型单轮选工具」换成 **确定性图骨架** —— `resolve_references → classify_intent → route_by_intent`(纯函数,写死在代码里)→ 五出口;知识类走强制预检索 + 置信度闸再进 Agent,业务类直交 Agent;Agent 是骨架里的**一个节点**(手写 ReAct,第二轮**不绑 tools** 是结构保证)。含 `POST /api/ticket`、聊天页两个独立按钮。设计源见 ch05 spec。
 - **ch06(分流器正式版)** 交付(分支 `ch06-intent-router`):把 ch05 里占位的前两个节点做成正式版 —— **八类意图**(含「其他」)+ `{intent, confidence}` 强制 JSON;**指代消解 + Query 改写**(失败原样透传);**退款退货/售后走一条确定性子流程**(取订单 → Query 扩写 + 强制检索政策 → 主力 Agent 判「这一单能不能退」→ 给退款表单或说明原因);**缺订单号时 `interrupt()` 真挂起**,前端渲染订单卡片,点选后 `Command(resume=...)` 同 thread 续跑;`POST /api/refund` + `refund_requests` 表。设计源见 ch06 spec。
 
-**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**全程不做**:多轮 Agent Loop、认证。
+- **ch07(上下文管理:三层滑窗 + 后台摘要 + 多会话)** 交付(分支 `ch07-context`):把 ch01 那条「按整轮裁到 token 预算」的单层裁剪升级成**三层结构** —— 最近**原文**(层 1,预算七成)/ 中间**截短**(层 2,三成)/ 最远**梗概**(后台摘要),两个锚点(`summary_upto_msg_id` / `layer1_from_msg_id`,都是 `messages.id`)划边界,**降级只挪 id、不搬数据**;token 预算**从模型窗口倒推**(`memory/budget.py`),不写死常量;每轮打两行 JSON 上下文日志(`model_ctx` / `history_ctx`);**工具结果本章起落表**(`role='tool'`);前端加**会话侧栏 + 切换回载**。设计源见 ch07 spec。
+
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -30,6 +32,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py       # 工具选择评估集,需真实 key + MySQL
 bash scripts/acceptance.sh                                      # 端到端验收 1–9,需服务已启动 + 真实 key
 # ch04 管理台:浏览器开 http://localhost:8000/admin.html(文档查看/上传、向量化/挖知识按钮)
+
+# ch07(前置:MySQL + Milvus + 真实 key)
+.venv/Scripts/python.exe scripts/run_summary_eval.py            # 摘要标注样例评估(11 条,打网络)
+bash scripts/acceptance_ch07.sh                                 # ch07 验收 1–5;⚠️ **自己起服务**(8000 演示配置 / 8001 默认配置)
+# ↑ 跑之前先清空 8000/8001;它自己截断 log/app.log(不截断的话断言会命中旧行而恒真)
 
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)
@@ -54,9 +61,12 @@ app/prompts.py    System/抽取 Prompt + 消息组装;Message -> BaseMessage 转
 app/schemas.py    纯数据模型,唯一被到处引用的类型源
 app/db/           base(引擎/会话工厂)、models(四张表)、session(FastAPI 依赖)
 app/tools/        business(五个 @tool)、registry(每请求组装)、executor(超时/重试/错误分类)
-app/memory/       store.py(锁注册表)、trim.py(token 预算与按整轮裁剪)—— **不依赖 LangChain**
-app/services/     chat.py(单轮编排)、extract.py(抽取)、history.py(会话历史读写)
-app/api/          chat.py、extract.py
+app/memory/       ch01-06:store.py(锁注册表)、trim.py(token 计数与按整轮切轮);
+                  ch07 新增:budget.py(窗口→历史预算→层1/层2)、layers.py(三层切分 + 层2 截短)、
+                  summarize.py(摘要 prompt + 触发判定 + 原子落库)、tasks.py(后台摘要执行体)、
+                  journal.py(两个上下文日志)—— **全部不依赖 LangChain**
+app/services/     chat.py(纯校验的 prepare_turn)、extract.py(抽取)、history.py(会话历史读写)
+app/api/          chat.py、extract.py、conversations.py(ch07 两个只读端点)
 app/static/       聊天页(单页,无构建工具链)
 app/retrieval/    ch03 在线检索:embedder.py(BGE-M3 懒加载)、milvus.py、search.py(KnowledgeRetriever)
 app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining
@@ -90,6 +100,32 @@ ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm,
 
 - **Milvus 只当索引,不存文本**:集合只有 `id`(= `str(MySQL id)`)与 `vector`;原文一律回 MySQL 取,所以集合可随时 drop 重建(`build_kb --reindex`)。
 - **`retrieval/search.py` 是错误语义的翻译边界**:Milvus/嵌入故障 → `ToolInfrastructureError`(502),绝不降级成「没搜到」。`tools/errors.py` 是零依赖的错误词汇表,retrieval 反向引用它已记账(ch03 spec §12)。
+
+### ch07 的上下文管理链路
+
+```
+messages 表(按 id 升序)
+├───────────────┬──────────────────────┬─────────────────────────┤
+│  已被梗概覆盖  │        层 2           │         层 1            │
+│  (不再逐条读)  │   中间,截短,预算 30%  │  最近,原文,预算 70%    │
+└───────────────┴──────────────────────┴─────────────────────────┘
+                ▲                      ▲
+     summary_upto_msg_id      layer1_from_msg_id        ← 都是 messages.id
+```
+
+每请求(`api/chat.py`,流开始**之前**):预算推导 → `layers.degrade`(层 1 超预算就往后挪锚点,
+**只挪 id**;挪过的轮次自动落进层 2)→ `layers.split`(层 2 **按截短后的版本计数**)→
+层 2 超预算 ⇒ **起后台摘要任务**(`memory/tasks.py`,不 await)→ 组装 `history`(层2 截短段 + 层1 原文段)
+→ 打 `history_ctx` → 播种进 state。Agent 节点组装前再打一行 `model_ctx`(带**分段** token 与锚点)。
+
+- **三档压缩强度递增、代价也递增**:层 1 原文(代价 0)→ 层 2 截短(有损但**可逆**,原文还在 MySQL)
+  → 梗概(提炼,**不可逆**,原文从此不进上下文)。**先用便宜的,不够了才用贵的。**
+- **两个动作看的版本不同**:降级看层 1 **原文**,摘要看层 2 **截短后**,而摘要**读的是原文**
+  (拿截短文本去提炼 = 把截断损失焊进梗概)。
+- 摘要的「落库 + 推锚点」是**一个原子动作**(`services/history.append_summary_and_advance`):
+  只成一半 ⇒ **梗概重复压一遍** 或 **一段历史永久消失**,两者都不报错。
+- 两个只读端点:`GET /api/conversations`(侧栏,`preview` 取第一条 `role='user'` 行的前 30 字)
+  与 `GET /api/conversations/{id}/messages`(回载**用户看见过的**对话:滤 `role='tool'` 与空 `content` 行)。
 
 ### 两条链路
 
@@ -166,6 +202,24 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 
 **裁剪按 `user` 边界切轮,不按 `assistant`**(`memory/trim.py`)。OpenAI 兼容 API 要求 `tool` 消息前面紧跟着带对应 `tool_call_id` 的 `assistant` 消息;按 `assistant` 收轮会把这对切开,而那**只在历史长到触发裁剪时偶发 400**。
 
+**ch07 · 上下文管理的命门**(细节见 ch07 spec §12 与 `dev-notes/ch07.md`):
+
+**`add_messages` 是 append-only,而且会给没有 id 的消息**当场赋一个 uuid4**(`langgraph.graph.message` 源码逐字:`if m.id is None: m.id = str(uuid.uuid4())`)。**后果**:每轮都「从 MySQL 读全量历史 → 塞进 `state.messages`」的话,重新构造的消息**没有 id** ⇒ **一个都匹配不上** ⇒ 整段历史被**再追加一遍**;第三轮历史就是三份,而**每一轮的回复看起来都完全正常**。两道防线缺一不可:① **只在 `state["messages"]` 为空时播种**;② `to_lc_messages` 给每条消息带上 `str(MySQL id)`(同一个 id 再次并入是**替换**不是追加 ⇒ 重播种幂等)。只有 ① 时「state 非空但库里有更多行」仍会追加;只有 ② 时每轮都要白读一次全量历史。
+
+**`InMemorySaver` 是纯内存字典,「落盘」不成立**(它的 docstring 自己写着 only for debugging or testing;本环境只装了 `langgraph.checkpoint.{base,memory,serde}`,没有任何持久化 saver)。⇒ 需求里那句「State 里的完整历史靠 checkpoint **落盘**留着」**是错的**,已作为与需求的偏离记在 ch07 spec §2.2。**MySQL 才是跨会话/跨进程的权威源**;服务重启后 checkpoint 全空 ⇒ 下一次请求自动从 MySQL 重新播种(这就是「重启自愈」)。
+
+**日志必须显式 `encoding="utf-8"`**(`app/logging_setup.py`)。本机 locale 是 **cp936**,不给 encoding 时 Python 用 `locale.getpreferredencoding()`,**中文日志行直接抛 `UnicodeEncodeError`** —— 而它发生在**写日志的时候**,报错位置指向与业务毫无关系的地方。连带:`setup_logging()` 必须在 **pytest 下跳过**,否则整套测试往仓库根写 108KB 的 `log/app.log`,**而验收 4b 就是 `grep log/app.log`** ⇒ 陈旧行让那条断言恒真。
+
+**层 2 必须按「截短后的版本」计数**(`layers.split`)。按原文数的话,截短就退化成纯渲染装饰 —— 摘要该什么时候触发还是什么时候触发,**截短对级联零影响**,而所有输出看起来都正常。这是全章最容易静默失效的一处(它同时是 T4 那条「不可能满足的断言」要守护的性质)。
+
+**两个锚点只能挪 id,不能搬数据;且 `0` 是有含义的值**(`summary_upto_msg_id=0` = 尚无梗概,`layer1_from_msg_id=0` = 层 1 起于最早、**层 2 为空**)。把 `0` 当成「到末尾」会让**新会话的每条消息同时落在层 1 与层 2**(组装是 `layer2 + layer1`)⇒ 上下文凭空翻倍,**不报错、不丢消息**。同理:`model_ctx` 的锚点**不能**由调用方传、更不能带 `0` 默认值 —— 那会打出一对长得像真值、却什么也没说的 `bounds`。
+
+**层 2 截短只截 `content`,结构字段(`tool_calls` / `tool_call_id`)原样保留**。截断 `tool_calls` 就是把 `tool` 消息与它父亲拆开 ⇒ 上游 400,且**只在历史长到触发分层时复现**。
+
+**摘要失败等于什么都没发生**(不重试、边界不动):「落库 + 推锚点」的原子性保证了两者要么都成、要么都不成。**模型返回空/纯空白时也不许落库、不许推锚点** —— 写一条空梗概**再**推锚点等于**把那段历史静默删除**(层 2 不再读它,而摘要表里那一段是空的)。`memory/tasks.py` 的 `summary skip` 因此把「区间为空」与「模型吐空」**分开记**。
+
+**后台摘要任务必须自建 engine**(专用线程 + 线程内 `asyncio.run` + 任务结束 `dispose()`),理由与 ch04 的 `orchestrate.py` 完全相同:`get_engine()` 的 lru_cache 单例绑在**首次使用它的事件循环**上。**在跑标记的摘除必须在 `finally` 里** —— 漏掉不是「多跑一次」,而是那个会话**再也压不了**(每次都被当成「已有任务在跑」),而用户侧每一轮看起来都完全正常。
+
 **`mount("/")` 必须在 `include_router` 之后**(`app/main.py`),否则静态目录会抢走 `/api/*`。
 
 ## 写测试的规矩(本项目血的教训)
@@ -186,7 +240,15 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
   - T4:单测断言 `log_turn` 的帧里有 `confidence`,但它是**直接塞进 state 字典**的 —— LangGraph 全程没参与,而 `ChatState` **根本没有这个通道**,真机上写入被静默丢弃、恒为 `None`。
   - T6:检索的「基础设施故障必须上抛」用例注入的也是**已翻译好**的错误;而 `_load_rows` 的裸 `SQLAlchemyError` 会被 `except Exception` 吞成「这条查询失败」。
   **判据**:写这类测试前先问「我注入的这个值,**在被测对象内部还会被处理一次吗**?」——会,就注入**处理之前**的形态。对照写法见 `tests/test_api_ticket.py:151-212`(注入裸 `OperationalError`,走真分类路径)。
-- **「语言/库 X 在情况 Z 下表现 Y」这类断言,要么带可复现证据,要么显式标注「未验证」**。ch05 一个 brief 里写过 `confidence_gate:pass`,实际是 `fail`;另一处断言「修好阈值验收 5 就会稳」,实测那个题面在阈值 0 时 top-1 只有 0.089(知识库**根本没覆盖**)。**两条都是先写结论、后没跑**。裁定「这不归本章管」时同理:**不能只看文本授权,还要算这条缺陷会不会卡住本章自己的验收**。
+- **「语言/库 X 在情况 Z 下表现 Y」这类断言,要么带可复现证据,要么显式标注「未验证」**。ch05 一个 brief 里写过 `confidence_gate:pass`,实际是 `fail`;另一处断言「修好阈值验收 5 就会稳」,实测那个题面在阈值 0 时 top-1 只有 0.089(知识库**根本没覆盖**)。**两条都是先写结论、后没跑**。裁定「这不归本章管」时同理:**不能只看文本授权,还要算这条缺陷会不会卡住本章自己的验收**。ch07 又中一次:验收脚本的注释里写「冷进程里第一次 `query_faq` 必然超时 502」,而实测是**一次 24 秒的静默停顿**(同步调用阻塞事件循环 ⇒ `asyncio.wait_for` 的定时器**根本没机会跑**;同机实测:套 `to_thread` 会超时、直接阻塞不会)。**结论错了,现象也就描述错了。**
+- **(e) 测试输入小到触发不了被测行为**(ch07 形态 ⑤)。`test_render_turns_includes_tool_rows` 里的工具内容只有 **29 字**,短于 `layer2_tool_chars=60` ⇒ **截短根本不触发**,「原文版」与「截短版」在那个输入上**完全一样**,三条断言对一个错误实现**同样成立** —— 而它守护的正是「`render_turns` 必须喂原文」这条本章最容易错的性质。同类:端点 `preview` 那条用例用了 5 个字的短消息 ⇒ **截不截到 30 字完全不可观测**。**判据:构造输入时先算一遍「这个输入真的会走到那条分支吗」**(阈值、长度、条数都要够)。
+- **(f) 断言一个变量,而它的名字与语义不符** —— 在 ch05 已记过(`agent_steps` 读作「步数」,实际是绑工具轮次的序号),**ch07 又长出同一个形状**:`tokens.layer1` 在 **`model_ctx`** 里是「层 1 的 token 数」,在 **`history_ctx`** 里却是「**整个扁平窗口**的 token 数」—— **同一个键名,两个意思**,而两行日志长得一样。**判据不变:断言一个字段之前,先去读它是怎么被赋值的。**
+- **(g) 替身替被测对象完成了语义**(ch07 形态 ⑦)。`FakeSession` 自己 `sorted(...)`,于是**端点删掉 `order_by` 照样绿**;同根两处:user 过滤退到 Python、`summarized: true` 在真实库里**从无实例**。**判据:被测对象是否把这件事委托给了替身?** 是 ⇒ 这条断言测的是替身。**修法**:凡「SQL 传没传对」这类语义,补一组 `@pytest.mark.db` 在真实库上验(见 `tests/test_api_conversations_db.py`),**并把该进 SQL 的过滤挪回 SQL,扩替身而不给实现加兜底**。
+
+**两条元教训(ch07 全章复盘)**:
+
+- **验证装置自己会产假绿 —— 而且它有两种长相,必须先分清**。ch07 的变异脚本一共出了**五次**事故:锚点打在**同一文件的另一处**(`replace(...,1)` 命中第二个 `.order_by`)、**node id 过期**(pytest **exit 4**,而 `tail` 把错误切掉后**连 `N passed` 都没有**)、**改注释让锚点失配**(而改的正是被锚着的那段注释)、**输出管道把「锚点没打上」的行过滤掉**(差一点被报成「全绿」)、正则吃掉闭括号让 JS 语法崩而被当成 RED。⇒ **「变异后没红」有两个互斥的解释:断言无判别力,或变异压根没生效。** 判据与动作:① 锚点**锚在代码上,不锚在注释上**(注释正是 diff 最容易改到的东西);② 每次变异后**断言命中数恰好为 1**;③ 看不到 `N passed|failed` 就打印 `!!!`(那是「不要再加 `-q`」那条的自动化版本);④ **绝不把证据输出接进任何截断/过滤管道**。
+- **不变量要放在唯一写口上,不要靠每个调用方自觉**。ch07 的前端竞态修法是把「代际令牌递增」收进 `setSessionId`(当前会话的唯一写口),一次关掉三种顺序;后端同款:消息 id 由 `to_lc_messages` **一处**给、锚点由 `layers` **一处**产出、层 2 的计数口径由 `_assemble` **一处**算、`MAX(seq)+1` 只该有**一个**实现。**每多一个「调用点自己记得做」,就多一种静默漂移。**
 - **读回数据库的值要用新 session**:SQLAlchemy 身份映射持**弱引用**,同 session 重读是否打到库取决于还有没有东西引用着那个 ORM 对象 —— 会变成「靠 refcount 走运」的断言。
 - **复述类断言要对着真实来源验**:让替身**真的把密钥写进异常文本**,否则「响应里没有密钥」是恒真的。
 - 单测**全程不联网**;评估集与验收脚本才允许打真实网络。
@@ -199,6 +261,8 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - `evals/retrieval_cases.jsonl`(ch03)—— 23 条(19 换说法正例 + 4 干扰项),闭式口径(期望片段取自语料**逐字原文**且须在**同一块**里全部出现,不掺主观判断)。**⚠️「23/23」那一版是 ch03 的 dense 单路;ch04 换混合+重排后从未复核过,现链路是 13/23** —— 引用时必须说清是哪条链路。用例自造、4 条干扰项里 3 条离阈值很远、不构成压力;**「卖手机」是唯一有信息量的近域硬负例**。
 - 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。**0.58 是在 dense 余弦分数上标定的**(正例最低 0.609 / 干扰最高 0.560,区间仅 0.049 宽),ch04 换混合+重排时**原值沿用**,而重排器输出的是 **sigmoid** 分数 —— 两把尺子不可通约,0.58 比可用区间上界还高。现链路实测可用区间 **`(0.114, 0.389]`**(宽 0.275),取中点。`dedupe_threshold` = 0.95 **仍是未实测值** —— 真实数据上从未被触发过,不要当成已验证的。
 - **`retrieval_score_threshold` 改一次要动两处,它们是一致的**:`app/tools/registry.py` 传给 retriever(过滤块)与 `app/agent/nodes.py` 的置信度闸(取 max 比阈值)。因为 `retrieve_knowledge` 拿到的块**已经**过同一阈值,闸的 `max(scores) >= threshold` 在有 evidence 时几乎恒真 —— **闸的实际效果约等于「检索是否返回非空」**。
+- `evals/summary_cases.jsonl`(ch07)—— 11 条**摘要**标注样例,四类:正例 3 / 负例 2 / **幻觉探针** 2 / 四样提炼物(product、identifier、request、unresolved)各 1。口径**闭式**(关键词、字数上限、`\d{4,32}` 正则)。**实测 9/11**:两条负例(纯寒暄)判 MISS —— 模型**不返回空串**,而是吐约 40 字的**元叙述**(「本次对话未涉及任何商品…」)。**它没有编事实,但那句正是 prompt 点名的「对话状态一律不留」** ⇒ 这条既是「prompt 遵从度不满」的读数,也说明 T8 的「空输出退路」在真实模型上**很难触发**。**引用时必须带上这句**,别把 9/11 读成「实现坏了」。
+  - **幻觉探针的判别力靠一个前提**:该用例的对话里**本来就没有** `\d{4,32}` 形态的数字。脚本对每条探针**自动核对这个前提**(用例自检),不成立就单独报 `!!!` 而不混进 MISS。另有**探针自检**:`\d{4,32}` 必须能匹配 `20240915`/`13800138000`(真会出现的形态)、**不能**匹配 `99` —— 后者正是 ch06 T1 那条**同义反复断言**(用 `\d{4,32}` 匹配「99」,长度对不上 ⇒ 恒真)的反面教材。
 - `evals/results/` 被 gitignore,是历史运行产物。
 
 ## 平台陷阱(Windows + Git Bash)
