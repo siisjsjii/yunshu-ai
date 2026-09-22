@@ -123,7 +123,8 @@ def test_model_ctx_sliding_is_the_truncated_form_plus_the_raw_tail(caplog):
 
     ⚠️ **这不是验收 4b。** 4b 判的是 **`history_ctx` 那一行**里看得见截短后的
     形态(spec §10.5),而那条线要等 T10 把分层接上才成立 —— 端点今天传进去的
-    `history` 是 `trim.select_history` 的输出,那个函数**只整轮丢弃、从不标注
+    `history` 是单层裁剪(`trim.select_history`,T10 已删)的输出 —— 那个函数
+    **只整轮丢弃、从不标注
     内容**,`…` 与 `[工具结果] ` 不可能出现。这里能看见形态,是因为本用例
     自己拿 `layers.split` 造了一份**分了层**的 `Layers`;生产上 `model_ctx`
     的调用点(T10 的 agent 节点)同样会拿到分了层的 `Layers`,所以那边成立。

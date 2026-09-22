@@ -161,7 +161,8 @@ def history_ctx(
     ✅ **T10 起它承载得了验收 4b**:端点传进来的 `history` 是**分层后的精简版**
     (`layers.split` 的 `layer2 + layer1`),所以客服答复带 `…`、工具结果是一行
     `[工具结果] ` —— 那两个标记**只有** `layers.truncate` 产得出来
-    (T7 记过:早先传的 `trim.select_history` 输出**只整轮丢弃、从不标注内容**,
+    (T7 记过:早先传的是单层裁剪(`trim.select_history`,T10 已删)的输出
+    —— **只整轮丢弃、从不标注内容**,
     那条线在结构上做不到)。**改回去就等于把 4b 打回不可达** ——
     `tests/test_api_chat.py::test_history_ctx_carries_the_truncated_layer2_forms`
     钉着这一条。

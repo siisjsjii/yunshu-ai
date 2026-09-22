@@ -278,7 +278,7 @@ def test_select_layer1_drops_whole_rounds_and_never_reorders():
 def test_lc_token_counter_counts_content_only_not_structure():
     """`trim_messages` 的 counter 必须**只数 content**,不数 `tool_calls`。
 
-    与 `trim.select_history` 的既有口径一致(结构性元数据不占预算)。
+    与 `layers`/`select_layer1` 的既有口径一致(结构性元数据不占预算)。
     口径不一致的症状是「预算说是够的、实际发出去超了」—— 两处都各自「看起来合理」。
 
     对应地,**层 1 的选择本身(`trim_messages(strategy="last", start_on="human")`)
@@ -298,7 +298,7 @@ def test_lc_token_counter_counts_content_only_not_structure():
 
     # 上面那一行的**判别力是零**:`count_tokens("四个字") == len("四个字") == 3`,
     # 所以一个「用 len(content) 顶替 count_tokens」的实现在它面前照样绿 ——
-    # 而那正是本条 docstring 说的病症(与 `select_history` 不是同一把尺子,
+    # 而那正是本条 docstring 说的病症(与 `layers` 不是同一把尺子,
     # 差一个 token 累积起来就是「预算说够、发出去超」)。
     # 这一串两者不同(实测 8 vs 7),把「到底调没调 count_tokens」也钉住;
     # 先断前提,免得日后 tiktoken 改了而这条悄悄退化成恒真。

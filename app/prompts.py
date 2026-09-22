@@ -182,7 +182,7 @@ def _lc_token_counter(messages: list) -> int:
     """`trim_messages` 要 `Callable[[list[BaseMessage]], int]`,本仓的
     `trim.count_tokens` 收 `str` —— 这就是那个适配器。
 
-    `tool_calls` **不计入**(与 `trim.select_history` 的既有口径一致:
+    `tool_calls` **不计入**(与 `layers` 的既有口径一致:
     结构性元数据不占预算)。
 
     `content` 不是 `str` 时(LC 1.x 的 content block 列表)整体 `str()` 兜底 ——
@@ -246,7 +246,7 @@ def select_layer1(history: Sequence[Message], *, max_tokens: int) -> list[Messag
       提问的回答,也不会把 `tool` 与它的 assistant 拆开 ⇒ 上游 400);
       装不下一整轮时宁可**空**,也不留半轮(那是 `allow_partial=False` 的语义);
     - **预算**:`token_counter` 用 `_lc_token_counter`(只数 `content`,与
-      `trim.select_history` 同一把尺子;`tool_calls` 这类结构元数据不占预算)。
+      `layers` 同一把尺子;`tool_calls` 这类结构元数据不占预算)。
 
     「保住了几条 = 末尾那几条」是对 `trim_messages(strategy="last")` 结果的
     **实测性质**(1.6.3:`_last_max_tokens` 只做切片,不复制、不重排),由

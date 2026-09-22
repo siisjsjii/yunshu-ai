@@ -1,36 +1,39 @@
-"""本轮对话的**前置**处理。
+"""本轮对话的**前置校验**。
 
 ch05 Task 8:单轮编排从这里搬走了 —— `stream_turn` 整个删掉,由
 `app/agent/graph.py` 的图负责(指代消解 → 意图识别 → 路由 → 检索/闸/Agent →
-落库)。本模块只剩 `prepare_turn`:它必须在图开始跑之前做完预算校验,
+落库)。本模块只剩 `prepare_turn`:它必须在图开始跑之前做完校验,
 因为端点只有"流还没开始"这个窗口能返回 400。
 
-ch07:这里守着 spec §8 那张表里的**两条 400** —— 本轮输入超
-`max_user_input_tokens`、以及历史预算连一轮都装不下。两条都必须在流开始前完成。
+ch07:
+- 这里守着 spec §8 那张表里的**两条 400** —— 本轮输入超 `max_user_input_tokens`、
+  以及历史预算连一轮都装不下。两条都必须在流开始前完成。
+- **它不再裁剪历史、也不再返回历史**(见 `prepare_turn` 的 docstring)。
 """
 
-from collections.abc import Sequence
-
 from app.config import Settings
-from app.memory import budget, trim
-from app.prompts import render_system_prompt
-from app.schemas import Message
+from app.memory import trim
+from app.memory.budget import ContextBudget
 
 
-def prepare_turn(*, settings: Settings, history: Sequence[Message], user_input: str) -> list[Message]:
-    """预算校验 + 历史裁剪。返回**裁剪后的历史**。
+def prepare_turn(*, settings: Settings, budget: ContextBudget, user_input: str) -> None:
+    """**纯校验**:流开始前的两条 400 判据。**不返回历史**。
 
-    ch07:预算从「直接给一个数」改成「从模型窗口倒推」(`memory.budget`)。
-    分层(三层 + 两个锚点)**不在本函数里** —— 它在端点,因为分层要读会话上
-    已经落库的两个锚点(`Conversation` 的两列),而本函数只看得到一份历史。
+    ch07 起,历史不再是「裁一条单层的」—— 它由 `layers.split` 分三层
+    (层 2 截短、层 1 原文,spec §3),而这一层与旧口径**不能叠加**:
+    拿裁剪过的历史去分层 = 层 2 少算 ⇒ `should_summarize` 永不触发,
+    而级联的第二环会在日志里**平静地缺席**。
+    所以这里只剩校验;`select_history` 连同它的调用一起删除。
 
-    预算不足时抛 `ContextOverflowError`,调用方在响应开始前处理,
-    因此能返回 400 而不是一个已经开始的 SSE 流。两条判据,顺序有意:
+    `budget` 由调用方推导后传入 —— 端点本来就要它来算两个层的预算与降级阈值,
+    在这里再 `derive` 一次是同一个事实算两遍(也是本仓「一个数只有一个来源」
+    那套既有取向;`derive` 是纯函数,但每请求多跑一遍 tiktoken 是白工)。
+
+    两条判据,顺序有意:
 
     1. **本轮输入**超 `max_user_input_tokens` —— 输入本身超限与历史装不下是
-       两回事,但对客户端都是 400,所以都归这一族。放在前面:它连 `derive`
-       都不用跑(输入长度与窗口预算无关)。
-    2. **历史预算装不下一轮**(`not fits_one_round`)—— 这是 spec §8 的判据。
+       两回事,但对客户端都是 400,所以都归这一族。放在前面:它连预算都不用看。
+    2. **历史预算装不下一轮**(`not budget.fits_one_round`)—— 这是 spec §8 的判据。
        T2 实现的是 `history_budget < 0`,两者在「预算为正但小于
        `per_round_steady`」时**结论相反**:那时按 spec 该 400,按 `< 0` 却会
        **静默带着几乎空的历史往下走** —— 用户拿到一个没有任何上下文的回答,
@@ -48,11 +51,9 @@ def prepare_turn(*, settings: Settings, history: Sequence[Message], user_input: 
                 used=used, budget=settings.max_user_input_tokens
             )
 
-    b = budget.derive(
-        settings=settings, system_prompt=render_system_prompt(settings.brand_name)
-    )
-    if not b.fits_one_round:            # spec §8:「装不下一轮」就是 400 的判据
+    if not budget.fits_one_round:       # spec §8:「装不下一轮」就是 400 的判据
         # 这是**配置**故障(窗口 < 固定开销 + 单轮峰值),不是用户输入的问题 ——
         # 用子类的文案,别让运维去猜是不是用户话太多(见 `trim` 的两个类)。
-        raise trim.ContextBudgetUnavailable(used=b.fixed_overhead, budget=b.window)
-    return trim.select_history(history, b.history_budget)
+        raise trim.ContextBudgetUnavailable(
+            used=budget.fixed_overhead, budget=budget.window
+        )

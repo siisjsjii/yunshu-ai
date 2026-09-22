@@ -52,35 +52,18 @@ def count_tokens(text: str) -> int:
     return len(_ENCODING.encode(text))
 
 
-# 「历史能用多少 token」这件事**不在本模块算**了(ch07):推导在
-# `app/memory/budget.py`(`窗口 - 固定开销 - 单轮峰值`,再与
-# `keep_rounds × per_round_steady` 取小)。本模块只做后半截 ——
-# 给定预算,裁到能放下。
-
-
-def select_history(
-    history: Sequence[Message],
-    available_tokens: int,
-) -> list[Message]:
-    """保留能放下的最近若干整轮历史,按时间正序返回。
-
-    轮的定义见 `to_rounds`(user 边界)。按整轮裁剪保证历史中不出现
-    "有问无答"的孤立消息 —— 那会让模型以为上一轮它没回复;
-    也保证 tool 消息不会被与它的 assistant 父亲切开。
-
-    计费只算 `content`:`tool_calls` / `tool_call_id` 是结构性元数据,
-    不计入预算,否则预算的含义会被悄悄改掉。
-    """
-    kept: list[list[Message]] = []
-    used = 0
-    for rnd in reversed(to_rounds(history)):
-        cost = sum(count_tokens(msg.content) for msg in rnd)
-        if used + cost > available_tokens:
-            break
-        used += cost
-        kept.append(rnd)
-    kept.reverse()
-    return [msg for rnd in kept for msg in rnd]
+# ---- ch07 起,本模块只剩三样东西 ----
+#
+# `count_tokens`(全仓唯一的 token 尺子)、`to_rounds`(轮的边界 = 不变量)、
+# 以及两个异常(`ContextOverflowError` 及其子类 —— 400 的词汇表)。
+#
+# 「历史能用多少 token」不在本模块算:推导在 `app/memory/budget.py`
+# (`窗口 - 固定开销 - 单轮峰值`,再与 `keep_rounds × per_round_steady` 取小)。
+# 「给定预算裁到能放下」也**不在**本模块:**原来的 `select_history` 已删除** ——
+# 它按**原文** token 整轮丢弃,而 ch07 的上下文由 `layers.split` 分层(层 2 按
+# **截短后**计数),两者叠加会让层 2 少算 ⇒ 摘要永不触发,级联的第二环静默缺席。
+# 今天裁的是两处:`layers`(分层 + 层 2 截短 + 降级挪边界)与
+# `prompts.select_layer1`(层 1 按 token 预算从最近一轮往前取)。
 
 
 def to_rounds(history: Sequence[Message]) -> list[list[Message]]:

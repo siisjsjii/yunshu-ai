@@ -128,30 +128,25 @@ async def chat_stream(
         context_budget = None
         if request.resume is None:
             # **全量**历史(带 MySQL 主键)。分层按 `messages.id` 切,所以它必须
-            # 是**整段** —— 见下面那条注释(为什么不用 `prepare_turn` 的产出)。
+            # 是**整段**、**未经裁剪**的 —— 裁剪过的历史会让层 2 少算,
+            # 而层 2 的截短后计数正是摘要的触发判据(见下面那段)。
             history = await load_history(session=session, conversation_id=session_id)
+            # 预算:本请求**只推导一次**,往下传给 `prepare_turn`(两条 400 判据)
+            # 与 `build_graph`(agent 节点打 `model_ctx` 要用同一份)。
+            context_budget = budget.derive(
+                settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+            )
             # 流开始前的两条 400 守卫(本轮输入超限 / 历史预算装不下一轮)在这里
             # 完成 —— 一旦 yield 过首帧,状态码就改不了了。
             #
-            # ⚠️ **返回值刻意丢弃** —— 这一点值得写清楚,因为它看起来像漏了。
-            # 它给的是 ch05–ch06 的单层裁剪(`trim.select_history`:按**原文**
-            # token 整轮丢弃),而本章起上下文由 `layers` 按两个锚点分层派生
-            # (spec §3)。**两者不能叠加**:摘要的触发判据是「层 2 的**截短后**
-            # token 数」,而 `select_history` 会先把层 2 的整轮消息丢在前面 ——
+            # 它是**纯校验、不碰历史**:ch07 起历史由下面的 `layers` 分层派生
+            # (spec §3),而旧的单层裁剪(`trim.select_history`,按**原文** token
+            # 整轮丢弃)与它**不能叠加** —— 叠在最前面会把层 2 的整轮消息先丢掉,
             # `layer2_tokens` 随之少算,**摘要会在该触发的时候不触发**(而且每轮
             # 丢得越来越顺手),声明的「级联」在日志里永远走不到第二环,
-            # 没有任何东西报错。
-            # 只有「锚点全是 0 且整段历史都放得下」时它才恰好是恒等变换,
-            # 而那是巧合,不足以依赖。
+            # 没有任何东西报错。所以那个函数连同这条调用一起删了。
             prepare_turn(
-                settings=settings, history=history, user_input=request.message
-            )
-            # 预算:本请求**只推导一次**,往下传给 `build_graph`(agent 节点打
-            # `model_ctx` 要用同一份)。`prepare_turn` 内部也推一份 —— 同一份
-            # settings、同一个 system prompt,纯函数,所以两者必然相等;
-            # 它的签名这一章不动(见 T10 的边界)。
-            context_budget = budget.derive(
-                settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+                settings=settings, budget=context_budget, user_input=request.message
             )
 
             # ---- 降级:层 1 的原文超预算就把边界往后挪(只挪 id,不搬数据)----
@@ -224,8 +219,8 @@ async def chat_stream(
             #
             # `history=` 用**分层后的精简版**(T10 的收口):4b 要在这行里看见
             # `…` 与 `[工具结果] `,而那两个标记只有 `layers.truncate` 产得出来
-            # —— 早先传的 `select_history` 输出**只整轮丢弃、从不标注内容**,
-            # 那条线在结构上承载不了 4b。
+            # —— 早先这条线拿的是单层裁剪的输出(`trim.select_history`,T10 已删),
+            # 它**只整轮丢弃、从不标注内容**,在结构上承载不了 4b。
             #
             # 这一行**不带锚点**:`history_ctx` 收的是扁平滑窗、不是「用两个锚点
             # 切出来的三层」,给它补一对锚点只能是编的(spec §7.6 的字段表里
@@ -301,8 +296,9 @@ async def chat_stream(
             # ② 不读历史、不跑 `prepare_turn`。`Command(resume=…)` 只把 resume 值
             #    交回挂起的那个节点,**不会**把输入合并进 state —— 历史、user_input、
             #    槽位全都从 checkpointer 的断点里恢复,读出来没有读者。而
-            #    `prepare_turn` 更不能用:它拿不到本轮输入(挂起那轮的原话在 state
-            #    里),真拿 None 递进去会炸在 tiktoken 里 —— 请求语义问题变 500。
+            #    `prepare_turn` 守的是「这**新的一轮**」的两条 400(本轮输入长度 /
+            #    历史预算装不下一轮)—— 续跑不是新一轮,它既不新增用户输入、也不重组
+            #    上下文,那两条判据在这里**没有对象**。
             #
             # ③ **不播种**(ch07)。续跑续的是**同一轮**,上下文从 checkpoint
             #    还原即可;这里递 `messages` 会被并进 state —— 而续跑的那一轮
@@ -324,7 +320,8 @@ async def chat_stream(
                 "conversation_id": session_id,
                 "user_input": request.message,
                 # 精简版 = 层 2 截短段 + 层 1 原文段(spec §7.5)。它**不是**
-                # `prepare_turn` 的单层裁剪 —— 两回事,见上面那段注释。
+                # 上面读出来的那份全量历史 —— 全量是分层的**输入**,
+                # 这一份才是发给模型的东西(见上面那段注释)。
                 "history": trimmed,
                 # 梗概全文(`join_summaries` 把多段拼成一段);空串 = 还没有梗概。
                 "summary_text": summary_text,

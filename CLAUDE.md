@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/Scripts/python.exe -m pytest                             # 全部测试(含 db,需 MySQL)
 .venv/Scripts/python.exe -m pytest -m "not db"                 # 只跑不需要数据库的
 .venv/Scripts/python.exe -m pytest tests/test_trim.py          # 单个文件
-.venv/Scripts/python.exe -m pytest tests/test_trim.py::test_select_history_never_returns_half_a_round
+.venv/Scripts/python.exe -m pytest tests/test_trim.py::test_rounds_never_start_with_a_tool_message
 
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务;浏览器开 http://localhost:8000
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py       # 工具选择评估集,需真实 key + MySQL

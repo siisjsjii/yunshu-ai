@@ -942,13 +942,14 @@ def test_validation_failure_releases_lock(client_factory, monkeypatch):
     """非流式退出路径必须释放锁,否则该会话永久 409。
 
     替身的签名必须与真实 prepare_turn 一致。ch01 那份还停在
-    `(*, settings, store, session_id, user_input)`,端点改用 `history=`
-    之后它抛的是 TypeError(而且被 pytest.raises(RuntimeError) 拦下,
-    测试仍会红但红在一个误导性的位置)—— 这里同步改掉。
+    `(*, settings, store, session_id, user_input)`,而 T10 之后真实签名是
+    `(*, settings, budget, user_input) -> None`(纯校验,不收历史)——
+    签名对不上时它抛的是 TypeError(而且被 pytest.raises(RuntimeError) 拦下,
+    测试仍会红但红在一个误导性的位置)。
     """
 
-    def boom(*, settings, history, user_input):
-        raise RuntimeError("组装消息失败")
+    def boom(*, settings, budget, user_input):
+        raise RuntimeError("预算校验失败")
 
     client, _ = client_factory(batches=[])
     monkeypatch.setattr(chat_api, "prepare_turn", boom)
@@ -1782,7 +1783,8 @@ def _layered_session() -> FakeSession:
 
     层 2 里放一条长工具结果与一段长客服答复 —— 它们正是验收 4b 要看见的
     「截短后的形态」(`[工具结果] …` / `…`)。那两样**只有** `layers.truncate`
-    产得出来:`trim.select_history` 只整轮丢弃、从不标注内容,所以分层接上之前,
+    产得出来:早先那条线传的是单层裁剪的输出(`trim.select_history`,只整轮
+    丢弃、从不标注内容 —— 该函数已在 T10 删除),所以分层接上之前,
     `history_ctx` 那一行在结构上承载不了 4b。
     """
     db = FakeSession()
@@ -1933,7 +1935,7 @@ def test_summary_trigger_is_logged_with_the_layer2_counts(
 def test_history_ctx_carries_the_truncated_layer2_forms(client_factory, caplog):
     """**验收 4b 的单元版**:`history_ctx` 那一行里必须看得见截短后的形态。
 
-    分层接上之前,这条线拿的是 `prepare_turn` 交给 `trim.select_history` 的输出
+    分层接上之前,这条线拿的是端点交给单层裁剪(`trim.select_history`)的输出
     —— 那个函数**只整轮丢弃、从不标注内容**,所以 `…` 与 `[工具结果] `
     **不可能出现**(T7 审查的 Important 2)。这条用例是它的收口:
     `history=` 换成分层后的精简版之后,形态才真的出现在那一行里。

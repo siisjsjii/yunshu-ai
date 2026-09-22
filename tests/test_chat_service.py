@@ -1,19 +1,23 @@
-"""对话编排测试。全部用替身,不联网、不碰 DB。
+"""对话前置校验测试。全部用替身,不联网、不碰 DB。
 
 ch05 Task 8:`stream_turn` 连同它的 18 条用例一起删掉了 —— 单轮编排改由图
-(`app/agent/nodes.py` 的 agent 节点 + `app/agent/graph.py`)负责,那些守卫
-逐条搬进了 `tests/test_agent_node.py` / `tests/test_agent_graph.py` 与
-`tests/test_api_chat.py`(逐条搬迁表见 task-8-report.md)。
+(`app/agent/nodes.py` 的 agent 节点 + `app/agent/graph.py`)负责。
 
-本文件现在只剩 `prepare_turn`,而且它的**产出语义变了**:从「组装好的消息」
-变成「裁剪后的历史」—— 消息组装搬进了 agent 节点(它要往里插证据块)。
+ch07 T10:`prepare_turn` 从「校验 + 裁剪并返回历史」缩成**纯校验** ——
+历史改由 `layers` 分层派生(见 `app/services/chat.py` 的 docstring),
+`trim.select_history` 连同它的三条用例一起删除(那三条里守着的**不变量**
+搬到了 `tests/test_trim.py` 的 `to_rounds` 一族上)。
+
+本文件因此只剩**两条 400 判据**,每条都要有一条**能区分**的用例:
+把判据删掉或放宽 ⇒ 对应那条变红(判别力实测见 task-10-report.md)。
 """
 
 import pytest
 
 from app.config import Settings
+from app.memory import budget
 from app.memory.trim import ContextOverflowError
-from app.schemas import Message
+from app.prompts import render_system_prompt
 from app.services.chat import prepare_turn
 
 REQUIRED = {
@@ -28,30 +32,23 @@ def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **REQUIRED, **overrides)
 
 
-@pytest.mark.anyio
-async def test_prepare_turn_returns_trimmed_history():
-    """预算校验仍在流开始前完成;产出是**裁剪后的历史**,消息组装交给节点。"""
-    history = [Message(role="user", content="在吗"),
-               Message(role="assistant", content="在的")]
-    kept = prepare_turn(settings=_settings(), history=history, user_input="你好")
-    assert [m.content for m in kept] == ["在吗", "在的"]
+def _budget(settings: Settings):
+    return budget.derive(
+        settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+    )
 
 
-def test_prepare_turn_raises_when_budget_is_exhausted():
-    """预算不足仍然抛 ContextOverflowError —— 端点靠它在流开始前返回 400。
+def test_prepare_turn_accepts_a_turn_that_fits_and_returns_nothing():
+    """装得下就**什么都不抛**,而且**不返回历史**(它是纯校验)。
 
-    ch07 换了判据的**来源**:不再是「system prompt + 本轮输入超过
-    `context_budget_tokens`」,而是「从窗口倒推出来的历史预算为负」。
-    所以这条用例不再靠一个超长输入去顶穿预算 —— 新口径下输入长度**不参与**
-    这个判据(见 `prepare_turn` 的 docstring);改成把窗口压到 `ge=1024` 的下界,
-    默认的固定开销与单轮峰值加起来远超它,`history_budget` 必然为负。
-    输入刻意用短句:长输入会把这条用例的触发点换成「输入超
-    `max_user_input_tokens`」那条(T10 在端点接线,spec §8)。
+    两个方向都有判别力:整段实现写成「恒定抛异常」时这里红;
+    而「又把历史返回回来了」的实现会让 `is None` 红 —— 那正是本任务要钉的契约
+    (返回历史意味着调用方可能拿它去分层,而裁剪过的历史会让层 2 少算)。
     """
-    with pytest.raises(ContextOverflowError):
-        prepare_turn(
-            settings=_settings(model_context_window=1024), history=[], user_input="在吗"
-        )
+    settings = _settings()
+    assert prepare_turn(
+        settings=settings, budget=_budget(settings), user_input="在吗"
+    ) is None
 
 
 def test_prepare_turn_rejects_input_over_the_per_message_cap():
@@ -67,12 +64,15 @@ def test_prepare_turn_rejects_input_over_the_per_message_cap():
     text = "这是一句明显超过五个 token 的话"
     with pytest.raises(ContextOverflowError):
         prepare_turn(
-            settings=_settings(max_user_input_tokens=5), history=[], user_input=text
+            settings=_settings(max_user_input_tokens=5),
+            budget=_budget(_settings(max_user_input_tokens=5)),
+            user_input=text,
         )
-    # 对照:同一个输入在足够大的上限下照常返回。
+    # 对照:同一个输入在足够大的上限下照常返回(None)。
+    settings = _settings(max_user_input_tokens=2000)
     assert prepare_turn(
-        settings=_settings(max_user_input_tokens=2000), history=[], user_input=text
-    ) == []
+        settings=settings, budget=_budget(settings), user_input=text
+    ) is None
 
 
 def test_prepare_turn_rejects_a_budget_that_cannot_fit_one_round():
@@ -84,38 +84,12 @@ def test_prepare_turn_rejects_a_budget_that_cannot_fit_one_round():
     上下文被悄悄截到几乎没有的回答,而没有任何东西报错。
     这条用例就是那个中间区间(实测:`keep_rounds=20 × 10000` 那一支打不过窗口,
     `history_budget` 落在 4537 > 0 上)。
+
+    判别力:判据删掉(不检查)或放宽回 `< 0` ⇒ 这条红(实测见报告)。
     """
+    settings = _settings(per_round_steady=10000)
+    b = _budget(settings)
+    assert 0 < b.history_budget < settings.per_round_steady   # ← 前提:那个中间区间
+
     with pytest.raises(ContextOverflowError):
-        prepare_turn(
-            settings=_settings(per_round_steady=10000),
-            history=[Message(role="user", content="在吗")],
-            user_input="在吗",
-        )
-
-
-def test_prepare_turn_applies_the_budget_to_the_history():
-    """放不下的历史必须被**真的**裁掉,而不是原样返回。
-
-    与上面两条互补:第一条的历史**放得下**(裁不裁都是那两条),第二条根本不
-    返回历史。只有这一条问「`select_history` 到底有没有被调用、算出来的
-    历史预算有没有真的用上」—— 把 `return trim.select_history(history,
-    history_budget)` 改成 `return list(history)`,只有它变红。
-
-    ch07 的「预算极小」怎么造:旧口径是 `context_budget_tokens=1000` 直接给小
-    预算,新口径下历史预算取 `min(keep_rounds × per_round_steady, 窗口匀得出来
-    的)`。这里把**按轮数估的那一支**压到 1(`keep_rounds=1` × `per_round_steady=1`
-    = 1 token),窗口那一支按默认值算远大于 1,于是 `history_budget == 1`。
-    刻意不写「窗口 = 某个刚好勉强够的数」:那要按 system prompt 当前的
-    token 数倒推(实测 701),提示词一改这条用例就红在一个与它无关的原因上。
-    """
-    history = [
-        Message(role="user", content="退" * 2000),
-        Message(role="assistant", content="好" * 2000),
-    ]
-    kept = prepare_turn(
-        settings=_settings(keep_rounds=1, per_round_steady=1),
-        history=history,
-        user_input="在吗",
-    )
-
-    assert kept == []
+        prepare_turn(settings=settings, budget=b, user_input="在吗")
