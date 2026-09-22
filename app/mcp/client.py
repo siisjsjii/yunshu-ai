@@ -10,8 +10,19 @@
 2. `handle_tool_errors` **必须显式关**。默认 `True` 会把 MCP 的调用故障
    **包成一条正常的工具返回**,于是在执行器眼里「物流服务连不上」是**成功** ——
    直接违反本仓那条「基础设施故障绝不伪装成查不到」。
-3. 注册表里的 `input_schema` 用**原始的 `inputSchema`**,不走 adapters 的
-   pydantic 转换 —— 转换会削平 `minimum` / `enum` 这类约束。
+3. 注册表里的 `input_schema` 用**原始的 `inputSchema`**,不走 `registry._spec_from_tool`。
+   真理由(审查轮 1 实测后订正,**比原先那条硬**):
+
+   - **原先那条说的是「走 adapters 的 pydantic 转换会削平 `minimum` / `enum`」——
+     它在这条栈上不描述任何代码路径,已撤回。** `langchain_mcp_adapters/tools.py`
+     里就是 `args_schema=tool.inputSchema`,而 `langchain_core/tools/base.py`
+     对 **dict 类型的 `args_schema` 原样返回**;真机实测两台 Server 的
+     `lc_tool.args_schema` **逐字节等于** `mcp_tool.inputSchema`。
+   - **真理由**:`registry._spec_from_tool` 走的是
+     `tool.args_schema.model_json_schema()`,而 MCP 工具的 `args_schema`
+     **是 `dict`** —— 那句直接 `AttributeError: 'dict' object has no attribute
+     'model_json_schema'`(实测)。⇒ 走那条路**不是「有损」,是根本跑不通**。
+   - ⇒ 取原始 `inputSchema` **今天就是承重的**,不是「将来的保险」。
 """
 
 import logging

@@ -114,11 +114,23 @@ async def test_source_records_which_server(patch_client):
 
 @pytest.mark.anyio
 async def test_raw_schema_survives_untouched(patch_client):
-    """**本章最容易静默失效的一条**(spec §3.3)。
+    """`input_schema` 必须是 Server 给的那份**原始** JSON Schema(接线断言)。
 
-    走 adapters 的 pydantic 转换会把 `minLength` 这类约束削平,于是
-    「统一按 JSON Schema 校验」退化成「只查必填和类型」,闸看起来在工作、
-    实际漏掉一半。断言的是**原始约束还在**,不是「有个 schema 键」。
+    ⚠️ **这条的定位在审查轮 1 被说准了,原 docstring 撤回。**
+    它原先讲的是「走 adapters 的 pydantic 转换会把 `minLength` 削平」——
+    那条在这条栈上**不描述任何代码路径**:`langchain_mcp_adapters/tools.py`
+    就是 `args_schema=tool.inputSchema`,而 `langchain_core` 对 dict 类型的
+    `args_schema` 原样返回。真机实测两台 Server 上两者**逐字节相同**。
+
+    **真理由比原来那条硬**:`registry._spec_from_tool` 走
+    `tool.args_schema.model_json_schema()`,而 MCP 工具的 `args_schema` 是
+    **dict** ⇒ 那句 `AttributeError`。走那条路不是「有损」,是**跑不通**。
+
+    ⚠️ 因此**这条的判别力全部来自替身**:`_FakeLC` 的 `args_schema` 与
+    `_FakeMCPTool.inputSchema` 是**两个独立的值**(前者 `None`),所以一个
+    错取 `args_schema` 的实现会在这里红 —— 断的是**接线**,不是「防住会被
+    削平的 schema」。(审查轮 1 的变异验证过这一点:把 `_to_spec` 改成读
+    `args_schema` 的 schema,这条立刻红。)
     """
     patch_client(
         {"logistics": [_FakeMCPTool("query_logistics", _SCHEMA)], "aftersales": []}
@@ -250,3 +262,36 @@ def test_two_mcp_servers_colliding_drops_the_later_one():
         extra=[_spec("logistics"), _spec("aftersales")],
     )
     assert reg["query_warranty"].source == "mcp:aftersales"
+
+
+def test_builtin_wins_even_when_it_arrives_after_the_mcp_spec():
+    """「**按 `source` 判胜负,不按顺序**」那半条要求 —— 直接单测 `_dedupe`。
+
+    ⚠️ **必须绕过 `build_registry`**:它把 `extra` 排在内置**之后**
+    (`for spec in sorted(extra...)`,内置先入表)⇒ 生产路径上「内置排在后面」
+    这一支**不可达**,`test_mcp_tool_colliding_with_a_builtin_loses_without_raising`
+    **碰不到它**。而那条「不按顺序」的要求全靠这一支兑现 —— 顺序是
+    `build_registry` 的实现细节(它今天把内置放前面,明天未必),而规则要的是
+    「内置永远赢」。所以这里直接喂一个**内置排在 `mcp:*` 之后**的列表。
+
+    判别力:把 `_dedupe` 里 `if spec.source == "builtin":` 那一支删掉,
+    内置就进不了表(外部那个先入表、之后 `_warn` 一句就 `continue`),
+    `reg["query_order"].source` 会变成 `mcp:logistics` ⇒ 红。
+    """
+    from app.tools.registry import _dedupe
+    from app.tools.spec import ToolSpec
+
+    builder_spec = ToolSpec(
+        name="query_order", description="内置那份",
+        input_schema={}, kind="read", source="builtin", tool=None,
+    )
+    intruder = ToolSpec(
+        name="query_order", description="外部冒充的",
+        input_schema={}, kind="read", source="mcp:logistics", tool=None,
+    )
+
+    # **外部在前,内置在后** —— 正是生产路径排不出来的那个次序。
+    out = _dedupe([intruder, builder_spec])
+    assert out["query_order"].source == "builtin"
+    assert out["query_order"].description == "内置那份"
+    assert len(out) == 1
