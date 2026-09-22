@@ -3536,6 +3536,11 @@ async def test_confirm_write_returns_the_decision(monkeypatch):
 # ---- apply_write_decision:副作用恰一次 --------------------------------
 
 
+async def _no_audit(**kwargs) -> None:
+    """审计替身。**必须是 `async def`** —— 见用过它那几处的说明。"""
+    return None
+
+
 class _Spec:
     name = "create_ticket"
     kind = "write"
@@ -3561,8 +3566,25 @@ async def test_approved_writes_once_and_appends_the_tool_message(monkeypatch):
 
     spec = _Spec()
     spec.tool = _Tool()
+    # ⚠️ **这个替身有两个坑,第一个会把第二个藏起来**(T8 的实现者实测上报):
+    #
+    # ① **要 patch 的是 `app.tools.executor.record_audit`**,不是
+    #    `app.agent.confirm_nodes.record_audit` —— 后者在 `confirm_nodes` 里
+    #    **根本不存在**(那个模块从不 import 它),配上 `raising=False` 就是一条
+    #    **静默失效的空操作**。一个看起来在隔离、其实什么都没隔离的装置,
+    #    比不写它还糟。
+    # ② **替身必须是 `async def`,不能是 `lambda`。** `execute_tool` 里是
+    #    `await record_audit(...)` —— 一个返回 `None` 的同步 lambda 会抛
+    #    `TypeError`,而它**被 `except Exception` 吞成**
+    #    `ToolInfrastructureError("工具执行失败")`,报错指向离替身十万八千里的地方。
+    #    ⚠️ **①没修对时②根本看不见** —— 目标错了 ⇒ 替身从没被调用过 ⇒ 它可不可
+    #    await 都无所谓。**两个坑必须一起修。**
+    #
+    # ③ 这个文件里有**三条**会走到写审计的路径(批准 ⇒ `success`、
+    #    取消 ⇒ `permission_denied`、以及 `test_turn_messages_...`),
+    #    **三处都要挂同一个替身** —— 只改一处的话行数仍在涨。
     monkeypatch.setattr(
-        "app.agent.confirm_nodes.record_audit", lambda **kw: None, raising=False
+        "app.tools.executor.record_audit", _no_audit, raising=False
     )
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
@@ -3811,6 +3833,13 @@ git commit -m "feat(ch08): 建工单确认流的两个节点 + ChatState 两个�
    **不新增判断通道。**
 2. **少回灌一个 tool 结果就是上游 400** —— 同一轮里若还有别的工具调用,
    它们必须照常执行并回灌。
+
+**第三条:T8 的实现者报上来的接缝,归本任务守。**
+`apply_write_decision` 在 **`pending_write` 为空**时会照样跑完,并产出一条
+**`tool_call_id=""`** 的 ToolMessage —— 那构成「有 tool result、没有对应 tool_call」,
+上游同样直接 **400**。⇒ **那个节点只在 `pending_write` 非空时才该被到达**,
+`route_after_agent` 现在恰好是这么写的,**补一条测试钉住它**,
+别让它只靠「现在恰好如此」。
 
 - [ ] **Step 1: 写失败测试**
 
