@@ -131,12 +131,19 @@ async def summarize_range(
     conversation_id: str,
     turns: Sequence[Message],
     upto_msg_id: int,
-) -> str | None:
+) -> tuple[int, str] | None:
     """把 `turns` 压成一段梗概,**成功才**落库并把边界推到 `upto_msg_id`。
 
-    返回梗概文本;`None` 表示**什么都没做**(区间为空,或模型没吐出任何文本)。
+    返回 `(seq, 梗概文本)`:落库那一行是**第几段**(从 1 起,由
+    `append_summary_and_advance` 算并返回)+ 梗概文本本身。
+    `None` 表示**什么都没做**(区间为空,或模型没吐出任何文本)。
     **异常原样抛出**,由调用方(T9 的后台任务)决定怎么记日志 —— 在这里吞掉的话,
     「上游 401」与「压完了」在调用方看来一模一样。
+
+    **`seq` 为什么必须带出来**:spec §7.6 要求摘要任务的生命周期日志里有
+    「第 N 段」—— 那行日志是「压完了」与「压了个空的」的唯一区分面之一。
+    在这里丢掉再让调用方查一次,就是同一个事实两处算,而两处**可以不一致**
+    (期间另一段提交了)。`None` 与「第几段」因此都只从这一个出口说话。
 
     **顺序即不变量**:`ainvoke` 在前,`append_summary_and_advance` 在后,而且
     只调一次。反过来(先推边界再落库,或者失败后仍落一次空梗概)会让这段历史
@@ -164,10 +171,11 @@ async def summarize_range(
         )
         return None
 
-    await append_summary_and_advance(
+    seq = await append_summary_and_advance(
         session=session,
         conversation_id=conversation_id,
         upto_msg_id=upto_msg_id,
         content=text,
     )
-    return text
+    # `seq` **原样**带出去,不在这里另算一次(`MAX(seq)+1` 只该有一个实现)。
+    return seq, text

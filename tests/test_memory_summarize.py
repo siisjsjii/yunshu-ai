@@ -280,13 +280,20 @@ class _FakeModel:
 
 
 class _AppendSpy:
-    """记下 `append_summary_and_advance` 的每一次调用。"""
+    """记下 `append_summary_and_advance` 的每一次调用,并**返回一个非 1 的段号**。
 
-    def __init__(self) -> None:
+    返回 `7` 而不是 `1` 是**故意的**:`summarize_range` 要把这个值原样带出去,
+    而「写死 1」与「根本没带出来」在段号为 1 时输出完全一样 —— 本仓第 (a) 种
+    假绿形态(期望值等于缺省/兜底产生的值)。
+    """
+
+    def __init__(self, seq: int = 7) -> None:
         self.calls: list[dict] = []
+        self.seq = seq
 
-    async def __call__(self, **kwargs) -> None:
+    async def __call__(self, **kwargs) -> int:
         self.calls.append(kwargs)
+        return self.seq
 
 
 def test_summarize_range_returns_none_for_an_empty_range():
@@ -358,7 +365,7 @@ def test_failure_writes_nothing_at_all(monkeypatch):
 
 
 def test_summarize_range_writes_once_and_advances_to_the_given_id(monkeypatch):
-    """成功路径:模型 → **一次**原子落库 → 返回梗概文本。
+    """成功路径:模型 → **一次**原子落库 → 返回 `(段号, 梗概文本)`。
 
     `turns` 的边界由调用方给(`upto_msg_id`),这里不自己算 —— 算的话就与
     重读锚点的那一步(T9)有两处答案。
@@ -368,7 +375,7 @@ def test_summarize_range_writes_once_and_advances_to_the_given_id(monkeypatch):
     model = _FakeModel("  用户问过订单 1002 能不能退。  ")
     session = object()
 
-    got = asyncio_run(summarize_range(
+    seq, text = asyncio_run(summarize_range(
         model=model, session=session, conversation_id="c1",
         turns=[
             Message(id=3, role="user", content="订单 1002 能退吗"),
@@ -378,12 +385,14 @@ def test_summarize_range_writes_once_and_advances_to_the_given_id(monkeypatch):
         upto_msg_id=6,
     ))
 
-    assert got == "用户问过订单 1002 能不能退。"     # 去掉了首尾空白
+    # 段号**原样**来自落库那一步(替身给的是 7,不是 1 —— 写死的实现在这里红)
+    assert seq == spy.seq
+    assert text == "用户问过订单 1002 能不能退。"   # 去掉了首尾空白
     assert len(spy.calls) == 1                      # **只落一次**
     assert spy.calls[0]["session"] is session
     assert spy.calls[0]["conversation_id"] == "c1"
     assert spy.calls[0]["upto_msg_id"] == 6
-    assert spy.calls[0]["content"] == got           # 落进去的就是返回的那段
+    assert spy.calls[0]["content"] == text          # 落进去的就是返回的那段
     # 模型看到的是**原文**(含工具行),不是截短版
     assert len(model.calls) == 1
     assert "1002" in model.calls[0][-1]["content"]

@@ -1,7 +1,7 @@
 """ch07 T9:后台摘要执行体 —— 同会话去重 / 重读锚点 / 失败不冒泡 / engine 必 dispose。
 
-**不联网、不碰 db、不依赖 LangChain。** 四组性质各有用例钉住,每一组都对应一个
-「错了也不报错」的失效:
+**除末尾那一条 `-m db` 用例,全部不联网、不碰 db。** 四组性质各有用例钉住,
+每一组都对应一个「错了也不报错」的失效:
 
 1. **同会话同一时刻只跑一个**,而**别的会话不受影响** —— 两个任务并发会把同一段
    原文压两遍(重复梗概里每一段单独看都正常);全局一把锁则会把所有会话串起来
@@ -14,6 +14,10 @@
    用户侧看起来完全正常,只是梗概永远不更新;
 4. **engine 自建、每条退出路径都 dispose** —— 漏掉异常路径就是每压一次泄漏一个
    连接池,而摘要任务每轮都可能起。
+
+末尾那条 `test_done_log_carries_the_real_segment_number` 标了 `@pytest.mark.db`:
+它要验的是 `summary done` 里的段号**真的由库里的状态决定**(预置第 1 段 ⇒ 本次是
+第 2 段),而那需要真实的 `MAX(seq)+1`。其余的替身接缝证明不了这一步。
 
 **为什么走 `_thread_target` / `_run_body` 这两个接缝**:起真线程再等它跑完会变成
 时序断言,而时序断言是不稳定的;不稳定的断言最后会被人删掉,而不是修好。
@@ -31,10 +35,21 @@ import threading
 import types
 
 import pytest
+from langchain.messages import AIMessage
+from sqlalchemy import text
 
-from app.config import Settings
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.config import Settings, get_settings
 from app.memory import tasks
 from app.schemas import Message
+from app.services.history import (
+    advance_anchors,
+    append_summary_and_advance,
+    append_turn,
+    ensure_conversation,
+    load_summaries,
+)
 
 
 #: `_env_file=None` 是本仓硬规矩(仓库根有真实 `.env`)。
@@ -45,6 +60,15 @@ REQUIRED = dict(
     openai_model="m",
     database_url="mysql+asyncmy://u:p@127.0.0.1:3306/x",
 )
+
+
+#: 单测里摘要替身返回的**段号**。
+#:
+#: **不是 1,也不是 2**:`summary done` 里那个字段要能被验成「落库那一步算出来的
+#: 那个值」,而写死 1(或任何顺手的小整数)的实现在段号平凡时与真实现输出相同
+#: —— 本仓第 (a) 种假绿形态(期望值等于缺省/兜底产生的值)。真机上段号由
+#: 库里的状态决定,那一路由文件末尾的 `-m db` 用例钉(预置第 1 段 ⇒ 本次为 2)。
+FAKE_SEQ = 13
 
 
 def _settings(**over):
@@ -230,7 +254,7 @@ def test_task_rereads_anchors_instead_of_trusting_the_trigger_snapshot(monkeypat
     async def _fake_summarize(*, model, session, conversation_id, turns, upto_msg_id):
         seen["turns"] = [m.id for m in turns]
         seen["upto"] = upto_msg_id
-        return "梗概"
+        return (FAKE_SEQ, "梗概")
 
     async def _reload(engine, conversation_id):
         return (3, 7, _HISTORY())
@@ -268,7 +292,7 @@ def test_empty_interval_never_reaches_the_model(monkeypatch, caplog):
 
     async def _fake_summarize(**kwargs):
         calls.append(kwargs)
-        return "梗概"
+        return (FAKE_SEQ, "梗概")
 
     async def _reload(engine, conversation_id):
         return (0, 0, _HISTORY())        # 两个锚点都是 0 ⇒ 层 2 为空
@@ -442,7 +466,7 @@ def test_engine_is_disposed_on_the_success_path(monkeypatch, caplog):
         return (0, 5, _HISTORY())
 
     async def _ok(**kwargs):
-        return "梗概"
+        return (FAKE_SEQ, "梗概")
 
     monkeypatch.setattr(tasks, "_reload_state", _reload)
     monkeypatch.setattr(tasks, "summarize_range", _ok)
@@ -483,14 +507,15 @@ def test_engine_is_disposed_when_the_body_fails(monkeypatch):
 def test_start_and_done_carry_the_conversation_id(monkeypatch, caplog):
     """`summary start` / `summary done` 各一行、都带会话 id(spec §7.6)。
 
-    顺带钉住两件事:
+    顺带钉住三件事:
     - **不记模型返回的原文** —— 日志是密钥泄漏面也是日志膨胀源(spec §8);
-    - `start` 的两端就是**重读到的**两个锚点(不是触发时的)。
+    - `start` 的两端就是**重读到的**两个锚点(不是触发时的);
+    - `done` 里的**段号是落库那一步给的那个值**(`FAKE_SEQ`),不是写死的。
     """
     marker = "梗概正文-MARKER-不该进日志"
 
     async def _ok(**kwargs):
-        return marker
+        return (FAKE_SEQ, marker)
 
     async def _reload(engine, conversation_id):
         return (0, 5, _HISTORY())
@@ -511,6 +536,7 @@ def test_start_and_done_carry_the_conversation_id(monkeypatch, caplog):
     assert starts[0]["summary_upto"] == 0
     assert starts[0]["layer1_from"] == 5
     assert dones[0]["upto_msg_id"] == 5      # 覆盖到重读到的上界为止
+    assert dones[0]["seq"] == FAKE_SEQ       # ← 段号**一路带上来**,不是写死的 1
     assert marker not in caplog.text
 
 
@@ -529,3 +555,113 @@ def test_trigger_line_carries_the_layer2_usage_and_budget(caplog):
     assert lines[0]["conversation_id"] == "c1"
     assert lines[0]["layer2_tokens"] == 120
     assert lines[0]["layer2_budget"] == 100
+
+
+# ------------------------------------------------- 段号:真机那条路(-m db)
+#
+# 上面那条用的是替身:它证明「`summarize_range` 给了什么,日志里就是什么」。
+# 但段号**真正**该由库里的状态决定(`MAX(seq)+1`),而替身证明不了这一步 ——
+# 所以下面这条走真路(只有模型是替身):预置第 1 段,让这一次压出第 2 段。
+
+#: 只给这一条 db 用例用的草稿会话号(32 字符,与 conversations.id 的列宽一致)。
+SCRATCH = "task9test00000000000000000000000"
+
+
+def _run_db(coro_fn):
+    """在一个**专属** engine 上跑一次 DB 往返,结束 dispose。
+
+    **不复用 `get_sessionmaker()` 的 `lru_cache` 单例**:这条用例跨了好几个
+    `asyncio.run`(每个开一个新的循环),而那个单例绑在首次使用它的循环上 ——
+    正是 `app/memory/tasks.py` 模块 docstring 记的那条(ch04 实测)。实测用单例时,
+    池里属于**已关闭循环**的连接会在 `terminate` 时被 sqlalchemy.pool 打成
+    一串 asyncmy/proactor 噪音(`AttributeError: 'NoneType' object has no attribute 'send'`),
+    测试本身照样过 —— 也就是「看着像坏了、其实没坏」,比真坏更难查。
+    自建 + 每条路径 dispose 之后输出干净。
+    """
+    async def _go():
+        engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+        try:
+            async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+                return await coro_fn(session)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_go())
+
+
+def _drop_scratch() -> None:
+    """清场。**梗概行必须一起清**:留着的话下一次跑 `max(seq)` 会从上一轮的值
+    接着涨,而「预置第 1 段 ⇒ 本次是第 2 段」这条断言就再也不成立(不是报错,
+    是漂移 —— `tests/test_history.py` 的 `_cleanup` 里记着同一条)。"""
+    async def _go(session):
+        for table in ("messages", "conversation_summaries", "conversations"):
+            column = "id" if table == "conversations" else "conversation_id"
+            await session.execute(
+                text(f"DELETE FROM {table} WHERE {column} = :c"), {"c": SCRATCH}
+            )
+        await session.commit()
+
+    _run_db(_go)
+
+
+@pytest.mark.db
+def test_done_log_carries_the_real_segment_number(caplog):
+    """预置第 1 段 ⇒ 这一次压出来的是**第 2 段**,`summary done` 里必须是 2。
+
+    **为什么不只断「日志里有 summary done」**:段号写死成 1(或任何常量)的
+    实现在那种断言下照样绿 —— 形状 ① 的教科书形态。这里段号由**库里的状态**
+    决定,所以它同时证明了日志与「那段真的被写成第 2 段」。
+    """
+    _drop_scratch()
+    try:
+        async def _seed(session):
+            await ensure_conversation(session=session, session_id=SCRATCH, user_id="u")
+            ids = await append_turn(
+                session=session, conversation_id=SCRATCH,
+                messages=[
+                    Message(role="user", content="订单 1002 能退吗"),
+                    Message(role="assistant", content="我帮您看看"),
+                    Message(role="tool", content='{"order_no":"1002"}',
+                            tool_call_id="call_1"),
+                    Message(role="user", content="好的"),
+                ],
+            )
+            # 第 1 段:压到第 1 条为止
+            first = await append_summary_and_advance(
+                session=session, conversation_id=SCRATCH,
+                upto_msg_id=ids[0], content="第 1 段:用户问订单 1002。",
+            )
+            # 层 1 从最后一条起 ⇒ 层 2 = 中间那两条(区间非空)
+            await advance_anchors(
+                session=session, conversation_id=SCRATCH, layer1_from=ids[3]
+            )
+            return first, ids
+
+        first_seq, ids = _run_db(_seed)
+        assert first_seq == 1           # ← 预置的确实是第 1 段(种子自己也是真的)
+
+        class _Model:
+            async def ainvoke(self, messages):
+                return AIMessage(content="第 2 段:用户报过订单 1002,尚未解决。")
+
+        with caplog.at_level(logging.INFO):
+            tasks._run_body(
+                # db 用例的 Settings **不加 `_env_file=None`**(仓规):要读真实
+                # .env 里的 DATABASE_URL —— `_run_body` 用它自建 engine。
+                conversation_id=SCRATCH, settings=Settings(),
+                model_factory=lambda s: _Model(),
+            )
+
+        dones = _payloads(caplog, "summary done ")
+        assert len(dones) == 1, "没有 summary done 行"
+        assert dones[0]["seq"] == 2               # ← 库里已有第 1 段 ⇒ 这是第 2 段
+        assert dones[0]["upto_msg_id"] == ids[3]
+
+        async def _read(session):
+            rows = await load_summaries(session=session, conversation_id=SCRATCH)
+            return [seq for seq, _ in rows]
+
+        # 换**新 session** 读回:日志说的那一段在库里确实是第 2 段
+        assert _run_db(_read) == [1, 2]
+    finally:
+        _drop_scratch()

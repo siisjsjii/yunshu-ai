@@ -260,7 +260,7 @@ async def _run(*, conversation_id: str, settings: Settings, model_factory) -> No
         model = model_factory(settings)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
-            text = await summarize_range(
+            written = await summarize_range(
                 model=model,
                 session=session,
                 conversation_id=conversation_id,
@@ -272,7 +272,7 @@ async def _run(*, conversation_id: str, settings: Settings, model_factory) -> No
                 upto_msg_id=layer1_from,
             )
 
-        if text is None:
+        if written is None:
             # 区间**非空**却什么都没压出来 ⇒ `summarize_range` 的另一半含义:
             # **模型吐了空**(空区间在上面就 return 了)。这与「区间为空」分开记。
             #
@@ -290,9 +290,13 @@ async def _run(*, conversation_id: str, settings: Settings, model_factory) -> No
             )
             return
 
+        # 段号是**落库那一步自己算出来的**,一路原样带到这里(spec §7.6 的
+        # 「第 N 段」)—— 在这里重算或写死都不是同一个事实。
+        seq, _text = written
         _emit(
             "done",
             conversation_id=conversation_id,
+            seq=seq,
             upto_msg_id=layer1_from,
             covered_from=summary_upto,
             turns=len(turns),

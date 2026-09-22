@@ -134,8 +134,16 @@ async def advance_anchors(
 
 async def append_summary_and_advance(
     *, session, conversation_id: str, upto_msg_id: int, content: str
-) -> None:
+) -> int:
     """**原子**落一段梗概并把 `summary_upto_msg_id` 推到 `upto_msg_id`。
+
+    **返回这一段新写入的 `seq`(第几段,从 1 起)。** 调用方(T9 的摘要任务)
+    要把它记进 `summary done` 那行日志 —— spec §7.6 的「第 N 段」。
+
+    **为什么是返回而不是让调用方再查一遍**:`seq` 是**本函数自己算出来的**
+    (`MAX(seq)+1`)。丢掉它再去查一次,就是把同一个事实算两遍,而两遍**可以
+    不一致**(期间并发的另一段提交了,或者读到的不是这一行)。返回出来才是
+    单一来源。(这处签名变更(T3 → `-> int`)向后兼容:既有调用方忽略返回值即可。)
 
     spec §6.1:只成一半的两种后果都很难看,所以这两步必须在同一个事务里提交。
     这就是为什么它们是**一个函数**而不是两个 —— 拆开就会出现「调用方忘了
@@ -166,3 +174,4 @@ async def append_summary_and_advance(
         .values(summary_upto_msg_id=upto_msg_id)
     )
     await session.commit()      # 一次提交,两步同时生效
+    return next_seq
