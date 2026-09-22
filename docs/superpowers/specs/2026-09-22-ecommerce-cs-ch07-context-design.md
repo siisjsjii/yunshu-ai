@@ -315,9 +315,14 @@ messages 表(按 id 升序)
 - **`content` 为空串的行** —— 工具调用那条 assistant 消息的 `content` 是空串(它只带 `tool_calls`,
   见 `app/agent/nodes.py` 的 `content=m.content or ""`),不过滤的话**每个「模型调了工具」的轮次
   都会在侧栏画出一个空气泡**。用 `content != ''` 而不是「assistant 且不带 tool_calls」:
-  两者**等价**——`user` 行不可能为空(`ChatRequest.message` 有 `min_length=1`),
-  而 `assistant` 行内容为空**只可能**是「只申请调用、还没产出文字」那一形态。
-  (写作要求:实现侧的 docstring 要把这个等价性写明,免得下一个人以为它还滤掉别的东西。)
+  它是**更窄、更保守**的那个条件,**不是**「assistant 且不带 `tool_calls`」的等价物
+  —— 2026-09-22 订正:`_lc_to_records` 会把 `content` 与 `tool_calls` **一起**写,
+  而 `_stream_round` 边累积 chunk 边把文字发 token 帧,所以
+  **一条既带 `tool_calls`、又带开场白的 assistant 行是结构上可达的**;
+  对那种行,「`content != ''`」**返回**它,而「不带 `tool_calls`」会**丢掉**它。
+  **丢掉它是错的** —— 那段开场白**是用户看见过的**(它以 token 帧流出去过)。
+  所以取 `content != ''`:它**只**滤掉用户没见过的空气泡,不误伤任何见过的东西。
+  (写作要求:实现侧的 docstring 要写**这条更窄的理由**,不要再写成「等价」。)
 
 2026-09-22 裁定 —— 这是本章新引入的一个缝:
 ch07 起**工具结果开始落库**(§2.4c),而本端点返回每一行 ⇒ 若不筛,
