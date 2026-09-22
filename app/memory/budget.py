@@ -8,6 +8,7 @@
 2. 中文「按字数折 token」不另立系数,直接用同一个 counter 折 —— 见 `tokens_for_chars`。
 """
 
+import math
 from dataclasses import dataclass
 
 from app.config import Settings
@@ -65,7 +66,10 @@ def derive(*, settings: Settings, system_prompt: str) -> ContextBudget:
     by_rounds = settings.keep_rounds * settings.per_round_steady
     history_budget = min(by_rounds, by_window)
 
-    layer1_budget = int(history_budget * LAYER1_SHARE)
+    # `math.floor`,不是 `int()` —— spec §7.2 写的是 floor。`int()` 对负数是
+    # **朝零截断**,退化配置(`history_budget` 为负,`fits_one_round is False`)
+    # 下两者差 1。
+    layer1_budget = math.floor(history_budget * LAYER1_SHARE)
     return ContextBudget(
         window=settings.model_context_window,
         fixed_overhead=fixed_overhead,
