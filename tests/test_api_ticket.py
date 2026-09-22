@@ -32,6 +32,7 @@ from app.db.models import Ticket
 from app.db.session import get_session
 from app.main import app
 from app.memory.store import SessionStore
+from app.tools.registry import _spec_from_tool
 
 # 顶层 import(`tests/` 没有 `__init__.py`,pytest 默认的 prepend 导入模式会把
 # `tests/` 放进 sys.path)—— **不要**写成 `tests.test_api_chat`:那会让同一份
@@ -77,11 +78,11 @@ def _client(session, *, store=None, **settings_overrides):
     """端点级测试客户端:三条依赖缝都替换掉(会话 / 会话存储 / 配置)。
 
     ⚠️ **替换 `get_settings` 并不能让这个文件摆脱仓库根的 `.env`** ——
-    `build_tools` 内部的 `build_retriever` 是**硬连线**调模块级 `get_settings()`
-    (`app/tools/registry.py:30`),不走 `Depends`,所以 DI 缝够不到它。
+    `build_registry` 内部的 `build_retriever` 是**硬连线**调模块级 `get_settings()`
+    (`app/tools/registry.py`),不走 `Depends`,所以 DI 缝够不到它。
 
     实测(移走 `.env` 后跑,修复轮 1 现数):本文件红 **1** 条 —— 只剩主用例,
-    因为另外 4 条要么被替身换掉了 `build_tools`、要么压根不进端点;而
+    因为另外 4 条要么被替身换掉了 `build_registry`、要么压根不进端点;而
     **全量快路径红 24 条**(其余散在 `test_api_chat.py` / `test_api_kb.py` /
     `test_registry.py`)。这条覆盖的用途是**控制等锁超时与密钥占位值**,
     不是可移植性。
@@ -163,6 +164,17 @@ def _failing_create_ticket():
     return create_ticket
 
 
+def _reg(*tools) -> dict:
+    """`BaseTool` 列表 → `name → ToolSpec`(ch08 T4 起注册表的形状)。
+
+    用生产的 `registry._spec_from_tool` 转换,不手搭 `ToolSpec`:手搭的话
+    `kind` / `input_schema` 就是测试自己编的,而**执行器的权限闸与校验闸
+    读的正是这两个字段** —— 那样「点按钮 → APPROVED 就真建单」这条会退化成
+    「测试自己造了一个能过闸的 spec」。
+    """
+    return {t.name: _spec_from_tool(t, source="builtin") for t in tools}
+
+
 def _slow_create_ticket():
     """建工单工具的替身:慢工具。本端点没有模型,「占住锁」只能靠它。"""
 
@@ -198,8 +210,8 @@ def test_infrastructure_failure_returns_502_not_500(monkeypatch):
     client = _client(session)
     monkeypatch.setattr(
         chat_api,
-        "build_tools",
-        lambda *, session, conversation_id: [_failing_create_ticket()],
+        "build_registry",
+        lambda *, session, conversation_id, settings=None: _reg(_failing_create_ticket()),
     )
     try:
         resp = client.post("/api/ticket", json={"session_id": SID})
@@ -227,8 +239,8 @@ def test_failed_request_releases_lock_so_the_session_stays_usable(monkeypatch):
     client = _client(session, session_lock_timeout_seconds=0.15)
     monkeypatch.setattr(
         chat_api,
-        "build_tools",
-        lambda *, session, conversation_id: [_failing_create_ticket()],
+        "build_registry",
+        lambda *, session, conversation_id, settings=None: _reg(_failing_create_ticket()),
     )
     try:
         first = client.post("/api/ticket", json={"session_id": SID})
@@ -258,8 +270,8 @@ async def test_concurrent_same_session_second_request_times_out_with_409(monkeyp
     client = _client(session, session_lock_timeout_seconds=0.15)
     monkeypatch.setattr(
         chat_api,
-        "build_tools",
-        lambda *, session, conversation_id: [_slow_create_ticket()],
+        "build_registry",
+        lambda *, session, conversation_id, settings=None: _reg(_slow_create_ticket()),
     )
     try:
         transport = httpx.ASGITransport(app=app)

@@ -46,6 +46,7 @@ from app.retrieval.expand import ExpandQueries
 from app.retrieval.search import RetrievedChunk
 from app.schemas import Message
 from app.tools.errors import ToolInfrastructureError, ToolNotFound
+from app.tools.registry import _spec_from_tool
 
 CONV = "conv-refund"
 
@@ -321,6 +322,11 @@ def _build_refund_graph(*, intent="退款退货", judgement=None, order_fail=Non
     if registry is None:
         registry = {"query_order": _order_tool(calls=calls, fail=order_fail,
                                                delay=order_delay)}
+    # ch08 T4 起注册表装的是 `ToolSpec`:执行器要用登记项上的 `kind`(推重试)
+    # 与 `input_schema`(校验前置)。调用方仍按「工具名 → 工具」写,转换收在这一处。
+    # **`{}` 转换后仍是 `{}`** —— 上面那条接线 bug 探针不受影响。
+    registry = {name: _spec_from_tool(tool, source="builtin")
+                for name, tool in registry.items()}
     graph = build_graph(
         model=model,
         intent_model=IntentModel(intent),

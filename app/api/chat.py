@@ -28,8 +28,8 @@ from app.services.history import (
     load_summaries,
 )
 from app.tools.errors import ToolInfrastructureError
-from app.tools.executor import execute_tool
-from app.tools.registry import build_retriever, build_tools, registry_for
+from app.tools.executor import APPROVED, execute_tool
+from app.tools.registry import build_retriever, build_registry
 
 router = APIRouter()
 
@@ -287,13 +287,16 @@ async def chat_stream(
         # 可恢复失败 —— 事件序列长得一模一样,只是永远查不出东西。
         #
         # 这两行也必须在守卫之内。make_query_faq / make_create_ticket 会做
-        # 导入、建闭包,ch03 起 build_tools 还在里面组装检索器
+        # 导入、建闭包,ch03 起 build_registry 还在里面组装检索器
         # (build_retriever:读配置 + 取懒加载的 embedder/Milvus 客户端单例),
         # 都是"拿到锁之后"这段里的新代码;它们抛异常时漏放锁的后果不是"慢"
         # —— 持锁的锁既不被 TTL 也不被 LRU 回收,该会话从此永久 409,
         # 症状与"泄漏"毫无相似之处。
-        tools = build_tools(session=session, conversation_id=session_id)
-        registry = registry_for(tools)
+        registry = build_registry(
+            session=session, conversation_id=session_id, settings=settings
+        )
+        # 绑给模型的 = 注册表的**投影**(ch08 T4 起注册表产出的是 `ToolSpec`)。
+        tools = [spec.tool for spec in registry.values()]
 
         # emit 必须在图**之外**创建、在节点里才被调用 —— make_emitter 返回的
         # 是可重复调用的函数,每次发帧时现取 writer(见 app/agent/emit.py)。
@@ -528,7 +531,13 @@ async def create_ticket_endpoint(
     「点建工单写 tickets 表」无法达成(spec §8.2)。
 
     护栏与对话端点一致:同一把会话锁串行化;`create_ticket` 是非幂等写操作,
-    executor 的重试白名单不含它,**永不重试**。
+    ch08 起执行器由 `kind == "write"` **结构性地**推出「永不重试」。
+
+    **`write_decision` 必须显式传 `APPROVED`**(ch08 T4)。执行器对写操作的
+    默认决议是 `PENDING` —— 不传的话这个端点会拿到一条 `confirmation_required`
+    的可恢复失败、进而回 502,而**症状与「服务挂了」一模一样**。
+    传 APPROVED 不是绕过闸,而是「点按钮本身就是用户确认」(spec §5.4):
+    这个端点根本没有模型参与,不存在「先问一句再执行」的那半程。
     """
     lock = store.lock_for(request.session_id)
     try:
@@ -540,8 +549,9 @@ async def create_ticket_endpoint(
         await ensure_conversation(
             session=session, session_id=request.session_id, user_id="demo-user"
         )
-        tools = build_tools(session=session, conversation_id=request.session_id)
-        registry = registry_for(tools)
+        registry = build_registry(
+            session=session, conversation_id=request.session_id, settings=settings
+        )
         outcome = await execute_tool(
             tool_call={
                 "name": "create_ticket",
@@ -551,6 +561,8 @@ async def create_ticket_endpoint(
             },
             registry=registry,
             settings=settings,
+            conversation_id=request.session_id,
+            write_decision=APPROVED,
         )
         if not outcome.ok:
             raise HTTPException(

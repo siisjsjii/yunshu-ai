@@ -334,8 +334,13 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
             for call in tool_calls:
                 emit({"frame": "tool_call", "name": call["name"],
                       "args": call["args"], "tool_call_id": call["id"]})
+                # `registry` 是 `name → ToolSpec`(ch08 T4 起)—— 执行器要用
+                # 登记项上的 `kind` 推权限与重试,`input_schema` 做校验前置。
+                # `write_decision` 走默认的 `pending`:Agent 这条正常路径从不传,
+                # 写调用因此**停在这里**(不执行),由确认流决定下一步。
                 outcome = await execute_tool(
-                    tool_call=call, registry=registry, settings=settings
+                    tool_call=call, registry=registry, settings=settings,
+                    conversation_id=state["conversation_id"],
                 )
                 emit({"frame": "tool_result", "tool_call_id": outcome.tool_call_id,
                       "ok": outcome.ok, "summary": outcome.summary})

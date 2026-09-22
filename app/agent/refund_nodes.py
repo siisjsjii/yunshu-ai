@@ -271,10 +271,10 @@ def make_refund_pick_order_node():
 def make_refund_fetch_order_node(*, registry, settings):
     """用 `query_order` 取这一单。
 
-    **走 `execute_tool` 而不是直接 `tool.ainvoke`**:超时、重试白名单
-    (`query_order` 幂等,可重试)、`ToolNotFound` 不重试、SQLAlchemy 故障翻成
-    `ToolInfrastructureError` —— 这些语义全都只在执行器里。直接 `ainvoke`
-    等于把「数据库挂了」和「这个单号查不到」混成一件事。
+    **走 `execute_tool` 而不是直接 `tool.ainvoke`**:超时、重试(ch08 起由
+    `spec.kind` 推出 —— `query_order` 是只读,可重试)、`ToolNotFound` 不重试、
+    SQLAlchemy 故障翻成 `ToolInfrastructureError` —— 这些语义全都只在执行器里。
+    直接 `ainvoke` 等于把「数据库挂了」和「这个单号查不到」混成一件事。
 
     **失败要分三种说**(`outcome.error_kind`,执行器带出来的):
 
@@ -307,6 +307,7 @@ def make_refund_fetch_order_node(*, registry, settings):
             },
             registry=registry,
             settings=settings,
+            conversation_id=state["conversation_id"],
         )
         if not outcome.ok:
             # 回显截断:`order_no` 来自客户端(resume 载荷),长度不受我们控制。

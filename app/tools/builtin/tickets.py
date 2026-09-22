@@ -17,8 +17,9 @@ from app.tools.errors import ToolNotFound
 def make_create_ticket(session, conversation_id: str):
     """构造建工单工具。conversation_id 绑在闭包里,模型看不到。
 
-    非幂等写操作 —— executor 的重试白名单不含它,超时也绝不重试,
-    否则会建出两张工单。
+    **非幂等写操作** —— `app/tools/policy.py` 把它声明成写操作,
+    执行器由 `kind == "write"` **结构性地**推出「永不重试」,
+    否则超时重试会建出两张工单。新注册的写工具自动继承这条。
     """
     import secrets
     from datetime import datetime

@@ -35,6 +35,7 @@ from app.retrieval.search import RetrievedChunk
 from app.tools.builtin import knowledge as builtin_knowledge
 from app.tools.errors import ToolNotFound
 from app.tools.mock_data import order_record
+from app.tools.registry import _spec_from_tool
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -418,14 +419,17 @@ def client_factory(monkeypatch):
         )
 
         if registry is not None:
-            # 端点用 build_tools 组装工具集、再 registry_for 建映射。
-            # 换掉 build_tools 就是同时换掉"绑给模型的"和"能执行的"两批;
+            # 端点用 build_registry 组装注册表、再**投影**出绑给模型的那批
+            # (ch08 T4 起注册表装的是 `ToolSpec`,不再是 `BaseTool`)。
+            # 换掉 build_registry 就是同时换掉"绑给模型的"和"能执行的"两批;
             # 端点若从别处取注册表,下面的断言会以"工具不存在"(ok=false)
             # 或"绑定内容不对"的形式变红。
+            specs = {name: _spec_from_tool(tool, source="builtin")
+                     for name, tool in registry.items()}
             monkeypatch.setattr(
                 chat_api,
-                "build_tools",
-                lambda *, session, conversation_id: list(registry.values()),
+                "build_registry",
+                lambda *, session, conversation_id, settings=None: specs,
             )
 
         async def _session_override():

@@ -15,6 +15,7 @@ from app.prompts import render_evidence, render_system_prompt, to_lc_messages
 from app.schemas import Message
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import SUMMARY_MAX_CHARS
+from app.tools.registry import _spec_from_tool
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -101,6 +102,16 @@ class ScriptedModel:
 
 
 class FakeTool:
+    #: ch08 T4 起注册表装的是 `ToolSpec`,而 `input_schema` 由
+    #: `tool.args_schema.model_json_schema()` 派生 —— 缺这个属性会 AttributeError。
+    #: 给 `None` = **空 schema** = 「什么参数都行」(`spec.validate_args` 对空
+    #: schema 一律放行)。这对本文件的替身正是想要的:它们不模拟参数校验,
+    #: 而**必须**能在校验闸之后被调到(否则「工具真的跑起来了」全线变红)。
+    args_schema = None
+    #: 同理,`_spec_from_tool` 还读 `tool.description`(`(x or "").strip()`)。
+    #: 本文件不绑工具定义块,给空串即可。
+    description = ""
+
     def __init__(self, name="query_order", content='{"status": "已发货"}', error=None):
         self.name = name
         self.content = content
@@ -114,10 +125,19 @@ class FakeTool:
         return type("_R", (), {"content": self.content})()
 
 
+def _reg(mapping: dict) -> dict:
+    """`name → BaseTool` → `name → ToolSpec`(ch08 T4 起注册表的形状)。
+
+    调用方仍按「工具名 → 工具」写,形状转换收在这一处 —— 本文件有六处直接
+    传注册表,逐处改会把这条约束散进每个用例,而它是**同一件事**。
+    """
+    return {name: _spec_from_tool(tool, source="builtin") for name, tool in mapping.items()}
+
+
 def _node(model, tools=(), registry=None, settings=None, frames=None):
     settings = settings or _settings()
     return make_agent_node(
-        model=model, tools=list(tools), registry=registry or {},
+        model=model, tools=list(tools), registry=_reg(registry or {}),
         settings=settings,
         # 生产路径由端点经 `build_graph` 传下来(每次请求只推一次)—— 单测这里
         # 现算一份:同一个纯函数、同一份输入,结果相同。

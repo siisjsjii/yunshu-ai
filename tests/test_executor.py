@@ -1,10 +1,15 @@
-"""执行器测试。全部用替身工具,不联网、不碰 DB。"""
+"""执行器测试。全部用替身工具,不联网、不碰 DB。
+
+⚠️ **ch08 T4 起注册表装的是 `ToolSpec`,不是 `BaseTool`** —— 执行器要用登记项
+上的 `kind`(推权限与重试)与 `input_schema`(校验前置)。这里**不给执行器**
+加「旧形状也认」的兼容分支:那会让「注册表里装的到底是什么」有两个答案,
+而其中一个是错的。本文件的 `_reg()` 就是新形状的唯一造法。
+"""
 
 import asyncio
 
 import pytest
 from langchain.tools import tool
-from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
 from app.config import Settings
@@ -14,9 +19,10 @@ from app.tools.executor import (
     ERROR_NOT_FOUND,
     ERROR_TIMEOUT,
     ERROR_TOOL_MISSING,
-    RETRYABLE_TOOLS,
+    APPROVED,
     execute_tool,
 )
+from app.tools.registry import _spec_from_tool
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",
@@ -34,6 +40,16 @@ def _tc(name: str, args: dict) -> dict:
     return {"name": name, "args": args, "id": "call_1", "type": "tool_call"}
 
 
+def _reg(*tools) -> dict:
+    """`BaseTool` 列表 → `name → ToolSpec`(注册表的新形状)。
+
+    用 `registry._spec_from_tool` 而不是手搭 `ToolSpec`:**它就是生产那个
+    转换函数**。手搭的话,测试里的 `input_schema` 与真注册表给的会各是各的
+    (比如漏掉 `required`),于是「校验前置」在单测里过得去、真机上不成立。
+    """
+    return {t.name: _spec_from_tool(t, source="builtin") for t in tools}
+
+
 class _CountingTool:
     """计次壳,只透传 ainvoke,用来数"执行器尝试了几次"。
 
@@ -41,6 +57,9 @@ class _CountingTool:
     pydantic validate_arguments 包在工具体外层(StructuredTool.from_function
     → create_schema_from_function),参数不合法时工具体根本不进入 ——
     按工具体计数恒为 0,重试与否就区分不出来了。
+
+    ⚠️ 它**同时**是校验前置的探针:装到 `ToolSpec.tool` 上之后,`ainvoke`
+    只有在两道闸都放行之后才会被调到。
     """
 
     def __init__(self, inner, counter: dict):
@@ -52,15 +71,18 @@ class _CountingTool:
         return await self._inner.ainvoke(tool_call)
 
 
-def test_retry_whitelist_excludes_create_ticket():
-    """create_ticket 是写操作,重试会建出两张工单 —— 必须在白名单之外。"""
-    assert "create_ticket" not in RETRYABLE_TOOLS
-    assert RETRYABLE_TOOLS == {
-        "query_order",
-        "query_product",
-        "query_logistics",
-        "query_faq",
-    }
+def _spec_with_counter(inner, counter: dict):
+    """把计次壳塞进登记项的 `tool` 槽位(而不是塞进注册表)。
+
+    `_spec_from_tool` 要的是真 `BaseTool`(`args_schema` 那一套),
+    所以先照真工具建 spec,再替换 `tool` 字段 —— `ToolSpec` 是 frozen 的,
+    用 `dataclasses.replace`。
+    """
+    import dataclasses
+
+    return dataclasses.replace(
+        _spec_from_tool(inner, source="builtin"), tool=_CountingTool(inner, counter)
+    )
 
 
 @pytest.mark.anyio
@@ -82,7 +104,7 @@ async def test_tool_not_found_is_recoverable():
 
     outcome = await execute_tool(
         tool_call=_tc("query_order", {"order_id": "9999"}),
-        registry={"query_order": query_order},
+        registry=_reg(query_order),
         settings=_settings(),
     )
     assert outcome.ok is False
@@ -98,15 +120,16 @@ async def test_validation_error_is_recoverable():
 
     outcome = await execute_tool(
         tool_call=_tc("query_order", {}),   # 缺必填参数
-        registry={"query_order": query_order},
+        registry=_reg(query_order),
         settings=_settings(),
     )
     assert outcome.ok is False
-    assert "ValidationError" in outcome.content or "参数" in outcome.content
+    assert "参数" in outcome.content
 
 
 @pytest.mark.anyio
-async def test_timeout_is_recoverable_and_retries_whitelisted_tool():
+async def test_timeout_is_recoverable_and_retries_a_read_tool():
+    """只读工具超时可重试 —— ch08 起由 `spec.kind` 推出,不再是白名单。"""
     calls = {"n": 0}
 
     @tool
@@ -118,7 +141,7 @@ async def test_timeout_is_recoverable_and_retries_whitelisted_tool():
 
     outcome = await execute_tool(
         tool_call=_tc("query_order", {"order_id": "1001"}),
-        registry={"query_order": query_order},
+        registry=_reg(query_order),
         settings=_settings(tool_timeout_seconds=0.05, tool_retry_attempts=1,
                            tool_retry_delay_seconds=0.01),
     )
@@ -128,8 +151,13 @@ async def test_timeout_is_recoverable_and_retries_whitelisted_tool():
 
 
 @pytest.mark.anyio
-async def test_non_whitelisted_tool_is_never_retried():
-    """create_ticket 超时后必须**恰好调用 1 次**。"""
+async def test_write_tool_is_never_retried_on_timeout():
+    """`create_ticket` 超时后必须**恰好调用 1 次**(写操作结构性不重试)。
+
+    `write_decision=APPROVED` 是必须的:默认的 `pending` 会在**权限闸**就返回
+    `confirmation_required`,工具一次都不会跑 —— 那样这条用例断的
+    「恰好 1 次」会因为「0 次」而红,红的原因却与重试规则无关。
+    """
     calls = {"n": 0}
 
     @tool
@@ -141,16 +169,23 @@ async def test_non_whitelisted_tool_is_never_retried():
 
     outcome = await execute_tool(
         tool_call=_tc("create_ticket", {"description": "换货", "ticket_type": "换货"}),
-        registry={"create_ticket": create_ticket},
+        registry=_reg(create_ticket),
         settings=_settings(tool_timeout_seconds=0.05, tool_retry_attempts=1),
+        write_decision=APPROVED,
     )
     assert outcome.ok is False
     assert calls["n"] == 1
 
 
 @pytest.mark.anyio
-async def test_validation_error_does_not_retry():
-    """参数错误重试无意义 —— 单轮下模型也没有第二次改参数的机会。"""
+async def test_invalid_args_are_rejected_before_ainvoke_and_not_retried():
+    """参数错误重试无意义 —— 单轮下模型也没有第二次改参数的机会。
+
+    ⚠️ **计数在 `ainvoke` 边界上**(CLAUDE.md 的硬约束):写在工具体里的话,
+    校验失败时它恒为 0,「校验前置」与「工具跑了才报错」就区分不开 ——
+    而这两件事的差别正是本节的全部内容。`n == 0` 是**校验前置**的判别式;
+    `retry_count == 0` 是**不重试**的判别式。两条都要断,缺一条就少一件事。
+    """
     calls = {"n": 0}
 
     @tool
@@ -158,12 +193,14 @@ async def test_validation_error_does_not_retry():
         """替身。"""
         return "ok"
 
-    await execute_tool(
+    outcome = await execute_tool(
         tool_call=_tc("query_order", {}),
-        registry={"query_order": _CountingTool(query_order, calls)},
+        registry={"query_order": _spec_with_counter(query_order, calls)},
         settings=_settings(tool_retry_attempts=3),
     )
-    assert calls["n"] == 1      # 首次即校验失败,不再重放
+    assert calls["n"] == 0      # 校验闸就拦下了,`ainvoke` 根本没被走到
+    assert outcome.error_kind == ERROR_INVALID_ARGS
+    assert outcome.retry_count == 0
 
 
 @pytest.mark.anyio
@@ -182,7 +219,7 @@ async def test_tool_not_found_does_not_retry():
 
     outcome = await execute_tool(
         tool_call=_tc("query_faq", {"keyword": "邮费"}),
-        registry={"query_faq": _CountingTool(query_faq, calls)},
+        registry={"query_faq": _spec_with_counter(query_faq, calls)},
         settings=_settings(tool_retry_attempts=3, tool_retry_delay_seconds=0.01),
     )
     assert outcome.ok is False
@@ -201,7 +238,7 @@ async def test_database_error_is_fatal():
     with pytest.raises(ToolInfrastructureError):
         await execute_tool(
             tool_call=_tc("query_order", {"order_id": "1001"}),
-            registry={"query_order": query_order},
+            registry=_reg(query_order),
             settings=_settings(),
         )
 
@@ -217,20 +254,21 @@ async def test_unexpected_exception_is_fatal():
     with pytest.raises(ToolInfrastructureError):
         await execute_tool(
             tool_call=_tc("query_order", {"order_id": "1001"}),
-            registry={"query_order": query_order},
+            registry=_reg(query_order),
             settings=_settings(),
         )
 
 
 @pytest.mark.anyio
 async def test_failure_kind_tells_the_caller_whom_to_blame():
-    """`ok=False` 只说明「没成功」;四种来源对调用方是**四件不同的事**。
+    """`ok=False` 只说明「没成功」;不同来源对调用方是**不同的事**。
 
     取数节点(`app/agent/refund_nodes.py`)按这个字段分三种话说:业务性未找到 →
     如实转述给用户;超时 → 「稍后再试」(**不**指责用户报的号码);
     其余(工具名不在注册表 / 参数不合 schema)→ 上抛,绝不产出面向用户的
-    「查无此单」。所以四个值必须**分别**钉住 —— 少一个,调用方就会把
+    「查无此单」。所以下面几个值必须**分别**钉住 —— 少一个,调用方就会把
     服务端或接线的问题说成「你要的东西不存在」。成功时它必须是 `None`。
+    (ch08 新增的两个权限类种类由 `tests/test_executor_gate.py` 钉。)
     """
     @tool
     async def query_order(order_id: str) -> str:
@@ -252,7 +290,7 @@ async def test_failure_kind_tells_the_caller_whom_to_blame():
 
     ok = await execute_tool(
         tool_call=_tc("query_order", {"order_id": "1001"}),
-        registry={"query_order": query_order}, settings=settings,
+        registry=_reg(query_order), settings=settings,
     )
     assert (ok.ok, ok.error_kind) == (True, None)
 
@@ -263,19 +301,19 @@ async def test_failure_kind_tells_the_caller_whom_to_blame():
 
     invalid = await execute_tool(
         tool_call=_tc("query_order", {}),          # 缺 order_id
-        registry={"query_order": query_order}, settings=settings,
+        registry=_reg(query_order), settings=settings,
     )
     assert (invalid.ok, invalid.error_kind) == (False, ERROR_INVALID_ARGS)
 
     not_found = await execute_tool(
         tool_call=_tc("not_found_tool", {"order_id": "1001"}),
-        registry={"not_found_tool": not_found_tool}, settings=settings,
+        registry=_reg(not_found_tool), settings=settings,
     )
     assert (not_found.ok, not_found.error_kind) == (False, ERROR_NOT_FOUND)
 
     timed_out = await execute_tool(
         tool_call=_tc("slow_tool", {"order_id": "1001"}),
-        registry={"slow_tool": slow_tool},
+        registry=_reg(slow_tool),
         settings=_settings(tool_timeout_seconds=0.05, tool_retry_attempts=0),
     )
     assert (timed_out.ok, timed_out.error_kind) == (False, ERROR_TIMEOUT)
@@ -290,7 +328,7 @@ async def test_summary_is_truncated_to_200_chars():
 
     outcome = await execute_tool(
         tool_call=_tc("query_order", {"order_id": "1001"}),
-        registry={"query_order": query_order},
+        registry=_reg(query_order),
         settings=_settings(),
     )
     assert outcome.ok is True
