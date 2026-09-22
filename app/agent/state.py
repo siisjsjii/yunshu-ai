@@ -8,6 +8,8 @@
 import operator
 from typing import Annotated, TypedDict
 
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from app.schemas import Message
@@ -56,6 +58,33 @@ class ChatState(TypedDict):
     user_input: str
     history: list[Message]        # 来自 MySQL(跨轮权威源),转 BaseMessage 只经 prompts.py
 
+    # ---- 完整历史(跨轮,ch07)----
+    # add_messages 是 **append-only** reducer:各节点只管吐**新**消息,框架按序并入。
+    # 同一个 id 再次并入是**替换**(LangGraph 的既定语义),这就是「播种幂等」
+    # 的另一半 —— `prompts.to_lc_messages` 给每条带上 MySQL 主键做稳定 id。
+    #
+    # ⚠️ 它**不进** `resolve_references` 的逐轮重置清单 —— 把 messages 加进那份
+    # 清单等于**每轮清空完整历史**,而单轮测试完全看不出来。
+    # (写它的是:端点的播种 [只在快照为空时] + 各出口节点的本轮消息。)
+    messages: Annotated[list[AnyMessage], add_messages]
+
+    #: 注入给模型的**梗概全文**(逐轮覆写,由端点播种)。空串 = 还没有梗概。
+    #: 与 `history` 同族:覆写语义 + 每轮重新播种,所以**进的是 `stream_input`**,
+    #: 不进 `resolve_references` 的重置清单。
+    summary_text: str
+
+    #: **本轮**新产生的消息 —— `log_turn` 落库的唯一依据。
+    #:
+    #: 为什么不直接用 `messages`:那个是**累积**通道(全量),拿它落库 = 每轮把
+    #: 整段历史再写一遍 ⇒ **历史翻倍**,而每一轮的回复看起来都正常、每条单测
+    #: 只要不数字数就全绿。这个是**覆写**通道,各节点写它时连同 `messages`
+    #: 一起写(两个都写)。
+    #:
+    #: 它是本章新增通道里**唯一一个不会被节点自动覆盖**的(其余每轮都有节点写,
+    #: 或由端点每轮播种),所以必须进 `resolve_references` 的逐轮重置 ——
+    #: 否则「这轮没产生消息」的路径会原样继承上一轮的值,上一轮的回复被再写一遍。
+    turn_messages: list[AnyMessage]
+
     # ---- 指代消解 ----
     resolved_input: str           # 本章 = user_input 原样
 
@@ -80,9 +109,10 @@ class ChatState(TypedDict):
     refund_decision: bool | None  # None = 还没判 / 判不出来;**不是** False(那是结论)
 
     # ---- Agent ----
-    # 刻意**不**放 ReAct 的消息序列:agent 节点在那一轮内部用局部变量组装
-    # (`_stream_round` 的 msgs),落库走 append_turn 的 user+assistant 两条。
-    # 放一个没人读写的 state 字段 = 死代码 + 白搭一个 reducer。
+    # ch07 起 ReAct 的消息序列**进 state**(上头的 `messages` / `turn_messages`)——
+    # ch05–ch06 那句「刻意不放」已经作废:那时它只活在 `_stream_round` 的局部
+    # 变量里、落库走 append_turn 的 user+assistant 两条,所以本章之前
+    # production **零处**写过 `role='tool'` 的行。
     agent_steps: int
     tool_calls_made: list[dict]
 

@@ -42,6 +42,7 @@ import json
 import logging
 
 from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import AIMessage
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
@@ -496,7 +497,15 @@ def make_refund_offer_node(*, emit):
             "order_no": order_no,
             "categories": list(REFUND_REASON_CATEGORIES),
         })
-        return {"reply": reply, "choices": [], "trace": [f"refund:offer {order_no}"]}
+        # 两个通道**都要写**(ch07):`messages` 给 add_messages 累积完整历史,
+        # `turn_messages` 是 `log_turn` 落库的唯一依据 —— 少写后者的话这一轮
+        # **只有用户那句话落库、客服回复永远不落**,而整轮看起来完全正常。
+        return {
+            "reply": reply,
+            "messages": [AIMessage(content=reply)],
+            "turn_messages": [AIMessage(content=reply)],
+            "choices": [], "trace": [f"refund:offer {order_no}"],
+        }
 
     return refund_offer
 
@@ -511,6 +520,12 @@ def make_refund_explain_node(*, emit):
     async def refund_explain(state) -> dict:
         reply = (state.get("reply") or "").strip() or EXPLAIN_FALLBACK
         emit({"frame": "token", "text": reply})
-        return {"reply": reply, "choices": [], "trace": ["refund:explain"]}
+        # 同上:两个通道都要写,理由见 `refund_offer`。
+        return {
+            "reply": reply,
+            "messages": [AIMessage(content=reply)],
+            "turn_messages": [AIMessage(content=reply)],
+            "choices": [], "trace": ["refund:explain"],
+        }
 
     return refund_explain

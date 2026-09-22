@@ -30,7 +30,7 @@ import json
 import pytest
 from langchain.tools import tool
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from sqlalchemy.exc import SQLAlchemyError
@@ -87,16 +87,20 @@ class _Queries:
         self.queries = list(queries)
 
 
-class _Chunk:
+class _Chunk(AIMessageChunk):
     """Agent 那一轮用的最小 chunk 替身。
 
     只有「物流轮的出口不是子流程」那条用例会碰到它 —— 退款子流程**不经过**
     Agent 节点(见 spec §3.3:判定是一次 `ainvoke`,不进 ReAct)。
+
+    ch07:基类是**真的 `AIMessageChunk`** —— agent 节点现在把累积出来的 chunk
+    塞进 `state["messages"]`,而 `add_messages` 会对条目做消息强制转换,裸对象的
+    红法是 `NotImplementedError: Unsupported message type: <class '_Chunk'>`
+    (指向替身,不是实现)。真实链路上流的本来就是 `AIMessageChunk`。
     """
 
     def __init__(self, text):
-        self.text = text
-        self.tool_calls = []
+        super().__init__(content=text)
         self.usage_metadata = None
 
     def __add__(self, other):

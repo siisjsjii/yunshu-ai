@@ -1,7 +1,7 @@
 """整图行为:五条出口各走一遍,断言 trace(验收 1/5 的可检查性来源)。"""
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.emit import make_emitter
@@ -24,10 +24,21 @@ class _Intent:
         self.confidence = confidence
 
 
-class FakeChunk:
+class FakeChunk(AIMessageChunk):
+    """ch07:**基类是真正的 `AIMessageChunk`**。
+
+    agent 节点现在把累积出来的 chunk 整个塞进 `state["messages"]`,而这个通道的
+    `add_messages` reducer 会对条目做消息强制转换 —— 裸对象的红法是
+    `NotImplementedError: Unsupported message type: <class '...FakeChunk'>`,
+    指向替身而不是实现。真实链路上流的**就是** `AIMessageChunk`,所以这是把替身
+    补齐到生产形状(与 T3 给替身补 `flush` 同一条理由)。
+    """
+
     def __init__(self, text="", tool_calls=None, usage=None):
-        self.text = text
-        self.tool_calls = [{"type": "tool_call", **tc} for tc in (tool_calls or [])]
+        super().__init__(
+            content=text,
+            tool_calls=[{"type": "tool_call", **tc} for tc in (tool_calls or [])],
+        )
         self.usage_metadata = usage
 
     def __add__(self, other):
@@ -393,6 +404,12 @@ async def test_resolve_references_resets_every_per_turn_channel():
     结果**当本轮知识塞进 prompt —— 用户看到的是上一轮的知识,且完全静默。
 
     两轮整图用例(闲聊轮)盖不住它:闲聊不读 `evidence`。
+
+    ch07:`turn_messages` 也进了这份清单,而且是**唯一不会自动被覆盖**的一个 ——
+    其余通道每轮都被节点写一遍,这个只在「本轮真的产生了消息」时才写。所以
+    「这轮没产生消息」的路径(挂起的那一轮)会**原样继承上一轮的值**,
+    上一轮的 assistant 消息就会被**再写一遍**。入参里**显式给一个非空旧值**:
+    不给的话它本来就是空的,断言恒真(与被测实现无关)。
     """
     node = make_resolve_references_node(model=_EchoModel())
     out = await node({
@@ -404,6 +421,7 @@ async def test_resolve_references_resets_every_per_turn_channel():
         "choices": ["handoff"],
         "citations": [{"n": 1}],
         "tool_calls_made": [{"name": "query_order"}],
+        "turn_messages": [AIMessage(content="上一轮的回复")],
     })
 
     assert out["resolved_input"] == "在吗"
@@ -415,6 +433,7 @@ async def test_resolve_references_resets_every_per_turn_channel():
     assert out["choices"] == []
     assert out["citations"] == []
     assert out["tool_calls_made"] == []
+    assert out["turn_messages"] == []
 
 
 @pytest.mark.anyio

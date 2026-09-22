@@ -8,7 +8,7 @@
 import logging
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import ValidationError
 
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
@@ -87,7 +87,15 @@ def make_chitchat_reply_node(*, emit):
 
     async def chitchat_reply(state) -> dict:
         emit({"frame": "token", "text": CHITCHAT_REPLY})
-        return {"reply": CHITCHAT_REPLY, "choices": [], "trace": ["chitchat_reply"]}
+        # 两个通道**都要写**:`messages` 给 add_messages 累积、`turn_messages` 给
+        # `log_turn` 落库(ch07)。只写 `reply` 的节点在 ch07 会**只落用户那一句、
+        # 客服回复永远不落库** —— 而每一轮看起来都正常(见 `log_turn` 的说明)。
+        return {
+            "reply": CHITCHAT_REPLY,
+            "messages": [AIMessage(content=CHITCHAT_REPLY)],
+            "turn_messages": [AIMessage(content=CHITCHAT_REPLY)],
+            "choices": [], "trace": ["chitchat_reply"],
+        }
 
     return chitchat_reply
 
@@ -100,7 +108,12 @@ def make_fallback_reply_node(*, emit):
 
     async def fallback_reply(state) -> dict:
         emit({"frame": "token", "text": FALLBACK_REPLY})
-        return {"reply": FALLBACK_REPLY, "choices": [], "trace": ["fallback_reply"]}
+        return {
+            "reply": FALLBACK_REPLY,
+            "messages": [AIMessage(content=FALLBACK_REPLY)],
+            "turn_messages": [AIMessage(content=FALLBACK_REPLY)],
+            "choices": [], "trace": ["fallback_reply"],
+        }
 
     return fallback_reply
 
@@ -117,6 +130,8 @@ def make_complaint_reply_node(*, emit):
         emit({"frame": "choices", "options": [CHOICE_HANDOFF, CHOICE_TICKET]})
         return {
             "reply": COMPLAINT_REPLY,
+            "messages": [AIMessage(content=COMPLAINT_REPLY)],
+            "turn_messages": [AIMessage(content=COMPLAINT_REPLY)],
             "choices": ["handoff", "ticket"],
             "trace": ["complaint_reply:choices"],
         }
@@ -241,6 +256,10 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         return acc, used
 
     async def agent_node(state) -> dict:
+        # ⚠️ `state.get("history")` 现在是**精简版**(层 2 截短段 + 层 1 原文段,
+        # T10 接线);`state["messages"]` 是累积的**完整**历史 —— 两者的分工见
+        # `app/agent/state.py`。收窄成 `history` 不违和,因为精简版正是为这一轮
+        # 组装出来的;**别**在这里改成读 `messages`,那会把整段历史原样塞进 prompt。
         msgs = build_messages(
             brand_name=settings.brand_name,
             history=state.get("history") or [],
@@ -253,6 +272,9 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         steps = 0
         usage_total = 0
         needs_final = False
+        # 本轮新产生的消息(不含播种进来的历史):tool 往返 + 最终回复。
+        # 交给 add_messages 并入 state,再由 log_turn 落库。
+        new_messages: list = []
 
         for step in range(1, settings.max_agent_steps + 1):
             steps = step
@@ -262,10 +284,13 @@ def make_agent_node(*, model, tools, registry, settings, emit):
 
             if not tool_calls:
                 needs_final = False
+                msgs.append(acc)
+                new_messages.append(acc)     # ← 这一轮的输出就是最终回复,收下
                 break
 
             needs_final = True
             msgs.append(acc)
+            new_messages.append(acc)         # ← 带 tool_calls 的 assistant
             for call in tool_calls:
                 emit({"frame": "tool_call", "name": call["name"],
                       "args": call["args"], "tool_call_id": call["id"]})
@@ -274,7 +299,9 @@ def make_agent_node(*, model, tools, registry, settings, emit):
                 )
                 emit({"frame": "tool_result", "tool_call_id": outcome.tool_call_id,
                       "ok": outcome.ok, "summary": outcome.summary})
-                msgs.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
+                tool_msg = ToolMessage(content=outcome.content, tool_call_id=call["id"])
+                msgs.append(tool_msg)
+                new_messages.append(tool_msg)      # ← 工具结果,层 2 要截的就是它
                 made.append({"name": call["name"], "ok": outcome.ok})
                 trace.append(f"agent:step{step} tool={call['name']}")
 
@@ -284,12 +311,27 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         if needs_final:
             # 收尾:不绑 tools。预算已超也照做一次 —— 它是**唯一**能产出
             # 用户可见答复的调用,不做的话这一轮就是「有工具调用、没有回答」。
-            _, used = await _stream_round(model, msgs, parts)
+            #
+            # 这一轮的输出**不在上面任何一条消息里**,必须自己收下来,
+            # 否则下一轮的完整历史里**没有客服说过的话**。
+            final_acc, used = await _stream_round(model, msgs, parts)
             usage_total += used
+            new_messages.append(
+                final_acc if final_acc is not None else AIMessage(content="".join(parts))
+            )
 
         trace.append("agent:converged")
+        # 两个键值**相同、语义不同**,别只写一个:
+        #   `messages`      → add_messages 累积进完整历史(跨轮)
+        #   `turn_messages` → 逐轮覆写,`log_turn` 落库的唯一依据(只写本轮)
+        # 只写前者 ⇒ 落库恒空(或写重);只写后者 ⇒ 完整历史里没有本轮。
+        # ⚠️ **不要**写成 `[*new_messages, AIMessage(content=reply)]` —— 无工具
+        # 那一轮 `acc` 已经在 `new_messages` 里了,再补一条就是**同一句回复出现
+        # 两次**,而它只在「模型一轮直接答完」时发生(带工具的轮次不会)。
         return {
             "reply": "".join(parts),
+            "messages": new_messages,
+            "turn_messages": new_messages,
             "agent_steps": steps,
             "tool_calls_made": made,
             "usage": {"total_tokens": usage_total},
@@ -374,6 +416,14 @@ def make_resolve_references_node(*, model):
             "citations": [],
             "evidence": [],
             "tool_calls_made": [],
+            # ch07:`turn_messages` 是**覆写**通道,而 `log_turn` 只拿它落库 ——
+            # 不重置的话「这轮没产生消息」的路径会**原样继承上一轮的值**,
+            # 上一轮的 assistant 消息被再写一遍(历史里同一个回复出现两次)。
+            # 它是这份清单里**唯一一个不会被节点自动覆盖**的通道,所以必须在这儿。
+            # 这是 ch05–ch06「**通道与它的清零必须同处一地**」的第三次应用。
+            # ⚠️ `messages` **不在此列**(它是累积通道):加进来等于每轮清空
+            # 完整历史,而单轮测试完全看不出来。
+            "turn_messages": [],
             # 退款子流程的三个槽位(T7 新加)。**通道与它的清零同处一地**:
             # 漏了这三行的后果是**静默串轮** —— 上一轮填过的订单号会被这一轮
             # 当成本轮槽位,用户明明没提订单号却既不弹卡片、又拿着**上一单**
@@ -387,6 +437,38 @@ def make_resolve_references_node(*, model):
     return resolve_references
 
 
+def _lc_to_records(messages) -> list[Message]:
+    """把本轮 ReAct 的 LangChain 消息转成落库用的纯数据 `Message`。
+
+    - `AIMessage` / `AIMessageChunk` → `role="assistant"`,带 `tool_calls`(可能为空)
+    - `ToolMessage` → `role="tool"`,带 `tool_call_id`
+
+    **不复用 `prompts.to_lc_messages`**:那是**反方向**的、且本函数刻意不依赖
+    LangChain 之外的东西;而 `memory/` 与 `services/` 不依赖 LangChain 是本仓的
+    既有约定 —— 落库的转换因此留在这个本来就 LangChain-facing 的文件里。
+
+    用 `isinstance(m, ToolMessage)` 分流而不是看 `role` 属性:LangChain 消息
+    没有 `role` 这个字段(有的是 `type`),按"我以为的形状"取值会在真机上炸。
+
+    `content` 取 `m.content or ""`:`AIMessage` 在只申请调用工具时 content 是
+    空串/None;而 `schemas.Message.content` 是 NOT NULL 的列。
+
+    ⚠️ `Message(role="tool")` 必须带**非空** `tool_call_id`,否则
+    `schemas.Message` 的 validator 会抛(ch01 加的护栏,本章第一次真的用到)。
+    ToolMessage 的这个字段由上游保证非空(`app/agent/nodes.py` 里构造时用的是
+    `call["id"]`),所以这里原样透传,不做 `or ""` 那种会把畸形行写进库的兜底。
+    """
+    out: list[Message] = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            out.append(Message(role="tool", content=m.content or "",
+                               tool_call_id=m.tool_call_id))
+        else:
+            out.append(Message(role="assistant", content=m.content or "",
+                               tool_calls=m.tool_calls or None))
+    return out
+
+
 def make_log_turn_node(*, session, emit):
     """日志记录:落一行结构化日志、把 trace 发成帧、把这一轮写回 MySQL。
 
@@ -395,6 +477,21 @@ def make_log_turn_node(*, session, emit):
 
     它同时以 `trace` 帧发给端点(端点折进 `done`、不外推给前端)—— 走的是
     和 token 帧同一条 emit 通道,所以**不需要第二个 stream_mode**。
+
+    ---- ch07:落库的内容从「user + reply」变成「user + 本轮 ReAct 往返」----
+
+    读的是 **`turn_messages`** 而不是 `messages`:
+
+    - `state["messages"]` 是 `add_messages` 通道,**累积的是全量**(播种进来的
+      历史 + 本轮新增)。拿它落库 = 每轮把整段历史再写一遍 ⇒ **历史翻倍**,
+      而每一轮的回复看起来都正常、每条单测只要不数字数就全绿。
+    - `turn_messages` 是**逐轮覆写**的通道,只装本轮新产生的消息。
+
+    **刻意不写「`turn_messages` 为空就退回用 `reply`」的兜底**:那会让「某个节点
+    忘了写这个通道」**静默退化成看起来正常的旧行为**(只落一条 assistant),
+    而本仓的记性里,这类兜底最后都变成了缺陷的藏身处。宁可让漏写的那轮落出
+    一条**空的** assistant 行(既有那几条「落库是 user+assistant 两条」的测试
+    会当场变红),也不要它自己悄悄补上。
     """
 
     async def log_turn(state) -> dict:
@@ -430,7 +527,7 @@ def make_log_turn_node(*, session, emit):
             conversation_id=state["conversation_id"],
             messages=[
                 Message(role="user", content=state["user_input"]),
-                Message(role="assistant", content=state.get("reply") or ""),
+                *_lc_to_records(state.get("turn_messages") or []),
             ],
         )
         return {"trace": ["log_turn"]}

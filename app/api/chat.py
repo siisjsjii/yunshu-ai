@@ -14,6 +14,7 @@ from app.db.session import get_session
 from app.llm import create_chat_model, create_extract_model
 from app.memory.store import SessionStore
 from app.memory.trim import ContextOverflowError
+from app.prompts import to_lc_messages
 from app.sanitize import redact_api_key
 from app.schemas import ChatRequest, TicketRequest
 from app.services.chat import prepare_turn
@@ -150,6 +151,22 @@ async def chat_stream(
             checkpointer=get_checkpointer(),
         )
 
+        # 这一线程当前的 state —— **两个分支都要用**,所以在分支之前取一次。
+        # (ch06 起它只服务 `resume` 那条待续检查;ch07 起非续跑的那条也要它
+        #  决定「要不要播种」。提到分支之前 = 每请求仍然只取**一次**快照,
+        #  代价是非续跑的那条路径多了一次内存读。)
+        snapshot = await graph.aget_state(
+            {"configurable": {"thread_id": session_id}}
+        )
+        # 播种判据。`messages` 从没被写过时是**空列表**(`add_messages` 通道的
+        # 初值就是 `[]`),不是 None —— `or []` 兜的是「这个 thread 还没有
+        # checkpoint」那种返回空 dict 的情形。
+        #
+        # ⚠️ 取的是 `snapshot.values`,**不是** `snapshot.next` —— 后者是
+        # 「待续节点名」,与 state 内容无关,取错了**恒得空列表** ⇒ 每轮都播种
+        # ⇒ 整段历史被重复追加,而每一轮的回复看起来都正常。
+        seeded = list(snapshot.values.get("messages") or [])
+
         if request.resume is not None:
             # **续跑不是新的一轮**(ch06,spec §5.1),而且**必须先确认真的有待续
             # 任务**。两件事都在这里说清:
@@ -168,9 +185,10 @@ async def chat_stream(
             #    槽位全都从 checkpointer 的断点里恢复,读出来没有读者。而
             #    `prepare_turn` 更不能用:它拿不到本轮输入(挂起那轮的原话在 state
             #    里),真拿 None 递进去会炸在 tiktoken 里 —— 请求语义问题变 500。
-            snapshot = await graph.aget_state(
-                {"configurable": {"thread_id": session_id}}
-            )
+            #
+            # ③ **不播种**(ch07)。续跑续的是**同一轮**,上下文从 checkpoint
+            #    还原即可;这里递 `messages` 会被并进 state —— 而续跑的那一轮
+            #    本来就会把它自己那批消息再写一遍。
             if not snapshot.next:
                 # 409 而不是 422:请求体本身**完全合约定**(spec §5.1 的形状),
                 # 冲突的是**这个会话的状态**(没有待续流程)—— 与本文件上面那条
@@ -190,6 +208,23 @@ async def chat_stream(
                 "history": history,        # prepare_turn 返回的**裁剪后**历史
                 "trace": [],
             }
+            # **只在 state 没有 messages 时播种**(spec §7.4)。`add_messages` 是
+            # append-only:每轮无条件播种会把整段历史重复追加,而每一轮的回复
+            # 看起来都**完全正常**(帧、落库、状态码一个都不变)。
+            #
+            # 两道防线缺一不可:① 这个判据;② `to_lc_messages` 给每条带上的
+            # MySQL 主键(稳定 id)—— 同一个 id 再次并入是**替换**而不是追加,
+            # 所以「重新播种同一批消息」是幂等的。只有 ① 时,播种在「state 非空
+            # 但库里有更多行」时仍会追加(agent 本轮写的消息没有 MySQL id);
+            # 只有 ② 时,每轮都要白读一次全量历史。
+            #
+            # 服务重启自愈:`InMemorySaver` 是**进程内**的,重启后 checkpoint 全空
+            # ⇒ 下一次请求 `messages` 为空 ⇒ 自动从 MySQL 重新播种(spec §7.4)。
+            # 这就是「MySQL 是权威源」在代码上的落点。
+            if not seeded:
+                stream_input["messages"] = to_lc_messages(
+                    await load_history(session=session, conversation_id=session_id)
+                )
     except ContextOverflowError as exc:
         lock.release()
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -1,11 +1,12 @@
 """主力 Agent 的 ReAct 循环:收敛、工具回灌、停止条件、token 预算、流式。"""
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
-from app.agent.nodes import make_agent_node
+from app.agent import nodes
+from app.agent.nodes import make_agent_node, make_log_turn_node
 from app.config import Settings
-from app.prompts import render_evidence
+from app.prompts import render_evidence, to_lc_messages
 from app.schemas import Message
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import SUMMARY_MAX_CHARS
@@ -34,6 +35,12 @@ def _text(msg) -> str:
 class FakeChunk:
     def __init__(self, text="", tool_calls=None, usage=None):
         self.text = text
+        #: ch07:**`content` 必须与 `text` 同步**。真实 `AIMessageChunk` 两个
+        #: 属性都有(content 是原样、text 是它的纯文本视图),而 agent 节点现在会把
+        #: 累积出来的 chunk **整个塞进 state**、再由 `log_turn` 的 `_lc_to_records`
+        #: 读 `m.content` 落库 —— 替身少了这个属性,红法是 `AttributeError:
+        #: 'FakeChunk' object has no attribute 'content'`,指向的是替身而不是实现。
+        self.content = text
         # 必须带 "type": "tool_call" —— 见 CLAUDE.md;缺键时 BaseTool.ainvoke
         # 会把整个 dict 当**参数**去校验 schema,每次调用都变成「参数不合法」。
         self.tool_calls = [{"type": "tool_call", **tc} for tc in (tool_calls or [])]
@@ -55,7 +62,7 @@ class FakeChunk:
             text=self.text + other.text,
             tool_calls=self.tool_calls + other.tool_calls,
             usage=other.usage_metadata or self.usage_metadata,
-        )
+        )   # ↑ content 由 __init__ 跟着 text 走,这里不另传(真实 chunk 同形)
 
 
 class _BoundModel:
@@ -386,6 +393,105 @@ async def test_evidence_block_numbering_is_one_based_and_matches_citations():
     assert "[2] (物流) 48 小时内发货" in text     # section_path 为 None 时退回 category
     assert "[0]" not in text
     assert "[3]" not in text
+
+
+@pytest.mark.anyio
+async def test_agent_node_returns_its_react_exchange_in_messages():
+    """agent 返回的 `messages` 必须**含** assistant(tool_calls)、tool、
+    以及收尾那条回复 —— 三条,一条都不能少。
+
+    少 tool 那条 ⇒ 工具往返不落库 ⇒ 下一轮的层 2 里没有「大块工具结果」可截,
+    而本章正是为它设计的。少收尾那条 ⇒ 完整历史里**没有客服说过的话**。
+
+    ⚠️ 与原计划的一处偏差:计划写的是
+    `[type(m).__name__ for m in out["messages"]] == ["AIMessage", "ToolMessage", "AIMessage"]`
+    —— 那个期望值**任何实现都拿不到**:agent 攒下来的是**流式 chunk**,
+    真机上是 `AIMessageChunk`、本文件里是 `FakeChunk`,两者的 `__name__` 都不是
+    "AIMessage"。而且它连「是不是工具结果」这一件事都表达不出来(三个名字里
+    只有中间那个是 `isinstance` 意义上的 ToolMessage)。改成 `isinstance` 判据:
+    判别力**只增不减** —— 中间那条换成任何非 ToolMessage 都会红。
+    """
+    tool = FakeTool(name="query_order", content='{"status": "已发货"}')
+    model = ScriptedModel([
+        [FakeChunk("", tool_calls=[
+            {"name": "query_order", "args": {"order_id": "1001"}, "id": "call_1"}
+        ])],
+        [FakeChunk("您的订单已发货。")],
+    ])
+    out = await _node(model, tools=[tool], registry={"query_order": tool}).__call__(_state())
+
+    assert [isinstance(m, ToolMessage) for m in out["messages"]] == [False, True, False]
+    # 第 0 条:**带 tool_calls 的 assistant**(不是随便一条非 ToolMessage)
+    assert [tc["name"] for tc in out["messages"][0].tool_calls] == ["query_order"]
+    assert out["messages"][1].tool_call_id == "call_1"       # 配对没断
+    assert out["messages"][2].content == "您的订单已发货。"   # 收尾回复在里面
+
+
+@pytest.mark.anyio
+async def test_log_turn_persists_the_react_exchange_including_tool_rows(monkeypatch):
+    """落库的历史必须含 `role='tool'` 的行。
+
+    改动前 production **零处**写这种行(grep 过全仓,只有 `test_history.py`
+    为验往返写过),所以这条断言是本仓库第一次真的要求它存在。
+
+    ⚠️ 与原计划的两处偏差(两处都让判别力**变强**,不是放宽):
+
+    ① 喂进去的是 **`turn_messages`** 而不是 `messages` —— `log_turn` 读的就是
+       前者。喂后者的话,`log_turn` 改成读 `messages`(本章最要命的写错方式)
+       这条**照样全绿**;喂前者才会红成「只剩 user 一条」。
+    ② 顺带把 `messages`(累积通道)也放进 state,且**比本轮多一条** —— 于是
+       「落库只写本轮」这件事真的被区分开:读 `messages` 会写出 5 行。
+    """
+    captured: list[Message] = []
+
+    async def _capture(*, session, conversation_id, messages):
+        captured.extend(messages)
+        return list(range(1, len(messages) + 1))
+
+    monkeypatch.setattr(nodes, "append_turn", _capture)
+    node = make_log_turn_node(session=object(), emit=lambda p: None)
+    turn = [
+        AIMessage(content="", tool_calls=[{
+            "name": "query_order", "args": {"order_id": "1001"},
+            "id": "call_1", "type": "tool_call",
+        }]),
+        ToolMessage(content='{"status": "已发货"}', tool_call_id="call_1"),
+        AIMessage(content="已发货。"),
+    ]
+    await node({
+        "conversation_id": "c1",
+        "user_input": "订单 1001 发货了吗",
+        "reply": "已发货。",
+        # 累积通道里是「播种进来的历史 + 本轮」—— 拿它落库 = 每轮把整段历史
+        # 再写一遍(历史翻倍,而每一轮的回复看起来都正常)。
+        "messages": [*to_lc_messages([Message(role="user", content="上一轮的问题")]), *turn],
+        "turn_messages": turn,
+    })
+
+    assert [m.role for m in captured] == ["user", "assistant", "tool", "assistant"]
+    tool_row = next(m for m in captured if m.role == "tool")
+    assert tool_row.tool_call_id == "call_1"        # schemas.Message 的护栏要求它
+    assert "已发货" in tool_row.content
+    # **只写本轮**:播种进来的历史已经在库里了,写重了就是历史翻倍,
+    # 而每一轮的回复看起来都正常。
+    assert len(captured) == 4
+    # 落库的是**完整**的工具结果,不是展示用的 summary(同 `_stream_round`
+    # 回灌给模型的那条口径:`outcome.content`,不是 `outcome.summary`)。
+    assert tool_row.content == '{"status": "已发货"}'
+
+
+def test_to_lc_messages_uses_the_mysql_id_as_the_langchain_id():
+    """稳定 id 是「重播种幂等」的前提。
+
+    没有它,`add_messages` 会给每条重新构造的消息赋一个新 uuid,
+    于是「重新播种同一批消息」= 再追加一遍。
+    """
+    msgs = to_lc_messages([
+        Message(id=7, role="user", content="你好"),
+        Message(id=8, role="assistant", content="你好呀"),
+        Message(role="assistant", content="还没有 id"),      # 手工构造的
+    ])
+    assert [m.id for m in msgs] == ["7", "8", None]
 
 
 @pytest.mark.anyio

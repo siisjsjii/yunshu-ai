@@ -12,7 +12,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from langchain.tools import tool
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from sqlalchemy import Update, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql.elements import BinaryExpression
 
@@ -64,7 +65,7 @@ CLAUSE_CHUNK = RetrievedChunk(
 # ---------- 替身 ----------
 
 
-class FakeChunk:
+class FakeChunk(AIMessageChunk):
     """模拟 AIMessageChunk:支持 + 累加,累加后携带 tool_calls。
 
     `"type": "tool_call"` 这个键**必须有**:真实链路上模型流出的 tool_call
@@ -73,14 +74,31 @@ class FakeChunk:
     `x.get("type") == "tool_call"`。缺键时 langchain 会把整个 dict 当成
     参数去校验,每次调用都退化成"参数不合法"的可恢复失败 —— 事件序列
     照样长得像那么回事,却一次都没走到真实执行路径上。
+
+    ch07:**基类从 `object` 换成真的 `AIMessageChunk`**。agent 节点现在把
+    累积出来的 chunk **整个塞进 `state["messages"]`**,而那个通道的
+    `add_messages` reducer 会对每个条目做消息强制转换 —— 一个裸对象的红法是
+    `NotImplementedError: Unsupported message type: <class '...FakeChunk'>`,
+    指向替身而不是实现。真实链路上这里流的**就是** `AIMessageChunk`
+    (`create_react_agent` 的模型节点也这么写),所以这不是给实现兜底,
+    是把替身补齐到生产形状(与 T3 给替身补 `flush` 同一条理由)。
     """
 
     def __init__(self, text="", tool_calls=None, usage=None):
-        self.text = text
-        self.tool_calls = [{"type": "tool_call", **tc} for tc in (tool_calls or [])]
+        # content/`tool_calls` 都走真实字段;`.text` 由基类的属性给出(即 content 的
+        # 纯文本视图),不再自己塞一个 —— 两个属性不会再有对不上的可能。
+        super().__init__(
+            content=text,
+            tool_calls=[{"type": "tool_call", **tc} for tc in (tool_calls or [])],
+        )
         self.usage_metadata = usage
 
     def __add__(self, other):
+        # 与既有实现同义(text/tool_calls 相加、usage 取非空的那个)。
+        # **刻意不换成基类的 `__add__`**:真实 chunk 的合并走的是
+        # `tool_call_chunks` 的按 index 分片拼接,而本文件的替身是把
+        # tool_call 整条塞进一批里 —— 那套分片语义在这里用不上,硬换会让
+        # 「一轮里两个 chunk 各带一个 tool_call」这条用例变成另一种形状。
         return FakeChunk(
             text=self.text + other.text,
             tool_calls=self.tool_calls + other.tool_calls,
@@ -288,7 +306,25 @@ class FakeSession:
         self._next_id = 1
 
     async def execute(self, stmt, *args, **kwargs):
+        # ch07 起端点还会发锚点推进用的 `update(...)`(降级路径,§7.2)。
+        # **必须真的改内存里的那条 Conversation** —— 做成 no-op 的替身会让
+        # 「降级真的持久化了吗」恒真(tests/test_api_chat.py 的 T10 那几条)。
+        # 本任务(T5)的端点路径还不会走到这里(update 只在 T10 接上),
+        # 先按计划把替身补齐:补它是替身的事,不是实现的事。
+        if isinstance(stmt, Update):
+            conversation = self.conversations[stmt.whereclause.right.value]
+            for col, val in stmt._values.items():
+                # ⚠️ `.values(layer1_from_msg_id=7)` 的 `_values` 里存的是
+                # **`BindParameter` 对象**,不是 7 本身 —— 原样 `setattr` 会把
+                # 绑定参数写进 ORM 属性,于是 T10 的断言
+                # (`conv.layer1_from_msg_id > 0`)在**比较**那一步炸成 TypeError,
+                # 读起来像实现坏了。下面这行同时兜住「绑定参数」与「已经是字面量」
+                # 两种形态(自检见
+                # `test_fake_session_applies_updates_and_still_rejects_unknown_queries`)。
+                setattr(conversation, col.key, getattr(val, "value", val))
+            return _Result([])
         entity = stmt.column_descriptions[0]["entity"]
+        # ↓ 以下原样保留(Conversation / MessageRecord 两个分支),一行未改。
         value = _where_value(stmt)
         if entity is Conversation:
             conversation = self.conversations.get(value)
@@ -388,6 +424,36 @@ def client_factory(monkeypatch):
     app.dependency_overrides.clear()
 
 
+@pytest.mark.anyio
+async def test_fake_session_applies_updates_and_still_rejects_unknown_queries():
+    """**替身自检**(计划要求的那一条)。
+
+    两件事必须同时成立,少一件都会让 T10 的端点用例变成假绿:
+
+    ① `update(...)` 分支**真的改内存里那条 Conversation** —— 做成 no-op 的替身
+       会让「降级真的持久化了吗」恒真(断言读的是它刚写进去的值);
+    ② `_where_value` 对不支持的查询形态**仍然直接抛** —— 顺手放宽成「返回全部」
+       的话,「降级有没有写对行」就再也观测不到了(忽略 where 的替身会让
+       「历史串了会话」这类缺陷无从观测)。
+
+    ⚠️ 本任务(T5)的端点路径走不到 ①,它是给 T10 的降级路径预先铺好的 ——
+    所以这里直接对替身做自检,而不是等 T10 用「碰巧跑到了」当证据。
+    """
+    db = FakeSession()
+    db.conversations["c1"] = Conversation(
+        id="c1", user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+
+    await db.execute(
+        update(Conversation).where(Conversation.id == "c1").values(layer1_from_msg_id=7)
+    )
+    assert db.conversations["c1"].layer1_from_msg_id == 7
+
+    with pytest.raises(AssertionError):
+        await db.execute(select(Conversation))          # 没有 where ⇒ 替身不认识
+
+
 def _parse_sse(body: str) -> list[tuple[str, dict]]:
     """把 SSE 响应体解析成 (event, data) 列表。"""
     events = []
@@ -482,6 +548,95 @@ def test_second_turn_receives_first_turn_context(client_factory):
         "assistant",
     ]
     assert {m.conversation_id for m in client.db.messages} == {"s1"}
+
+
+def _state_messages(session_id: str) -> list:
+    """读**进程级 checkpointer** 里这个 thread 的 `messages` 通道。
+
+    端点用的就是 `graph.get_checkpointer()` 那个单例(T5 起端点在流开始前
+    读它做播种判据),所以这里读到的是真链路写进去的东西,不是替身的复述。
+    """
+    from app.agent.graph import get_checkpointer
+
+    tup = get_checkpointer().get_tuple({"configurable": {"thread_id": session_id}})
+    assert tup is not None, f"thread {session_id} 没有 checkpoint"
+    return list(tup.checkpoint["channel_values"].get("messages") or [])
+
+
+def test_second_turn_on_the_same_session_does_not_duplicate_history(client_factory):
+    """**播种幂等** —— `add_messages` append-only 那个坑的落点。
+
+    每轮无条件播种 ⇒ 重新构造的消息没有 id ⇒ 当场被赋全新 uuid ⇒
+    整段历史被**再追加一遍**。第三轮时历史是三份,**而每一轮的回复看起来都正常**。
+
+    观测点选**模型实际收到的消息条数** + **state 里 `messages` 的内容** ——
+    帧、落库、HTTP 状态码在两种实现下**完全一样**。
+
+    ⚠️ 与原计划的两处偏差:
+
+    ① 计划写 `humans = [m for _, msgs in model.calls for m in msgs ...]`(跨
+       **所有**调用累计)。那会数到**两轮**的入参:第一轮 1 条 + 第二轮 2 条 = 3,
+       与它自己那句「上一轮 1 条 + 本轮 1 条 = 2」矛盾 —— 那条断言**永远红**。
+       改成只看**第二轮**那一次调用(这正是它要观测的东西)。
+    ② 只断「模型收到的条数」是**不够**的:模型收到的是 `history` 通道(端点从
+       MySQL 读出来再播种),而 `messages` 通道在 T5 里还没有读者 —— 于是
+       「每轮重复播种」这个变异**一个模型入参都不改**,条数照样是 2。所以这里
+       对 **checkpointer 里的 `messages`** 再断一次「没有一条内容出现两遍」:
+       那才是播种真的坏掉时会变的地方(实测变异:去掉 `if not seeded` 守卫,
+       下面第三组断言当场变红,见 task-5-report.md)。
+    """
+    client, model = client_factory(batches=[[FakeChunk("好")], [FakeChunk("的")]])
+    with client as c:
+        sid = _parse_sse(c.post("/api/chat/stream", json={"message": "第一句"}).text)
+        sid = [d for e, d in sid if e == "meta"][0]["session_id"]
+        c.post("/api/chat/stream", json={"session_id": sid, "message": "第二句"})
+
+    # 第二轮模型收到的 human 消息:上一轮 1 条 + 本轮 1 条 = 2。
+    # 重复播种会让上一轮那条()被再追加一次 ⇒ 3 条。
+    humans = [m for m in model.calls[-1][1] if type(m).__name__ == "HumanMessage"]
+    assert len(humans) == 2
+    assert [m.content for m in humans] == ["第一句", "第二句"]
+
+    # state 里的完整历史:一轮只该并入一次。
+    contents = [m.content for m in _state_messages(sid)]
+    assert contents, "state 里一条消息都没有 —— 播种/并入这条路根本没跑"
+    assert len(contents) == len(set(contents)), f"有内容被并入了两遍:{contents}"
+
+
+def test_first_request_seeds_the_history_that_is_already_in_mysql(client_factory):
+    """**播种那一半**:state 为空(进程重启/新会话)时,历史必须**真的**被读进来。
+
+    上一条只钉「不重复」——**不播种**的实现能让它全绿(0 条也是「没有重复」)。
+    本条的会话在 MySQL 里**已经有历史**而同 thread 的 checkpoint 尚不存在,
+    正是服务重启后的真实情形:`InMemorySaver` 是进程内的,重启后全空 ⇒
+    下一次请求必须从 MySQL 补回来(spec §7.4 的「重启自愈」)。
+
+    判据取「state 里出现了**库里那条**的内容」:把播种整段删掉,这里一条都看不到。
+    """
+    db = FakeSession()
+    db.conversations["s-seed"] = Conversation(
+        id="s-seed", user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    db.add(MessageRecord(conversation_id="s-seed", role="user", content="上一轮的问题"))
+    db.add(MessageRecord(conversation_id="s-seed", role="assistant", content="上一轮的回答"))
+
+    client, _ = client_factory(batches=[[FakeChunk("本轮的回答")]], session=db)
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"session_id": "s-seed", "message": "本轮的问题"})
+
+    assert resp.status_code == 200
+    msgs = _state_messages("s-seed")
+    contents = [m.content for m in msgs]
+    assert "上一轮的问题" in contents          # ← 播种真的发生了
+    assert "上一轮的回答" in contents
+    assert "本轮的回答" in contents            # ← 本轮那条照常并入
+    # 稳定 id:播种进来的消息带的是 MySQL 主键(`str(1)` / `str(2)`),
+    # **不是**当场生成的 uuid —— 「重播种幂等」全靠它。
+    # 判据按**内容**挑出播种的那两条(而不是按位置/按"不是本轮那条"),
+    # 免得将来「用户消息也进 state」时这条断言被误伤成假红。
+    seeded_ids = [m.id for m in msgs if m.content in ("上一轮的问题", "上一轮的回答")]
+    assert seeded_ids == ["1", "2"]
 
 
 def test_unknown_session_id_is_created_silently(client_factory):
@@ -926,16 +1081,27 @@ def test_chat_stream_emits_tool_call_event(client_factory):
         "create_ticket",
     }
 
-    # **调过工具的一轮也要落库,且落的是最终答复**。ch05 起 `log_turn` 是唯一
-    # 写方,写的只有 user + assistant(reply)两条 —— ch02 那四条(user /
-    # assistant(tool_calls) / tool / assistant)按设计不再落库。剩下这条**残留
-    # 保证**没人钉:`reply` 是 agent 各轮 `parts` 的拼接,工具轮的 token 是空的,
-    # 所以落库的 assistant 内容必须来自**收尾那一轮**。把 `log_turn` 里那次
-    # `append_turn` 删掉、或让它写 `state["user_input"]` 当回复,下面两条变红
-    # (前者由 `test_successful_turn_is_persisted_to_mysql_history` 一并覆盖,
-    # 后者只有这里看得见)。
-    assert [m.role for m in client.db.messages] == ["user", "assistant"]
-    assert client.db.messages[1].content == "已揽件。"
+    # **调过工具的一轮落库的是完整往返**(ch07 起):user / assistant(tool_calls)
+    # / tool / assistant。ch05–ch06 只落 user + assistant(reply)两条 —— 那句
+    # 旧注释连同它守的东西一起在这里作废,因为**本章的层 2 要截的就是那条
+    # tool 行**:不落它,「大块工具结果」在下一轮根本不存在。
+    #
+    # 四条各自钉住一件事,少一条就有一种实现能蒙混:
+    #   ① 工具轮的 assistant(tool_calls)**落库且配对**(`tool_call_id` 与
+    #      assistant 那条的 `tool_calls[].id` 一致)—— 落成两条无配对的
+    #      assistant 也能让「角色列表」看起来对,但下一轮读历史转
+    #      `ToolMessage` 时上游直接 400;
+    #   ② tool 行的内容是**完整工具结果**,不是展示用的截断 summary;
+    #   ③ 收尾那条 assistant 的内容来自**收尾那一轮**(`reply` 是各轮 parts 的
+    #      拼接,工具轮的 token 是空的)。
+    assert [m.role for m in client.db.messages] == ["user", "assistant", "tool", "assistant"]
+    calls_row, tool_row, final_row = client.db.messages[1], client.db.messages[2], client.db.messages[3]
+    assert [c["id"] for c in calls_row.tool_calls] == ["c1"]
+    assert tool_row.tool_call_id == calls_row.tool_calls[0]["id"]
+    # 落的是**完整**工具结果(JSON 文本),不是给前端看的截断 summary ——
+    # 截断版是 JSON 前缀、`json.loads` 直接炸(而那正是层 2 截短前的原料)。
+    assert json.loads(tool_row.content)["order_id"] == _SHIPPED_ORDER
+    assert final_row.content == "已揽件。"
 
 
 def test_recoverable_tool_failure_is_not_an_error_frame(client_factory):

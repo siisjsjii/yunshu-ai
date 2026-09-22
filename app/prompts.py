@@ -78,16 +78,27 @@ def to_lc_messages(history: Sequence[Message]) -> list:
 
     role="assistant" 且带 tool_calls 时,content 通常是空串 —— 这在
     上游是合法的(模型只申请调用、还没产出文字)。
+
+    ch07:`id` 用 **MySQL 主键**做稳定 id(`str(message.id)`;None 则不带)。
+    这不是修饰 —— `add_messages` 是 append-only,无 id 的消息会被当场赋一个新
+    uuid,于是「重新播种同一批消息」= **再追加一遍**。稳定 id 让重播种幂等。
+
+    反向的那一半(LC 消息 → 落库用的 `Message`)**不在本模块**:
+    它在 `app/agent/nodes.py::_lc_to_records` —— 那条路只在落库前走一次,
+    而 `memory/` 与 `services/` 不依赖 LangChain 是本仓的既有约定,
+    LangChain-facing 的文件本来就只有本模块与 `app/agent/`。
     """
     converted = []
     for message in history:
+        lc_id = str(message.id) if message.id is not None else None
         if message.role == "user":
-            converted.append(HumanMessage(message.content))
+            converted.append(HumanMessage(message.content, id=lc_id))
         elif message.role == "tool":
             converted.append(
                 ToolMessage(
                     content=message.content,
                     tool_call_id=message.tool_call_id or "",
+                    id=lc_id,
                 )
             )
         else:
@@ -95,6 +106,7 @@ def to_lc_messages(history: Sequence[Message]) -> list:
                 AIMessage(
                     content=message.content,
                     tool_calls=message.tool_calls or [],
+                    id=lc_id,
                 )
             )
     return converted
