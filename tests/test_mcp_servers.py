@@ -77,6 +77,30 @@ async def test_logistics_says_not_found_for_an_unsent_order():
 
 
 @pytest.mark.anyio
+async def test_warranty_product_comes_from_the_shared_order_record():
+    """⚠️ **这条是 T6 定稿后补的**(实现者实测上报)。
+
+    初稿只守住了**物流**那一半的「两个 Server 必须共用 `mock_data`」——
+    实现者把「改一个 aftersales 的种子前缀」这个变异跑了一遍,**6 条测试全绿**:
+    变异**确实生效了**(输出从「保修中」变成「已过保」),但**没有任何断言看得见它**。
+    也就是说,把 `query_warranty` 里那句 `order_record(order_no)["product"]`
+    换成它自己的随机流,**一条测试都不会红** ——
+    而它坏掉的表现与物流那半**一模一样**:
+    **同一个订单号,`query_order` 说「无线耳机」、`query_warranty` 说「运动鞋」。**
+
+    这里断的是**一致性**(而不是钉一个会随种子漂移的黄金值):
+    售后报的商品必须与订单真相源报的**是同一个**。
+    """
+    from app.tools.mock_data import order_record
+
+    order_no = "1008"
+    result = await aftersales.call_tool("query_warranty", {"order_id": order_no})
+    payload = json.loads(result[0][0].text)
+    assert payload["order_id"] == order_no
+    assert payload["product"] == order_record(order_no)["product"]
+
+
+@pytest.mark.anyio
 async def test_aftersales_is_deterministic():
     """同一入参两次调用必须同结果 —— 否则验收写不了会失败的断言。"""
     a = await aftersales.call_tool("query_warranty", {"order_id": "1002"})
