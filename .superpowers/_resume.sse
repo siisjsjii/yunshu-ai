@@ -1,0 +1,14 @@
+event: meta
+data: {"session_id": "c6e1160417454f90a0c7962139ef1cda", "model": "deepseek-flash"}
+
+event: citations
+data: {"items": [{"n": 1, "chunk_id": 1036, "section_path": null, "question": "退货政策是怎么规定的", "answer": "自签收之日起 7 天内,商品完好、不影响二次销售的,支持七天无理由退货,但需保持商品完好、吊牌齐全 [3][2]。定制类、生鲜类商品不适用无理由退货 [3]。退货商品经平台核验通过后,退款将原路退回,具体到账时效以平台售后规则为准 [1]。", "category": "退换货"}, {"n": 2, "chunk_id": 632, "section_path": "退货退款政策 > 无理由退货 > 适用范围", "question": "适用范围", "answer": "自签收之日起 7 天内,商品完好、不影响二次销售的,支持无理由退货。定制类、生鲜类商品除外。", "category": "退货退款政策 > 无理由退货"}, {"n": 3, "chunk_id": 633, "section_path": "退货退款政策 > 无理由退货 > 退款时效", "question": "退款时效", "answer": "退货商品经平台核验通过后,退款原路退回,到账时效以平台售后规则为准。", "category": "退货退款政策 > 无理由退货"}, {"n": 4, "chunk_id": 652, "section_path": null, "question": "退货政策是什么", "answer": "支持七天无理由退货,商品需保持完好、吊牌齐全。", "category": "退换货"}, {"n": 5, "chunk_id": 605, "section_path": "商品与购物 FAQ > 退货政策是什么", "question": "退货政策是什么", "answer": "支持 7 天无理由退货,商品需保持完好、不影响二次销售,具体以平台售后规则为准。", "category": "商品与购物 FAQ"}]}
+
+event: token
+data: {"text": "您这台机械键盘不属于定制类、生鲜类商品，按规则自签收之日起7天内、商品完好且不影响二次销售，是支持七天无理由退货的[1][2][4]。麻烦您保持商品完好、吊牌齐全再寄回，退款到账时效以平台售后规则为准[1]。"}
+
+event: refund_offer
+data: {"order_no": "20240915", "categories": ["商品质量问题", "不想要了", "发错货", "少发/漏发", "与描述不符"]}
+
+event: done
+data: {"finish_reason": "stop", "usage": null, "trace": ["resolve_references", "classify_intent:退款退货", "refund:resume 回填订单号", "refund:fetch ok", "refund_expand_retrieve:3 路 5 命中 top=0.57", "refund:judge 能退", "refund:offer 20240915", "log_turn"], "intent": "退款退货", "confidence": 0.95, "gate_passed": null, "agent_steps": 0}

@@ -1,0 +1,5 @@
+event: meta
+data: {"session_id": "c6e1160417454f90a0c7962139ef1cda", "model": "deepseek-flash"}
+
+event: order_choice
+data: {"options": [{"order_no": "20240915", "status": "已付款", "product": "机械键盘", "amount": "60.32"}, {"order_no": "20240901", "status": "已取消", "product": "机械键盘", "amount": "507.56"}, {"order_no": "20240818", "status": "已取消", "product": "无线耳机", "amount": "769.12"}, {"order_no": "20240808", "status": "已取消", "product": "双肩包", "amount": "478.23"}]}
