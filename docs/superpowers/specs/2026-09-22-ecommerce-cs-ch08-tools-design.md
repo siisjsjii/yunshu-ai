@@ -60,7 +60,8 @@ wheel 确认 v1 的真实形状:
 | 事实 | 证据(wheel 内路径) |
 |---|---|
 | 1.x 的入口是 **`mcp.server.FastMCP`**(不是 `MCPServer`) | `mcp/server/__init__.py`:`from .fastmcp import FastMCP` |
-| 传输参数在**构造函数**里(v1 语义) | `FastMCP(..., settings=Settings(...))` |
+| 传输参数在**构造函数**里(v1 语义),且是**直接关键字参数** | `FastMCP(name, *, host="127.0.0.1", port=8000, streamable_http_path="/mcp", json_response=False, stateless_http=False, …)` |
+| ⚠️ 不是 `FastMCP(..., settings=Settings(...))` | 写实现计划时逐字核对 `__init__` 订正 —— 同级还有一个名字也叫 `Settings` 的 pydantic 模型(`debug` / `log_level` 等**无默认值**),照猜会踩进去 |
 | `Settings` 含 `host` / `port` / `streamable_http_path` / `stateless_http` / `json_response` | `mcp/server/fastmcp/server.py` |
 | `mcp.streamable_http_app() -> Starlette`(路由 `/mcp`) | 同上 |
 | `mcp.run(transport="streamable-http")`(`Literal["stdio","sse","streamable-http"]`) | 同上 |
