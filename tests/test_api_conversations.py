@@ -18,7 +18,7 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.sql.elements import BinaryExpression
+from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList
 
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
@@ -26,6 +26,7 @@ from app.main import app
 
 CONV_A = "a" * 32
 CONV_B = "b" * 32
+CONV_C = "c" * 32
 
 #: 两个时刻。**T0 早、T1 晚**,且「别人的会话」用 T1 —— 列表若漏了 user 过滤,
 #: 它不但会出现,还会**排在第一个**(见 test_list_...)。
@@ -70,59 +71,68 @@ class _StubSession:
     async def execute(self, stmt, *args, **kwargs):
         cols = stmt.column_descriptions
         entity = cols[0]["entity"]
+        terms = _where_terms(stmt)
         if entity is Conversation:
             # 两种查询形态,**按比较的是哪一列**区分,不能只看「有没有 where」:
             #   `Conversation.id == <id>`   → 按 id 查单条(→ 404 那条路)
-            #   `Conversation.user == <u>`  → 列表查询(还有可能什么都没有)
+            #   `Conversation.user == <u>`  → 列表查询(还可能什么都没有)
             # **不要把这两种混成一种**:混了之后「列表接口串了另一个用户的会话」
             # 与「详情接口查不到就 404」两条断言会互相掩盖。
             #
-            # 列表这一支**要真按 user 过滤**:替身自己筛,端点漏了 `.where()`
-            # 就会把别人的会话带出来(见 `_where_column`)。写成「端点筛不筛都行」
-            # 的替身,等于让那条断言恒真。
-            clause = _where_clause(stmt)
-            if clause is not None and _where_column(clause) == "id":
-                row = self.conversations.get(clause.right.value)
+            # 列表这一支**真按 where 里写的条件筛**:端点漏了 `.where()`、或把条件
+            # 写错列,都会在断言上现形。写成「端点筛不筛都行」的替身,等于让
+            # 那条断言恒真。
+            by_id = [t for t in terms if t[0] == "id"]
+            if by_id:
+                if len(terms) != 1 or by_id[0][1] != "eq":
+                    raise AssertionError(f"替身不支持复合的 id 查询:{terms}")
+                row = self.conversations.get(by_id[0][2])
                 return _Result([row] if row is not None else [])
-            rows = list(self.conversations.values())
-            if clause is not None:
-                column = _where_column(clause)
-                if column != "user":
-                    raise AssertionError(f"替身不支持的列表过滤列:{column}")
-                rows = [c for c in rows if c.user == clause.right.value]
+            rows = [c for c in self.conversations.values() if _matches(c, terms)]
             # ⚠️ 这一句 `sorted` 让「端点有没有写 ORDER BY」在本文件里**不可观测**
             # (替身替它排好了)—— 顺序改由 db 用例钉,见
             # `tests/test_api_conversations_db.py`。
             return _Result(sorted(rows, key=lambda c: c.created_at, reverse=True))
         if entity is MessageRecord:
-            cid = _where_clause(stmt).right.value
-            if _where_column(_where_clause(stmt)) != "conversation_id":
-                raise AssertionError("替身只支持按 conversation_id 查消息")
-            rows = [m for m in self.messages if m.conversation_id == cid]
+            # 消息这一支同理:**替身自己按 where 筛**(`conversation_id == …` 与
+            # `role != 'tool'` 都在这里生效),但排序仍然是替身做的 ⇒
+            # 「按 id 升序」在单测里不可观测,同样由 db 用例钉。
+            rows = [m for m in self.messages if _matches(m, terms)]
             return _Result(sorted(rows, key=lambda m: m.id))
         raise AssertionError(f"替身不支持的实体:{entity}")
 
 
-def _where_clause(stmt):
-    """取 `select(...).where(col == 值)` 的那个子句;没有 where 就是 None。
+def _where_terms(stmt) -> list[tuple[str, str, object]]:
+    """把 `.where(...)` 拆成 `[(列名, 比较符, 值)]`;没有 where 就是 `[]`。
 
-    **取不出来时直接抛**,不退化成「返回全部」—— 忽略 where 的替身会让
-    「列表读到了别人的会话 / 详情读到了不存在的会话」这类缺陷无从观测。
+    支持的**形态**只有「列 `==` 值」与「列 `!=` 值」,多个条件按 AND(这也是本仓
+    端点实际用到的全部)。**取不出来时直接抛**,不退化成「返回全部」—— 忽略 where
+    的替身会让「列表读到了别人的会话」「详情读到了不存在的会话」「工具行漏进了
+    回载」这类缺陷统统无从观测。
     """
     clause = stmt.whereclause
     if clause is None:
-        return None
-    if not isinstance(clause, BinaryExpression):
-        raise AssertionError(f"替身不支持的查询形态:{stmt}")
-    return clause
+        return []
+    parts = list(clause.clauses) if isinstance(clause, BooleanClauseList) else [clause]
+    terms: list[tuple[str, str, object]] = []
+    for part in parts:
+        if not isinstance(part, BinaryExpression):
+            raise AssertionError(f"替身不支持的查询形态:{stmt}")
+        key = getattr(getattr(part, "left", None), "key", None)
+        op = getattr(getattr(part, "operator", None), "__name__", None)
+        if key is None or op not in ("eq", "ne"):
+            raise AssertionError(f"替身不支持的比较:{part}")
+        terms.append((key, op, part.right.value))
+    return terms
 
 
-def _where_column(clause):
-    """这个 where 比的是哪一列(`Conversation.id` / `Conversation.user` / …)。"""
-    key = getattr(getattr(clause, "left", None), "key", None)
-    if key is None:
-        raise AssertionError(f"替身取不出被比较的列:{clause}")
-    return key
+def _matches(obj, terms) -> bool:
+    """按 `_where_terms` 的结果判一行是否命中(列名即 ORM 属性名)。"""
+    for key, op, value in terms:
+        actual = getattr(obj, key)          # 列名写错 ⇒ AttributeError,响亮地炸
+        if (actual == value) is (op == "ne"):
+            return False
+    return True
 
 
 class _Result:
@@ -167,20 +177,20 @@ def conv_client():
     app.dependency_overrides.clear()
 
 
-def test_list_filters_by_demo_user_and_orders_newest_first(conv_client):
-    """固定 `user='demo-user'`(无认证,前端从来不传 user_id),新在前。
+def test_list_filters_by_demo_user(conv_client):
+    """固定 `user='demo-user'`(无认证,前端从来不传 user_id)。
 
     **必须放一个别的 user 的会话进去** —— 不放的话「有没有 WHERE user」
     在输出上完全一样,这条用例就恒真。
 
     别人的那条**故意给更晚的 `created_at`**:漏过滤时它不只是「多出来一条」,
-    而是**顶到第一位**,于是 `== [CONV_A]` 在第一个元素上就红(两种错法
-    ——「忘了过滤」与「过滤了但顺序反了」—— 的观测值因此不同)。
+    而是**顶到第一位**,于是 `== [CONV_A]` 在第一个元素上就红。
 
-    ⚠️ 「新在前」这一半在本文件里**没有判别力**:替身的 LIST 分支自己就按
-    `created_at` 倒序排,端点哪怕不写 `ORDER BY` 也照样绿 —— 替身替端点把事做了。
-    顺序与 SQL 侧的过滤改由 `tests/test_api_conversations_db.py` 在**真实库**上钉
-    (那边两个都会红:把 `order_by` 反过来、把 `.where()` 删掉)。
+    ⚠️ **名字里不再有「orders newest first」**(订正:原先的名字高报了)。
+    「新在前」在本文件里**没有判别力** —— 替身的 LIST 分支自己就按 `created_at`
+    倒序排,端点哪怕不写 `ORDER BY` 也照样绿(替身替端点把事做了)。
+    顺序改由 `tests/test_api_conversations_db.py` 在**真实库**上钉(把 `order_by`
+    反过来那边会红);过滤也在那边再钉一次(把 `.where()` 删掉)。
     """
     convs = {
         CONV_A: _conv(CONV_A, "demo-user", T0),
@@ -190,18 +200,29 @@ def test_list_filters_by_demo_user_and_orders_newest_first(conv_client):
     with client as c:
         items = c.get("/api/conversations").json()["items"]
     assert [i["id"] for i in items] == [CONV_A]        # ← 别人的那个不在里面
+    # 一条消息都没有 ⇒ 空串(spec §5.1「没有则空串」)。**必须断**:这个分支
+    # 每个探针都会走到,但没人断它 —— 返回 `None` 会违反声明的 str 契约,
+    # 而当时九条用例全绿(形态 (a):不设这一句,「没有」与「空串」就没人分开)。
+    assert items[0]["preview"] == ""
 
 
 def test_preview_comes_from_the_first_user_message(conv_client):
-    """预览取**第一条 user 消息**前 30 字 —— 不是最后一条,也不是条数。
+    """预览取**第一条 user 消息**前 30 字 —— 不是第一条消息,也不是最后一条。
 
-    放**两条** user 消息进去,取值取错(取最后一条)就会红。
+    放**两条** user 消息 + **一行 `role='tool'` 的工具结果**进去:
+    - 「取最后一条 user 消息」⇒ 拿到「后面又问的那个」,红;
+    - 「取第一条消息、不看 role」⇒ 拿到工具载荷,红(工具结果 ch07 起真的落表)。
+
+    ⚠️ **本文件判不了「顺序错了」**:替身的 messages 分支自己按 `m.id` 排,
+    端点把 `order_by` 反过来照样绿 ⇒ 「取第一条 user 消息」在真实库上由
+    `tests/test_api_conversations_db.py` 单独钉(那边插入顺序与 id 序相反)。
     """
     convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
     msgs = [
-        _msg(1, CONV_A, "user", "第一个问题"),
-        _msg(2, CONV_A, "assistant", "第一个回答"),
-        _msg(3, CONV_A, "user", "后面又问的那个"),
+        _msg(1, CONV_A, "tool", '{"order_no":"1002","status":"已取消"}'),
+        _msg(2, CONV_A, "user", "第一个问题"),
+        _msg(3, CONV_A, "assistant", "第一个回答"),
+        _msg(4, CONV_A, "user", "后面又问的那个"),
     ]
     client = conv_client(conversations=convs, messages=msgs)
     with client as c:
@@ -236,18 +257,50 @@ def test_summarized_flag_reflects_the_anchor_not_the_row_count(conv_client):
     A 的锚点是 0、B 的是 12;若实现改去数梗概行数,两个都会是 False,
     于是 B 那条断言变红。
 
-    两个会话都**不带任何消息、也没有梗概表** —— 「数梗概行数」那种实现
-    在这里数出 0 行,A 与 B 都会是 False,B 那行因此必红。
+    三个会话都**不带任何消息、也没有梗概表** —— 「数梗概行数」那种实现
+    在这里数出 0 行,A 与 C 都会是 False,B 那行因此必红。
+
+    **C 是用来分开两个锚点的**(`summary=0` 而 `layer1=5`):这个状态在生产上
+    **可达** —— `layers.degrade` 推进 `layer1_from` 时**不需要有梗概存在**。
+    缺了它,所有夹具的两个锚点都是相关的(`(0,0)` 与 `(12,20)`),
+    于是「把 `summary_upto_msg_id` 写成 `layer1_from_msg_id`」这个变异全绿 ——
+    而它的真实后果是:**在一个没有梗概的会话上报 `summarized: true`**。
     """
     convs = {
         CONV_A: _conv(CONV_A, "demo-user", T0, summary_upto_msg_id=0, layer1_from_msg_id=0),
         CONV_B: _conv(CONV_B, "demo-user", T0, summary_upto_msg_id=12, layer1_from_msg_id=20),
+        CONV_C: _conv(CONV_C, "demo-user", T0, summary_upto_msg_id=0, layer1_from_msg_id=5),
     }
     client = conv_client(conversations=convs, messages=[])
     with client as c:
         items = {i["id"]: i for i in c.get("/api/conversations").json()["items"]}
     assert items[CONV_A]["summarized"] is False
     assert items[CONV_B]["summarized"] is True       # ← 这条把「数行数」判死
+    assert items[CONV_C]["summarized"] is False      # ← 这条把「读错锚点」判死
+
+
+def test_messages_endpoint_hides_tool_rows(conv_client):
+    """`role='tool'` 的行**不回载**(spec §5.2 裁定)。
+
+    ch07 起工具结果落 `messages` 表,而「用户看见过的对话」里没有它们 ——
+    回给侧栏的话,`{"order_no":"1002","status":"已取消"}` 这种**原始工具载荷**
+    会被当成一条消息气泡画出来。
+
+    同时断言**同一批里 user/assistant 的行仍然在**:只断「工具行不在」的话,
+    一个恒返回空列表的实现也满足它。
+    """
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    msgs = [
+        _msg(1, CONV_A, "user", "订单 1002 到哪了"),
+        _msg(2, CONV_A, "assistant", "正在为您查询"),
+        _msg(3, CONV_A, "tool", '{"order_no":"1002","status":"已取消"}'),
+        _msg(4, CONV_A, "assistant", "这一单已取消"),
+    ]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
+    assert [i["role"] for i in items] == ["user", "assistant", "assistant"]
+    assert not any("order_no" in i["content"] for i in items)
 
 
 def test_messages_endpoint_returns_raw_text_not_truncated(conv_client):

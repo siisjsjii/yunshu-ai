@@ -8,8 +8,6 @@
 东西 —— 尤其**不重新渲染**任何内容(见 `list_messages` 的说明)。
 """
 
-import logging
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,12 +15,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
 
-logger = logging.getLogger(__name__)
-
 #: 无认证(spec §5.1 的产品口径),所以列表**固定**按这个 user 过滤 ——
 #: 与会话端点 `request.user_id or "demo-user"` 的默认值**同一个字面量**:
 #: 两边不一致的话,前端建出来的会话一个都不会出现在列表里,而两边都不报错。
 DEMO_USER = "demo-user"
+
+#: `messages` 表里**不进对话回载**的那一类行(spec §5.2)。
+#:
+#: ch07 起工具结果也落这张表(`app/memory/journal.py` 那条路),而它们是**模型与
+#: 工具之间**的往返,不是用户看见过的对话。回载给侧栏的话,`{"order_no":"1002",
+#: "status":"已取消"}` 这种**原始工具载荷**会被当成一条消息气泡画出来。
+TOOL_ROLE = "tool"
 
 #: 预览取前多少字(spec §5.1)。
 PREVIEW_CHARS = 30
@@ -112,7 +115,7 @@ async def list_conversations(session: AsyncSession = Depends(get_session)) -> di
 async def list_messages(
     conversation_id: str, session: AsyncSession = Depends(get_session)
 ) -> dict:
-    """某会话的全部消息,**按 id 升序**,回的是**原文**(spec §5.2)。
+    """某会话**用户看见过的**对话,**按 id 升序**,回的是**原文**(spec §5.2)。
 
     为什么是原文:侧栏切回来要看的就是「当初聊了什么」。**不能**拿发给模型的
     那份精简版回载 —— 层 2 的截短(`app/memory/layers.py:truncate`,
@@ -120,6 +123,17 @@ async def list_messages(
     「这条回复本来只有 50 字」写进 UI,而**没有任何东西报错**;梗概更不能回:
     它是**替换物**,原文还在库里,回梗概等于让用户看不见自己说过的话。
     本端点因此**不导入 `app.memory.layers`** —— 让它连误用的机会都没有。
+
+    **`role='tool'` 的行不回载**(spec §5.2 裁定)。ch07 起工具结果也落这张表,
+    而「用户看见过的对话」里没有它们:工具往返是**模型与工具之间**的,
+    回给侧栏的话 `{"order_no":"1002","status":"已取消"}` 这类**原始工具载荷**
+    会被当成一条消息气泡画出来。**过滤在 SQL 里**(`role != 'tool'`),
+    不是读回来再筛 —— 与列表的 user 过滤同一条理由:替身验不出「端点有没有
+    传对 SQL」。
+
+    ⚠️ **「按 id 升序」同样由 db 用例钉,单测钉不住** —— 替身的 messages 分支
+    自己就按 `m.id` 排(端点把 `order_by` 反过来它照样绿)。db 用例里探针消息的
+    **插入顺序与 id 升序相反**,`order_by` 一旦反了就现形。
 
     404 只表示「这个 id 在库里不存在」:前端点的那条会话可能已被删/清库,
     这时该给一个明确的「会话不存在」,而不是 200 + 空列表(空列表是
@@ -136,7 +150,10 @@ async def list_messages(
     rows = (
         await session.execute(
             select(MessageRecord)
-            .where(MessageRecord.conversation_id == conversation_id)
+            .where(
+                MessageRecord.conversation_id == conversation_id,
+                MessageRecord.role != TOOL_ROLE,
+            )
             .order_by(MessageRecord.id)
         )
     ).scalars().all()
