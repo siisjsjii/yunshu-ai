@@ -6,7 +6,11 @@
 SET NAMES utf8mb4;
 
 -- ch07:会话梗概。只追加,不删除、不重写(seq 从 1 起,只增不改)。
-CREATE TABLE IF NOT EXISTS conversation_summaries (
+-- 不带 IF NOT EXISTS(与 db/ch03.sql / db/ch04.sql / db/ch06.sql 同规矩):重复执行要
+-- **响亮地失败**,否则「表已存在但形状不对」会被静默咽掉 —— 典型情形是先跑了
+-- `scripts/init_db.py`(create_all 建表,那时 ORM 若没声明唯一键就建不出它),
+-- 这一句于是安静地什么都不做,唯一键**永远不存在而没有任何东西报错**。
+CREATE TABLE conversation_summaries (
   id              BIGINT       NOT NULL AUTO_INCREMENT,
   conversation_id VARCHAR(32)  NOT NULL,
   seq             INT          NOT NULL COMMENT '第 N 段,从 1 起,只增不改',

@@ -10,6 +10,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -191,14 +192,25 @@ class ConversationSummary(Base):
     `seq` 从 1 起(由 `services/history.append_summary_and_advance` 在提交前
     取 `MAX(seq)+1` 算得);`upto_msg_id` 是这一段覆盖到哪条 `messages.id`(含)。
 
-    ⚠️ **唯一键 `(conversation_id, seq)` 不在 ORM 声明里**(本类只声明了
-    `index=True`),它只在 db/ch07.sql 里 —— 所以 `create_all` 建出来的表
-    **没有这道防线**。这不是疏漏:它是并发保护的第二道(同一会话两个摘要任务
-    同时提交时,后者撞唯一键 ⇒ 失败 ⇒ 锚点不推进 ⇒ 下次重来;内存锁挡不住
-    多进程)。把库当成 db/ch07.sql 建的,`tests/test_db_models.py` 有哨兵。
+    唯一键 `(conversation_id, seq)` 是并发保护的第二道:同一会话两个摘要任务
+    同时提交时,后者撞唯一键 ⇒ 失败 ⇒ 锚点不推进 ⇒ 下次重来。内存锁挡不住
+    多进程,这个能。
+
+    它**必须在 DDL 与 ORM 两侧各声明一份**(见 `__table_args__` 那段):
+    两条建库路径(`scripts/init_db.py` 的 create_all / `db/ch07.sql` 的手工执行)
+    建出来的表形状必须相同。
     """
 
     __tablename__ = "conversation_summaries"
+
+    __table_args__ = (
+        # 必须在这里也声明一份:DDL 与 ORM 是**两条建库路径**
+        # (`scripts/init_db.py` 跑 create_all / `db/ch07.sql` 手工执行)。
+        # 只在一侧声明,两条路径建出来的表**形状不同** —— 行为变成
+        # 「看谁建的库」,而**没有任何东西会报错**。
+        # (同类教训:`RefundRequest.status` 的 default/server_default 两处都要。)
+        UniqueConstraint("conversation_id", "seq", name="uk_conv_seq"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
