@@ -44,13 +44,21 @@ bash scripts/acceptance_ch07.sh                                 # ch07 验收 1�
 #    比对形状,也不会报错。所以**每个带 `db/chNN.sql` 的章都必须在 init_db 之外
 #    再执行那份 DDL**,升级一个老库时尤其:`db/ch03.sql`(knowledge_chunks)、
 #    `db/ch04.sql`(low_confidence_questions)、`db/ch06.sql`(refund_requests)、
-#    **`db/ch07.sql`(新表 conversation_summaries + conversations 的两个锚点列)**。
+#    `db/ch07.sql`(新表 conversation_summaries + conversations 的两个锚点列)、
+#    **`db/ch08.sql`(新表 tool_audit_logs)**。
 #    漏掉 ch07 那份的后果不是「少个功能」:`conversations` 缺两列、`conversation_summaries`
 #    整张表不存在 ⇒ **每一个请求**都在 `ensure_conversation` 或分层读锚点那一步炸,
-#    而报错指向 SQL 列名,读起来像「ORM 写错了」。四份文件都不幂等(重复执行**响亮地失败**,
+#    而报错指向 SQL 列名,读起来像「ORM 写错了」。五份文件都不幂等(重复执行**响亮地失败**,
 #    这是刻意的:静默跳过会让「表已存在但形状不对」永远补不上);顺序上 `db/ch07.sql`
 #    自己**先 ALTER 后 CREATE**,必须在它内部的次序就是那样,别再调。
-#    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07`。
+#    ⚠️ `db/ch08.sql` 在**全新**库上会响亮地报 `ERROR 1050`(表已存在)—— 因为 ORM 侧有
+#    同名模型,`init_db.py` 的 create_all 已经顺带把这张表建了出来。**这是刻意的**,
+#    与 `db/ch06.sql` 的 refund_requests 是同一个已知取舍,不是脏库。但两条路径建出来的
+#    表**形状不同**(create_all 版:`id` 是 INT 不是 BIGINT、三个字符串列没有 `DEFAULT ''`、
+#    没有 `idx_created`、没有 COMMENT),所以新库上应当**让 DDL 建表**:要么先跑
+#    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
+#    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
+#    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`。
 
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)

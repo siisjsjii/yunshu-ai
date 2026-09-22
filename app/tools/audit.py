@@ -1,21 +1,87 @@
-"""工具调用审计 —— **唯一写口**。
+"""审计写入 —— 本章**唯一**的写口。
 
-⚠️ **本文件此刻是占位版**:只打一条 debug 日志,不落库。
-真正的实现(新表 `tool_audit_logs` + 独立 session + 失败只 `logger.error`)
-在 **T5**。占位先行的理由:执行器(T4)必须在**固定几处**调它,而那几处的
-**签名**正是 T5 要对着写的接口 —— 参数名在这一版就定死,别在 T5 里改。
+**两条硬约束**(要求 5 明写):
 
-**调用方**(`app/tools/executor.py`)传的参数名是固定的:
-`conversation_id` / `tool_call_id` / `tool_name` / `source` / `args` /
-`result_summary` / `status` / `retry_count` / `duration_ms`,
-外加校验失败时的 `error_detail`。改任何一个都要连带改执行器。
+1. **写审计失败不许反过来拦工具执行。** 所以这里一律 `except` + 日志,
+   绝不向上抛 —— 用 raise 的话,「库抖了一下」会变成「工具调用失败」,
+   方向正好反了。
+2. **自己开一个 session。** 不能复用工具那个:工具刚把 session 弄进
+   待回滚状态时,拿它写审计会把两件事绑在一起(审计成了工具失败的陪葬)。
+
+**为什么没有第二个调用点**:不变量要放在唯一写口上,不靠每个调用方自觉
+(本仓的元教训之一)。执行器在固定的两处调它 —— 校验拦下、执行结束。
 """
 
+import json
 import logging
+
+from app.db.base import get_sessionmaker
+from app.db.models import ToolAuditLog
 
 logger = logging.getLogger(__name__)
 
+#: 与 `db/ch08.sql` 的列宽一致。超长必须**截断而不是抛** ——
+#: 一个被模型撑爆的摘要字段不该让整条审计行丢掉
+#: (`create_ticket` 当年就栽过同一件事,它把 `ticket_type` 夹到 64)。
+_SUMMARY_MAX = 500
+_DETAIL_MAX = 500
+_NAME_MAX = 64
+_SOURCE_MAX = 64
+_CALL_ID_MAX = 128
 
-async def record_audit(**kwargs) -> None:
-    """占位:真正的落库在 T5。"""
-    logger.debug("audit %s", kwargs)
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _dump_args(args) -> str:
+    """入参 → 存进表的 JSON 文本。
+
+    `default=str` 是**必须的**:模型给的东西不受我们控制,
+    一个不可序列化的值不该让整条审计行丢掉。
+    """
+    try:
+        return json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:                                   # noqa: BLE001
+        return repr(args)
+
+
+async def record_audit(
+    *,
+    conversation_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    source: str,
+    args,
+    result_summary: str,
+    status: str,
+    error_detail: str = "",
+    retry_count: int = 0,
+    duration_ms: int = 0,
+) -> None:
+    """落一行。**永不抛。**"""
+    try:
+        async with get_sessionmaker()() as session:
+            session.add(
+                ToolAuditLog(
+                    conversation_id=conversation_id[:32],
+                    tool_call_id=_clip(tool_call_id, _CALL_ID_MAX),
+                    tool_name=_clip(tool_name, _NAME_MAX),
+                    source=_clip(source, _SOURCE_MAX),
+                    args=_dump_args(args),
+                    result_summary=_clip(result_summary, _SUMMARY_MAX),
+                    status=status,
+                    error_detail=_clip(error_detail, _DETAIL_MAX),
+                    retry_count=retry_count,
+                    duration_ms=duration_ms,
+                )
+            )
+            await session.commit()
+    except Exception:                                   # noqa: BLE001
+        # 宽到 `Exception` 是**刻意的**:这条路径上任何失败都只该留下痕迹,
+        # 不该影响工具执行。`BaseException`(CancelledError)不在内 —— 取消
+        # 要照常向上传播。
+        logger.exception(
+            "写审计失败(不影响工具执行):tool=%s status=%s", tool_name, status
+        )

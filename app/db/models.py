@@ -223,3 +223,35 @@ class ConversationSummary(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
+
+
+class ToolAuditLog(Base):
+    """工具调用审计。**只映射,不被任何业务读写。**
+
+    **刻意不挂外键**(spec §7.1):审计是**旁路记录** —— 挂了外键的话,
+    删会话/删工单会受约束,甚至反过来影响主流程。审计的职责是**只记不拦**。
+    """
+
+    __tablename__ = "tool_audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 不是 ForeignKey —— 见类 docstring。
+    conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    args: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    result_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_detail: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    # 两侧默认值都要:与 Conversation 的两个锚点同款理由 ——
+    # 只留 `default` 会让 create_all 建的表与 db/ch08.sql 建的表**形状不同**。
+    retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    duration_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
