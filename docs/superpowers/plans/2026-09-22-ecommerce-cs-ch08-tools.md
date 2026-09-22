@@ -171,6 +171,7 @@ import pytest
 from app.tools.mock_data import (
     ECHO_LIMIT,
     LOGISTICS_BY_STATUS,
+    logistics_record,
     order_record,
     require_order_no,
     rng,
@@ -193,18 +194,31 @@ def test_order_record_fields_are_stable():
     assert set(rec) == {"order_id", "status", "product", "amount", "created_at"}
 
 
-def test_order_record_never_contradicts_itself():
-    """ch02 的既有不变量:物流候选是从**订单状态**派生的,不是独立抽的。
+def test_logistics_exists_exactly_when_the_order_status_says_so():
+    """ch02 的既有不变量:物流记录**从订单状态派生**,不是另起一条随机流。
 
-    两个工具各自 `_rng(不同前缀, 同一订单号)` 时是两条独立随机流,
+    两个工具各自 `rng(不同前缀, 同一订单号)` 时是两条独立随机流,
     同一个订单可以同时是「已取消」和「已签收」。
+
+    ⚠️ **这一条的初稿是同义反复,零判别力** —— 写成了
+    `if status in TABLE: continue` 后面跟 `assert status not in TABLE`,
+    对任何实现都恒真(实现者在 T1 上报,已订正)。现在它**真的**去调
+    `logistics_record`,于是「按状态派生」与「独立抽一条」这两种实现
+    会在这里分叉。
     """
-    for no in ("1002", "1003", "1004", "2001", "2002"):
-        rec = order_record(no)
-        if rec["status"] in LOGISTICS_BY_STATUS:
-            continue
-        # 未在表里的状态(待付款/已付款/已取消)⇒ 没有物流记录
-        assert rec["status"] not in LOGISTICS_BY_STATUS
+    shipped = unsent = 0
+    for no in (str(1000 + i) for i in range(1, 60)):
+        status = order_record(no)["status"]
+        if status in LOGISTICS_BY_STATUS:
+            assert logistics_record(no)["status"] in LOGISTICS_BY_STATUS[status]
+            shipped += 1
+        else:
+            with pytest.raises(ToolNotFound):
+                logistics_record(no)
+            unsent += 1
+    # **两个分支都要真的走到过** —— 否则这条测试可能整段被跳过
+    # (本仓记过的第 (e) 类假绿:输入小到触发不了被测行为)。
+    assert shipped > 0 and unsent > 0
 
 
 @pytest.mark.parametrize("bad", ["", "12", "abc", "١٢٣٤", "²²²²"])
@@ -1201,8 +1215,23 @@ git rm app/tools/business.py
 | `app/agent/graph.py:5`(注释) | `app/tools/business.py` 的说明 | `app/tools/registry.py` 的说明 |
 | `app/agent/nodes.py:3`(注释) | 同 `app/tools/business.py` 的既有做法 | `app/tools/builtin/` 的既有做法 |
 | `app/refund/orders.py:3,39`(注释) | `app/tools/business.py` 的 `_order_record()` / `business.py:_require_order_no` | `app/tools/mock_data.py` 的 `order_record()` / `mock_data.py:require_order_no` |
+| `scripts/acceptance.sh:236-249`(`shipped_order()`) | `from app.tools.business import query_order` + `LOGISTICS_BY_STATUS` | **改写成直接调 `app.tools.mock_data`**(见下方说明) |
+| `scripts/acceptance.sh:257-272`(`expected_logistics_status()`) | `from app.tools.business import query_logistics` | **改写成直接调 `app.tools.mock_data.logistics_record`** |
 
 **注释也要改** —— 这份代码库最贵的一类缺陷就是「注释还指着已经搬走的东西」。
+
+> **为什么 `scripts/acceptance.sh` 这两个 helper 要改成直查 `mock_data`**
+> (而不是改成 `from app.tools.builtin.orders import …`):
+> 那份脚本是 **ch01–ch04 的回归网**,不该被后面三个任务的搬迁连累 ——
+> `query_order` 在 T3 换模块、`query_logistics` 在 **T7 整个搬进 MCP Server**,
+> 跟着改一次就要再改一次。两个 helper 要的只是**确定性的订单状态**,
+> 而脚本自己的注释已经写明了这个分工:
+> 「*动态取值而非写死 —— 工具改了种子函数也不必改脚本;而『工具到底返回什么』
+> 由 Tier 1 的跨进程确定性测试守护*」。改写后连 `asyncio` 与 `tool_call` 字典都不用了。
+>
+> **流水线口径不能变**:`shipped_order()` 的输出必须是**同一个**订单号,
+> 所以它挑号码的规则(遍历 `1000..1039`、取第一个状态落在
+> `LOGISTICS_BY_STATUS` 里的)要**一字不动**地保留。
 
 - [ ] **Step 9: 跑全量测试**
 
