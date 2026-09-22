@@ -59,7 +59,9 @@ app/config.py     pydantic-settings 读 .env;四个必填字段(三个 OPENAI_* 
 app/llm.py        ChatOpenAI 工厂,_build 收口全部硬约束
 app/prompts.py    System/抽取 Prompt + 消息组装;Message -> BaseMessage 转换的**唯一**出口
 app/schemas.py    纯数据模型,唯一被到处引用的类型源
-app/db/           base(引擎/会话工厂)、models(四张表)、session(FastAPI 依赖)
+app/db/           base(引擎/会话工厂)、models(**8 张表**:conversations / messages / tickets /
+                  knowledge_chunks / low_confidence_questions / qa_extraction_staging /
+                  refund_requests / conversation_summaries)、session(FastAPI 依赖)
 app/tools/        business(五个 @tool)、registry(每请求组装)、executor(超时/重试/错误分类)
 app/memory/       ch01-06:store.py(锁注册表)、trim.py(token 计数与按整轮切轮);
                   ch07 新增:budget.py(窗口→历史预算→层1/层2)、layers.py(三层切分 + 层2 截短)、

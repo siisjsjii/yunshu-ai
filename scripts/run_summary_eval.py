@@ -109,7 +109,11 @@ def _probe_selfcheck(patterns: set[str]) -> bool:
             f" 放过 {not_matched}(应含全部 {len(_MUST_NOT_MATCH)} 个) {'✓' if good else '✗'}"
         )
     if not patterns:
-        emit("  ⚠️ 用例文件里没有任何 forbidden_pattern —— 幻觉探针这一类**没有用例**")
+        # **响亮失败,不是 ⚠️**:幻觉探针是四类样例之一(spec §10.4),
+        # 一条都没有 ⇒ 这一类的判别力为零,而「⚠️ 然后 exit 0」会让人以为跑过了。
+        # 与下面那条探针自检一样,装置不成立就不要发布数字。
+        emit("  !!! 用例文件里没有任何 forbidden_pattern —— 幻觉探针这一类**没有用例**,本次结果不可读。")
+        ok = False
     return ok
 
 
@@ -178,9 +182,15 @@ async def main() -> int:
             if not digest:
                 notes.append("梗概为空 —— 正例不许为空")
         elif kind == "negative":
+            # 「不能硬凑」有**两半**:① 不啰嗦(字数)② **不编内容**(不得凭空冒出标识形态的数字)。
+            # 只断字数是**半条断言** —— 一条 15 字的编造订单号(「订单 20240915 已查到」)全过。
+            # 两半合起来才是负例要挡的东西。
             limit = row["max_chars"]
-            case_ok = case_ok and len(digest) <= limit
+            hit = re.search(pattern, digest) if pattern else None
+            case_ok = case_ok and len(digest) <= limit and hit is None
             notes.append(f"{len(digest)} 字 / 上限 {limit}{'(空)' if not digest else ''}")
+            if hit:
+                notes.append(f"硬凑出了 {pattern} 形态的数字:{hit.group(0)!r}")
         elif kind == "hallucination":
             hit = re.search(pattern, digest)
             case_ok = case_ok and hit is None
@@ -218,10 +228,13 @@ async def main() -> int:
     emit(f"非空梗概 {nonempty}/{len(rows)} —— 负例与探针**靠「什么都没有」通过**,")
     emit("  所以这个数必须与总通过数一起读:它接近 0 时那两类的绿是装置坏了,不是结论。")
     emit(f"总通过 {passed}/{len(rows)}")
+    # **装置坏了就退非 0** —— 与探针自检同一条规矩:一条用例自检未过、或全部梗概为空,
+    # 都意味着上面的数字**不可读**,而「打一行 !!! 然后 exit 0」在脚本/CI 里与通过无异。
     if bad_cases:
-        emit(f"!!! 用例自检未过 {bad_cases} 条(见上面的 !!! 行)—— 这些条的结果不可读")
+        emit(f"!!! 用例自检未过 {bad_cases} 条(见上面的 !!! 行)—— 这些条的结果不可读,退 1。")
+        return 1
     if nonempty == 0:
-        emit("!!! 所有梗概都是空的 —— 负例/探针的「通过」全部恒真,本次结果不可读。")
+        emit("!!! 所有梗概都是空的 —— 负例/探针的「通过」全部恒真,本次结果不可读,退 1。")
         return 1
     return 0
 

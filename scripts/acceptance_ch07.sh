@@ -57,20 +57,44 @@ fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 SERVER_PID=""
+KEEP=0
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null
     sleep 1
     kill -9 "$SERVER_PID" 2>/dev/null
   fi
-  # 失败时**保留**证据目录(SSE 原文与两个服务的控制台输出),通过时才清掉。
-  if [ "$FAIL" -eq 0 ]; then
+  # 失败时**保留**证据目录(SSE 原文、timing、两个服务的控制台输出),通过时才清掉。
+  # ⚠️ 判据是 `FAIL -gt 0` **或** `KEEP -eq 1`,**不能只看 FAIL**:几条 preflight 分支
+  # 在**一条断言都还没打**的时候就 `exit 1`(那时 FAIL 仍是 0),只认 FAIL 的话
+  # `cleanup()` 会把工作目录连同**唯一的**那份控制台日志一起删掉 ——
+  # 而那几条恰恰是最可能真触发的路径(Milvus 没起 / 模型加载失败 / 端口被占),
+  # 也就是**最需要证据的时候**。这正是 ch06「`tail` 把错误切掉、11 条失败没留下」的形状。
+  if [ "$FAIL" -eq 0 ] && [ "$KEEP" -eq 0 ]; then
     rm -rf "$WORK"
   else
-    echo "  (证据留在 $WORK/ —— SSE 原文、timing、两个服务的控制台输出)"
+    echo "  (证据留在 $(pwd)/$WORK/ —— SSE 原文、timing、两个服务的控制台输出)"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# ⚠️ **外部打断(Ctrl-C / `timeout` 发的 TERM)必须自己 `exit`**:装了 trap 之后
+# bash **不会**因为收到信号就退出 —— 信号处理函数返回后,脚本**继续往下跑**。
+# 实测(2026-09-22,故意用错 DB 端口触发失败路径时撞上):TERM 到了 → `cleanup`
+# 以 `FAIL=0 && KEEP=0` 判定「这是一次成功」⇒ **把工作目录删掉**;然后脚本
+# **接着往下走**到失败分支,那里再 `cat "$WORK/server_a.log"` 就只剩
+# 「No such file or directory」—— 证据在它被需要的前一刻被自己删了。
+# 打断时一律 `KEEP=1`(这正是最需要证据的时候)并真的退出。
+on_signal() {
+  KEEP=1
+  exit 130
+}
+trap on_signal INT TERM
+
+# preflight 失败的统一出口:**必须用它,不要直接 `exit 1`**(理由见 `cleanup`)。
+fail_exit() {
+  KEEP=1
+  exit 1
+}
 
 # ── 预检:两个端口必须是空的 ────────────────────────────────────────────────
 # 本脚本**自己起服务**,所以 8000/8001 上不能有别的进程:占用时 uvicorn 起不来,
@@ -82,6 +106,8 @@ for p in "$PORT_A" "$PORT_B"; do
     echo "预检失败:端口 $p 上已经有服务在监听(返回 $code)。本脚本要自己起服务,请先清掉:"
     echo "  netstat -ano | grep ':$p'                                    # 记下 PID"
     echo "  powershell -NoProfile -Command \"Stop-Process -Id <PID> -Force\""
+    # 这一支用普通 exit:**此刻工作目录还是空的**(一条断言都没打、一个文件都没写),
+    # 没有证据可留。其余几支一律走 `fail_exit`。
     exit 1
   fi
 done
@@ -102,25 +128,47 @@ stop_server() {
   kill -9 "$SERVER_PID" 2>/dev/null
   SERVER_PID=""
 }
+# 就绪轮询。**按挂钟计时(`SECONDS`),不是按次数**,而且 curl 自带 `--max-time`:
+# 按次数循环时,每次 curl 若因为服务半死而卡上几秒,「60 秒」会变成好几分钟
+# (实测:后端连不上库时,一轮 60 次跑了近 200 秒,把外面的 `timeout` 先等来了)。
 wait_ready() {     # $1=base $2=秒数
-  local i
-  for i in $(seq 1 "$2"); do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "$1/api/conversations")" = "200" ] && return 0
+  local deadline=$((SECONDS + $2))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$1/api/conversations")" = "200" ] && return 0
     sleep 1
   done
   return 1
 }
 # 等 BGE-M3 预热完(它跑在后台线程里,要十几秒)。不等的话,第一次碰到检索的轮次会
-# 撞 10 秒工具超时 → 502 → 验收 1 的「无 error 帧」红在一个与上下文管理无关的地方。
-# 判据用 ASCII 子串 `BGE-M3`(那行日志是 `app.main BGE-M3 预热完成`)。
-wait_warmup() {
+# 白等一次现场加载。
+#
+# ⚠️ **不能拿 `BGE-M3` 这个 ASCII 子串当判据**:同一条日志流里还有一句
+# `BGE-M3 预热失败,首次检索会退化为现场加载`(app/main.py),它**也含**这个子串 ——
+# 于是预热**失败**时脚本会打印「BGE-M3 预热完成」。这是**断言级的错**(消息说谎),
+# 不只是措辞问题;而下面二十轮的读数就没人敢信了。
+#
+# 判据句(「预热完成」/「预热失败」)**只能以十六进制码点传参**(纯 ASCII 走 argv),
+# 由 python 侧 `chr()` 拼出来:直接把中文当参数传同样会走 argv、同样被 CP936 重编码,
+# 而那个后果是**沉默地等满 90 秒**(永远匹配不上)。路径走 argv 没事(纯 ASCII)。
+_warmup_line() {   # $1 = 空格分隔的码点,例:"9884 70ed"
+  "$PYTHON" -c '
+import sys
+try:
+    text = open(sys.argv[1], "rb").read().decode("utf-8")
+except (OSError, UnicodeDecodeError):
+    raise SystemExit(1)
+needle = "".join(chr(int(h, 16)) for h in sys.argv[2].split())
+raise SystemExit(0 if needle in text else 1)' "$LOG" "$1"
+}
+wait_warmup() {    # 判据 = 「预热完成」(9884 70ed 5b8c 6210)
   local i
   for i in $(seq 1 90); do
-    grep -q 'BGE-M3' "$LOG" && return 0
+    _warmup_line "9884 70ed 5b8c 6210" && return 0
     sleep 1
   done
   return 1
 }
+warmup_failed() { _warmup_line "9884 70ed 5931 8d25"; }   # 判据 = 「预热失败」
 
 # ── SSE 收发 ────────────────────────────────────────────────────────────────
 # 发一条消息,并把**首帧到达时刻**记进 timing 文件(验收 4 的时序判据靠它)。
@@ -248,9 +296,9 @@ first = {}
 done_ts = []
 mc_layer1_over = mc_layer2_over = mc_seen = 0
 last_budget = None
-summary_has_needle = 0
+any_summary_has_needle = 0
 hc_trunc_assistant = hc_trunc_tool = hc_lines_with_trunc = hc_lines_with_tool = 0
-hc_max_layer1 = 0
+hc_window_max = 0
 
 for line in text.splitlines():
     i = line.find("{")
@@ -291,10 +339,13 @@ for line in text.splitlines():
         mc_layer2_over += tok["layer2"] > bud["layer2"]
         last_budget = (bud["layer1"], bud["layer2"])
         if needle and needle in (obj.get("summary") or ""):
-            summary_has_needle = 1
+            any_summary_has_needle = 1
     elif kind == "history_ctx":
         last_budget = (obj["budgets"]["layer1"], obj["budgets"]["layer2"])
-        hc_max_layer1 = max(hc_max_layer1, obj["tokens"]["layer1"])
+        # 名字里的 "layer1" 指的是**那一行的 `tokens.layer1` 键**,而它在 `history_ctx` 里
+        # 数的是**整个扁平窗口**(见 journal 的 docstring)⇒ 它报的是**窗口**的上界,
+        # 不是「层 1」的。键名与打印文案都按这个来(本章刚写进规则 (f) 的那一条)。
+        hc_window_max = max(hc_window_max, obj["tokens"]["layer1"])
         ent = obj["sliding"]
         if any(e["role"] == "tool" for e in ent):
             hc_lines_with_tool += 1
@@ -324,12 +375,12 @@ out.append("done_min_elapsed_ms=%d" % (don["elapsed_ms"] if don else -1))
 out.append("mc_layer1_over=%d" % mc_layer1_over)
 out.append("mc_layer2_over=%d" % mc_layer2_over)
 out.append("mc_seen=%d" % mc_seen)
-out.append("summary_has_needle=%d" % summary_has_needle)
+out.append("any_summary_has_needle=%d" % any_summary_has_needle)
 out.append("hc_trunc_assistant=%d" % hc_trunc_assistant)
 out.append("hc_trunc_tool=%d" % hc_trunc_tool)
 out.append("hc_lines_with_trunc=%d" % hc_lines_with_trunc)
 out.append("hc_lines_with_tool=%d" % hc_lines_with_tool)
-out.append("hc_max_layer1_tokens=%d" % hc_max_layer1)
+out.append("hc_window_max_tokens=%d" % hc_window_max)
 if last_budget:
     out.append("budget_layer1_logged=%d" % last_budget[0])
     out.append("budget_layer2_logged=%d" % last_budget[1])
@@ -468,15 +519,37 @@ DEMO_ENV=(
 echo "== 起服务(演示配置:spec §9.4 那一组显式覆盖)=="
 start_server "$PORT_A" "$WORK/server_a.log" "${DEMO_ENV[@]}"
 if ! wait_ready "$BASE_A" 60; then
-  echo "预检失败:$BASE_A 60 秒内没起来。控制台尾部:"
-  tail -20 "$WORK/server_a.log"
-  exit 1
+  echo "预检失败:$BASE_A 60 秒内没起来。控制台输出(前 60 行 + 末 15 行):"
+  # **文件整份留着、路径打出来,终端只印头尾** —— 这两个要求不冲突,而且是必须分开的:
+  #   * ch06 的教训是「`tail` 让**证据**没了」⇒ 这里证据**在文件里**(失败不删,见 cleanup),
+  #     而且**行数与路径都打出来**,谁都能去看全文;
+  #   * 但把整份 `cat` 出来同样是错的:后端连不上库时,一轮就重试出 **7354 行 / 467 KB**
+  #     (60 次同样的 traceback),断言输出会被冲得看不见 —— 那才是真正丢证据的方式。
+  # 头尾各印一段:头部有启动横幅,尾部有**真正的错因**(SQLAlchemy 的异常文本在最后一行)。
+  "$PYTHON" -c '
+import sys
+path = sys.argv[1]
+lines = open(path, "rb").read().decode("utf-8", "replace").splitlines()
+head, tail = 60, 15
+out = list(lines[:head])
+if len(lines) > head + tail:
+    out.append("... [中间省略 %d 行,全文见文件] ..." % (len(lines) - head - tail))
+out += lines[-tail:] if len(lines) > tail else []
+out.append("(共 %d 行)" % len(lines))
+sys.stdout.buffer.write(("\n".join(out)).encode("utf-8") + b"\n")' "$WORK/server_a.log"
+  echo "  (上面是节选;**完整控制台输出在 $WORK/server_a.log,失败不删**) "
+  fail_exit
 fi
 echo "  服务已就绪(pid $SERVER_PID)"
 if wait_warmup; then
   echo "  BGE-M3 预热完成(碰到检索的轮次可以跑了)"
+elif warmup_failed; then
+  # **分开报**:这句话与上面那句差一个词,含义却相反。拿 `BGE-M3` 子串去 grep 的话,
+  # 预热**失败**会被打印成「预热完成」—— 消息说谎,而下面二十轮的读数就没人信了。
+  warn "BGE-M3 **预热失败**(日志里是「预热失败,首次检索会退化为现场加载」)——
+        碰到检索的轮次会白等一次现场加载,读数仍有效,但要记着这一条"
 else
-  warn "90 秒内没看到 BGE-M3 预热完成 —— 碰到检索的轮次可能撞工具超时(与本章无关的红)"
+  warn "90 秒内既没看到「预热完成」也没看到「预热失败」—— 预热线程可能还没跑完"
 fi
 EXP_A=$(expected_budget "${DEMO_ENV[@]}")
 echo "  生产代码现算的预算:$EXP_A"
@@ -535,7 +608,8 @@ if [ "$WARM_OK" = "no" ]; then
   echo "    docker logs milvus-standalone --since 10m | grep -n 'panic:'"
   echo "    curl -s http://127.0.0.1:19530/healthz   # 正常应回 OK"
   echo "    docker restart milvus-standalone        # panic 后重启通常即可(实测一次)"
-  exit 1
+  echo "  (三次预热的 SSE 原文在 $WORK/warm_*.sse —— 它们保留了失败现场)"
+  fail_exit
 fi
 echo "  检索预热通过:$WARM_OK"
 echo "  控制台里 \"Loading weights\" 进度条刷了 ${LOADS:-0} 次(只能说明「确实加载过模型」;只作证据)"
@@ -584,7 +658,7 @@ fi
 #     仍然装着那段超出预算的旧历史(设计如此,spec §3.3)。所以它只要求
 #     「超预算的行数 <= 触发次数」,不能要求 0(那是把正常的异步语义当成缺陷)。
 TRG=$(lget "$ST1" trigger)
-MAXW=$(lget "$ST1" hc_max_layer1_tokens)
+MAXW=$(lget "$ST1" hc_window_max_tokens)
 OVER1=$(lget "$ST1" mc_layer1_over); OVER2=$(lget "$ST1" mc_layer2_over)
 if [ "${MC1:-0}" -ge 1 ] && [ "${OVER1:-1}" = "0" ]; then
   ok "层 1 从没超过它自己的预算(model_ctx $MC1 行全部合规;扁平窗口最大 ${MAXW:-0} token)"
@@ -643,10 +717,10 @@ fi
 echo "  ── 落点(模型判定,warn 档):第 15 轮问「我最开始问的那个订单,现在物流到底是什么情况?」"
 PROBE_REPLY=$(join_tokens < "$WORK/s1_15.sse")
 HAS_ID=no; case "$PROBE_REPLY" in *20240915*) HAS_ID=yes;; esac
-HAS_DIGEST=$(lget "$ST1" summary_has_needle)     # 0/1(来自 log_state)
-echo "     回复里出现订单号 20240915:$HAS_ID / 日志里最后一段 model_ctx 的梗概含 20240915:$HAS_DIGEST(1=含)"
+HAS_DIGEST=$(lget "$ST1" any_summary_has_needle)   # 0/1(来自 log_state;**任一** model_ctx 行置的,不是「最后一段」)
+echo "     回复里出现订单号 20240915:$HAS_ID / 日志里**任一** model_ctx 的梗概含 20240915:$HAS_DIGEST(1=含)"
 echo "     回复原文:$PROBE_REPLY"
-# ⚠️ 比较的是 `1`,不是 `yes` —— 第 4 次跑时这里写错过(`summary_has_needle` 是 0/1),
+# ⚠️ 比较的是 `1`,不是 `yes` —— 第 4 次跑时这里写错过(`any_summary_has_needle` 是 0/1),
 # 于是「梗概里有、回复里没有」被打印成了「梗概与回复里都没有」:
 # **判据写错,证据的读法就跟着错**,而两句话看起来都合理。
 if [ "$HAS_ID" = "yes" ] && [ "$HAS_DIGEST" = "1" ]; then
@@ -715,9 +789,20 @@ echo "  (停掉演示配置的服务,用默认配置起 $PORT_B)"
 stop_server
 start_server "$PORT_B" "$WORK/server_b.log"
 if ! wait_ready "$BASE_B" 60; then
-  echo "预检失败:$BASE_B 60 秒内没起来。控制台尾部:"
-  tail -20 "$WORK/server_b.log"
-  exit 1
+  echo "预检失败:$BASE_B 60 秒内没起来。控制台输出(前 60 行 + 末 15 行):"
+  "$PYTHON" -c '
+import sys
+path = sys.argv[1]
+lines = open(path, "rb").read().decode("utf-8", "replace").splitlines()
+head, tail = 60, 15
+out = list(lines[:head])
+if len(lines) > head + tail:
+    out.append("... [中间省略 %d 行,全文见文件] ..." % (len(lines) - head - tail))
+out += lines[-tail:] if len(lines) > tail else []
+out.append("(共 %d 行)" % len(lines))
+sys.stdout.buffer.write(("\n".join(out)).encode("utf-8") + b"\n")' "$WORK/server_b.log"
+  echo "  (上面是节选;**完整控制台输出在 $WORK/server_b.log,失败不删**)"
+  fail_exit
 fi
 echo "  服务已就绪(pid $SERVER_PID,默认窗口)"
 ASK_BASE="$BASE_B"
@@ -763,7 +848,7 @@ for v in "$D3DEG" "$D3TRG" "$D3DONE" "$D3START" "$D3SKIP" "$D3FAIL"; do
   [ "${v:-1}" = "0" ] || ZERO_ALL=no
 done
 if [ "$ZERO_ALL" = "yes" ]; then
-  ok "装得下就不压:降级 0 次、触发 0 次、摘要 start/done/skip/fail 全 0(窗口最大 $(lget "$ST3" hc_max_layer1_tokens) token < 层1 预算 $E3_1)"
+  ok "装得下就不压:降级 0 次、触发 0 次、摘要 start/done/skip/fail 全 0(扁平窗口最大 $(lget "$ST3" hc_window_max_tokens) token < 层1 预算 $E3_1)"
 else
   bad "纯聊天也动了上下文:降级=$D3DEG 触发=$D3TRG start=$D3START done=$D3DONE skip=$D3SKIP fail=$D3FAIL —— 「保守起见每次都压一点」"
 fi
