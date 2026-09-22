@@ -54,9 +54,15 @@ bash scripts/acceptance_ch07.sh                                 # ch07 验收 1�
 #    ⚠️ `db/ch08.sql` 在**全新**库上会响亮地报 `ERROR 1050`(表已存在)—— 因为 ORM 侧有
 #    同名模型,`init_db.py` 的 create_all 已经顺带把这张表建了出来。**这是刻意的**,
 #    与 `db/ch06.sql` 的 refund_requests 是同一个已知取舍,不是脏库。但两条路径建出来的
-#    表**形状不同**,但 T5 修复轮之后**只剩两处**:两个索引名(`idx_conv` / `idx_created`
-#    对 SQLAlchemy 自动生成的 `ix_tool_audit_logs_*`)与表的 COMMENT —— `id` 的 INT/BIGINT、
-#    三个字符串列的 `DEFAULT ''`、`idx_created` 都已对齐。所以新库上仍然应当**让 DDL 建表**:要么先跑
+#    表**形状不同**,但 T5 修复轮之后**只剩两处**:
+#    ① **两个索引名** —— DDL 的 `idx_conv` / `idx_created` 对 SQLAlchemy 自动生成的
+#       `ix_tool_audit_logs_conversation_id` / `ix_tool_audit_logs_created_at`;
+#    ② **表的 `COMMENT`** —— DDL 有 `COMMENT='工具调用审计(ch08)'`,ORM 侧为 None。
+#    **其余都已对齐**(逐列比对 `ToolAuditLog.__table__` 与 `db/ch08.sql` 得出):
+#    `id` 两条路都是 `BIGINT`;带 `DEFAULT ''` 的字符串列**恰好两个**
+#    (`result_summary`、`error_detail`),`args` 与 `status` 两条路**都没有** `DEFAULT`;
+#    `created_at` 两条路**都有索引**(只是名字不同,即上面 ①)。
+#    所以新库上仍然应当**让 DDL 建表**:要么先跑
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
 #    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`。
