@@ -14,3 +14,6 @@ cryptography==50.0.1
 pymilvus==2.6.17
 FlagEmbedding==1.4.2
 langgraph==1.2.11
+mcp>=1.24,<2
+langchain-mcp-adapters==0.3.2
+jsonschema==4.26.0

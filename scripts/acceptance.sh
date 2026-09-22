@@ -237,14 +237,15 @@ shipped_order() {
   "$PYTHON" -c '
 import asyncio, json, sys
 
-from app.tools.business import _LOGISTICS_BY_STATUS, query_order
+from app.tools.business import query_order
+from app.tools.mock_data import LOGISTICS_BY_STATUS
 
 def status(oid):
     call = {"name": "query_order", "args": {"order_id": oid}, "id": "p", "type": "tool_call"}
     return json.loads(asyncio.run(query_order.ainvoke(call)).content)["status"]
 
 for i in range(1000, 1040):
-    if status(str(i)) in _LOGISTICS_BY_STATUS:
+    if status(str(i)) in LOGISTICS_BY_STATUS:
         sys.stdout.buffer.write(str(i).encode("ascii"))
         break
 '

@@ -33,8 +33,8 @@ from app.refund.orders import DEMO_ORDERS
 from app.retrieval.expand import ExpandQueries
 from app.retrieval.search import RetrievedChunk
 from app.tools import registry as tools_registry
-from app.tools.business import _order_record
 from app.tools.errors import ToolNotFound
+from app.tools.mock_data import order_record
 
 REQUIRED = {
     "openai_base_url": "https://example.invalid/v1",

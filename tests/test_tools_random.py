@@ -185,7 +185,7 @@ def test_unshipped_order_has_no_logistics():
 def test_order_and_logistics_status_never_contradict():
     """同一订单号下,订单状态与物流状态必须自洽。
 
-    两个工具各自 `_rng(不同前缀, 同一订单号)` 时是**两条独立随机流**,
+    两个工具各自 `rng(不同前缀, 同一订单号)` 时是**两条独立随机流**,
     于是同一个订单可以同时是「已取消」和「已签收」。实测 1000 个订单里
     807 个自相矛盾(80.7%),连当时演示用的 1001 都落在里面。
 
@@ -216,7 +216,7 @@ def test_order_and_logistics_status_never_contradict():
 def test_logistics_trace_never_predates_the_order():
     """物流轨迹时间必须晚于下单时间。
 
-    同一个根因的另一面:轨迹时间原本也从 `_rng("logistics", ...)` 独立抽,
+    同一个根因的另一面:轨迹时间原本也从 `rng("logistics", ...)` 独立抽,
     于是能出现「9 月 5 日已发出」而订单「9 月 20 日下单」的包裹先于订单存在。
 
     这条的矛盾率远低于状态那条(量级 1%),故扫描区间要够宽 —— 区间窄了

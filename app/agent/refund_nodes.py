@@ -21,7 +21,7 @@ refund_judge       同一个主力模型,**一次** ainvoke,不绑工具、不�
 `interrupt()` **之前**的代码会再执行一遍,`interrupt()` 之后的部分只跑一次。
 所以 `refund_pick_order` 里**不许有任何有副作用的动作** —— 取订单数据放在它
 **后面**的节点。同理,弹卡片所需的候选订单只能由**纯函数**算出
-(`candidate_orders` + `_order_record`,两者都是确定性、无 IO),重跑一遍
+(`candidate_orders` + `order_record`,两者都是确定性、无 IO),重跑一遍
 不会产生第二次查询、也不会多扣一次钱。
 
 **② 节点返回的每个 key 都必须在 `ChatState` 里声明过。** LangGraph 对未声明
@@ -52,13 +52,13 @@ from app.refund.categories import REFUND_REASON_CATEGORIES
 from app.refund.orders import candidate_orders
 from app.retrieval.expand import expand_queries, multi_search
 from app.schemas import Message
-from app.tools.business import _order_record
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import (
     ERROR_NOT_FOUND,
     ERROR_TIMEOUT,
     execute_tool,
 )
+from app.tools.mock_data import order_record
 
 logger = logging.getLogger(__name__)
 
@@ -150,16 +150,16 @@ def _card_options(state) -> list[dict]:
     「候选从哪来」在槽位与卡片两处各有一份说法,而那份说法只在**将来**
     槽位的判据变动时才分叉(那时卡片会悄悄变成另一批号码)。
 
-    详情借 `app/tools/business.py` 的 `_order_record`(**私有**,同模块的
-    `query_order` 也用它):它是**纯函数、无 IO**,所以放在 `interrupt()` 之前
-    也安全 —— resume 重跑一遍只是把同样的数算第二遍。
+    详情借 `app/tools/mock_data.py` 的 `order_record`(**三进程共用的公开入口**,
+    内置 `query_order` 与两个业务 MCP Server 都经它取值):它是**纯函数、无 IO**,
+    所以放在 `interrupt()` 之前也安全 —— resume 重跑一遍只是把同样的数算第二遍。
 
     为什么不调 `query_order` 工具:那会在**每一次 resume 之前**先查一遍
     (节点从头重跑),四条候选就是八次查询;而且返回的是 JSON 文本,
     这里要的是卡片字段。
     """
     return [
-        {"order_no": no, **_pick_record(_order_record(no))}
+        {"order_no": no, **_pick_record(order_record(no))}
         for no in _candidates(state)
     ]
 
@@ -211,8 +211,8 @@ def _picked_order_no(picked) -> str:
     —— 这句话会把内部的载荷形状漏给用户,而且它出现在**跨任务**的接缝上
     (本文件的单测传的是裸串,端点测试若没走真实 resume 路径就看不见)。
 
-    **只取值,不清洗**:号码合不合法由 `query_order` 的 `_require_order_no` 判
-    (它才是有权说「查无此单」的地方)。这里截断/纠正格式,等于把
+    **只取值,不清洗**:号码合不合法由 `query_order` 的 `mock_data.require_order_no`
+    判(它才是有权说「查无此单」的地方)。这里截断/纠正格式,等于把
     「这个号我处理不了」伪装成「用户没选号」。
     """
     if picked is None:

@@ -1,97 +1,38 @@
 """五个业务工具。
 
 三个「假装有上游系统」的工具(query_order / query_product / query_logistics)
-在本模块内用确定性伪随机生成数据 —— 不接真实接口、不建表。同一入参
-永远得到同样结果,故验收可以写会失败的断言。
+的数据由 `app/tools/mock_data.py` 用确定性伪随机生成 —— 不接真实接口、不建表。
+同一入参永远得到同样结果,故验收可以写会失败的断言。
+
+**数据源为什么在别的模块**:`query_logistics` 后续要搬进**独立进程**的
+MCP Server,而订单的唯一真相源必须三处共用 —— 各带一套随机数的话,
+同一个订单号会「订单说已发货、物流说待付款」。详见 `app/tools/mock_data.py`。
 
 另两个工具需要数据库会话,故用工厂函数**每请求构造**,见 make_query_faq /
 make_create_ticket。
 """
 
-import hashlib
 import json
-import random
 from datetime import datetime, timedelta
 
 from langchain.tools import tool
 
 from app.tools.errors import ToolNotFound
-
-
-def _rng(*parts: str) -> random.Random:
-    """由入参派生稳定种子。
-
-    **绝不能用内置 hash()** —— 它对 str 每进程随机化(PYTHONHASHSEED),
-    会让"同一订单号永远返回同样数据"在进程重启后失效,而同进程内的
-    测试完全测不出来。sha256 跨进程、跨平台稳定。
-    """
-    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
-    return random.Random(int.from_bytes(digest, "big"))
-
-
-#: 回显给模型的入参最多截这么长 —— 模型给的输入不受我们控制,原样回灌
-#: 等于让它自己决定往上下文里塞多少 token。
-_ECHO_LIMIT = 32
-
-
-def _require_order_no(order_id: str) -> str:
-    """订单号须为 4-32 位 ASCII 数字。不符合视为查无此单,而不是编一个结果。
-
-    必须是 `isascii() and isdigit()` 两个条件:单独一个 `isdigit()` 是
-    Unicode 感知的,`"١٢٣٤".isdigit()`(阿拉伯-印度数字)与 `"²²²²".isdigit()`
-    (上标)都为 True —— 这类输入会**通过**校验并拿到一张凭空编造的订单,
-    而不是 ToolNotFound。
-    """
-    cleaned = order_id.strip()
-    if not (cleaned.isascii() and cleaned.isdigit()) or not (4 <= len(cleaned) <= 32):
-        raise ToolNotFound(f"未找到订单 {cleaned[:_ECHO_LIMIT]},请核对订单号后重试")
-    return cleaned
-
-
-_ORDER_STATUS = ["待付款", "已付款", "已发货", "已完成", "已取消"]
-_PRODUCT_NAMES = ["无线耳机", "运动鞋", "双肩包", "保温杯", "机械键盘"]
-
-#: 订单状态 → 该状态下**可能**出现的物流状态。
-#:
-#: 这是本模块唯一的「状态耦合」定义:物流状态不是自己抽的,而是从订单状态
-#: 派生出的候选里抽。反向的那半同样重要 ——「待付款 / 已付款 / 已取消」不在
-#: 表里,没发货的单子就是**没有**物流记录,查物流应当查不到,而不是编一条出来。
-_LOGISTICS_BY_STATUS = {
-    "已发货": ("已揽件", "运输中", "派送中"),
-    "已完成": ("已签收",),
-}
-
-
-def _order_record(order_no: str) -> dict:
-    """订单的唯一真相源 —— query_order 与 query_logistics 都必须经它取值。
-
-    两个工具各自 `_rng(不同前缀, 同一订单号)` 是本模块最容易犯的错:那是
-    **两条相互独立**的随机流,于是同一个订单可以同时是「已取消」和「已签收」。
-    实测 1000 个订单里 807 个状态矛盾、2000 个里 217 个轨迹早于下单时间。
-    共用同一条记录之后,这类矛盾在结构上不可能出现。
-
-    **抽取顺序不可改动** —— 改动会改变每个订单号的具体取值。
-    """
-    r = _rng("order", order_no)
-    return {
-        "order_id": order_no,
-        "status": r.choice(_ORDER_STATUS),
-        "product": r.choice(_PRODUCT_NAMES),
-        "amount": f"{r.randint(49, 999)}.{r.randint(0, 99):02d}",
-        "created_at": (
-            f"2026-{r.randint(1, 9):02d}-{r.randint(10, 28):02d} "
-            f"{r.randint(9, 21):02d}:{r.randint(0, 59):02d}"
-        ),
-    }
+from app.tools.mock_data import (
+    CITIES,
+    ECHO_LIMIT,
+    LOGISTICS_BY_STATUS,
+    PRODUCT_SPECS,
+    order_record,
+    require_order_no,
+    rng,
+)
 
 
 @tool
 async def query_order(order_id: str) -> str:
     """查询订单详情:状态、商品、金额、下单时间。仅当用户给出订单号时使用。"""
-    return json.dumps(_order_record(_require_order_no(order_id)), ensure_ascii=False)
-
-
-_PRODUCT_SPECS = ["标准版", "Pro 版", "家用款", "经典款"]
+    return json.dumps(order_record(require_order_no(order_id)), ensure_ascii=False)
 
 
 @tool
@@ -100,11 +41,11 @@ async def query_product(keyword: str) -> str:
     cleaned = keyword.strip()
     if not cleaned:
         raise ToolNotFound("请提供商品名称或关键词")
-    r = _rng("product", cleaned)
+    r = rng("product", cleaned)
     # 只抽一次。抽两次的话 name 里的规格与 spec 字段相互独立,四次里只有一次
     # 对得上 —— 工具会把自相矛盾的数据喂给模型,而本章验收全靠模型如实转述
     # 工具结果,喂矛盾数据等于从源头破坏它。
-    spec = r.choice(_PRODUCT_SPECS)
+    spec = r.choice(PRODUCT_SPECS)
     return json.dumps(
         {
             "keyword": cleaned,
@@ -117,15 +58,12 @@ async def query_product(keyword: str) -> str:
     )
 
 
-_CITIES = ["广州分拨中心", "上海分拨中心", "北京分拨中心", "成都分拨中心"]
-
-
 @tool
 async def query_logistics(order_id: str) -> str:
     """查询订单的物流状态、当前位置与轨迹。用户问"到哪了""发货没"时使用。"""
-    order_no = _require_order_no(order_id)
-    order = _order_record(order_no)
-    candidates = _LOGISTICS_BY_STATUS.get(order["status"])
+    order_no = require_order_no(order_id)
+    order = order_record(order_no)
+    candidates = LOGISTICS_BY_STATUS.get(order["status"])
     if candidates is None:
         # 未发货的单子**没有**物流记录 —— 这是"查无此物",不是上游故障,
         # 所以走 ToolNotFound(可恢复),不是 ToolInfrastructureError。
@@ -134,9 +72,9 @@ async def query_logistics(order_id: str) -> str:
             f"请如实告知用户,不要自行编造物流信息"
         )
 
-    r = _rng("logistics", order_no)
+    r = rng("logistics", order_no)
     status = r.choice(candidates)
-    city = r.choice(_CITIES)
+    city = r.choice(CITIES)
     # 轨迹时间必须**从下单时间往后推**。另起一条随机流去抽 2026-09-xx 会得到
     # 早于下单的「已发出」时间 —— 那是与状态矛盾同一类的自相矛盾,实测 2000 个
     # 订单里 217 个中招。
@@ -200,9 +138,9 @@ def make_query_faq(session, retriever):
         if not chunks:
             # 全部命中都被相似度阈值滤掉 = 库里的确没有相关内容。回显截断:
             # 这段文本会回灌进模型上下文(可恢复路径),而关键词是模型给的,
-            # 长度不受我们控制。理由与 _require_order_no 那处一致。
+            # 长度不受我们控制。理由与 mock_data.require_order_no 那处一致。
             raise ToolNotFound(
-                f"常见问题库里没有与「{cleaned[:_ECHO_LIMIT]}」相关的内容,"
+                f"常见问题库里没有与「{cleaned[:ECHO_LIMIT]}」相关的内容,"
                 f"请如实告知用户暂未收录,不要自行编造答案"
             )
         return json.dumps(
