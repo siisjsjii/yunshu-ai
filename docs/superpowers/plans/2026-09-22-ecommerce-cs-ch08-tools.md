@@ -2592,8 +2592,12 @@ async def test_logistics_returns_the_same_record_as_the_builtin_data_source():
         if order_record(no)["status"] in ("已发货", "已完成")
     )
     result = await logistics.call_tool("query_logistics", {"order_id": shipped})
-    text = result[0].text if isinstance(result, list) else json.dumps(result)
-    assert json.loads(text) == logistics_record(shipped)
+    # ⚠️ **`call_tool()` 返回的是 2-tuple `(list[ContentBlock], dict)`,不是列表。**
+    # 函数签名上的返回注解写的是 `Sequence[ContentBlock] | dict[str, Any]`,
+    # **与实测不符** —— 照注解写 `result[0].text` 会得到
+    # `TypeError: Object of type TextContent is not JSON serializable`。
+    # (T6 的实现者实测到并订正了;这个注解是个陷阱。)
+    assert json.loads(result[0][0].text) == logistics_record(shipped)
 
 
 @pytest.mark.anyio
@@ -2612,6 +2616,30 @@ async def test_logistics_says_not_found_for_an_unsent_order():
     with pytest.raises(Exception) as exc:
         await logistics.call_tool("query_logistics", {"order_id": unsent})
     assert "物流" in str(exc.value) or "尚未发货" in str(exc.value)
+
+
+@pytest.mark.anyio
+async def test_warranty_product_comes_from_the_shared_order_record():
+    """⚠️ **这条是 T6 定稿后补的**(实现者实测上报)。
+
+    初稿只守住了**物流**那一半的「两个 Server 必须共用 `mock_data`」——
+    实现者把「改一个 aftersales 的种子前缀」这个变异跑了一遍,**6 条测试全绿**:
+    变异**确实生效了**(输出从「保修中」变成「已过保」),但**没有任何断言看得见它**。
+    也就是说,把 `query_warranty` 里那句 `order_record(order_no)["product"]`
+    换成它自己的随机流,**一条测试都不会红** ——
+    而它坏掉的表现与物流那半**一模一样**:
+    **同一个订单号,`query_order` 说「无线耳机」、`query_warranty` 说「运动鞋」。**
+
+    这里断的是**一致性**(而不是钉一个会随种子漂移的黄金值):
+    售后报的商品必须与订单真相源报的**是同一个**。
+    """
+    from app.tools.mock_data import order_record
+
+    order_no = "1008"
+    result = await aftersales.call_tool("query_warranty", {"order_id": order_no})
+    payload = json.loads(result[0][0].text)
+    assert payload["order_id"] == order_no
+    assert payload["product"] == order_record(order_no)["product"]
 
 
 @pytest.mark.anyio
@@ -3153,6 +3181,20 @@ async def discover_mcp_specs(*, settings) -> list[ToolSpec]:
 > mcp 1.30.0 的 `MCPTool` 是 pydantic 模型,通常是 camelCase 别名 + 允许
 > 填充下划线。若 `call_tool`/`list_tools` 实测报 `AttributeError`,
 > 改成 `mcp_tool.input_schema` 并在报告里记一句。
+
+> ✅ **T6 已实测给出答案**:`mcp.types.Tool` 的字段**就是 camelCase `inputSchema`**
+> (`input_schema` 不存在、也没有别名),与线上线格式一致。**照本条写即可。**
+
+### ⚠️ 两条 T6 实测出来的、T7 必须知道的事实
+
+1. **`FastMCP.call_tool()` 返回 2-tuple `(list[ContentBlock], dict)`**,
+   而它的**返回注解写的是** `Sequence[ContentBlock] | dict[str, Any]` —— **注解与实测不符**。
+   照注解写 `result[0].text` 会得到
+   `TypeError: Object of type TextContent is not JSON serializable`。(T6 已订正。)
+2. **`ToolNotFound` 经 HTTP 回来是 `isError: true` 的**一次正常结果**,
+   **不是 JSON-RPC 层的 error**。**T7 的错误分诊必须据此判断** ——
+   把它当成传输故障(→`TransientToolError`)会让「这一单查不到」变成 502,
+   正是本仓那条「不许拿服务端故障指责用户输入」的反面。
 
 - [ ] **Step 4: 改 `app/tools/registry.py` 的 `build_registry`**
 
