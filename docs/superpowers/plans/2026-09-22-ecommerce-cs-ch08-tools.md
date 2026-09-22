@@ -556,8 +556,13 @@ def test_missing_required_names_the_field():
 
 
 def test_wrong_type_is_reported():
+    """⚠️ 初稿只写了 `assert problems` —— **对 `type` 分支零判别力**
+    (实现者的常量探针证实:把 `_readable` 换成常量它照样绿)。
+    与本文件头一条 docstring 的说法自相矛盾,已订正为字段级断言。
+    """
     problems = validate_args(_spec(SCHEMA), {"order_id": 1002})
     assert problems
+    assert any("order_id" in p for p in problems)
 
 
 def test_below_minimum_is_reported():
