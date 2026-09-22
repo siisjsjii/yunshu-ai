@@ -461,7 +461,12 @@ async def test_fake_session_applies_updates_and_still_rejects_unknown_queries():
        会让「降级真的持久化了吗」恒真(断言读的是它刚写进去的值);
     ② `_where_value` 对不支持的查询形态**仍然直接抛** —— 顺手放宽成「返回全部」
        的话,「降级有没有写对行」就再也观测不到了(忽略 where 的替身会让
-       「历史串了会话」这类缺陷无从观测)。
+       「历史串了会话」这类缺陷无从观测);
+    ③(ch07 T10 补)`add` 会替 SQLAlchemy 落**标量 Python 侧默认值**:
+       `ensure_conversation` **新建**出来的会话两个锚点必须是 `0`,不是 `None`
+       —— 真实库读回来实测就是 `0 / 0`(见 `test_ensure_conversation_...` 的说明),
+       而 `None` 会让端点的分层在 `None < id` 上炸成 TypeError(指向 `layers`,
+       而缺的是替身这一步)。
 
     ⚠️ 本任务(T5)的端点路径走不到 ①,它是给 T10 的降级路径预先铺好的 ——
     所以这里直接对替身做自检,而不是等 T10 用「碰巧跑到了」当证据。
@@ -479,6 +484,12 @@ async def test_fake_session_applies_updates_and_still_rejects_unknown_queries():
 
     with pytest.raises(AssertionError):
         await db.execute(select(Conversation))          # 没有 where ⇒ 替身不认识
+
+    # ③ 新建的会话带着 ORM 的标量默认值(生产路径上 flush 会补,真实库读回来是 0)。
+    fresh = Conversation(id="c-new", user="demo-user", status="active")
+    assert fresh.summary_upto_msg_id is None             # ← 前提:ORM 默认值是**在 flush 时**落的
+    db.add(fresh)
+    assert (fresh.summary_upto_msg_id, fresh.layer1_from_msg_id) == (0, 0)
 
 
 def _parse_sse(body: str) -> list[tuple[str, dict]]:
@@ -606,8 +617,9 @@ def test_second_turn_on_the_same_session_does_not_duplicate_history(client_facto
        与它自己那句「上一轮 1 条 + 本轮 1 条 = 2」矛盾 —— 那条断言**永远红**。
        改成只看**第二轮**那一次调用(这正是它要观测的东西)。
     ② 只断「模型收到的条数」是**不够**的:模型收到的是 `history` 通道(端点从
-       MySQL 读出来再播种),而 `messages` 通道在 T5 里还没有读者 —— 于是
-       「每轮重复播种」这个变异**一个模型入参都不改**,条数照样是 2。所以这里
+       MySQL 读出来、按锚点分层后播种),而 `messages` 通道**不是模型入参的
+       一部分**(它唯一的读边是播种判据本身)—— 于是「每轮重复播种」这个变异
+       **一个模型入参都不改**,条数照样是 2。所以这里
        对 **checkpointer 里的 `messages`** 再断一次「没有一条内容出现两遍」:
        那才是播种真的坏掉时会变的地方(实测变异:去掉 `if not seeded` 守卫,
        下面第三组断言当场变红,见 task-5-report.md)。
@@ -619,7 +631,11 @@ def test_second_turn_on_the_same_session_does_not_duplicate_history(client_facto
         c.post("/api/chat/stream", json={"session_id": sid, "message": "第二句"})
 
     # 第二轮模型收到的 human 消息:上一轮 1 条 + 本轮 1 条 = 2。
-    # 重复播种会让上一轮那条()被再追加一次 ⇒ 3 条。
+    #
+    # ⚠️ 这条**不区分播种实现**,别把它当成播种的守卫(原始注释曾声称
+    # 「重复播种会让上一轮那条被再追加一次 ⇒ 3 条」—— 那是错的):模型读的是
+    # `history` 通道(端点从 MySQL 读出来再分层派生),**不是** `messages`,
+    # 所以「每轮重复播种」一个模型入参都不改。判别力在下面第三组断言里。
     humans = [m for m in model.calls[-1][1] if type(m).__name__ == "HumanMessage"]
     assert len(humans) == 2
     assert [m.content for m in humans] == ["第一句", "第二句"]
