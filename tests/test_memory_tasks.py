@@ -456,18 +456,29 @@ class _FakeSession:
     `assert engine.dispose_calls == 1` **照样绿**(异常路径也 dispose)。
     一个「注入的值在被测对象里还会被处理一次」的假绿,正是本仓第 (b) 种形态。
     换了替身之后,下一条用例的 `summary done` 断言才说明它真的走完了。
+
+    `close_boom=True` 时 `__aexit__` 抛:那是「**with 体之后才失败**」那条路径的
+    最小形态(见 `test_fail_in_the_session_exit_says_the_anchors_already_moved`)。
     """
+
+    def __init__(self, *, close_boom: bool = False):
+        self.close_boom = close_boom
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *exc):
+        if self.close_boom:
+            raise RuntimeError("session close failed")
         return False
 
 
-def _patch_engine(monkeypatch, engine):
+def _patch_engine(monkeypatch, engine, *, close_boom: bool = False):
     monkeypatch.setattr(tasks, "create_async_engine", lambda *a, **kw: engine)
-    monkeypatch.setattr(tasks, "async_sessionmaker", lambda *a, **kw: _FakeSession)
+    monkeypatch.setattr(
+        tasks, "async_sessionmaker",
+        lambda *a, **kw: (lambda: _FakeSession(close_boom=close_boom)),
+    )
 
 
 def test_engine_is_disposed_on_the_success_path(monkeypatch, caplog):
@@ -517,6 +528,44 @@ def test_engine_is_disposed_when_the_body_fails(monkeypatch):
                     model_factory=lambda s: None)
 
     assert engine.dispose_calls == 1
+
+
+def test_fail_in_the_session_exit_says_the_anchors_already_moved(monkeypatch, caplog):
+    """**`async with` 的 `__aexit__` 抛**时,`summary fail` 必须如实说「已经写进去了」。
+
+    这条路径比 dispose 那条**更靠前**,也更难想到:`await summarize_range(...)`
+    已经返回(那次原子落库**已经提交**、原文**已被永久取代**),然后 with 体的
+    `__aexit__` 关闭 session 时抛(连接断了)。
+
+    它因此是**置位点位置**的判据:置位必须发生在 **with 体内、await 返回的那一刻**。
+    挪到 with 外面(上一版的写法)时,`__aexit__` 跑在置位**之前**,这条路会打出一行
+    `anchors_advanced: false` —— 而这个字段存在的全部意义就是回答「那段历史被覆盖了
+    没有」,答反了比不写更糟。**实测过**:把置位挪回去,这条用例变红。
+    """
+    engine = _FakeEngine()
+    _patch_engine(monkeypatch, engine, close_boom=True)
+
+    async def _reload(engine_, conversation_id):
+        return (0, 5, _HISTORY())
+
+    async def _ok(**kwargs):
+        return (FAKE_SEQ, "梗概")
+
+    monkeypatch.setattr(tasks, "_reload_state", _reload)
+    monkeypatch.setattr(tasks, "summarize_range", _ok)
+
+    with caplog.at_level(logging.INFO):
+        tasks._run_body(conversation_id="c1", settings=_settings(),
+                        model_factory=lambda s: None)      # ← 仍然**不抛**给调用方
+
+    fails = _payloads(caplog, "summary fail ")
+    assert len(fails) == 1
+    # 确实是**这条**路(不是别的异常碰巧也打了 fail)
+    assert fails[0]["error"] == "session close failed"
+    assert fails[0]["anchors_advanced"] is True     # ← 那一段已经写进去了,如实说
+    # 注意这条路**没有** `summary done`(异常在 with 的 `__aexit__` 里就抛了,
+    # 那行日志在 with 之后)。所以对运维来说,「那段历史到底被覆盖了没有」这个
+    # 问题**只由 `anchors_advanced` 回答** —— 这正是它必须如实的原因。
 
 
 def test_fail_after_the_write_says_the_anchors_already_moved(monkeypatch, caplog):

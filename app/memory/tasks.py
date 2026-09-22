@@ -36,7 +36,7 @@ import load_history`,而本仓的方向是 `services → memory`。理由与 T8 
 **五个生命周期节点**(spec §7.6)在本模块说同一套话:`trigger` / `start` /
 `done` / `skip` / `fail`,每行都带 `conversation_id`。其中 `trigger` 由**触发方**
 打(见 `log_trigger`)—— 它是唯一知道层 2 用量与预算的地方,本模块不知道。
-`skip` 的三种原因**必须分开**(见三个 `SKIP_*` 常量),它们的运维含义是相反的。
+`skip` 的四种原因**必须分开**(见四个 `SKIP_*` 常量),它们的运维含义是相反的。
 """
 
 import asyncio
@@ -70,7 +70,7 @@ _INFLIGHT: set[str] = set()
 #: 「不在跑」然后各自加进去 —— 恰好就是上面那条要防的形态。
 _INFLIGHT_LOCK = threading.Lock()
 
-#: `summary skip` 的三种原因 —— **必须是三个不同的值**。
+#: `summary skip` 的四种原因 —— **必须是四个不同的值**。
 #:
 #: 「区间为空」是**正常**(这一轮确实没有可压的东西);「模型吐了空」是**故障**
 #: (spec §12.2 的连带):`summarize_range` 返回 `None` 时这两种成因长得一模一样,
@@ -90,13 +90,18 @@ class _RunState:
     """跨 `_run` / `_run_body` 的**事实**:这一段到底写进去了没有。
 
     **不能靠「异常抛在写之前」来推断。** `_run` 里在写**之后**才抛的异常同样会走到
-    `summary fail` 那一行 —— 最现实的一条是 `finally` 里的 `engine.dispose()`
-    (连接已断/网络抽风);此外 session 上下文退出时抛也一样。那时**那一段已经提交、
-    `summary_upto_msg_id` 已经推过去了**,若日志照旧声称「锚点未推进」,运维会以为
-    这段历史还没被覆盖(去重压一遍,或者以为丢了)。
+    `summary fail` 那一行,而且有**两条**这样的路径:
+
+    1. `async with factory() as session:` 的 **`__aexit__`**(关 session)——
+       它跑在 `await summarize_range(...)` 返回**之后、with 体之外**;
+    2. `finally` 里的 `engine.dispose()`(连接已断 / 网络抽风)。
+
+    这两条路上**那一段已经提交、`summary_upto_msg_id` 已经推过去了**,若日志照旧
+    声称「锚点未推进」,运维会以为这段历史还没被覆盖(去重压一遍,或者以为丢了)。
 
     这个字段存在的**全部意义**就是回答「这段历史被覆盖了没有」—— 答反了比不写更糟。
-    所以它由**真的执行到哪一步**决定(`_run` 里落库成功后置位),而不是靠代码位置猜。
+    所以它由**真的执行到哪一步**决定:置位点在 `_run` 的 **with 体内**、`await`
+    返回的那一刻(`if written is not None:`)—— 放在 with 外面就会漏掉上面第 1 条。
     """
 
     anchors_advanced: bool = False
@@ -295,6 +300,12 @@ async def _run(
                 # off-by-one 在这里的表现是「一条消息既没进梗概、又留在层 2」。
                 upto_msg_id=layer1_from,
             )
+            # ⚠️ **置位必须在 with 体内、`await` 返回的那一刻**:`__aexit__`(关
+            # session)跑在这行的**后面**,它抛同样会走到 `summary fail` —— 而那时
+            # 这次原子落库**已经提交**。挪到 with 外面(曾经的写法)就漏掉那条路径,
+            # 报出一个说反了的 `anchors_advanced: false`。
+            if written is not None:
+                state.anchors_advanced = True
 
         if written is None:
             # 区间**非空**却什么都没压出来 ⇒ `summarize_range` 的另一半含义:
@@ -313,11 +324,6 @@ async def _run(
                 no_backoff=True,
             )
             return
-
-        # 走到这里 = `summarize_range` 正常返回 = 那次**原子落库已经提交**
-        # (落库与推锚点共用一个事务)。**此后任何异常都必须如实说「锚点已经动了」**
-        # —— `finally` 里的 dispose、session 上下文退出,都可能在这里之后才抛。
-        state.anchors_advanced = True
 
         # 段号是**落库那一步自己算出来的**,一路原样带到这里(spec §7.6 的
         # 「第 N 段」)—— 在这里重算或写死都不是同一个事实。
