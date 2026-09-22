@@ -2372,6 +2372,38 @@ T2 之后这个检查**不存在了**:旧口径把 `count_tokens(user_input)` �
 (端点既有注释已写明),所以这里不必处理 `None`;**但不要假设它永远不是 None**,
 真拿不准就 `if user_input is not None and ...`。
 
+**(b2) 判据从 `< 0` 改成 `not b.fits_one_round` —— 这是一条 spec 分歧的收口。**
+
+spec §8 那张表写着「**历史预算装不下一轮** → 400」,对应 `not b.fits_one_round`;
+而 T2 实现的是 `b.history_budget < 0`。两者在「预算为正但小于 `per_round_steady`」
+时**结论不同**:比如 `history_budget = 5`,按 spec 该 400,按现实现却**静默带着
+空历史往下走**(用户拿到一个没有任何上下文的回答,而没有任何东西报错)。
+`fits_one_round` 因此在本章里**只有 T7 的启动自检一个消费者**,而它在请求路径上
+无人问津 —— 这是「有写无读」的变体。
+
+改 `prepare_turn` 里的判据:
+
+```python
+    if not b.fits_one_round:            # spec §8:「装不下一轮」就是 400 的判据
+        raise trim.ContextOverflowError(used=b.fixed_overhead, budget=b.window)
+```
+
+`< 0` 被它完全覆盖(`0 < per_round_steady` 恒成立),所以是收紧不是放宽。
+
+**(b3) 400 的文案现在指错了地方 —— 顺手改对。**
+
+`ContextOverflowError(used=b.fixed_overhead, budget=b.window)` 拼出来的是
+「本轮输入需要 5463 tokens,超出可用预算 1024 tokens」:`used` 其实是**固定开销**、
+`budget` 是**整个窗口**。故障在**配置**(窗口比 开销+峰值 还小),而这句话把
+运维指向了**用户输入**。改 `app/memory/trim.py:17` 那句模板,让它在配置故障下说得像
+配置故障(如「上下文预算不足:固定开销与单轮峰值已占满窗口」)。
+**不必担心破坏测试**:`tests/test_trim.py` 自己构造异常、只断言两个数字出现在
+`str(err)` 里;`tests/test_api_chat.py` 只要求消息里有 `"tokens"`。措辞可以随便改。
+
+**(b4) 把 `app/services/chat.py` docstring 里那句「由端点在 T10 接线」改掉** ——
+检查落在**这个文件**,不是端点。一句把人指到错文件去的注释,
+与本仓的「报错指向别处」是同一类毛病,只是印刷在注释里。
+
 **(c) T2 的空档已经存在(承诺修复点就是这里)**:T2 到 T10 之间,超长输入
 不再被拒。这是**计划没写明的空档,不是 T2 的实现缺陷**(它照计划写的,
 并在 docstring 里如实记了这一点)。本步是它的关闭点。
