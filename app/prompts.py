@@ -1,7 +1,13 @@
 import json
 from collections.abc import Sequence
 
-from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    trim_messages,
+)
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.memory.trim import count_tokens
@@ -214,14 +220,55 @@ def build_context_messages(
     (用户 2026-09-22 拍板)。两者都没有时,这条消息就是用户原话**逐字**。
 
     **层 1 的选择(`trim_messages(strategy="last", start_on="human")`)不在本
-    函数里**,由端点经 `_lc_token_counter` 接入(T10):本函数拿到的
-    `history` 已经是精简版,这样它才是纯函数、可单测。
+    函数里**,由端点调 `prompts.select_layer1` 做:本函数拿到的 `history`
+    已经是精简版,这样它才是纯函数、可单测。
     """
     msgs = [SystemMessage(render_system_prompt(brand_name))]
     msgs.extend(to_lc_messages(history))
     tail = _render_tail(summary=summary, evidence=evidence)
     msgs.append(HumanMessage(f"{user_input}\n\n{tail}" if tail else user_input))
     return msgs
+
+
+def select_layer1(history: Sequence[Message], *, max_tokens: int) -> list[Message]:
+    """层 1 的选择:从**最近的一轮**起,取到 token 预算装不下为止。
+
+    包住 `trim_messages(strategy="last", start_on="human", allow_partial=False)`。
+    **端点是调用方,但不直接碰 `trim_messages`** —— 本模块是 LangChain 的
+    唯一面(CLAUDE.md 的贯穿性约定 + spec §7.1):把 LLM 库的调用点收在一处,
+    是「`memory/` 与端点都不依赖 LangChain」这条约定能成立的前提。
+
+    三件事一起成立才是这个函数:
+
+    - **后缀**:留下来的恒是入参的连续后缀、原序。返回的是 `schemas.Message`
+      (不是 LangChain 消息)——它们**带着 MySQL 主键**,而分层全靠 id;
+    - **整轮**:`start_on="human"` 保证窗口从一轮的开头起(不会留下一条没有
+      提问的回答,也不会把 `tool` 与它的 assistant 拆开 ⇒ 上游 400);
+      装不下一整轮时宁可**空**,也不留半轮(那是 `allow_partial=False` 的语义);
+    - **预算**:`token_counter` 用 `_lc_token_counter`(只数 `content`,与
+      `trim.select_history` 同一把尺子;`tool_calls` 这类结构元数据不占预算)。
+
+    「保住了几条 = 末尾那几条」是对 `trim_messages(strategy="last")` 结果的
+    **实测性质**(1.6.3:`_last_max_tokens` 只做切片,不复制、不重排),由
+    `tests/test_prompts.py` 钉住 —— 库的行为一变,红在那条用例上,而不是让端点
+    静默少发几条历史。按**长度**回切而不是按 id 或内容匹配:手工构造的
+    `Message` 可能没有 id,内容也可能重复。
+    """
+    messages = list(history)
+    if not messages:
+        return []
+    kept = trim_messages(
+        to_lc_messages(messages),
+        max_tokens=max_tokens,
+        token_counter=_lc_token_counter,
+        strategy="last",
+        start_on="human",
+        # 历史切片里**没有** SystemMessage(那是 `build_context_messages` 的
+        # 第 0 条,不在这里),所以这个开关今天不产生行为差异;显式写 False
+        # 是为了不留下「这里会保留系统消息」的误读面。
+        include_system=False,
+    )
+    return messages[len(messages) - len(kept) :]
 
 
 def build_extract_messages(text: str) -> list:

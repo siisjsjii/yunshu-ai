@@ -54,6 +54,45 @@ def test_prepare_turn_raises_when_budget_is_exhausted():
         )
 
 
+def test_prepare_turn_rejects_input_over_the_per_message_cap():
+    """**本轮输入本身**超 `max_user_input_tokens` ⇒ 抛(端点据此在流前 400)。
+
+    这条在 T2 到 T10 之间是**空档**:旧口径把 `count_tokens(user_input)` 算进
+    「已用」,新口径把它归进单轮峰值的 `max_user_input_tokens`,于是实际输入
+    长度**再也没有人比过** —— 50k token 的一句话会一路送到上游。
+
+    判据取「同一段文本在松上限下**不抛**」作对照:少了它,一条「恒定抛异常」
+    的实现也能让上面那半条通过。
+    """
+    text = "这是一句明显超过五个 token 的话"
+    with pytest.raises(ContextOverflowError):
+        prepare_turn(
+            settings=_settings(max_user_input_tokens=5), history=[], user_input=text
+        )
+    # 对照:同一个输入在足够大的上限下照常返回。
+    assert prepare_turn(
+        settings=_settings(max_user_input_tokens=2000), history=[], user_input=text
+    ) == []
+
+
+def test_prepare_turn_rejects_a_budget_that_cannot_fit_one_round():
+    """**spec §8 的判据是「装不下一轮」,不是「预算为负」**。
+
+    两者在「预算为正、但小于 `per_round_steady`」时结论相反:比如
+    `history_budget = 4537` 而 `per_round_steady = 10000`,按 spec 该 400,
+    按 `history_budget < 0` 却**静默带着一小段历史往下走** —— 用户拿到一个
+    上下文被悄悄截到几乎没有的回答,而没有任何东西报错。
+    这条用例就是那个中间区间(实测:`keep_rounds=20 × 10000` 那一支打不过窗口,
+    `history_budget` 落在 4537 > 0 上)。
+    """
+    with pytest.raises(ContextOverflowError):
+        prepare_turn(
+            settings=_settings(per_round_steady=10000),
+            history=[Message(role="user", content="在吗")],
+            user_input="在吗",
+        )
+
+
 def test_prepare_turn_applies_the_budget_to_the_history():
     """放不下的历史必须被**真的**裁掉,而不是原样返回。
 

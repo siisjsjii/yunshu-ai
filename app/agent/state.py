@@ -63,8 +63,12 @@ class ChatState(TypedDict):
     # 同一个 id 再次并入是**替换**(LangGraph 的既定语义),这就是「播种幂等」
     # 的另一半 —— `prompts.to_lc_messages` 给每条带上 MySQL 主键做稳定 id。
     #
-    # ⚠️ 它**不进** `resolve_references` 的逐轮重置清单 —— 把 messages 加进那份
-    # 清单等于**每轮清空完整历史**,而单轮测试完全看不出来。
+    # ⚠️ 它**不进** `resolve_references` 的逐轮重置清单 —— 那份清单是给
+    # 「没有播种者、只能靠重置」的通道用的,而 `messages` 是**累积**语义。
+    # (更正一处早先写错机制的注释:把 `messages` 加进清单**不会**清空历史 ——
+    # `add_messages(left, [])` 实测**原样返回 `left`**,空列表更新在 append-only
+    # reducer 上是 no-op。决定不改(不放清单)仍然对,但理由是「**不必要**」,
+    # 不是「危险」。)
     #
     # 三个写者,加起来才是「完整历史」:
     #   ① 端点(只在快照为空时播种一次,重启自愈);
@@ -77,6 +81,22 @@ class ChatState(TypedDict):
     #: 与 `history` 同族:覆写语义 + 每轮重新播种,所以**进的是 `stream_input`**,
     #: 不进 `resolve_references` 的重置清单。
     summary_text: str
+
+    #: 这一轮**真的用过**的那一对锚点(逐轮覆写,由端点播种,spec §7.5)。
+    #:
+    #: 为什么要在 state 里:agent 节点打完 `model_ctx` 那一行时,手里是**扁平**的
+    #: 精简版,而 `journal.model_ctx` 要一份 `Layers`(它从中读 `sliding` 与
+    #: `bounds`)。没有锚点就没法重新分类,而那行日志会把 `bounds` 报成 `0`
+    #: —— `0` 在本章**是个有含义的值**(尚无梗概 / 层 1 起于最早),
+    #: 于是「日志在描述一次没发生过的切分」而两边都不报错。
+    #:
+    #: ⚠️ **必须在 `ChatState` 里声明**:通道集合由 `StateGraph(ChatState)` 的
+    #: 注解决定,写没声明的通道 LangGraph **静默丢弃**(只 warning 不抛)——
+    #: ch06 的 `confidence` 就是这么丢的(T4 的 Critical)。
+    #: 与 `history` / `summary_text` 同族:覆写 + 每轮播种,**不进重置清单**
+    #: (续跑那条路读到的是 checkpoint 里上一轮的值,而它只供日志、不参与判断)。
+    summary_upto_msg_id: int
+    layer1_from_msg_id: int
 
     #: **本轮**新产生的消息 —— `log_turn` 落库的唯一依据。
     #:

@@ -12,14 +12,20 @@ from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
 from app.db.session import get_session
 from app.llm import create_chat_model, create_extract_model
-from app.memory import budget, journal
+from app.memory import budget, journal, layers, summarize
 from app.memory.store import SessionStore
+from app.memory.tasks import log_trigger, run_summary_in_background
 from app.memory.trim import ContextOverflowError
-from app.prompts import render_system_prompt, to_lc_messages
+from app.prompts import render_system_prompt, select_layer1, to_lc_messages
 from app.sanitize import redact_api_key
 from app.schemas import ChatRequest, TicketRequest
 from app.services.chat import prepare_turn
-from app.services.history import ensure_conversation, load_history, load_summaries
+from app.services.history import (
+    advance_anchors,
+    ensure_conversation,
+    load_history,
+    load_summaries,
+)
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import execute_tool
 from app.tools.registry import build_retriever, build_tools, registry_for
@@ -110,16 +116,95 @@ async def chat_stream(
         # ensure_conversation 必须在**持锁之后**。它在锁外有个建会话竞态:
         # 两个并发的首请求都看不到行,其中一个 INSERT 撞主键抛 IntegrityError。
         # 持锁跨过"检查 + 插入"把窗口关掉 —— 这看着像偶然细节,不是。
-        await ensure_conversation(
+        # 返回值**必须留着**:降级与分层要读会话上那两个已落库的锚点。
+        # (`test_ensure_conversation_runs_under_the_lock` 的替身也因此必须返回
+        #  生产形状的对象 —— 见那条用例的说明。)
+        conv = await ensure_conversation(
             session=session, session_id=session_id, user_id=user_id
         )
+        # `resume` 分支**不推导预算**:它不组装上下文(从 checkpoint 还原)、
+        # 也不进 Agent 节点,推导出来没有读者。`build_graph` 拿到 None 时现算
+        # 一份(纯函数,同一个值),所以那条路上也不会缺。
+        context_budget = None
         if request.resume is None:
+            # **全量**历史(带 MySQL 主键)。分层按 `messages.id` 切,所以它必须
+            # 是**整段** —— 见下面那条注释(为什么不用 `prepare_turn` 的产出)。
             history = await load_history(session=session, conversation_id=session_id)
-            # 产出是**裁剪后的历史**(不是组装好的消息):消息组装搬进了
-            # agent 节点 —— 它要往本轮 human 消息里插检索证据块。
-            history = prepare_turn(
+            # 流开始前的两条 400 守卫(本轮输入超限 / 历史预算装不下一轮)在这里
+            # 完成 —— 一旦 yield 过首帧,状态码就改不了了。
+            #
+            # ⚠️ **返回值刻意丢弃** —— 这一点值得写清楚,因为它看起来像漏了。
+            # 它给的是 ch05–ch06 的单层裁剪(`trim.select_history`:按**原文**
+            # token 整轮丢弃),而本章起上下文由 `layers` 按两个锚点分层派生
+            # (spec §3)。**两者不能叠加**:摘要的触发判据是「层 2 的**截短后**
+            # token 数」,而 `select_history` 会先把层 2 的整轮消息丢在前面 ——
+            # `layer2_tokens` 随之少算,摘要**该触发而不触发**(而且每轮丢得更顺手),
+            # 声明的「级联」在日志里永远走不到第二环、还没有任何东西报错。
+            # 只有「锚点全是 0 且整段历史都放得下」时它才恰好是恒等变换,
+            # 而那是巧合,不足以依赖。
+            prepare_turn(
                 settings=settings, history=history, user_input=request.message
             )
+            # 预算:本请求**只推导一次**,往下传给 `build_graph`(agent 节点打
+            # `model_ctx` 要用同一份)。`prepare_turn` 内部也推一份 —— 同一份
+            # settings、同一个 system prompt,纯函数,所以两者必然相等;
+            # 它的签名这一章不动(见 T10 的边界)。
+            context_budget = budget.derive(
+                settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+            )
+
+            # ---- 降级:层 1 的原文超预算就把边界往后挪(只挪 id,不搬数据)----
+            # 挪过的那几轮**自动落进层 2**,下一轮以截短形态出现(spec §3.3)。
+            layer1_from = layers.degrade(
+                history,
+                summary_upto_msg_id=conv.summary_upto_msg_id,
+                layer1_from_msg_id=conv.layer1_from_msg_id,
+                layer1_budget=context_budget.layer1_budget,
+                settings=settings,
+            )
+            if layer1_from != conv.layer1_from_msg_id:
+                # 只在**真的动了**的时候写库:每次请求都写一遍会让
+                # 「降级发生了没有」在 DB 层看不出来,也白一次 commit。
+                await advance_anchors(
+                    session=session, conversation_id=session_id, layer1_from=layer1_from
+                )
+
+            # ---- 分层 + 截短 ----
+            got = layers.split(
+                history,
+                summary_upto_msg_id=conv.summary_upto_msg_id,
+                layer1_from_msg_id=layer1_from,
+                settings=settings,
+            )
+            # ---- 摘要任务:起在后台,**不 await** ----
+            # 它压的是**更早**的一段历史,与这一轮的回复无关,所以可以晚、也可以
+            # 失败(失败等于什么都没发生,下一轮再触发)。`trigger` 那行日志只能
+            # 在这里打:只有这个接缝同时拿着层 2 的用量与预算(T9 拿不到)。
+            if summarize.should_summarize(got, layer2_budget=context_budget.layer2_budget):
+                log_trigger(
+                    conversation_id=session_id,
+                    layer2_tokens=got.layer2_tokens,
+                    layer2_budget=context_budget.layer2_budget,
+                )
+                run_summary_in_background(
+                    conversation_id=session_id,
+                    settings=settings,
+                    model_factory=create_extract_model,
+                )   # 不 await
+            # ---- 组装精简版(层 2 截短段 + 层 1 原文段)----
+            # 层 1 再过一道 `trim_messages`(`prompts.select_layer1`,本仓
+            # LangChain 的唯一面):`degrade` 是按**整轮**收敛的,而它有一条
+            # 「只剩一轮还超预算就停在原地」的出口 —— 那一条留给这里收口,
+            # 宁可少发一段上下文,也不把窗口顶穿。
+            trimmed = got.layer2 + select_layer1(
+                got.layer1, max_tokens=context_budget.layer1_budget
+            )
+            summaries = await load_summaries(
+                session=session, conversation_id=session_id
+            )
+            # 多段梗概拼成**一段背景**(不是逐段清单);空列表 → 空串。
+            summary_text = summarize.join_summaries(summaries)
+
             # ch07 §7.6:指代消解 / 意图识别共用的那份上下文,**每轮必打**。
             # 位置有两重意义:① 在 `resolve_references` **之前**(它就是这个
             # 上下文最早的两个消费者);② 在**路由之前** —— 闲聊/投诉/兜底/
@@ -130,20 +215,19 @@ async def chat_stream(
             # checkpoint 还原上下文,`resolve_references` 也不会重跑 ——
             # 这里再打一行会是一条与事实不符的日志。
             #
-            # 这一行**不带锚点**:它手里是一份扁平的滑窗,不是「用两个锚点切出来
-            # 的三层」,给它补一对锚点只能是编的(spec §7.6 给 `history_ctx`
-            # 的字段表里也没有 `bounds`)。分层接上之后(T10),`history` 会换成
-            # 分层后的精简版,那时验收 4b 的 `…` / `[工具结果] ` 才会真的出现。
+            # `history=` 用**分层后的精简版**(T10 的收口):4b 要在这行里看见
+            # `…` 与 `[工具结果] `,而那两个标记只有 `layers.truncate` 产得出来
+            # —— 早先传的 `select_history` 输出**只整轮丢弃、从不标注内容**,
+            # 那条线在结构上承载不了 4b。
+            #
+            # 这一行**不带锚点**:`history_ctx` 收的是扁平滑窗、不是「用两个锚点
+            # 切出来的三层」,给它补一对锚点只能是编的(spec §7.6 的字段表里
+            # 也没有 `bounds`;`model_ctx` 才有,它的 `Layers` 自带锚点)。
             journal.history_ctx(
                 conversation_id=session_id,
-                summaries=await load_summaries(
-                    session=session, conversation_id=session_id
-                ),
-                history=history,
-                budget=budget.derive(
-                    settings=settings,
-                    system_prompt=render_system_prompt(settings.brand_name),
-                ),
+                summaries=summaries,
+                history=trimmed,
+                budget=context_budget,
             )
         # 工具集与注册表**同源**:绑给模型的与能执行的必须是同一批对象。
         # 两处各取一份时,模型会"看得到却执行不到",退化成一条 ok=false 的
@@ -175,6 +259,7 @@ async def chat_stream(
             conversation_id=session_id,
             emit=emit,
             checkpointer=get_checkpointer(),
+            context_budget=context_budget,
         )
 
         # 这一线程当前的 state —— **两个分支都要用**,所以在分支之前取一次。
@@ -231,7 +316,17 @@ async def chat_stream(
             stream_input = {
                 "conversation_id": session_id,
                 "user_input": request.message,
-                "history": history,        # prepare_turn 返回的**裁剪后**历史
+                # 精简版 = 层 2 截短段 + 层 1 原文段(spec §7.5)。它**不是**
+                # `prepare_turn` 的单层裁剪 —— 两回事,见上面那段注释。
+                "history": trimmed,
+                # 梗概全文(`join_summaries` 把多段拼成一段);空串 = 还没有梗概。
+                "summary_text": summary_text,
+                # 这一轮**真的用过**的那对锚点。agent 节点靠它们把扁平的精简版
+                # 重新分类成 `Layers`,好让 `model_ctx` 那一行说得准被切的是
+                # 哪一段。**两个通道必须在 `ChatState` 里声明过** ——
+                # LangGraph 对未声明通道的写入是静默丢弃的(ch06 的教训)。
+                "summary_upto_msg_id": conv.summary_upto_msg_id,
+                "layer1_from_msg_id": layer1_from,     # 降级**之后**的那个
                 "trace": [],
             }
             # **只在 state 没有 messages 时播种**(spec §7.4)。`add_messages` 是
@@ -252,8 +347,14 @@ async def chat_stream(
                     await load_history(session=session, conversation_id=session_id)
                 )
     except ContextOverflowError as exc:
+        # 两条 400(本轮输入超限 / 历史预算装不下一轮)都从这里出去。文案由
+        # `trim` 里那两个类给出(不含任何 Python 标识符,也不含用户文本),
+        # 仍然过一遍脱敏 —— 出站文本一律过 `redact_api_key` 是本章不新开例外的规矩。
         lock.release()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=redact_api_key(str(exc), settings.openai_api_key),
+        ) from exc
     except BaseException:
         # 拿到锁之后,凡是不返回 EventSourceResponse 的退出都必须释放锁,
         # 否则该会话会永久 409(lock_for 一直返回同一把被持锁)。

@@ -95,10 +95,37 @@ def truncate(message: Message, *, settings: Settings) -> Message:
     )
 
 
+def _assemble(
+    layer2: list[Message],
+    layer1: list[Message],
+    *,
+    summary_upto_msg_id: int,
+    layer1_from_msg_id: int,
+) -> Layers:
+    """把切好的两段包成 `Layers`(含计数与锚点)。
+
+    `split` 与 `resplit` **共用**它:计数口径(按传入那一版的内容、同一个
+    `trim.count_tokens`)只写一处 —— 各写一份就是两把尺子,而两把尺子给出的
+    `layer2_tokens` 会不同,却两边看起来都合理。
+    """
+    return Layers(
+        layer2=layer2,
+        layer1=layer1,
+        layer2_tokens=sum(trim.count_tokens(m.content) for m in layer2),
+        layer1_tokens=sum(trim.count_tokens(m.content) for m in layer1),
+        # 锚点原样带上:它们是这次切分的**输入**,`Layers` 与它的观测面
+        # (`journal.model_ctx` 的 `bounds`)必须是同一份,否则日志说的与
+        # 实际切的那一刀可以不一致,而两边都不报错。
+        summary_upto_msg_id=summary_upto_msg_id,
+        layer1_from_msg_id=layer1_from_msg_id,
+    )
+
+
 def split(
     history, *, summary_upto_msg_id: int, layer1_from_msg_id: int, settings: Settings
 ) -> Layers:
-    """切三层。**层 2 的 token 按截短后的版本数** —— 见模块 docstring 与 spec §3.2。
+    """切三层,并把层 2 截短。**层 2 的 token 按截短后的版本数** ——
+    见模块 docstring 与 spec §3.2。
 
     「按截短后数」是层 2 存在的全部意义:按原文数的话 §3.4 的截短就退化成
     纯渲染装饰,级联(何时摘要)与截短有没有做**完全无关**。
@@ -108,14 +135,39 @@ def split(
     )
     layer1 = _tail(history, from_id=layer1_from_msg_id)
     layer2 = [truncate(m, settings=settings) for m in layer2_raw]
-    return Layers(
-        layer2=layer2,
-        layer1=layer1,
-        layer2_tokens=sum(trim.count_tokens(m.content) for m in layer2),
-        layer1_tokens=sum(trim.count_tokens(m.content) for m in layer1),
-        # 锚点原样带上:它们是这次切分的**输入**,`Layers` 与它的观测面
-        # (`journal.model_ctx` 的 `bounds`)必须是同一份,否则日志说的与
-        # 实际切的那一刀可以不一致,而两边都不报错。
+    return _assemble(
+        layer2, layer1,
+        summary_upto_msg_id=summary_upto_msg_id,
+        layer1_from_msg_id=layer1_from_msg_id,
+    )
+
+
+def resplit(
+    history, *, summary_upto_msg_id: int, layer1_from_msg_id: int
+) -> Layers:
+    """给一份**已经截短过**的历史(端点播进来的精简版)重新分类,**不再截短一次**。
+
+    它服务的是观测面:端点的 `model_ctx` 要一份 `Layers` 才能记 `sliding` 与
+    `bounds`,而 state 里放的是**扁平的** `layer2 + layer1`。
+
+    **为什么不能用 `split` 代替**(这不是洁癖,是一个算得出来的差):
+
+    ```
+    工具结果截完 = "[工具结果] " + content[:60] + "…" = 67 字 > 阈值 60
+    ⇒ 再截一次会叠上第二个 "[工具结果] " 前缀,内容也变了
+    ```
+
+    于是日志描述的就**不是真正发出去的那批消息**,而它看起来完全正常 ——
+    端点那行 `model_ctx` 的全部价值就是描述发出去的那批消息,所以它必须
+    与实际发出去的那一份**同源**。`layers.truncate` 对 `assistant` 恰好幂等
+    (前缀是空串,`content[:limit]` 正好把上次的 `…` 切掉再补回来),**对
+    `tool` 不幂等** —— 只害工具结果,而工具结果正是层 2 里最大的一块。
+
+    不接 `Settings`:本函数**不做任何截短**,没有可配的东西。
+    """
+    return _assemble(
+        _middle(history, after_id=summary_upto_msg_id, before_id=layer1_from_msg_id),
+        _tail(history, from_id=layer1_from_msg_id),
         summary_upto_msg_id=summary_upto_msg_id,
         layer1_from_msg_id=layer1_from_msg_id,
     )

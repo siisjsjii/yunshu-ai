@@ -14,7 +14,15 @@ from pydantic import ValidationError
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
-from app.prompts import build_intent_messages, build_messages, build_resolve_messages
+from app.memory import journal, layers
+from app.memory.budget import ContextBudget
+from app.memory.trim import count_tokens
+from app.prompts import (
+    build_context_messages,
+    build_intent_messages,
+    build_resolve_messages,
+    render_evidence,
+)
 from app.schemas import Message
 from app.services.history import append_turn
 from app.tools.executor import execute_tool
@@ -231,7 +239,7 @@ def _total_tokens(chunk) -> int:
     return int(meta.get("total_tokens") or 0)
 
 
-def make_agent_node(*, model, tools, registry, settings, emit):
+def make_agent_node(*, model, tools, registry, settings, emit, context_budget: ContextBudget):
     """主力 Agent 的 ReAct 循环。
 
     **不用 ToolNode / create_react_agent**:工具执行必须走 `execute_tool`,
@@ -241,6 +249,11 @@ def make_agent_node(*, model, tools, registry, settings, emit):
 
     停止条件是**结构保证**:循环里绑着 tools 走 `max_agent_steps` 轮;步数用尽
     或预算超限后,收尾那一轮**不绑 tools**,模型在结构上无法再调。
+
+    `context_budget` 由端点**一次推导**后经 `build_graph` 传进来(它给
+    `journal.model_ctx` 记用量与预算)。**刻意没有默认值**:有默认值的话,
+    端点忘了传也能跑,而日志里那份预算就是另一个来源算的 —— 本仓的规矩是
+    依赖走显式注入(`services/` 收 llm 实例同款),不留会自己兜底的参数。
     """
     bound = model.bind_tools(list(tools))
 
@@ -256,15 +269,42 @@ def make_agent_node(*, model, tools, registry, settings, emit):
         return acc, used
 
     async def agent_node(state) -> dict:
-        # ⚠️ `state.get("history")` 现在是**精简版**(层 2 截短段 + 层 1 原文段,
-        # T10 接线);`state["messages"]` 是累积的**完整**历史 —— 两者的分工见
-        # `app/agent/state.py`。收窄成 `history` 不违和,因为精简版正是为这一轮
-        # 组装出来的;**别**在这里改成读 `messages`,那会把整段历史原样塞进 prompt。
-        msgs = build_messages(
+        # ⚠️ `state.get("history")` 是**精简版**(层 2 截短段 + 层 1 原文段,
+        # 由端点每轮派生并播种);`state["messages"]` 是累积的**完整**历史 ——
+        # 两者的分工见 `app/agent/state.py`。这里读 `history` 不违和,因为精简版
+        # 正是为这一轮组装出来的;**别**改成读 `messages`,那会把整段历史原样
+        # 塞进 prompt(它是 id 不可比的 LangChain 消息,分层也无从谈起)。
+        history = state.get("history") or []
+        summary_text = state.get("summary_text") or ""
+        evidence = state.get("evidence") or []
+        msgs = build_context_messages(
             brand_name=settings.brand_name,
-            history=state.get("history") or [],
-            evidence=state.get("evidence") or [],
+            history=history,
             user_input=state["resolved_input"],
+            summary=summary_text,
+            evidence=evidence,
+        )
+        # ---- ch07 §7.6:主力 Agent 每次组装完上下文,一行 `model_ctx` ----
+        # **用真的用过的那对锚点重新切分**(端点播进 state),因为 state 里是
+        # 扁平的精简版,而 `journal.model_ctx` 要一份 `Layers`(读 `sliding`
+        # 与 `bounds`)。用过期值或 `0` 的话,那一行会**平静地描述一次没发生过的
+        # 切分** —— 而没有任何断言会因此变红。
+        #
+        # 切分用 `layers.resplit`(**不再截短一次**):精简版里的层 2 已经是截短过的
+        # 形态,再走一遍 `layers.split` 会给工具结果叠上第二个 `[工具结果] ` 前缀,
+        # 于是日志与「真正发出去的那批消息」分叉 —— 而那条日志的全部价值就是这个。
+        journal.model_ctx(
+            conversation_id=state["conversation_id"],
+            summary=summary_text,
+            layers=layers.resplit(
+                history,
+                summary_upto_msg_id=state.get("summary_upto_msg_id") or 0,
+                layer1_from_msg_id=state.get("layer1_from_msg_id") or 0,
+            ),
+            # 证据按**渲染后的那一段**数(它就是并进用户消息的东西),
+            # 不是按条数、也不是按 `answer` 的裸长度。
+            evidence_tokens=count_tokens(render_evidence(evidence)) if evidence else 0,
+            budget=context_budget,
         )
         parts: list[str] = []
         made: list[dict] = []
@@ -442,8 +482,13 @@ def make_resolve_references_node(*, model):
             # 上一轮的 assistant 消息被再写一遍(历史里同一个回复出现两次)。
             # 它是这份清单里**唯一一个不会被节点自动覆盖**的通道,所以必须在这儿。
             # 这是 ch05–ch06「**通道与它的清零必须同处一地**」的第三次应用。
-            # ⚠️ `messages` **不在此列**(它是累积通道):加进来等于每轮清空
-            # 完整历史,而单轮测试完全看不出来。
+            # ⚠️ `messages` **不在此列**(它是累积通道):这份清单是给
+            # 「没有播种者、只能靠重置」的通道用的,而 `messages` 每轮都有人吐新
+            # 消息进去。**更正一处早先写错机制的注释**:加进来**并不会**清空历史
+            # —— `add_messages(left, [])` 实测**原样返回 `left`**(空列表更新在
+            # append-only reducer 上是 no-op)。决定不变,但理由是「**不必要**」,
+            # 不是「危险」。ch07 新增的 `summary_text` 与两个锚点同样不在此列:
+            # 它们每轮由端点播种(见 `app/agent/state.py`)。
             "turn_messages": [],
             # 退款子流程的三个槽位(T7 新加)。**通道与它的清零同处一地**:
             # 漏了这三行的后果是**静默串轮** —— 上一轮填过的订单号会被这一轮

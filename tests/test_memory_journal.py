@@ -24,7 +24,7 @@ from app import main as main_module
 from app.config import Settings
 from app.db.models import Conversation, ConversationSummary, MessageRecord
 from app.logging_setup import setup_logging
-from app.memory import budget, journal, layers, trim
+from app.memory import budget, journal, layers, summarize, trim
 from app.schemas import Message
 
 REQUIRED = dict(
@@ -315,11 +315,19 @@ def test_history_ctx_from_the_endpoint_carries_the_real_session_and_window(
 
     上一条只验「有没有那一行」。conversation_id 写错、`sliding` 装成空列表
     都照样绿 —— 而这一行存在的全部意义就是让人能把它与某个会话对上。
+
+    ⚠️ 两个锚点取 **(1, 3)**,而且必须是**轮的起点**(3 是那条 user)。
+    T10 之前这里写的是 (2, 4):`layer1_from=4` 落在一条 **assistant** 上,而
+    端点的层 1 选择走 `trim_messages(start_on="human")` —— **一段没有 user 的
+    层 1 会被整轮丢掉**(实测 `sliding` 里只剩层 2)。锚点在**生产**上恒是轮的
+    起点(`0` 或 `degrade` 挪出来的那个,它只落在 user 上;摘要任务推进
+    `summary_upto` 时用的也是 `layer1_from`),所以 (2, 4) 那种取值不是本章的
+    语义 —— 拿它当输入,验的就成了另一件事。
     """
     db = FakeSession()
     db.conversations["c-anchored"] = Conversation(
         id="c-anchored", user="demo-user", status="active",
-        summary_upto_msg_id=2, layer1_from_msg_id=4,
+        summary_upto_msg_id=1, layer1_from_msg_id=3,
     )
     for role, content in [
         ("user", "你好"), ("assistant", "你好呀"),
@@ -454,3 +462,30 @@ def test_lifespan_does_not_configure_file_logging_under_pytest(
         c.post("/api/chat/stream", json={"message": "你好"})
 
     assert called == []
+
+
+def test_history_ctx_counts_the_summary_with_the_shared_joiner(caplog):
+    """`tokens.summary` 必须与**真正注入时**的拼法同源。
+
+    `journal` 原先自己复制了一份 `"\n\n"`,而权威是
+    `summarize.join_summaries`(T8)。两处不一致时,这一行报的 token 数
+    就不是模型实际收到的那段文本的数 —— 一个「看起来正常、其实什么也没说」的
+    观测面。
+
+    ⚠️ 这条断言的**强度是有限的**:分隔符从 `"\n\n"` 改成 `"\n"` 时
+    tiktoken 给出的数**恰好相等**,所以它抓不到那一种漂移。真正堵住它的是
+    `journal` 现在**直接调用** `join_summaries`(不再留第二份实现)——
+    这条用例是跨模块的交叉核对,不是唯一防线。
+    """
+    rows = [(1, "第一段:用户问过订单 1002"), (2, "第二段:要求退款并补偿运费")]
+    s = _settings()
+    b = budget.derive(settings=s, system_prompt="你是客服。")
+    with caplog.at_level(logging.INFO):
+        journal.history_ctx(
+            conversation_id="c9", summaries=rows,
+            history=[Message(id=5, role="user", content="现在这句")], budget=b,
+        )
+
+    payload = _last_payload(caplog, "history_ctx")
+    assert payload["tokens"]["summary"] > 0
+    assert payload["tokens"]["summary"] == trim.count_tokens(summarize.join_summaries(rows))

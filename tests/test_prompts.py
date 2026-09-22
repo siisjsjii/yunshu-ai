@@ -7,8 +7,10 @@ from app.prompts import (
     build_extract_messages,
     build_messages,
     render_system_prompt,
+    select_layer1,
     to_lc_messages,
 )
+from app.memory import trim
 from app.schemas import Message, RequestType
 
 
@@ -193,6 +195,84 @@ def test_evidence_is_appended_after_the_user_text_and_keeps_its_numbering():
     assert tail.index("这个能退吗") < tail.index("[1]")
     assert "[1] (退款政策) 七天无理由" in tail
     assert "[2] (运费规则) 满 99 包邮" in tail
+
+
+def test_summary_rides_before_evidence_when_both_are_present():
+    """**梗概在前、证据在后** —— 两者**同时非空**时的顺序。
+
+    这是此前没人覆盖的组合:已有用例一次只喂一样(`summary` 或 `evidence`),
+    于是把 `_render_tail` 里两段**对调**、或者把它俩之间的连接符改掉,
+    **六条用例全绿**(T6 审查的 Minor)。而它俩的顺序是有理由的:梗概是背景,
+    证据是回答本问题的直接依据,贴得离用户那句话越近越好。
+
+    期望值写成**位置关系**(`index(梗概) < index("[1]")`),不是逐字文案 ——
+    这个函数不测措辞,测的是两段的相对位置。
+    """
+    msgs = build_context_messages(
+        brand_name="本店", history=[], user_input="这个能退吗",
+        summary="用户问过订单 1002",
+        evidence=[{"section_path": "退款政策", "category": "policy", "answer": "七天无理由"}],
+    )
+    assert len(msgs) == 2, "梗概与证据都不许另起一条消息"
+    content = msgs[-1].content
+    assert content.startswith("这个能退吗")
+    assert content.index("用户问过订单 1002") < content.index("[1]")   # ← 梗概在前
+    assert "用户问过订单 1002" in content and "[1] (退款政策) 七天无理由" in content
+
+
+def test_select_layer1_keeps_the_recent_tail_that_fits_and_starts_on_a_turn():
+    """`select_layer1` 包住的正是 `trim_messages(strategy="last", start_on="human")`。
+
+    三件事必须同时成立,少一件它就退化成另一个函数:
+
+    ① **从最近的往前留**:留下来的恒是入参的**后缀**(返回的是 `schemas.Message`、
+       而且带着 MySQL 主键 —— 分层全靠 id);
+    ② **预算真的被用上**:把预算压到只装得下最后两条时,前面的必须掉;
+    ③ **从一轮的开头起**(`start_on="human"`):否则会留下一条没有提问的回答,
+       或者把 `tool` 消息与它的 assistant 拆开(上游直接 400)。
+    """
+    history = [
+        Message(id=1, role="user", content="第一问" * 10),
+        Message(id=2, role="assistant", content="第一答" * 10),
+        Message(id=3, role="user", content="第二问"),
+        Message(id=4, role="assistant", content="第二答"),
+    ]
+    # ③ 预算刚好只装得下最后一轮(第二问 + 第二答)。
+    tight = trim.count_tokens("第二问") + trim.count_tokens("第二答")
+    kept = select_layer1(history, max_tokens=tight)
+    assert [m.content for m in kept] == ["第二问", "第二答"]
+    assert [m.id for m in kept] == [3, 4]                 # ① 主键跟着回来(分层靠它)
+    assert kept[0].role == "user"                          # ③ 从一轮的开头起
+    # ② 对照:预算放宽到装得下全部时,一条都不许掉(恒定砍尾巴的实现过不了这半条)。
+    loose = sum(trim.count_tokens(m.content) for m in history)
+    assert select_layer1(history, max_tokens=loose) == history
+    # 空输入是**空**,不是异常(新会话的第一句)。
+    assert select_layer1([], max_tokens=100) == []
+
+
+def test_select_layer1_drops_whole_rounds_and_never_reorders():
+    """留下来的必须是**入参的后缀**、原序,**整轮**地留或丢。
+
+    两点各有来由:
+
+    ① 「保住了几条 = 末尾那几条」是一个**对 `trim_messages` 行为的依赖**:
+       `strategy="last"` 的结果是入参的连续后缀(实测装的 1.6.3:`_last_max_tokens`
+       只做切片,不复制不重排)。这条把这个前提钉住 —— 将来库的行为一变,
+       红在这里,而不是让端点静默少发几条历史。
+    ② 装不下一轮时宁可**空**,也不留半轮:半轮 = 一条没有提问的回答,
+       或者 tool 消息与它的 assistant 被拆开(上游 400)。这是 `start_on="human"`
+       与 `allow_partial=False` 共同给的,不是我们另外加的判断。
+    """
+    history = [
+        Message(id=1, role="user", content="甲" * 40),
+        Message(id=2, role="assistant", content="乙" * 40),
+        Message(id=3, role="user", content="丙" * 40),
+        Message(id=4, role="assistant", content="丁" * 40),
+    ]
+    one_round = trim.count_tokens("丙" * 40) + trim.count_tokens("丁" * 40)
+    assert select_layer1(history, max_tokens=one_round) == [history[2], history[3]]
+    # 少一个 token:整轮都装不下 ⇒ 空(而不是留下没有提问的那半轮)。
+    assert select_layer1(history, max_tokens=one_round - 1) == []
 
 
 def test_lc_token_counter_counts_content_only_not_structure():

@@ -1,12 +1,17 @@
 """主力 Agent 的 ReAct 循环:收敛、工具回灌、停止条件、token 预算、流式。"""
 
+import json
+import logging
+
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from app.agent import nodes
 from app.agent.nodes import make_agent_node, make_log_turn_node
 from app.config import Settings
-from app.prompts import render_evidence, to_lc_messages
+from app.memory import budget
+from app.memory.trim import count_tokens
+from app.prompts import render_evidence, render_system_prompt, to_lc_messages
 from app.schemas import Message
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import SUMMARY_MAX_CHARS
@@ -110,9 +115,15 @@ class FakeTool:
 
 
 def _node(model, tools=(), registry=None, settings=None, frames=None):
+    settings = settings or _settings()
     return make_agent_node(
         model=model, tools=list(tools), registry=registry or {},
-        settings=settings or _settings(),
+        settings=settings,
+        # 生产路径由端点经 `build_graph` 传下来(每次请求只推一次)—— 单测这里
+        # 现算一份:同一个纯函数、同一份输入,结果相同。
+        context_budget=budget.derive(
+            settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+        ),
         emit=(frames.append if frames is not None else (lambda p: None)),
     )
 
@@ -122,6 +133,14 @@ def _state(**over):
             "resolved_input": "订单 1001 发货了吗", "history": []}
     base.update(over)
     return base
+
+
+def _last_payload(caplog, prefix: str) -> dict:
+    """取出最后一条 `"<prefix> <json>"` 的 JSON 体。取不到**直接抛**。"""
+    for record in reversed(caplog.records):
+        if record.message.startswith(f"{prefix} "):
+            return json.loads(record.message.split(" ", 1)[1])
+    raise AssertionError(f"日志里没有 {prefix} 行")
 
 
 @pytest.mark.anyio
@@ -492,6 +511,69 @@ def test_to_lc_messages_uses_the_mysql_id_as_the_langchain_id():
         Message(role="assistant", content="还没有 id"),      # 手工构造的
     ])
     assert [m.id for m in msgs] == ["7", "8", None]
+
+
+@pytest.mark.anyio
+async def test_model_ctx_describes_the_layers_actually_sent(caplog):
+    """`model_ctx` 用**真的用过的锚点**重切精简版,而且**不再截短一次**。
+
+    两条断言各有分工,缺一条就有一种实现能蒙混:
+
+    ① `bounds` 是 state 里那两个锚点(0 / 5)。写成 `0`/`0`、或读通道读成
+       `None` 的实现在这里红 —— 而 `0` 在本章**是个有含义的值**(尚无梗概 /
+       层 1 起于最早),读日志的人分不出它是真值还是占位。
+    ② `sliding` 与真的发给模型的历史**逐条内容相同**。精简版里的层 2 已经是
+       截短过的形态,用 `layers.split` 再切一次会给工具结果叠上**第二个**
+       `[工具结果] ` 前缀(实测:截完 6+60+1 = 67 字 > 阈值 60 ⇒ 再截一次),
+       而那一行日志**看起来完全正常** —— 没有任何东西会报错。
+    """
+    truncated = "[工具结果] " + "工" * 60 + "…"
+    history = [
+        Message(id=1, role="user", content="订单 1002 能退吗"),
+        Message(id=2, role="assistant", content="",
+                tool_calls=[{"id": "c1", "name": "query_order", "args": {"order_id": "1002"}}]),
+        Message(id=3, role="tool", content=truncated, tool_call_id="c1"),
+        Message(id=4, role="assistant", content="客" * 50 + "…"),
+        Message(id=5, role="user", content="那运费退吗"),
+    ]
+    model = ScriptedModel([[FakeChunk("好")]])
+    with caplog.at_level(logging.INFO):
+        await _node(model).__call__(_state(
+            history=history,
+            summary_upto_msg_id=0, layer1_from_msg_id=5,
+            summary_text="用户问过订单 1002",
+        ))
+
+    payload = _last_payload(caplog, "model_ctx")
+    assert payload["conversation_id"] == "c1"
+    assert payload["bounds"] == {"summary_upto_msg_id": 0, "layer1_from_msg_id": 5}
+    # ② 与真的发出去的那批**逐条相同**(第 0 条是 system、最后一条是本轮 human)。
+    sent = model.bound_messages
+    assert [m.content for m in sent[1:-1]] == [m["content"] for m in payload["sliding"]]
+    assert payload["sliding"][2]["content"] == truncated          # ← 没有二次截短
+    assert payload["sliding"][4]["content"] == "那运费退吗"        # 层 1 是这一条
+    assert payload["tokens"]["layer2"] > 0 and payload["tokens"]["layer1"] > 0
+    assert payload["tokens"]["summary"] == count_tokens("用户问过订单 1002")
+    assert payload["summary"] == "用户问过订单 1002"
+
+
+@pytest.mark.anyio
+async def test_model_ctx_counts_the_evidence_it_injects(caplog):
+    """`tokens.evidence` 数的是**真的并进用户消息的那段证据**。
+
+    它要能被区分:恒 0 的实现让「证据有没有进上下文」在这一行里看不出来,
+    而那正是这一行存在的意义(分段计数,不只是总数)。
+    """
+    evidence = [{"section_path": "退货政策", "category": "退换货", "answer": "七天无理由"}]
+    model = ScriptedModel([[FakeChunk("好")]])
+    with caplog.at_level(logging.INFO):
+        await _node(model).__call__(_state(evidence=evidence))
+
+    payload = _last_payload(caplog, "model_ctx")
+    rendered = render_evidence(evidence)
+    assert payload["tokens"]["evidence"] == count_tokens(rendered) > 0
+    # 前提:这段证据真的在模型收到的最后一条消息里(否则上面那个数只是自说自话)。
+    assert rendered in [m.content for m in model.bound_messages][-1]
 
 
 @pytest.mark.anyio

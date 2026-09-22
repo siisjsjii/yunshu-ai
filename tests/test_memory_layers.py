@@ -180,3 +180,54 @@ def test_degrade_loops_until_it_converges():
     assert tight_from >= loose
     assert layers.split(h, summary_upto_msg_id=0, layer1_from_msg_id=tight_from,
                         settings=tight).layer1_tokens <= 1 or tight_from == 9
+
+
+# ------------------------------------------------------------ resplit(T10)
+
+#: 一条**长过** `layer2_tool_chars` 的工具结果。短的话截短不触发,
+#: 「二次截短」与「不再截短」在那个输入上**完全一样**(本章第五种假绿:
+#: 测试输入小到触发不了被测行为)。
+_LONG_TOOL_RESULT = "订单 1002 已取消,用户可以申请退款。" * 20
+
+
+def _long_tool_history():
+    return [
+        Message(id=1, role="user", content="订单 1002 能退吗"),
+        Message(id=2, role="assistant", content="", tool_calls=[
+            {"name": "query_order", "args": {"order_id": "1002"},
+             "id": "call_1", "type": "tool_call"}
+        ]),
+        Message(id=3, role="tool", content=_LONG_TOOL_RESULT, tool_call_id="call_1"),
+        Message(id=4, role="user", content="那运费退吗"),
+    ]
+
+
+def test_resplit_is_the_identity_on_an_already_truncated_window():
+    """`resplit` 给**已经截短过**的精简版重新分类,**不再截短一次**。
+
+    为什么不能用 `split` 代替 —— 这不是洁癖,是一个可以算出来的差:
+
+    ```
+    工具结果截完 = "[工具结果] " + content[:60] + "…" = 67 字 > 阈值 60
+    ⇒ 再走一遍 `split` 会二次截短,并叠上第二个 "[工具结果] " 前缀
+    ```
+
+    日志里描述的因此**不是真正发出去的那批消息**,而它看起来完全正常
+    (端点那行 `model_ctx` 的全部价值就是描述发出去的那批消息)。
+    这条用例把两种行为**并排**钉住:先是 `split` 的二次截短(前提前半),
+    再是 `resplit` 的恒等 —— 任何一边被改坏都会红。
+    """
+    s = _settings()
+    anchors = dict(summary_upto_msg_id=0, layer1_from_msg_id=4)
+    got = layers.split(_long_tool_history(), settings=s, **anchors)
+    once = next(m for m in got.layer2 if m.role == "tool").content
+    assert once.startswith("[工具结果] ") and once.endswith("…")
+    assert len(once) > 60                      # ← 前提:截短后的形态仍然超阈值
+
+    trimmed = got.layer2 + got.layer1
+    # 前提前半:再走一遍 `split` 确实会二次截短(所以不能拿它当 resplit)。
+    again = layers.split(trimmed, settings=s, **anchors)
+    assert again.layer2[2].content.startswith("[工具结果] [工具结果] ")
+
+    # `resplit` 对同一批消息、同一对锚点是**恒等**的:内容、token 数、锚点全等。
+    assert layers.resplit(trimmed, **anchors) == got

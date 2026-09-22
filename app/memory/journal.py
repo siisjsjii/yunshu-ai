@@ -13,8 +13,8 @@
 `app/logging_setup.py` 钉住)。转义成 `\\uXXXX` 的话日志对人就没用了。
 
 **四条硬要求**(spec §7.6)。注意:验收 4b 判的是 **`history_ctx` 那一行**里
-看得见截短后的形态,而那条线**要等分层接上(T10)才成立** —— 详见
-`history_ctx` 的 docstring,别把 4b 挪到 `model_ctx` 上:
+看得见截短后的形态(自 T10 起端点传进来的就是**分层后**的精简版,那两个标记
+真的会出现)—— 详见 `history_ctx` 的 docstring,**别把 4b 挪到 `model_ctx` 上**:
 1. `tokens` **必须分段** —— 只给一个总计的话,层 2 那段的数字再也不会随截短
    而变,「按截短后计数」失效与生效无从区分;
 2. `sliding` 装的是**截短后**的消息,它要能一眼看出 `…` 与 `[工具结果] `;
@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from app.memory import trim
 from app.memory.budget import ContextBudget
 from app.memory.layers import Layers
+from app.memory.summarize import join_summaries
 from app.schemas import Message
 
 logger = logging.getLogger(__name__)
@@ -143,34 +144,43 @@ def history_ctx(
     就是那么丢的(节点写了值、通道根本不存在、单测全绿而生产恒为 `None`),
     而它当时没有任何观测面。
 
-    ⚠️ **这一份不分层**:入参 `history` 是端点已经裁好的**单一滑窗**
-    (指代消解与意图识别都只看最近的一段)。所以:
+    ⚠️ **这一份不按层报数**:入参 `history` 是一个**扁平的窗口**
+    (指代消解与意图识别都只看最近的一段),`tokens.layer1` 数的是**整个窗口**。
+    窗口里**可以**含层 2 的截短形态(T10 起就是——4b 靠这个),但这一行**不区分**
+    哪几条来自层 2:
 
     - `tokens.layer2` 与 `tokens.evidence` 结构性为 `0`,**不是因为截短/检索
-      没生效** —— 键保留只是为了与 `model_ctx` 同形(读日志的人用同一套键读
-      两行),而不是在声称这里有分层;
+      没生效**(层 2 的截短形态就混在 `sliding` 里)—— 键保留只是为了与
+      `model_ctx` 同形(读日志的人用同一套键读两行),而不是在声称这里有分层;
     - **没有 `bounds`**。这份上下文不是由「两个锚点切出来的」,给它补一对锚点
       只能靠调用方另行传入,而那正是「长得像真值、其实什么也没说」的形状
       (`0` 在本章是有含义的值)。spec §7.6 给 `history_ctx` 的字段表里本来
       也只有 `summary` / `sliding` / `tokens`。
+      要按层看数的是 **`model_ctx`** 那一行(它拿的是 `Layers`,锚点自带)。
 
-    ⚠️ **当下它还承载不了验收 4b。** 4b 判的是 `history_ctx` 里看得见**截短后的
-    形态**(客服答复带 `…`、工具结果是一行 `[工具结果] `),而端点今天传进来的
-    `history` 是 `trim.select_history` 的输出 —— 那个函数**只整轮丢弃、从不标注
-    内容**,所以那两个标记**不可能出现**。产出它们的是 `layers.truncate`,
-    分层要到 T10 才接上。`model_ctx` 的 `sliding` 确实已经带截短形态,但**那不是
-    4b 指定的那条线** —— 4b 指定的是本函数这一行,别把验收标准挪过去迎合实现。
+    ✅ **T10 起它承载得了验收 4b**:端点传进来的 `history` 是**分层后的精简版**
+    (`layers.split` 的 `layer2 + layer1`),所以客服答复带 `…`、工具结果是一行
+    `[工具结果] ` —— 那两个标记**只有** `layers.truncate` 产得出来
+    (T7 记过:早先传的 `trim.select_history` 输出**只整轮丢弃、从不标注内容**,
+    那条线在结构上做不到)。**改回去就等于把 4b 打回不可达** ——
+    `tests/test_api_chat.py::test_history_ctx_carries_the_truncated_layer2_forms`
+    钉着这一条。
+    顺带:`model_ctx` 的 `sliding` 也带截短形态,但**那不是 4b 指定的那条线**
+    —— 4b 指定的是本函数这一行,别把验收标准挪过去迎合实现。
 
-    `tokens.summary` 是**摘要段**的估算:多段摘要按 `"\\n\\n"` 相拼后计数
-    (与 `prompts.py` 里段间连接符同源)。真注入时用的是
-    `memory.summarize.join_summaries` 的拼法 —— 两者若日后不一致,这个数会
-    偏一点(而**日志与模型实际收到的不是同一段文本**,正是本模块最该避免的
-    那种「看起来正常」)。**改 `join_summaries` 的拼法时把这里一起改。**
+    `tokens.summary` 是**摘要段**的估算,拼法**直接调**
+    `memory.summarize.join_summaries`(真注入时用的就是它)—— 本模块原先自己
+    复制了一份 `"\\n\\n"`,而两处不一致时,这里报的 token 数就不是模型实际收到
+    的那段文本的数:T8 给的分隔符常量与这份副本**都会**「看起来合理」。
+    真正注入的拼法只有一个实现,计数跟着它走。
     """
     sliding = _sliding(history)
     rows = _summary_rows(summaries)
+    # 拼法只有一个实现(见 docstring):按 `(seq, content)` 交给 `join_summaries`。
     summary_tokens = (
-        trim.count_tokens("\n\n".join(row["content"] for row in rows)) if rows else 0
+        trim.count_tokens(join_summaries([(r["seq"], r["content"]) for r in rows]))
+        if rows
+        else 0
     )
     layer1_tokens = sum(trim.count_tokens(message.content) for message in history)
     _emit(

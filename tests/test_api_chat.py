@@ -7,6 +7,7 @@ ch02 Task 11 整体改写:端点的历史来源从进程内 `SessionStore` 换�
 
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -23,7 +24,11 @@ from app.config import Settings, get_settings
 from app.db.models import Conversation, ConversationSummary, MessageRecord
 from app.db.session import get_session
 from app.main import app
+from app.memory import budget as memory_budget
+from app.memory import layers, trim
 from app.memory.store import SessionStore
+from app.prompts import render_system_prompt
+from app.schemas import Message
 from app.refund.orders import DEMO_ORDERS
 from app.retrieval.expand import ExpandQueries
 from app.retrieval.search import RetrievedChunk
@@ -342,6 +347,19 @@ class FakeSession:
         raise AssertionError(f"替身不支持的实体:{entity}")
 
     def add(self, obj):
+        # ch07 T10:真实 `AsyncSession` 在 flush/commit 时会把**标量 Python 侧默认值**
+        # 落到对象上(`Conversation.summary_upto_msg_id` 的 `default=0` 就是这类,
+        # 与表上的 `server_default="0"` 互为表里)。替身不模拟这一步的话,
+        # `ensure_conversation` **新建**出来的会话两个锚点是 `None` ——
+        # 而端点的分层要拿它们与 `messages.id` 比大小,红法是一句
+        # `TypeError: '<' not supported between instances of 'NoneType' and 'int'`
+        # 指向 `layers`,而真正缺的是替身的这一步。**补替身,不给实现加兜底**:
+        # 生产路径上这两个值确实是 0(真实库读回来实测就是 `0 / 0`)。
+        for column in obj.__table__.columns:
+            if getattr(obj, column.key) is None and getattr(
+                column.default, "is_scalar", False
+            ):
+                setattr(obj, column.key, column.default.arg)
         if isinstance(obj, Conversation):
             self.conversations[obj.id] = obj
         elif isinstance(obj, MessageRecord):
@@ -1664,3 +1682,399 @@ async def test_done_frame_carries_the_intent_confidence(client_factory):
     done = _parse_sse(resp.text)[-1]
     assert done[0] == "done"
     assert done[1]["confidence"] == 0.77
+
+
+# ---------- ch07:端点接线(降级 → 起任务 → 播种精简版 → 两个观测面) ----------
+#
+# 本节验的**只有接线**:降级、分层截短、摘要触发、组装、观测面各自都有单测,
+# 而把它们接错时**那些单测一条都不会红**(每一件都还在,只是不在请求路径上)。
+# 所以这里一律走**端点**,观测点取「模型真的收到了什么」与「日志里真的写了什么」。
+
+SCRATCH_CONV = "c" * 32
+
+#: 层 2 里那条工具结果。远超 `layer2_tool_chars=60`,所以**一定会被截短** ——
+#: 短于阈值的输入会让「截短生效」与「截短失效」在这条用例里长得一模一样
+#: (本章第五种假绿形态:测试输入小到触发不了被测行为)。
+_LONG_TOOL_RESULT = json.dumps(
+    {"order_no": "1002", "status": "已取消",
+     "note": "用户已申请退款,等待仓库确认。" * 12},
+    ensure_ascii=False,
+)
+
+#: 层 2 里那条客服答复。同理,要长过 `layer2_assistant_chars=50`。
+_LONG_REPLY = "您的订单 1002 当前状态为已取消,已为您登记退款申请。" * 5
+
+#: 降级用例的默认行数。**标定值,不是随手写的数**(计划给的是 20)。
+_DEGRADE_ROWS = 24
+#: 摘要用例的行数 —— 必须长到层 2 的**截短后** token 数超过 `layer2_budget`。
+_SUMMARY_ROWS = 40
+
+LAYERED_CONV = "d" * 32
+
+
+def _log_payload(caplog, prefix: str) -> dict:
+    """从日志里取出最后一条 `"<prefix> <json>"` 的 JSON 体。
+
+    取不到**直接抛** —— 退化成「返回 {}」会让断言全变成 KeyError 或恒真,
+    而本节的用例问的正是「那一行到底有没有、里面是什么」。
+    """
+    for record in reversed(caplog.records):
+        if record.message.startswith(f"{prefix} "):
+            # 按**前缀长度**切,不是 `split(" ", 1)`:`tasks._emit` 的前缀是
+            # `"summary <event>"`(两个词),按空格切会切掉半个前缀、
+            # 留下 `'trigger {...}'` 这种不是 JSON 的东西,而红法会是
+            # 一句没头没脑的 JSONDecodeError。
+            return json.loads(record.message[len(prefix) :].lstrip())
+    raise AssertionError(f"日志里没有 {prefix} 行")
+
+
+def _stuffed_session(rows: int = _DEGRADE_ROWS) -> FakeSession:
+    """造一个已存在、且历史长到会触发降级的会话。
+
+    ⚠️ `rows` 是**标定过的**(计划给的 20 有一个致命问题:它触发不了摘要,
+    于是「摘要任务被起起来了」那条用例会以 `fired == []` 的形式失败,而
+    红法看起来像「接线没做」)。实测(默认配置:窗口 18000、固定开销 5463、
+    单轮峰值 8000 ⇒ `history_budget=4537`、层 1 预算 3175、层 2 预算 1362;
+    每行「很长的历史内容」×20 = 140 字 ≈ 160 token):
+
+    | rows | 降级后层 1 起点 | 层 1 token | 层 2 token | 触发摘要 |
+    |---|---|---|---|---|
+    | 20 | 3 | 2880 | 219 | 否 |
+    | **24** | 7 | 2880 | 657 | 否 |   ← 默认
+    | 40 | 23 | 2880 | 2409 | **是** |
+
+    默认取 24:降级**确定发生**(那才是 `test_degrade_...` 要验的),
+    而层 2 离触发线还远 —— 免得那条用例在无人察觉的情况下起一个真的后台线程
+    (它自带 engine 与 HTTP 客户端,而「单测全程不联网」是硬规矩)。
+    """
+    db = FakeSession()
+    db.conversations[SCRATCH_CONV] = Conversation(
+        id=SCRATCH_CONV, user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    for i in range(rows):
+        db.add(MessageRecord(
+            conversation_id=SCRATCH_CONV,
+            role="user" if i % 2 == 0 else "assistant",
+            content="很长的历史内容" * 20,
+        ))
+    return db
+
+
+def _layered_session() -> FakeSession:
+    """一个**已经降过级**的会话:两个锚点非零 ⇒ 层 2 非空。
+
+    层 2 里放一条长工具结果与一段长客服答复 —— 它们正是验收 4b 要看见的
+    「截短后的形态」(`[工具结果] …` / `…`)。那两样**只有** `layers.truncate`
+    产得出来:`trim.select_history` 只整轮丢弃、从不标注内容,所以分层接上之前,
+    `history_ctx` 那一行在结构上承载不了 4b。
+    """
+    db = FakeSession()
+    db.conversations[LAYERED_CONV] = Conversation(
+        id=LAYERED_CONV, user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=5,
+    )
+    db.add(MessageRecord(conversation_id=LAYERED_CONV, role="user", content="订单 1002 能退吗"))
+    db.add(MessageRecord(
+        conversation_id=LAYERED_CONV, role="assistant", content="",
+        tool_calls=[{"id": "c1", "name": "query_order", "args": {"order_id": "1002"}}],
+    ))
+    db.add(MessageRecord(
+        conversation_id=LAYERED_CONV, role="tool",
+        content=_LONG_TOOL_RESULT, tool_call_id="c1",
+    ))
+    db.add(MessageRecord(conversation_id=LAYERED_CONV, role="assistant", content=_LONG_REPLY))
+    db.add(MessageRecord(conversation_id=LAYERED_CONV, role="user", content="那运费退吗"))
+    db.add(MessageRecord(
+        conversation_id=LAYERED_CONV, role="assistant", content="运费在退款时一并退还。"
+    ))
+    return db
+
+
+def test_oversized_user_input_returns_400_json_before_streaming(client_factory):
+    """超 `max_user_input_tokens` ⇒ 400 且**是普通 JSON 不是 SSE**。
+
+    一旦 yield 过首帧,响应头就发出去了、状态码再也改不了 ——
+    这正是预算校验必须在流开始前的原因,也是这条断言存在的理由。
+    """
+    client, model = client_factory(batches=[[FakeChunk("好")]], max_user_input_tokens=5)
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"message": "这是一句明显超过五个 token 的话"})
+
+    assert resp.status_code == 400
+    assert resp.headers["content-type"].startswith("application/json")   # ← 不是 SSE
+    assert "event:" not in resp.text          # 确认真的没走流
+    # 模型一次都没被调用 —— 「400 但已经把这一轮跑了一遍」也是一种实现。
+    assert model.calls == []
+
+
+def test_degrade_persists_the_new_anchor_and_does_not_touch_messages(
+    client_factory, monkeypatch
+):
+    """降级只写一个整数,**一行 messages 都不动**。
+
+    「不搬数据」是本章的核心卖点,必须有断言钉住 —— 否则「顺手把旧消息截短了
+    写回 messages 表」这种实现能让其余**所有**用例照样通过。
+
+    后台任务在这里**挡掉**(本用例不测它):这段历史是按 `_DEGRADE_ROWS`
+    标定的 —— 触发降级、但不触发摘要。顺带把「没触发」也断下来,
+    标定一旦漂移(提示词变长、阈值改动)这里会**响亮**地红,而不是默默起一个
+    连真 MySQL、真上游客户端的线程,或者默默不验降级。
+    """
+    fired = []
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background",
+        lambda **kw: (fired.append(kw), False)[1],
+    )
+    db = _stuffed_session()
+    before = [(m.role, m.content) for m in db.messages]
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)
+
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    conv = db.conversations[SCRATCH_CONV]
+    assert conv.layer1_from_msg_id > 0                      # ← 降级真的写进去了
+    assert fired == []                                      # 见 docstring:这个尺度不触发摘要
+    after = [(m.role, m.content) for m in db.messages[:len(before)]]
+    assert after == before                                  # ← 旧行一行没改
+    # 新增的两行是本轮的 user + assistant,不是被搬过来的历史
+    assert len(db.messages) == len(before) + 2
+
+
+def test_summary_task_is_fired_without_blocking_the_reply(client_factory, monkeypatch):
+    """摘要任务被起起来了,而**回复不 await 它**。
+
+    spec 验收 4「摘要生成没有阻塞该轮用户回复」。测法是**换掉起任务的函数**,
+    让它记录调用后立刻返回,再断言 done 帧照样到 ——
+    而不是去测时间差(那会退化成一条不稳定断言,且在快机器上恒真)。
+    """
+    fired: list[str] = []
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background",
+        lambda **kw: (fired.append(kw["conversation_id"]), True)[1],
+    )
+    # ↑ 这要求 `app/api/chat.py` 里是 `from app.memory.tasks import
+    #   run_summary_in_background`(模块级名字),而不是 `from app.memory import
+    #   tasks` 再 `tasks.run_summary_in_background(...)`。后者 patch 不到,
+    #   而红法会是「明明起了、断言说没起」—— 指向测试而不是实现。
+    #   同理,T4 的 `layers` 与 T8 的 `summarize` 在端点里也要是模块级名字。
+    db = _stuffed_session(rows=_SUMMARY_ROWS)
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)
+
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    assert fired == [SCRATCH_CONV]                    # ← 起了
+    assert _parse_sse(resp.text)[-1][0] == "done"     # ← 而回复没被它挡住
+
+
+def test_summary_trigger_is_logged_with_the_layer2_counts(
+    client_factory, monkeypatch, caplog
+):
+    """级联的**第一环**:`summary trigger` 必须带上层 2 的截短后 token 与预算。
+
+    它**只能**在端点这一处打:T9 的 `log_trigger` 拿不到那两个数(算分层的那边
+    才有)。不调它,验收 2 要 grep 的那一行在日志里**根本不存在** ——
+    而摘要照跑、落库照写、回复照出,一切都「看起来正常」。
+
+    两个数都对着**库里读回来的锚点**现算(cross-check 的是**接线**:
+    端点有没有把降级后的锚点那一份交出去),而不是写死成常量 ——
+    写死的话,「日志报的是降级**前**的层 2(恒为 0)」这种实现也能过。
+    """
+    fired: list[str] = []
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background",
+        lambda **kw: (fired.append(kw["conversation_id"]), True)[1],
+    )
+    db = _stuffed_session(rows=_SUMMARY_ROWS)
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)
+
+    with caplog.at_level(logging.INFO):
+        with client as c:
+            c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    assert fired == [SCRATCH_CONV]
+    payload = _log_payload(caplog, "summary trigger")
+
+    settings = _settings()
+    got = layers.split(
+        [Message(id=m.id, role=m.role, content=m.content) for m in db.messages],
+        summary_upto_msg_id=0,
+        # **降级之后**的锚点(写进库的那个),不是请求开始时的 0。
+        layer1_from_msg_id=db.conversations[SCRATCH_CONV].layer1_from_msg_id,
+        settings=settings,
+    )
+    b = memory_budget.derive(
+        settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+    )
+    assert got.layer2_tokens > 0                      # 前提:层 2 真的非空
+    assert payload["layer2_tokens"] == got.layer2_tokens
+    assert payload["layer2_budget"] == b.layer2_budget
+    assert payload["layer2_tokens"] > payload["layer2_budget"]   # 触发判据(严格 >)
+
+
+def test_history_ctx_carries_the_truncated_layer2_forms(client_factory, caplog):
+    """**验收 4b 的单元版**:`history_ctx` 那一行里必须看得见截短后的形态。
+
+    分层接上之前,这条线拿的是 `prepare_turn` 交给 `trim.select_history` 的输出
+    —— 那个函数**只整轮丢弃、从不标注内容**,所以 `…` 与 `[工具结果] `
+    **不可能出现**(T7 审查的 Important 2)。这条用例是它的收口:
+    `history=` 换成分层后的精简版之后,形态才真的出现在那一行里。
+
+    用 `intent="闲聊"`:`history_ctx` 在**路由之前**打,这条断言与 Agent 无关,
+    也就不该被 Agent 的批次脚本干扰(「每轮必打」由 T7 那条覆盖)。
+    """
+    db = _layered_session()
+    client, _ = client_factory(batches=[], session=db, intent="闲聊")
+
+    with caplog.at_level(logging.INFO):
+        with client as c:
+            c.post("/api/chat/stream", json={"session_id": LAYERED_CONV, "message": "在吗"})
+
+    sliding = _log_payload(caplog, "history_ctx")["sliding"]
+    assert [m["role"] for m in sliding] == ["user", "assistant", "tool", "assistant", "user", "assistant"]
+    assert sliding[0]["content"] == "订单 1002 能退吗"          # 层 2 的 user 原话不动
+    assert sliding[1]["content"] == ""                         # 带 tool_calls 的那条(结构原样)
+    assert sliding[2]["content"].startswith("[工具结果] ")      # ← 4b 的形态
+    assert sliding[2]["content"].endswith("…")
+    assert sliding[3]["content"].endswith("…")                 # 客服答复只留开头
+    assert sliding[4]["content"] == "那运费退吗"                # 层 1 是原文,一个字不动
+
+
+def test_model_ctx_describes_the_messages_actually_sent(client_factory, caplog):
+    """`model_ctx` 必须描述**真正发出去的那批消息**,`bounds` 必须是真的锚点。
+
+    ① `sliding` 逐条**等于**模型实际收到的历史。这一条钉住「重切用 `layers.split`」
+       的实现:精简版里的层 2 已经是截短过的形态,**再截一次**会给工具结果叠上
+       第二个 `[工具结果] ` 前缀、内容也随之变短 —— 日志从此描述的是**另一次
+       切分**,而它看起来完全正常、没有任何断言覆盖这种分叉。
+    ② `bounds` 是降级之后真的用过的两个锚点。它们靠 state 的两个通道传下来,
+       而**没在 `ChatState` 里声明的通道会被 LangGraph 静默丢弃**(ch06 的教训)
+       —— 那时这里读到的是 `0`/`0`,也就是「一次没发生过的切分」。
+    """
+    db = _layered_session()
+    client, model = client_factory(batches=[[FakeChunk("好的")]], session=db)
+
+    with caplog.at_level(logging.INFO):
+        with client as c:
+            c.post("/api/chat/stream", json={"session_id": LAYERED_CONV, "message": "在吗"})
+
+    payload = _log_payload(caplog, "model_ctx")
+    sent = model.last_messages
+    # ① 逐条比内容(系统提示词与末尾那条 human 不在 sliding 里)。
+    assert [m.content for m in sent[1:-1]] == [m["content"] for m in payload["sliding"]]
+    assert payload["rounds"] == len(payload["sliding"]) == 6
+    assert payload["sliding"][2]["content"].startswith("[工具结果] ")
+    assert not payload["sliding"][2]["content"].startswith("[工具结果] [工具结果] ")
+    # ② 锚点是**降级之后**的那一对(层 1 从第 5 条起),不是默认的 0/0。
+    assert payload["bounds"] == {"summary_upto_msg_id": 0, "layer1_from_msg_id": 5}
+    assert payload["tokens"]["layer2"] > 0
+
+
+def test_the_joined_summary_is_seeded_into_the_model_context(client_factory):
+    """多段梗概**拼成一段**后注入,引导语与拼法在真链路上对得上。
+
+    `_SUMMARY_HEADER`(prompts)、`join_summaries`(summarize)与
+    `history_ctx` 里那个计数口径分别写在三处 —— 这条用例走**真链路**把它们
+    对上:库里两段梗概,模型看到的是**一段**带引导语的背景,两段都在、按 seq 序、
+    且排在用户原话**之后**。拼法或顺序改了,这里会红。
+    """
+    db = _layered_session()
+    db.summaries.append(ConversationSummary(
+        conversation_id=LAYERED_CONV, seq=1, upto_msg_id=2, content="第一段:用户问过订单 1002",
+    ))
+    db.summaries.append(ConversationSummary(
+        conversation_id=LAYERED_CONV, seq=2, upto_msg_id=4, content="第二段:要求退运费",
+    ))
+    client, model = client_factory(batches=[[FakeChunk("好的")]], session=db)
+
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": LAYERED_CONV, "message": "在吗"})
+
+    content = model.last_messages[-1].content
+    assert content.startswith("在吗")
+    assert "第一段:用户问过订单 1002" in content
+    assert "第二段:要求退运费" in content
+    # 按 seq 序拼成**一段**,不是两条消息、也不是倒序。
+    assert content.index("第一段") < content.index("第二段")
+    assert content.index("第一段:用户问过订单 1002") < content.rindex("第二段:要求退运费")
+    assert sum(1 for m in model.last_messages if content == m.content) == 1
+
+
+def test_an_over_budget_last_round_is_dropped_rather_than_blowing_the_window(
+    client_factory,
+):
+    """层 1 的选择真的在干活:**装不下的那一轮整轮不留**。
+
+    这条咬人的场合是 `degrade` 的另一个出口 —— 「只剩一轮还超预算就停在原地」
+    (再挪就把层 1 挪空了)。一轮工具密集的 ReAct(单条工具结果封顶 1200 token,
+    最多 5 步)真的能比 `layer1_budget` 还大,那时只有 `select_layer1` 能收口:
+    **宁可这一轮的历史一条都不发,也不把窗口顶穿**。
+
+    「整轮丢、不留半轮」是 `start_on="human"` + `allow_partial=False` 一起给的
+    —— 半轮 = 一条没有提问的回答,或者 tool 消息与它的 assistant 被拆开
+    (上游直接 400,且只在历史长到触发分层时才复现)。
+
+    前提断在最前面:这一轮的原文 token **确实**超过层 1 预算。少了它,这条用例
+    在别的配置下会退化成「什么都没发生」还照样绿。
+    """
+    settings = _settings()
+    b = memory_budget.derive(
+        settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+    )
+    db = FakeSession()
+    db.conversations[SCRATCH_CONV] = Conversation(
+        id=SCRATCH_CONV, user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    db.add(MessageRecord(conversation_id=SCRATCH_CONV, role="user", content="这一轮的开头"))
+    for i in range(22):     # 一轮里塞 22 次工具往返 —— 全部落在**同一轮**
+        db.add(MessageRecord(
+            conversation_id=SCRATCH_CONV, role="assistant", content="",
+            tool_calls=[{"id": f"c{i}", "name": "query_order", "args": {"order_id": "1002"}}],
+        ))
+        db.add(MessageRecord(
+            conversation_id=SCRATCH_CONV, role="tool",
+            content="很长的历史内容" * 20, tool_call_id=f"c{i}",
+        ))
+    round_tokens = sum(
+        trim.count_tokens(m.content) for m in db.messages
+    )
+    assert round_tokens > b.layer1_budget          # ← 前提:这一轮装不下
+
+    client, model = client_factory(batches=[[FakeChunk("好")]], session=db)
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    # 窗口里只剩 [system, 本轮 human] —— 那一轮整轮被丢在外面,而不是顶穿窗口。
+    assert [type(m).__name__ for m in model.last_messages] == ["SystemMessage", "HumanMessage"]
+    # 而它**没有**被写进库的锚点(`degrade` 挪不动:挪了就空了)。
+    assert db.conversations[SCRATCH_CONV].layer1_from_msg_id == 0
+
+
+def test_layer1_within_budget_triggers_neither_degrade_nor_summary(client_factory, monkeypatch):
+    """**验收 3 的单元版**:装得下就一个动作都不做。
+
+    「压缩是成本不是美德」。这条防的是「保守起见每次都压一点」的实现 ——
+    那种实现能让验收 1/2/4 **全部通过**,而它在默认窗口下白白把历史压没了。
+    """
+    fired = []
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background",
+        lambda **kw: (fired.append(kw), False)[1],
+    )
+    db = FakeSession()
+    db.conversations[SCRATCH_CONV] = Conversation(
+        id=SCRATCH_CONV, user="demo-user", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    db.add(MessageRecord(conversation_id=SCRATCH_CONV, role="user", content="你好"))
+    db.add(MessageRecord(conversation_id=SCRATCH_CONV, role="assistant", content="你好呀"))
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)   # 默认窗口
+
+    with client as c:
+        c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    assert fired == []                                        # 没起任务
+    assert db.conversations[SCRATCH_CONV].layer1_from_msg_id == 0   # 也没降级

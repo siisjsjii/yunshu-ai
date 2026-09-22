@@ -10,12 +10,41 @@ _ENCODING = tiktoken.get_encoding("cl100k_base")
 
 
 class ContextOverflowError(Exception):
-    """单轮输入本身超出预算,无法通过裁剪历史解决。"""
+    """**本轮输入本身**超出预算,无法通过裁剪历史解决。
+
+    ⚠️ 这句文案只对「用户输入过长」成立:`used` 是本轮输入的 token 数、
+    `budget` 是 `max_user_input_tokens`。**配置故障**(窗口比 固定开销+单轮峰值
+    还小)走子类 `ContextBudgetUnavailable` —— 那时这两个数分别是**固定开销**
+    与**整个窗口**,套用这句话会把运维指向「用户话太多」,而真正要改的是窗口配置
+    (T10 记账:这是「报错指向别处」的注释版,只是印刷在异常文本里)。
+    """
 
     def __init__(self, *, used: int, budget: int) -> None:
         self.used = used
         self.budget = budget
         super().__init__(f"本轮输入需要 {used} tokens,超出可用预算 {budget} tokens")
+
+
+class ContextBudgetUnavailable(ContextOverflowError):
+    """**配置**故障:窗口连「固定开销 + 单轮峰值」都装不下(一行历史都放不了)。
+
+    与父类同一族(调用方**只 catch 父类**,端点的 400 路径不用改),
+    但文案必须不同 —— 两者说的是两件事,而只有一句真话:
+    父类那句说的是「这段话太长」,这里的问题是**窗口配得比开销还小**。
+
+    两个数字仍然都在文本里(`used` = 固定开销与峰值算出来的占地、`budget` = 窗口):
+    `tests/test_trim.py` 与 `tests/test_api_chat.py` 都按「数字 + `tokens` 字样」
+    断言,换措辞不破坏它们。
+    """
+
+    def __init__(self, *, used: int, budget: int) -> None:
+        Exception.__init__(
+            self,
+            f"上下文预算不足:固定开销与单轮峰值已占满窗口"
+            f"(需要 {used} tokens,窗口 {budget} tokens)",
+        )
+        self.used = used
+        self.budget = budget
 
 
 def count_tokens(text: str) -> int:

@@ -43,6 +43,8 @@ from app.agent.routing import (
     route_by_intent,
 )
 from app.agent.state import ChatState
+from app.memory import budget
+from app.prompts import render_system_prompt
 
 #: 出口节点 —— 它们统一汇进 log_turn 再结束。
 #:
@@ -82,8 +84,20 @@ def build_graph(
     conversation_id,
     emit,
     checkpointer,
+    context_budget=None,
 ):
-    """组装本请求的图并编译。"""
+    """组装本请求的图并编译。
+
+    `context_budget` 由**端点**推导一次后传进来(agent 节点用它给
+    `journal.model_ctx` 记用量与预算)。`None` 时这里现算一份 —— 那是给
+    **单测与别的调用方**留的口子:`budget.derive` 是纯函数(同一份 settings、
+    同一个 system prompt ⇒ 同一个结果),没有 IO,也没有漂移的余地;
+    生产路径永远由端点传下来,于是**每请求只推一次**。
+    """
+    if context_budget is None:
+        context_budget = budget.derive(
+            settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+        )
     graph = StateGraph(ChatState)
 
     # 消解用**主力模型**(与 Agent 同一个):它要读的是完整对话,不是结构化出参。
@@ -112,7 +126,8 @@ def build_graph(
     graph.add_node(
         "agent",
         make_agent_node(
-            model=model, tools=tools, registry=registry, settings=settings, emit=emit
+            model=model, tools=tools, registry=registry, settings=settings, emit=emit,
+            context_budget=context_budget,
         ),
     )
     graph.add_node("complaint_reply", make_complaint_reply_node(emit=emit))
