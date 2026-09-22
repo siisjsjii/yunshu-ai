@@ -29,6 +29,17 @@ class Layers:
     layer2_tokens: int = 0
     #: 原文 token 数 —— 触发降级看的是它。
     layer1_tokens: int = 0
+    #: 切分时用的两个锚点。**跟着 `Layers` 一起走**,而不是让每个调用方各记一份:
+    #: 调用方各记一份的后果是「日志里的 bounds 与实际切分用的锚点可以不一致,
+    #: 而两边都不报错」。`0` 是**有含义的值**(尚无梗概 / 层 1 起于最早,
+    #: 见模块 docstring),所以它不能被当成「未知」的哨兵。
+    #:
+    #: ch07 T7 补:观测量(`journal.model_ctx` 的 `bounds`)要能说出「被截的是
+    #: **哪一段**」。锚点若由调用方另行传入、且带一个 `0` 的默认值,那行日志在
+    #: 拿不到锚点时会**报出 `{0, 0}` 而切分用的是真锚点** —— 一个说不出任何东西
+    #: 却又长得像真值的观测面(本仓「期望值等于默认值」那类假绿的生产版)。
+    summary_upto_msg_id: int = 0
+    layer1_from_msg_id: int = 0
 
 
 def _tail(history, *, from_id: int) -> list[Message]:
@@ -102,6 +113,11 @@ def split(
         layer1=layer1,
         layer2_tokens=sum(trim.count_tokens(m.content) for m in layer2),
         layer1_tokens=sum(trim.count_tokens(m.content) for m in layer1),
+        # 锚点原样带上:它们是这次切分的**输入**,`Layers` 与它的观测面
+        # (`journal.model_ctx` 的 `bounds`)必须是同一份,否则日志说的与
+        # 实际切的那一刀可以不一致,而两边都不报错。
+        summary_upto_msg_id=summary_upto_msg_id,
+        layer1_from_msg_id=layer1_from_msg_id,
     )
 
 

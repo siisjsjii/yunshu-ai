@@ -1004,9 +1004,10 @@ def test_ensure_conversation_runs_under_the_lock(client_factory, monkeypatch):
     async def spy(*, session, session_id, user_id):
         # 用同一个 store 问一次:此刻锁是否已被本请求持有。
         seen["locked"] = client.store.lock_for(session_id).locked()
-        # 返回值必须**与生产形状一致**:`ensure_conversation` 从不返回 None,
-        # 而 ch07 T7 起端点在它之后读两个锚点(打 `history_ctx`)。
-        # 返回 None 会让这条用例红在一个与「锁」毫无关系的地方 ——
+        # 返回值必须**与生产形状一致**:`ensure_conversation` 从不返回 None
+        # (新建时当场 commit,两个标量默认值随即落到属性上 —— 实测真实库读回来
+        # 是 `0 / 0`)。返回 None 是形状违规,而 ch07 的降级与播种要读它的两个
+        # 锚点 —— 那时这条用例会红在一个与「锁」毫无关系的地方。
         # 与 T3 给替身补 `flush` 是同一条理由:补替身,不是给实现加兜底。
         return Conversation(
             id=session_id, user=user_id, status="active",

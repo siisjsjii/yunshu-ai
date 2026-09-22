@@ -12,7 +12,9 @@
 `ensure_ascii=False`:中文原样写进 `log/app.log`(handler 的 utf-8 由
 `app/logging_setup.py` 钉住)。转义成 `\\uXXXX` 的话日志对人就没用了。
 
-**四条硬要求**(spec §7.6 / 验收 4b):
+**四条硬要求**(spec §7.6)。注意:验收 4b 判的是 **`history_ctx` 那一行**里
+看得见截短后的形态,而那条线**要等分层接上(T10)才成立** —— 详见
+`history_ctx` 的 docstring,别把 4b 挪到 `model_ctx` 上:
 1. `tokens` **必须分段** —— 只给一个总计的话,层 2 那段的数字再也不会随截短
    而变,「按截短后计数」失效与生效无从区分;
 2. `sliding` 装的是**截短后**的消息,它要能一眼看出 `…` 与 `[工具结果] `;
@@ -78,8 +80,6 @@ def model_ctx(
     layers: Layers,
     evidence_tokens: int,
     budget: ContextBudget,
-    summary_upto_msg_id: int = 0,
-    layer1_from_msg_id: int = 0,
 ) -> None:
     """主力 Agent 每次调模型前一行。
 
@@ -90,10 +90,11 @@ def model_ctx(
     是因为只给用量的话「这段快满了」要靠人记住窗口有多大 —— 而那正是本章
     调参(`per_round_steady` 等未实测值)要做的事。
 
-    两个锚点做成**带默认值的关键字参数**而不是必填:`Layers` 只带分好的两段与
-    各自的 token 数,**不带锚点**(它是纯切分结果)。默认给 `0`,与 `Layers`
-    docstring 里 `0 = 尚无梗概 / 层 1 起于最早` 的语义一致;拿得到锚点的调用方
-    (端点/节点)应当**显式传**,否则 `bounds` 这一段就只是个占位。
+    `bounds` 取自 `layers` 自己带的两个锚点,**不接受调用方另行传入**:`bounds`
+    是把这一行日志与**某一段具体历史**对上的唯一字段,而它一旦由调用方传、
+    又带个 `0` 的默认值,拿不到锚点的调用方(agent 节点里根本没有锚点来源)
+    就会报出 `{0, 0}` 而切分用的是真锚点 —— 一个长得像真值、却什么也没说的
+    观测面。跟着 `Layers` 走,两者就不可能不一致。
     """
     sliding = _sliding([*layers.layer2, *layers.layer1])
     summary_tokens = trim.count_tokens(summary) if summary else 0
@@ -121,8 +122,8 @@ def model_ctx(
                 "layer2": budget.layer2_budget,
             },
             "bounds": {
-                "summary_upto_msg_id": summary_upto_msg_id,
-                "layer1_from_msg_id": layer1_from_msg_id,
+                "summary_upto_msg_id": layers.summary_upto_msg_id,
+                "layer1_from_msg_id": layers.layer1_from_msg_id,
             },
         },
     )
@@ -134,8 +135,6 @@ def history_ctx(
     summaries: Sequence[tuple],
     history: Sequence[Message],
     budget: ContextBudget,
-    summary_upto_msg_id: int = 0,
-    layer1_from_msg_id: int = 0,
 ) -> None:
     """指代消解 / 意图识别共用的那份上下文,**每轮必打**。
 
@@ -145,10 +144,22 @@ def history_ctx(
     而它当时没有任何观测面。
 
     ⚠️ **这一份不分层**:入参 `history` 是端点已经裁好的**单一滑窗**
-    (指代消解与意图识别都只看最近的一段)。所以 `tokens.layer2` 与
-    `tokens.evidence` 结构性为 `0`,**不是因为截短/检索没生效** —— 键保留是为了
-    与 `model_ctx` 同形(读日志的人用同一套键读两行),而不是在声称这里有分层。
-    真要观测「层 2 按截短后计数」,看的是 `model_ctx` 那一行。
+    (指代消解与意图识别都只看最近的一段)。所以:
+
+    - `tokens.layer2` 与 `tokens.evidence` 结构性为 `0`,**不是因为截短/检索
+      没生效** —— 键保留只是为了与 `model_ctx` 同形(读日志的人用同一套键读
+      两行),而不是在声称这里有分层;
+    - **没有 `bounds`**。这份上下文不是由「两个锚点切出来的」,给它补一对锚点
+      只能靠调用方另行传入,而那正是「长得像真值、其实什么也没说」的形状
+      (`0` 在本章是有含义的值)。spec §7.6 给 `history_ctx` 的字段表里本来
+      也只有 `summary` / `sliding` / `tokens`。
+
+    ⚠️ **当下它还承载不了验收 4b。** 4b 判的是 `history_ctx` 里看得见**截短后的
+    形态**(客服答复带 `…`、工具结果是一行 `[工具结果] `),而端点今天传进来的
+    `history` 是 `trim.select_history` 的输出 —— 那个函数**只整轮丢弃、从不标注
+    内容**,所以那两个标记**不可能出现**。产出它们的是 `layers.truncate`,
+    分层要到 T10 才接上。`model_ctx` 的 `sliding` 确实已经带截短形态,但**那不是
+    4b 指定的那条线** —— 4b 指定的是本函数这一行,别把验收标准挪过去迎合实现。
 
     `tokens.summary` 是**摘要段**的估算:多段摘要按 `"\\n\\n"` 相拼后计数
     (与 `prompts.py` 里段间连接符同源)。真注入时用的是
@@ -180,9 +191,6 @@ def history_ctx(
                 "layer1": budget.layer1_budget,
                 "layer2": budget.layer2_budget,
             },
-            "bounds": {
-                "summary_upto_msg_id": summary_upto_msg_id,
-                "layer1_from_msg_id": layer1_from_msg_id,
-            },
+            # **没有 bounds**:这份上下文不是用两个锚点切出来的(见 docstring)。
         },
     )

@@ -118,9 +118,16 @@ def test_model_ctx_segments_carry_distinct_values_not_one_total(caplog):
 def test_model_ctx_sliding_is_the_truncated_form_plus_the_raw_tail(caplog):
     """`sliding` 装的是**截短后**的消息,不是别的什么东西。
 
-    验收 4b 就是在这个字段上做形态匹配(客服答复带 `…`)。若 `sliding` 只装
-    层 1(或装了原文),「截短真的生效了吗」在日志里**看不出来** ——
-    而那正是本章最容易静默失效的一处。
+    若 `sliding` 只装层 1(或装了原文),「截短真的生效了吗」在 `model_ctx`
+    这一行里**看不出来**。
+
+    ⚠️ **这不是验收 4b。** 4b 判的是 **`history_ctx` 那一行**里看得见截短后的
+    形态(spec §10.5),而那条线要等 T10 把分层接上才成立 —— 端点今天传进去的
+    `history` 是 `trim.select_history` 的输出,那个函数**只整轮丢弃、从不标注
+    内容**,`…` 与 `[工具结果] ` 不可能出现。这里能看见形态,是因为本用例
+    自己拿 `layers.split` 造了一份**分了层**的 `Layers`;生产上 `model_ctx`
+    的调用点(T10 的 agent 节点)同样会拿到分了层的 `Layers`,所以那边成立。
+    **不要把 4b 挪到这一行来** —— 那是改验收标准去迎合实现。
     """
     s = _settings(layer2_assistant_chars=10)
     b = budget.derive(settings=s, system_prompt="你是客服。")
@@ -150,12 +157,19 @@ def test_model_ctx_sliding_is_the_truncated_form_plus_the_raw_tail(caplog):
     assert len(sliding[2]["content"]) < 200
 
 
-def test_model_ctx_bounds_are_the_anchors_it_was_given(caplog):
-    """`bounds` 取自入参,不是写死的 0。
+def test_model_ctx_bounds_come_from_the_layers_it_was_handed(caplog):
+    """`bounds` 取自 `Layers` 自己带的锚点 —— 调用方**传不进来**,也就伪造不了。
 
-    简报里那条断言(`layer1_from_msg_id == 0`)喂进去的锚点**本来就是 0**,
-    所以一个把 `bounds` 写死成 0 的实现能让它照样通过 —— 这正是本仓
-    「期望值等于某个默认值」那类假绿。这条用两个**非默认**的锚点把它区分开。
+    锚点若做成 `model_ctx` 的参数、又带一个 `0` 的默认值,拿不到锚点的调用方
+    (agent 节点里根本没有锚点来源)就会打出 `{0, 0}`,而 `layers.split` 用的是
+    **真锚点** —— 日志与切分不一致,而两边都不报错。`bounds` 是这一行日志与
+    某一段具体历史对上的唯一字段,恒为 `{0, 0}` 等于让它说不出「被截的是哪一段」;
+    更糟的是 `0` 在本章**是个有含义的值**(尚无梗概 / 层 1 起于最早),
+    读日志的人分不出它是真值还是占位。
+
+    喂进去的 `Layers` 由 `split` 产出、锚点是**非默认**的 4 / 7 ——
+    把 `Layers` 的这两个字段写死成 0 的实现会立刻变红。
+    (简报那条 `bounds ... == 0` 的断言做不到这件事:它的期望值恰好等于那个默认值。)
     """
     s = _settings()
     b = budget.derive(settings=s, system_prompt="你是客服。")
@@ -163,10 +177,12 @@ def test_model_ctx_bounds_are_the_anchors_it_was_given(caplog):
         [Message(id=7, role="user", content="现在这句")],
         summary_upto_msg_id=4, layer1_from_msg_id=7, settings=s,
     )
+    # 替身自检:锚点真的**跟着 Layers 走到了这里**,而不是被 split 丢掉。
+    assert (got.summary_upto_msg_id, got.layer1_from_msg_id) == (4, 7)
+
     with caplog.at_level(logging.INFO):
         journal.model_ctx(
             conversation_id="c1", summary="", layers=got, evidence_tokens=0, budget=b,
-            summary_upto_msg_id=4, layer1_from_msg_id=7,
         )
 
     payload = _last_payload(caplog, "model_ctx")
@@ -219,7 +235,11 @@ def test_model_ctx_counts_the_summary_with_the_shared_counter(caplog):
 
 
 def test_history_ctx_logs_summary_lines_and_segmented_tokens(caplog):
-    """`history_ctx` 的 `summary` 是**摘要行列表**,`tokens` 同样分段。"""
+    """`history_ctx` 的 `summary` 是**摘要行列表**,`tokens` 同样分段。
+
+    **没有 `bounds`** —— 这份上下文不是用两个锚点切出来的,给它补一对锚点只能
+    靠调用方另行传入(spec §7.6 给它的字段表里也只有 summary/sliding/tokens)。
+    """
     s = _settings()
     b = budget.derive(settings=s, system_prompt="你是客服。")
     history = [
@@ -230,16 +250,15 @@ def test_history_ctx_logs_summary_lines_and_segmented_tokens(caplog):
             conversation_id="c9",
             summaries=[(1, "第一段:用户问过订单 1002"), (2, "第二段:要求退款")],
             history=history, budget=b,
-            summary_upto_msg_id=2, layer1_from_msg_id=5,
         )
 
     payload = _last_payload(caplog, "history_ctx")
     assert payload["conversation_id"] == "c9"
+    assert "bounds" not in payload
     assert [row["seq"] for row in payload["summary"]] == [1, 2]
     assert [row["content"] for row in payload["summary"]] == [
         "第一段:用户问过订单 1002", "第二段:要求退款",
     ]
-    assert payload["bounds"] == {"summary_upto_msg_id": 2, "layer1_from_msg_id": 5}
     assert {"layer1", "layer2", "summary", "evidence", "total"} <= set(payload["tokens"])
     assert payload["tokens"]["layer1"] == trim.count_tokens("现在这句")
     assert payload["tokens"]["summary"] == trim.count_tokens(
@@ -289,13 +308,13 @@ def test_history_ctx_is_logged_even_for_the_fallback_branch(client_factory, capl
     _last_payload(caplog, "history_ctx")      # 取不到就抛 ⇒ 红
 
 
-def test_history_ctx_from_the_endpoint_carries_the_real_session_and_anchors(
+def test_history_ctx_from_the_endpoint_carries_the_real_session_and_window(
     client_factory, caplog
 ):
-    """端点上那一行带的是**这个会话**与**库里的锚点**,不是占位值。
+    """端点上那一行带的是**这个会话**与**它当时真的读进上下文的那段历史**。
 
-    上一条只验「有没有那一行」。conversation_id 写错、锚点写死 0 都照样绿 ——
-    而这一行存在的全部意义就是让人能把它与某个会话、某段历史对上。
+    上一条只验「有没有那一行」。conversation_id 写错、`sliding` 装成空列表
+    都照样绿 —— 而这一行存在的全部意义就是让人能把它与某个会话对上。
     """
     db = FakeSession()
     db.conversations["c-anchored"] = Conversation(
@@ -318,7 +337,6 @@ def test_history_ctx_from_the_endpoint_carries_the_real_session_and_anchors(
 
     payload = _last_payload(caplog, "history_ctx")
     assert payload["conversation_id"] == "c-anchored"
-    assert payload["bounds"] == {"summary_upto_msg_id": 2, "layer1_from_msg_id": 4}
     assert [m["content"] for m in payload["sliding"]][-1] == "已登记"
 
 
