@@ -99,9 +99,13 @@ class ChatRequest(BaseModel):
     def _message_and_resume_are_exclusive(self) -> Self:
         """`message` 与 `resume` **恰好给一个**。
 
-        - **两个都不给**:没有任何东西可跑。放过去的话 `message=None` 会一路
-          走到 `prepare_turn(user_input=None)`,在 tiktoken 里炸成一个 500 ——
-          一个请求语义错被报成服务端故障。必须在**入参**上拒。
+        - **两个都不给**:没有任何东西可跑。必须在**入参**上拒 —— 判据与
+          「流开始前的两条 400」同一条:一旦 yield 过首帧就再也改不了状态码,
+          请求语义错只能变成一个 200 的 error 帧。
+          (早先这里写的是「不放过去的话 `message=None` 会走到 `prepare_turn`
+          在 tiktoken 里炸成 500」—— **那句已不成立**:T10 之后 `prepare_turn`
+          不收历史、且对 `user_input is None` 有守卫,那条路不可能再抛。
+          校验本身仍然对,只是理由要换成上面这条。)
         - **两个都给**:是自相矛盾的请求,而 `resume` 会**静默吞掉** `message`
           —— 用户那句原话既没被回答、也没落库,事后什么都查不到。
           (spec F4 的「挂起时改发普通新消息」是**只给 message** 那条路,与这里

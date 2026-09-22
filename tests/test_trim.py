@@ -1,4 +1,5 @@
 from app.memory.trim import (
+    ContextBudgetUnavailable,
     ContextOverflowError,
     count_tokens,
     to_rounds,
@@ -41,6 +42,39 @@ def test_budget_leaves_no_room_for_history_when_overhead_eats_the_window():
     )
     b = budget.derive(settings=s, system_prompt="你是客服。")
     assert b.history_budget < 0
+
+
+def test_context_overflow_errors_carry_their_numbers_and_their_own_message():
+    """**两个**异常类各自:`.used` / `.budget` 两个字段 + 文本里的两个数字与 `tokens`。
+
+    (T10 的修复轮**恢复**并**重定向**:这条原先叫
+    `test_context_overflow_error_carries_numbers`,被当作 `select_history` 退役的
+    附带损失删掉了 —— 而它既不测那个函数、也不测分层,是**连坐**。
+    它一删,`ContextOverflowError.used` / `.budget` 与文本里的两个数字就无处断言了。)
+
+    子类那半条同时堵住一个真缺口:`ContextBudgetUnavailable` 此前**只作为父类**
+    被验到(调用方只 catch 父类 —— 两种消息都满足那些断言),
+    于是**把它退化成父类,整套测试照样绿**。所以这里额外钉两件事:
+
+    ① 两个类的文本**必须不同**(子类存在的全部理由);
+    ② 父类那句说的是**本轮输入**(它对输入超限是对的),而子类**不许**这么开场
+       —— 配置故障把运维指向「用户话太多」,正是 (b3) 要消灭的那类误导。
+    """
+    for cls in (ContextOverflowError, ContextBudgetUnavailable):
+        err = cls(used=500, budget=100)
+        assert err.used == 500
+        assert err.budget == 100
+        assert "500" in str(err)
+        assert "100" in str(err)
+        assert "tokens" in str(err)
+
+    base, child = (
+        str(ContextOverflowError(used=500, budget=100)),
+        str(ContextBudgetUnavailable(used=500, budget=100)),
+    )
+    assert base != child                      # ① 退化成父类 ⇒ 这里红
+    assert "本轮输入" in base                  # ② 父类说的是输入
+    assert "本轮输入" not in child             # ② 子类说的是窗口配置
 
 
 # ---- ch07 T10:`select_history` 已删除,它守着的不变量搬到这里 ----

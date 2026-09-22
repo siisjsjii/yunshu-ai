@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -31,6 +32,8 @@ from app.tools.executor import execute_tool
 from app.tools.registry import build_retriever, build_tools, registry_for
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 _store: SessionStore | None = None
 
@@ -158,13 +161,6 @@ async def chat_stream(
                 layer1_budget=context_budget.layer1_budget,
                 settings=settings,
             )
-            if layer1_from != conv.layer1_from_msg_id:
-                # 只在**真的动了**的时候写库:每次请求都写一遍会让
-                # 「降级发生了没有」在 DB 层看不出来,也白一次 commit。
-                await advance_anchors(
-                    session=session, conversation_id=session_id, layer1_from=layer1_from
-                )
-
             # ---- 分层 + 截短 ----
             got = layers.split(
                 history,
@@ -172,6 +168,40 @@ async def chat_stream(
                 layer1_from_msg_id=layer1_from,
                 settings=settings,
             )
+
+            if layer1_from != conv.layer1_from_msg_id:
+                # 只在**真的动了**的时候写库:每次请求都写一遍会让
+                # 「降级发生了没有」在 DB 层看不出来,也白一次 commit。
+                #
+                # **级联的第一环就打在**这里**(spec §10.5 验收 2 要 grep 的那行)**:
+                # 两个值(旧/新)只有这一个接缝上同时有 —— `layers.degrade` 只返回
+                # 新值,`advance_anchors` 只收新值。少这一行,验收 2 的
+                # 「层 1 超预算就降级一批」在日志里**根本没有生产者**,
+                # 而那条断言要么失败、要么在验收脚本里被写成一条恒真的 grep。
+                #
+                # 格式与 `journal` / `memory.tasks` 同款(前缀 + JSON、`ensure_ascii=False`)——
+                # 另起一种日志形状等于让读日志的人多学一套。
+                # `layer1_tokens` / `layer1_budget` 一起报:只报「挪了」而不报
+                # 「为什么挪」,读的人还得自己去推(本仓「日志里的数必须是真的」)。
+                logger.info(
+                    "layer1 降级 %s",
+                    json.dumps(
+                        {
+                            "conversation_id": session_id,
+                            "from": conv.layer1_from_msg_id,
+                            "to": layer1_from,
+                            # 挪**之后**的层 1 用量:它就是「装下了」的证据
+                            # (所以必然 <= budget)。
+                            "layer1_tokens": got.layer1_tokens,
+                            "layer1_budget": context_budget.layer1_budget,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                await advance_anchors(
+                    session=session, conversation_id=session_id, layer1_from=layer1_from
+                )
+
             # ---- 摘要任务:起在后台,**不 await** ----
             # 它压的是**更早**的一段历史,与这一轮的回复无关,所以可以晚、也可以
             # 失败(失败等于什么都没发生,下一轮再触发)。`trigger` 那行日志只能

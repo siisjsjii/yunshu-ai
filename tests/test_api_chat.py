@@ -1564,8 +1564,12 @@ async def test_request_with_neither_message_nor_resume_is_rejected(client_factor
     """两个字段都没有 = 请求语义错 → 422,**不是**把 None 递给下游。
 
     `message` 在 ch06 之前是必填(缺了本来就 422);加了 `resume` 之后它必须
-    变成可选,于是「两个都没给」这条路径**新开出来了** —— 没人守着的话它会
-    一路走到 `prepare_turn(user_input=None)`,在 tiktoken 里炸成一个 500。
+    变成可选,于是「两个都没给」这条路径**新开出来了** —— 没人守着的话
+    `user_input=None` 会一路带进图里,而那时**流已经开始**,只能变成一条
+    error 帧(HTTP 200),请求语义错被报成服务端故障的样子。
+    (早先这里写的是「在 `prepare_turn` 的 tiktoken 里炸成 500」—— **那句已不成立**:
+    T10 之后 `prepare_turn` 不收历史、对 `user_input is None` 有守卫;
+    校验本身仍然对,理由换成上面这条。)
     """
     client, _ = client_factory(batches=[], intent="退款退货")
     with client as c:
@@ -1661,7 +1665,10 @@ async def test_empty_resume_payload_is_not_a_new_turn(client_factory):
 
     这一条钉的是端点的分支判据必须是 `is not None` 而不是真值判断:写成
     `if request.resume:` 时,空 dict 会掉进"开新一轮"那一支,而那一支要
-    `message`(None)—— 于是 `prepare_turn` 在 tiktoken 里炸成一个 500。
+    `message` —— 拿到的却是 `None`,于是这一轮带着一个空输入进图。
+    (早先这里写的是「`prepare_turn` 在 tiktoken 里炸成 500」—— **那句已不成立**:
+    T10 之后 `prepare_turn` 不收历史、对 `user_input is None` 有守卫。)
+    判据仍然必须是 `is not None`,理由换成上面这条。
 
     载荷本身没意义(槽位是空串),子流程的既定行为是**如实说明查不到**
     (T7 已记账:文案里那个空订单号略糙但无害)。这里只要求「不是服务端故障」。
@@ -1858,6 +1865,72 @@ def test_degrade_persists_the_new_anchor_and_does_not_touch_messages(
     assert after == before                                  # ← 旧行一行没改
     # 新增的两行是本轮的 user + assistant,不是被搬过来的历史
     assert len(db.messages) == len(before) + 2
+
+
+def test_degrade_is_logged_with_both_the_old_and_the_new_anchor(
+    client_factory, monkeypatch, caplog
+):
+    """**级联的第一环**:`layer1 降级` 那行必须报出**真的**旧值与新值。
+
+    它是 spec §10.5 验收 2 要 grep 的那一行,而**只有这一个接缝**同时握着两个值:
+    `layers.degrade` 只返回新值,`advance_anchors` 只收新值。没有它,
+    「层 1 超预算就降级一批」在日志里没有生产者 —— 验收那条断言要么失败,
+    要么被写成一条恒真的 grep。
+
+    四条断言各有分工:
+
+    ① `from` 是**请求开始时**那个锚点(用例预置的 10,非默认值 —— 期望值撞上
+       默认的 0 时,「报了真值」与「谁填了个 0」给出同一个观测值);
+    ② `to` 与**库里最终那个值**一致 —— 报一个没落库的边界等于说谎;
+    ③ `from != to != 0` 是前提:真的挪了、且两个值都不是默认值;
+    ④ `0 < layer1_tokens <= layer1_budget` —— 数的是**挪之后**的层 1 用量
+       (它就是「装下了」的证据)。报挪之前那个数(必然超预算)会在这里红。
+    """
+    fired: list[str] = []
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background",
+        lambda **kw: (fired.append(kw["conversation_id"]), True)[1],
+    )
+    db = _stuffed_session(rows=_SUMMARY_ROWS)
+    db.conversations[SCRATCH_CONV].layer1_from_msg_id = 10   # 上一次降级的产物
+    settings = _settings()
+
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)
+    with caplog.at_level(logging.INFO):
+        with client as c:
+            c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    payload = _log_payload(caplog, "layer1 降级")
+    assert payload["conversation_id"] == SCRATCH_CONV
+    assert payload["from"] == 10                                        # ①
+    assert payload["to"] == db.conversations[SCRATCH_CONV].layer1_from_msg_id   # ②
+    assert payload["from"] != payload["to"] != 0                        # ③
+    assert 0 < payload["layer1_tokens"] <= payload["layer1_budget"]     # ④
+    assert payload["layer1_budget"] == memory_budget.derive(
+        settings=settings, system_prompt=render_system_prompt(settings.brand_name)
+    ).layer1_budget
+
+
+def test_no_degrade_means_no_degrade_log_line(client_factory, monkeypatch, caplog):
+    """装得下就**不打**那行日志 —— 与「装得下就什么都不做」同一条纪律。
+
+    少了这条反向断言,一个「每轮都打一行(旧=新)」的实现能通过上面那条
+    (`from == to` 的日志同样说得通),而它在日志里制造的是噪音:
+    读的人会以为降级在持续发生。
+    """
+    monkeypatch.setattr(
+        chat_api, "run_summary_in_background", lambda **kw: False
+    )
+    db = _stuffed_session(rows=2)
+    client, _ = client_factory(batches=[[FakeChunk("好")]], session=db)
+
+    with caplog.at_level(logging.INFO):
+        with client as c:
+            c.post("/api/chat/stream", json={"session_id": SCRATCH_CONV, "message": "现在这句"})
+
+    # 前提:这段历史**确实**装得下(否则「没有日志」与「没跑过降级」分不开)。
+    assert db.conversations[SCRATCH_CONV].layer1_from_msg_id == 0
+    assert [r for r in caplog.records if r.message.startswith("layer1 降级")] == []
 
 
 def test_summary_task_is_fired_without_blocking_the_reply(client_factory, monkeypatch):

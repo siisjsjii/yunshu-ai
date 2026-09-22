@@ -33,8 +33,13 @@ class ContextBudgetUnavailable(ContextOverflowError):
     父类那句说的是「这段话太长」,这里的问题是**窗口配得比开销还小**。
 
     两个数字仍然都在文本里(`used` = 固定开销与峰值算出来的占地、`budget` = 窗口):
-    `tests/test_trim.py` 与 `tests/test_api_chat.py` 都按「数字 + `tokens` 字样」
-    断言,换措辞不破坏它们。
+    `tests/test_trim.py`(两个类**各**一条)与 `tests/test_api_chat.py` 都按
+    「数字 + `tokens` 字样」断言,换措辞不破坏它们。
+
+    ⚠️ 但**两个类的文本必须不同**(`tests/test_trim.py` 钉着这一条):
+    子类存在的全部理由就是「父类那句在配置故障下说反了」——
+    文本一旦退化成父类那句,故障的方向又会被指错,而调用方只 catch 父类,
+    **没有任何一处会因为消息说错而报错**。
     """
 
     def __init__(self, *, used: int, budget: int) -> None:
