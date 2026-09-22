@@ -11,23 +11,6 @@ from app.agent import confirm_nodes
 from app.tools.executor import APPROVED, DENIED
 
 
-class _Registry:
-    def __init__(self, spec):
-        self._spec = spec
-
-    def get(self, name):
-        return self._spec if self._spec and name == self._spec.name else None
-
-    def __contains__(self, name):        # execute_tool 里 sorted(registry) 要用
-        return self.get(name) is not None
-
-    def __iter__(self):
-        return iter([] if self._spec is None else [self._spec.name])
-
-    def keys(self):
-        return list(iter(self))
-
-
 class _Settings:
     tool_timeout_seconds = 10.0
     tool_retry_attempts = 2
@@ -56,7 +39,10 @@ async def _no_audit(**_kwargs) -> None:
 #: `execute_tool` 在**这个模块里**按这个名字查找它(模块顶层
 #: `from app.tools.audit import record_audit`),所以 patch 的必须是
 #: `app.tools.executor.record_audit` —— 不是 `app.agent.confirm_nodes.record_audit`
-#: (那个模块从不 import 它,配上 `raising=False` 就是一条**静默失效的空操作**)。
+#: (那个模块从不 import 它)。三处 `monkeypatch.setattr` **一律不带
+#: `raising=False`** —— 那一轮它正是「静默空操作」的成因:目标哪天被改名或挪走,
+#: patch 就悄悄退化,而这个文件又开始往**验收 5 要读的那张表**写行、没有任何信号。
+#: 不带它,那种漂移会变成 **patch 时刻的 `AttributeError`,响亮**。
 _AUDIT_TARGET = "app.tools.executor.record_audit"
 
 
@@ -67,7 +53,12 @@ def _state(**over):
             "tool_call_id": "call_1",
             "name": "create_ticket",
             "args": {"description": "耳机坏了", "ticket_type": "售后"},
-            "preview": {"description": "耳机坏了", "ticket_type": "售后"},
+            # ⚠️ **刻意与 `args` 不等**(多一个只有预览才有的键)。
+            # 两者相等时 `test_confirm_write_payload_carries_the_preview`
+            # 分不出 `pending.get("preview")` 与 `pending.get("args")` ——
+            # 把实现改成读错的那一个**照样绿**,而用户看到的卡片就是另一份东西。
+            "preview": {"description": "耳机坏了", "ticket_type": "售后",
+                        "title": "建工单预览"},
         },
         "write_decision": "",
         "turn_messages": [],
@@ -92,7 +83,10 @@ async def test_confirm_write_payload_carries_the_preview(monkeypatch):
     node = confirm_nodes.make_confirm_write_node()
     await node(_state())
     assert seen[0]["frame"] == "ticket_confirm"
-    assert seen[0]["preview"] == {"description": "耳机坏了", "ticket_type": "售后"}
+    # 断言**整份**预览(含只有 `preview` 才有的那个键):少断言一个键
+    # 就分不出实现读的是 `preview` 还是 `args`。
+    assert seen[0]["preview"] == {"description": "耳机坏了", "ticket_type": "售后",
+                                  "title": "建工单预览"}
 
 
 @pytest.mark.parametrize(
@@ -158,7 +152,7 @@ async def test_approved_writes_once_and_appends_the_tool_message(monkeypatch):
     # **验收 5 要读的那张表**写 3 行。一个看起来在隔离、其实什么都没隔离的装置,
     # 比不写它还糟。(T8 的实现者实测上报;`executor` 才是
     # `execute_tool` 查找那个名字的地方。)
-    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
@@ -180,7 +174,7 @@ async def test_denied_does_not_write(monkeypatch):
     spec = _Spec()
     spec.tool = _Tool()
     # 取消这条**也会**落审计(`permission_denied`)—— 同一条写路径,同样要挡。
-    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
@@ -212,13 +206,53 @@ async def test_turn_messages_are_appended_not_replaced(monkeypatch):
 
     spec = _Spec()
     spec.tool = _Tool()
-    monkeypatch.setattr(_AUDIT_TARGET, _no_audit, raising=False)
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
         registry={"create_ticket": spec}, settings=_Settings()
     )
     out = await node(_state(write_decision=APPROVED, turn_messages=[prior]))
     assert len(out["turn_messages"]) == 2
     assert out["turn_messages"][0] is prior
+
+
+@pytest.mark.anyio
+async def test_apply_write_decision_refuses_an_empty_pending_write(monkeypatch):
+    """**空 `pending_write` 是接线 bug,不是一次调用** —— 入口必须自己拒(T9)。
+
+    空着往下走会造出一条 **`tool_call_id=""`** 的 ToolMessage:那构成
+    「有 tool result、没有对应 tool_call」,上游同样直接 **400** ——
+    而且它**看起来像一次正常结果**,没有任何东西会响。
+
+    路由侧(`nodes.route_after_agent`)也守一次,但那是**调用方的自觉**;
+    真正的不变量在**这个唯一写口**上(本仓元教训:不变量不要寄存在调用方的记忆里)。
+    所以这条用例**直接调节点**,刻意绕过路由。
+
+    ⚠️ 替身**不许自己抛**:替身一抛,`execute_tool` 的 `except Exception`
+    会把它翻成 `ToolInfrastructureError` —— 于是「有没有那道守卫」两种实现
+    **都**满足 `pytest.raises`,这条用例就成了恒真。这里让替身**正常返回**,
+    守卫缺席时节点会**一路跑完并返回** ⇒ RED。
+    """
+    from app.tools.errors import ToolInfrastructureError
+
+    calls: list = []
+
+    class _Tool:
+        async def ainvoke(self, call):
+            calls.append(call)
+
+            class _M:
+                content = "{}"
+            return _M()
+
+    spec = _Spec()
+    spec.tool = _Tool()
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
+    node = confirm_nodes.make_apply_write_decision_node(
+        registry={"create_ticket": spec}, settings=_Settings()
+    )
+    with pytest.raises(ToolInfrastructureError):
+        await node(_state(pending_write={}, write_decision=APPROVED))
+    assert calls == [], "空 pending_write 时不该执行任何工具"
 
 
 # ---- 通道本身:声明 + 每轮清零 ------------------------------------------

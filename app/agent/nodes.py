@@ -25,7 +25,7 @@ from app.prompts import (
 )
 from app.schemas import Message
 from app.services.history import append_turn
-from app.tools.executor import execute_tool
+from app.tools.executor import ERROR_CONFIRMATION_REQUIRED, execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -311,10 +311,41 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
         trace: list[str] = []
         steps = 0
         usage_total = 0
-        needs_final = False
         # 本轮新产生的消息(不含播种进来的历史):tool 往返 + 最终回复。
         # 交给 add_messages 并入 state,再由 log_turn 落库。
         new_messages: list = []
+
+        # ---- ch08:续跑判定(复用**已有的**不变量,不新增通道)----------
+        # `turn_messages` 已被 ch07 放进 `resolve_references` 的每轮重置清单,
+        # 所以「进场时非空」只可能是**一轮的中途**(`apply_write_decision` 刚
+        # 追加了一条 tool 结果)。续跑续的是**同一轮**,不该重跑 ReAct 循环。
+        existing_turn = list(state.get("turn_messages") or [])
+        if existing_turn:
+            msgs = msgs + existing_turn
+            trace.append("agent:write_resumed")
+            # **一轮不绑 tools**:结构上不可能再触发第二次写调用。
+            # ⚠️ 用**未绑**的 `model`,不是 `bound`。
+            final_acc, used = await _stream_round(model, msgs, parts)
+            usage_total += used
+            final_acc = (
+                final_acc if final_acc is not None
+                else AIMessage(content="".join(parts))
+            )
+            new_messages = existing_turn + [final_acc]
+            return {
+                "reply": "".join(parts),
+                "messages": [final_acc],
+                "turn_messages": new_messages,
+                # ⚠️ **不要**写 `"agent_steps": steps` —— 续跑路径上 `steps`
+                # 仍是初值 0,会把上一半算出来的步数**归零**。
+                "agent_steps": state.get("agent_steps") or 0,
+                "tool_calls_made": [],
+                "usage": {"total_tokens": usage_total},
+                "trace": trace,
+            }
+
+        needs_final = False
+        pending: dict = {}
 
         for step in range(1, settings.max_agent_steps + 1):
             steps = step
@@ -342,6 +373,29 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
                     tool_call=call, registry=registry, settings=settings,
                     conversation_id=state["conversation_id"],
                 )
+                if outcome.error_kind == ERROR_CONFIRMATION_REQUIRED:
+                    # 写操作待确认:那次调用**根本没发生** ⇒ 不回灌 tool 结果,
+                    # 由 `apply_write_decision` 在决议之后补上。
+                    if not pending:
+                        pending = {
+                            "tool_call_id": call["id"],
+                            "name": call["name"],
+                            "args": call["args"],
+                            "preview": outcome.preview or dict(call["args"]),
+                        }
+                        trace.append(f"agent:write_pending tool={call['name']}")
+                    else:
+                        # 同一轮里的**第二个**待确认写调用:它不会有第二次
+                        # confirm 机会,但**必须**补一条 tool 结果 ——
+                        # 少回灌一个就构成「有 tool_calls 没有对应 tool 消息」,
+                        # 上游直接 400(CLAUDE.md 的硬约束)。
+                        stub = ToolMessage(
+                            content="本轮已有一个写操作待用户确认,本次未执行。",
+                            tool_call_id=call["id"],
+                        )
+                        msgs.append(stub)
+                        new_messages.append(stub)
+                    continue
                 emit({"frame": "tool_result", "tool_call_id": outcome.tool_call_id,
                       "ok": outcome.ok, "summary": outcome.summary})
                 tool_msg = ToolMessage(content=outcome.content, tool_call_id=call["id"])
@@ -349,6 +403,20 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
                 new_messages.append(tool_msg)      # ← 工具结果,层 2 要截的就是它
                 made.append({"name": call["name"], "ok": outcome.ok})
                 trace.append(f"agent:step{step} tool={call['name']}")
+
+            if pending:
+                # 停循环:交给 `confirm_write` → `apply_write_decision` → 回来续跑。
+                # **不发收尾那一轮** —— 用户还没确认,现在就作答等于先把话说死。
+                return {
+                    "reply": "".join(parts),
+                    "messages": new_messages,
+                    "turn_messages": new_messages,
+                    "agent_steps": steps,
+                    "tool_calls_made": made,
+                    "pending_write": pending,
+                    "usage": {"total_tokens": usage_total},
+                    "trace": trace,
+                }
 
             if usage_total > settings.agent_token_budget:
                 break
@@ -384,6 +452,15 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
         }
 
     return agent_node
+
+
+def route_after_agent(state) -> str:
+    """`agent` 之后往哪走。
+
+    **判据是 `pending_write` 非空** —— 那条路径上 `agent` 已经停循环、
+    没有发收尾那一轮;其余一律照旧汇进 `log_turn`。
+    """
+    return "confirm_write" if state.get("pending_write") else "log_turn"
 
 
 # ---- 骨架的首尾两步 ----

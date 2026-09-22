@@ -12,6 +12,10 @@ from functools import lru_cache
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.agent.confirm_nodes import (
+    make_apply_write_decision_node,
+    make_confirm_write_node,
+)
 from app.agent.nodes import (
     make_agent_node,
     make_chitchat_reply_node,
@@ -22,6 +26,7 @@ from app.agent.nodes import (
     make_log_turn_node,
     make_resolve_references_node,
     make_retrieve_knowledge_node,
+    route_after_agent,
 )
 from app.agent.refund_nodes import (
     make_refund_expand_retrieve_node,
@@ -48,12 +53,16 @@ from app.prompts import render_system_prompt
 
 #: 出口节点 —— 它们统一汇进 log_turn 再结束。
 #:
-#: `refund_pick_order` **不在此列**:它可能停在 `interrupt()` 上,那时 run 根本
+#: `agent` **不在此列**:ch08 起它是**条件出口** —— 撞到未确认的写调用时
+#: 走 `confirm_write`(挂起)→ `apply_write_decision` → **回 agent 续跑** →
+#: 才汇进 `log_turn`。把它也连上 `log_turn` 会让挂起那一轮**一半写库、一半没写**。
+#:
+#: `refund_pick_order` 同样不在此列:它可能停在 `interrupt()` 上,那时 run 根本
 #: 走不到 `log_turn`("挂起的那一轮不落库",spec §5.1)。它若也连上 log_turn,
 #: 挂起路径就成了「一半写库、一半没写」—— 而这在单测里看不出来(单测要显式
 #: resume 才走得到那儿)。
 _OUTLETS = (
-    "agent", "complaint_reply", "chitchat_reply", "fallback_reply",
+    "complaint_reply", "chitchat_reply", "fallback_reply",
     "refund_offer", "refund_explain",
 )
 
@@ -153,6 +162,12 @@ def build_graph(
     graph.add_node("refund_judge", make_refund_judge_node(model=model))
     graph.add_node("refund_offer", make_refund_offer_node(emit=emit))
     graph.add_node("refund_explain", make_refund_explain_node(emit=emit))
+    # ---- 建工单确认流(ch08 T9)----
+    graph.add_node("confirm_write", make_confirm_write_node())
+    graph.add_node(
+        "apply_write_decision",
+        make_apply_write_decision_node(registry=registry, settings=settings),
+    )
     graph.add_node("log_turn", make_log_turn_node(session=session, emit=emit))
 
     graph.add_edge(START, "resolve_references")
@@ -190,6 +205,15 @@ def build_graph(
     graph.add_conditional_edges(
         "confidence_gate", _gate_route, {"agent": "agent", "fallback_reply": "fallback_reply"}
     )
+    # ch08:写操作确认流。`confirm_write` **只有 interrupt()**(resume 从头重跑,
+    # 那个节点里不能有别的事);副作用在执行/拒绝那个节点里,resume 之后只跑一次。
+    graph.add_conditional_edges(
+        "agent",
+        route_after_agent,
+        {"confirm_write": "confirm_write", "log_turn": "log_turn"},
+    )
+    graph.add_edge("confirm_write", "apply_write_decision")
+    graph.add_edge("apply_write_decision", "agent")
     for outlet in _OUTLETS:
         graph.add_edge(outlet, "log_turn")
     graph.add_edge("log_turn", END)
