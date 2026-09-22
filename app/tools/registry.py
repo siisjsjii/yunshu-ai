@@ -19,13 +19,20 @@ from app.tools.policy import kind_of
 from app.tools.spec import ToolSpec
 
 
-def build_retriever(session) -> KnowledgeRetriever:
+def build_retriever(session, settings) -> KnowledgeRetriever:
     """按配置组装检索器。
 
     构造**不连 Milvus、不加载 BGE-M3**(两者都是懒加载),所以拿在请求
     路径上建它是安全的;真正的连接/加载发生在第一次 `search`。
+
+    ⚠️ `settings` 是**必传参数,这里不再读模块级 `get_settings()`**
+    (ch08 T7 收口)。原先它写死读全局,而 `build_registry` 收了一个
+    `settings` 参数却**从不往下传** —— 于是「调用方传了一份、实际生效的是
+    另一份」,`app/api/chat.py` 那行 `settings=settings` 看着像接上了、
+    其实是个没有读者的装饰。本项目对「看起来接上、其实没接」的形状有明令。
+    唯一还读全局的地方收在 `build_registry` 的 `settings is None` 分支
+    (那是「调用方明确表示不关心配置」的入口)。
     """
-    settings = get_settings()
     return KnowledgeRetriever(
         session,
         get_vector_store(settings.milvus_uri, settings.milvus_collection),
@@ -75,19 +82,38 @@ def _dedupe(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     return out
 
 
-def build_registry(*, session, conversation_id, settings=None) -> dict[str, ToolSpec]:
+def build_registry(
+    *, session, conversation_id, settings=None, extra=None
+) -> dict[str, ToolSpec]:
     """组装本请求的注册表:`name → ToolSpec`。
+
+    `extra` 是 **MCP 那条路**拿回来的规格(由 `app/mcp/client.py` 的
+    `discover_mcp_specs` 产出,那是异步的,**由调用方 await 之后喂进来**)。
+    注册表本身是**纯组装**,不碰网络 —— 这样它保持可同步单测。
 
     `retriever` 在这里造好再喂进 `discover` —— 让 `builtin/knowledge.py`
     自己 import `registry` 会成环(registry → builtin → registry)。
+
+    ⚠️ **不加 `lru_cache` 或任何装饰器**:本函数每请求组装(`query_faq` /
+    `create_ticket` 是每请求闭包),缓存会让上一个会话的工具凭据被下一个
+    会话用上。
+
+    `settings is None` 是「调用方明确表示不关心配置」(纯组装类单测),
+    只有在那个分支上才回落到模块级 `get_settings()` —— 生产的两条调用
+    (`app/api/chat.py` 的两个端点)一律显式传,不留「传一份、读另一份」的缝。
     """
-    retriever = build_retriever(session)
+    settings = settings or get_settings()
+    retriever = build_retriever(session, settings)
     specs = [
         _spec_from_tool(tool, source="builtin")
         for tool in builtin.discover(
             session=session, conversation_id=conversation_id, retriever=retriever
         )
     ]
+    # 顺序稳定 = 工具定义块逐字节相同 = 前缀缓存命中(spec §3.4):
+    # 内置在前,MCP 按 (server, name) 排。
+    for spec in sorted(extra or [], key=lambda s: (s.source, s.name)):
+        specs.append(spec)
     return _dedupe(specs)
 
 

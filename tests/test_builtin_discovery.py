@@ -27,25 +27,26 @@ def _registry(session=None):
     )
 
 
-def test_five_builtin_tools_are_registered():
+def test_four_builtin_tools_are_registered():
+    """**四个**,不再是五个。
+
+    ch08 T7 把 `query_logistics` 从内置下线(物流 MCP Server 接管,名字不变),
+    所以它**不该**出现在这张表里。这里断言的是**精确相等**:多一个少一个
+    都要显式改这一行。少一个 → 模型永远调不到;多一个 → 模型调了却没有执行体。
+
+    配套的那条 `test_query_logistics_is_still_builtin_before_t7`(T3 写、
+    T7 删)**已按计划删除** —— 它的存在意义就是守「T3 与 T7 之间物流还有
+    提供者」那段空窗,窗口关了就作废。
+    """
     reg = _registry()
     assert set(reg) == {
         "query_order",
         "query_product",
-        "query_logistics",
         "query_faq",
         "create_ticket",
     }
-
-
-def test_query_logistics_is_still_builtin_before_t7():
-    """⚠️ **T7 会把这条测试删掉** —— 那时 `query_logistics` 已搬进物流 MCP Server。
-
-    留它的理由:本任务结束时它必须还在内置里,否则 T3 与 T7 之间
-    「物流查询」会有一段**谁都提供不了**的空窗,而验收 2 的题面在 T7 之前
-    就已经被人手动跑过。
-    """
-    assert _registry()["query_logistics"].source == "builtin"
+    # 反面:它**只**换了提供者,不是消失了 —— 物流那半在 `app/mcp/client.py`。
+    assert "query_logistics" not in reg
 
 
 def test_every_spec_carries_the_three_things():
@@ -79,11 +80,13 @@ def test_order_is_stable_and_sorted(monkeypatch):
     顺序 —— 那条断言测的是「同进程内两次一样」,而那件事**同义反复**。
 
     ⚠️ 复审给的第二版是 `assert names == sorted(names)` —— **它在正确实现下
-    不可能通过**,实测:
+    不可能通过**,实测(**ch08 T7 之前的表,那时 `query_logistics` 还在内置**):
         实际 ['query_faq', 'query_logistics', 'query_order', 'query_product', 'create_ticket']
         sorted() ['create_ticket', 'query_faq', 'query_logistics', 'query_order', 'query_product']
     因为排序键是 `(模块名, 工具名)`(brief 逐字规定),而 `create_ticket` 来自
     `tickets` 模块 —— 全局按工具名的字母序根本不是这条实现的口径。
+    (结论与那五个名字无关:T7 拿掉 `query_logistics` 之后 `create_ticket`
+     仍然排在末尾,`names == sorted(names)` 照样不成立。)
 
     所以这里断言**那句 sort 真正提供的东西**:枚举顺序被搅乱时,注册表顺序不变。
     它比「写死一张五元素清单」结实 —— 后者在本章的核心场景(新增/搬迁工具)里
@@ -128,7 +131,7 @@ def test_new_module_is_picked_up_without_touching_core_code(tmp_path, monkeypatc
     # ⚠️ **写文件也必须在 `try` 里**:它一旦落在外面,测试被中止(Ctrl-C /
     # `delitem` 抛错 / 超时)就会把 `zz_scratch_probe.py` 留在包目录里 ——
     # 此后 `discover()` 会把它装进**每一个请求**,模型凭空多出一个
-    # `echo_probe` 工具,而 `test_five_builtin_tools_are_registered` 变红;
+    # `echo_probe` 工具,而 `test_four_builtin_tools_are_registered` 变红;
     # 一次 `git add -A` 还会把它带进提交。
     try:
         new_module.write_text(
@@ -168,8 +171,8 @@ def test_duplicate_tool_name_raises_loudly(monkeypatch):
     表现是「工具偶尔返回另一种数据」,没人查得出来。
 
     ⚠️ 与 task-3-brief 的一字之差:`match` 是 `query_order` 而非 `query_product`。
-    `orders.build` 返回 `[query_order, query_product, query_logistics]`,
-    `[0]` 就是 **query_order** —— brief 里那个匹配串在正确实现下**不可能通过**
+    `orders.build` 返回 `[query_order, query_product]`(T7 之后),
+    `[0]` 仍是 **query_order** —— brief 里那个匹配串在正确实现下**不可能通过**
     (它写的时候大概以为首个是商品)。断言的本意(报错**点名**重名工具)不变,
     所以改的是匹配串,不是「去重该不该抛」。
     """

@@ -176,7 +176,7 @@ async def search_kb(q: str, session=Depends(get_session),
     query = q.strip()
     if not query:
         raise HTTPException(status_code=422, detail="查询词不能为空")
-    chunks = await build_retriever(session).search(query)
+    chunks = await build_retriever(session, settings).search(query)
     index = chunk_source_index(
         KNOWLEDGE_DIR, max_chars=settings.chunk_max_chars,
         overlap_chars=settings.chunk_overlap_chars)

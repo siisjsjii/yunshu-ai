@@ -214,10 +214,15 @@ class _Judgement:
 class FakeRetriever:
     """检索器替身。
 
-    **必须有**:端点每请求都会 `build_retriever(session)`(真实实现会连 Milvus
-    并按需加载 BGE-M3 权重),而「单测全程不联网」是硬规矩。用例通过
+    **必须有**:端点每请求都会 `build_retriever(session, settings)`(真实实现会
+    连 Milvus 并按需加载 BGE-M3 权重),而「单测全程不联网」是硬规矩。用例通过
     `client_factory(retriever=...)` 把 `chat_api.build_retriever` 换掉 ——
     与 `build_tools` 走同一个注入缝。
+
+    ⚠️ `settings` 形参是 ch08 T7 加的:`build_retriever` 原先**写死**读模块级
+    `get_settings()`,而 `build_registry` 收了一个 `settings` 却从不往下传 ——
+    于是「调用方传了一份、实际生效的是另一份」。现在它是必传参数,替身的形参
+    必须跟着对齐(少收一个抛 `TypeError`,红法指向这行 lambda)。
     """
 
     def __init__(self, chunks=()):
@@ -401,22 +406,40 @@ def client_factory(monkeypatch):
     """
 
     def make(batches, session=None, registry=None, intent="订单", retriever=None,
-             **settings_overrides):
+             mcp_specs=None, **settings_overrides):
         model = ScriptedModel(batches)
         intent_model = FakeIntentModel(intent)
         db = session if session is not None else FakeSession()
         store = SessionStore(ttl_seconds=60, max_sessions=10)
 
-        # 端点每请求自己 `build_retriever(session)`,真实实现会连 Milvus 并按需
-        # 加载 BGE-M3 权重 —— **默认也要换掉**,不是"传了才换":任何一条将来走到
-        # 退款检索腿却没传 `retriever=` 的用例,都会在无人察觉的情况下真的出网
-        # (「单测全程不联网」是硬规矩)。默认给一个**空结果**的哑检索器:
+        # 端点每请求自己 `build_retriever(session, settings)`,真实实现会连 Milvus
+        # 并按需加载 BGE-M3 权重 —— **默认也要换掉**,不是"传了才换":任何一条
+        # 将来走到退款检索腿却没传 `retriever=` 的用例,都会在无人察觉的情况下
+        # 真的出网(「单测全程不联网」是硬规矩)。默认给一个**空结果**的哑检索器:
         # 走到检索腿的用例拿到"没命中"这个确定行为,而不是一次真实 IO。
+        #
+        # ⚠️ ch08 T7 起真实签名是 `(session, settings)`,`settings` 在这里**用不到**
+        # (哑检索器不读配置)—— 但形参必须收下:少收一个的话抛的是 `TypeError`,
+        # 而用例期待的是别的异常或 200,红法会指向这行 lambda 而不指向被测代码。
         monkeypatch.setattr(
             chat_api,
             "build_retriever",
-            lambda session: retriever if retriever is not None else FakeRetriever([]),
+            lambda session, settings=None: (
+                retriever if retriever is not None else FakeRetriever([])
+            ),
         )
+
+        # 端点每请求**真的**会 `await discover_mcp_specs(settings=...)`(ch08 T7),
+        # 那是两次 Streamable HTTP 往返(127.0.0.1:8101 / 8102)。
+        # **默认也要换掉**,理由与上面那条完全相同:留着的话任何一条走到端点的
+        # 用例都会真发请求,拿到 connection refused 或 5s 超时 ——
+        # 「单测全程不联网」是硬规矩。默认给**空列表**(= 两个 Server 都没起),
+        # 那是生产里明确支持的降级态:聊天仍可用,只剩内置工具。
+        # 要验「MCP 那半真的并进来了」的用例显式传 `mcp_specs=`。
+        async def _fake_discover(*, settings):
+            return list(mcp_specs or [])
+
+        monkeypatch.setattr(chat_api, "discover_mcp_specs", _fake_discover)
 
         if registry is not None:
             # 端点用 build_registry 组装注册表、再**投影**出绑给模型的那批
@@ -424,12 +447,16 @@ def client_factory(monkeypatch):
             # 换掉 build_registry 就是同时换掉"绑给模型的"和"能执行的"两批;
             # 端点若从别处取注册表,下面的断言会以"工具不存在"(ok=false)
             # 或"绑定内容不对"的形式变红。
+            #
+            # ⚠️ 形参要与生产逐个对齐(**包括 `extra`**):T7 起端点会多传一个
+            # `extra=mcp_specs`,替身少收一个会抛 `TypeError` —— 而那看起来
+            # 像"工具组装坏了",不像"替身签名旧了"。
             specs = {name: _spec_from_tool(tool, source="builtin")
                      for name, tool in registry.items()}
             monkeypatch.setattr(
                 chat_api,
                 "build_registry",
-                lambda *, session, conversation_id, settings=None: specs,
+                lambda *, session, conversation_id, settings=None, extra=None: specs,
             )
 
         async def _session_override():
@@ -1127,18 +1154,29 @@ def test_user_id_defaults_to_demo_user(client_factory):
 
 # ---------- 工具事件(ch02 新增) ----------
 
-#: 一个「已发货」的订单号 —— `ok=True` 要求工具**真的执行成功**。
-#: 多数订单号(含 1001)是「未发货」,对它们查物流会正确地返回 ToolNotFound。
-#: 「哪些号码有物流」由 tests/test_tools_random.py 的自洽断言守护;种子函数
-#: 若变动,这里会以 `assert False is True` 硬失败,而不是被悄悄放宽。
-_SHIPPED_ORDER = "1003"
+#: 一个合法订单号 —— `ok=True` 要求工具**真的执行成功**。
+#:
+#: ⚠️ **ch08 T7 之前这里叫 `_SHIPPED_ORDER = "1003"`,带着「必须挑一个真发了货
+#: 的单号」那段说明**。那段说明属于 `query_logistics` —— 它对未发货的单会
+#: 正确地抛 `ToolNotFound`。T7 把物流搬进 MCP Server 之后,**这条用例改走
+#: `query_order`**(见下面 docstring 的原因),而它对**任何**合法订单号都成功,
+#: 所以那个挑号码的约束在这里没有对象了。「挑号码」那套现在还活着的地方是
+#: `tests/test_tools_random.py: _order_ids()`(由它自己的自洽断言守护)。
+_SHIPPED_ORDER = "1001"
 
 
 def test_chat_stream_emits_tool_call_event(client_factory):
     """验收 1 的后端一半:必须推出 tool_call 帧,且 name / args 正确。
 
-    这里不替换注册表 —— 走的是生产的那五个工具(query_logistics 是确定性
-    伪随机、不碰 DB 的那个),顺带证明 build_tools 真被端点用上了。
+    这里不替换注册表 —— 走的是**生产的内置工具集**(`query_order` 是确定性
+    伪随机、不碰 DB 的那个),顺带证明 `build_registry` 真被端点用上了。
+
+    ⚠️ **为什么不再是 `query_logistics`**(ch08 T7):它已从内置下线,由**独立
+    进程**的物流 MCP Server 提供;端点拿它是靠 `await discover_mcp_specs(...)`,
+    而单测不联网(那条路在 `tests/test_mcp_servers.py` 与 `tests/test_mcp_client.py`
+    里各自有覆盖)。拿它当本用例的样本会退化成「喂一条伪造的 MCP 工具再断它
+    能跑」—— 测的是替身,不是接线。内置工具是**真跑的**:下面 `ok is True`
+    与落库的完整 JSON 都来自真实执行。
     """
     client, model = client_factory(
         batches=[
@@ -1146,7 +1184,7 @@ def test_chat_stream_emits_tool_call_event(client_factory):
                 FakeChunk(
                     tool_calls=[
                         {
-                            "name": "query_logistics",
+                            "name": "query_order",
                             "args": {"order_id": _SHIPPED_ORDER},
                             "id": "c1",
                         }
@@ -1158,7 +1196,7 @@ def test_chat_stream_emits_tool_call_event(client_factory):
     )
     with client as c:
         resp = c.post(
-            "/api/chat/stream", json={"message": f"订单 {_SHIPPED_ORDER} 的物流到哪了"}
+            "/api/chat/stream", json={"message": f"订单 {_SHIPPED_ORDER} 的状态"}
         )
         events = _parse_sse(resp.text)
 
@@ -1166,7 +1204,7 @@ def test_chat_stream_emits_tool_call_event(client_factory):
     assert "tool_call" in kinds
     assert "tool_result" in kinds
     payload = next(p for name, p in events if name == "tool_call")
-    assert payload["name"] == "query_logistics"
+    assert payload["name"] == "query_order"
     assert payload["args"] == {"order_id": _SHIPPED_ORDER}
     assert payload["tool_call_id"] == "c1"
     assert kinds[-1] == "done"
@@ -1178,10 +1216,13 @@ def test_chat_stream_emits_tool_call_event(client_factory):
 
     # 绑给模型的就是生产工具集(绑一批、能执行另一批是本章的接线隐患;
     # "执行批"那一半由下面替换注册表的那条测试钉住)。
+    #
+    # ch08 T7 起内置是**四个** —— `query_logistics` 已下线,它由 MCP 那条路
+    # 每请求现问现拿,不在这个函数的射程里(夹具的 `mcp_specs` 默认为空)。
+    # 「MCP 那半真的并进来了」由下面 `test_endpoint_merges_mcp_specs_...` 钉。
     assert {t.name for t in model.bound_tools} == {
         "query_order",
         "query_product",
-        "query_logistics",
         "query_faq",
         "create_ticket",
     }
@@ -1207,6 +1248,79 @@ def test_chat_stream_emits_tool_call_event(client_factory):
     # 截断版是 JSON 前缀、`json.loads` 直接炸(而那正是层 2 截短前的原料)。
     assert json.loads(tool_row.content)["order_id"] == _SHIPPED_ORDER
     assert final_row.content == "已揽件。"
+
+
+#: 「MCP 那条路拿回来的工具」的替身(ch08 T7)。真实那份跑在**独立进程**的
+#: 售后 MCP Server 里(`mcp_servers/aftersales.py`),单测够不到 —— 单测不联网。
+#: 这里替的是**接线**,不是那个 Server(Server 自己的验证在
+#: `tests/test_mcp_servers.py`,发现协议在 `tests/test_mcp_client.py`)。
+@tool
+async def query_warranty(order_id: str) -> str:
+    """查在保。测试替身。"""
+    return json.dumps({"order_id": order_id, "status": "保修中"}, ensure_ascii=False)
+
+
+MCP_WARRANTY_SPEC = _spec_from_tool(query_warranty, source="mcp:aftersales")
+
+
+def test_endpoint_merges_discovered_mcp_specs(client_factory):
+    """**接线**:端点 `await discover_mcp_specs(...)` 之后必须把 `extra=` 喂进注册表。
+
+    ⚠️ 判别力在**「它能不能被执行」**,不在「它有没有出现在 `bound_tools` 里」:
+    一个「绑给模型 MCP、注册表里没有」的实现(正是本章点名的接线隐患 ——
+    模型看得到、执行不到)在只断 `bound_tools` 的写法下**照样绿**,
+    而它的表现是一条 `ok=false` 的可恢复失败,事件序列长得一模一样。
+    所以下面断的是 `ok is True` + 回灌内容真的来自那个工具。
+    """
+    client, model = client_factory(
+        batches=[
+            [
+                FakeChunk(
+                    tool_calls=[
+                        {"name": "query_warranty",
+                         "args": {"order_id": "1001"},
+                         "id": "w1"}
+                    ]
+                )
+            ],
+            [FakeChunk("查到了。")],
+        ],
+        mcp_specs=[MCP_WARRANTY_SPEC],
+    )
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"message": "这台还在保吗"})
+        events = _parse_sse(resp.text)
+
+    assert "query_warranty" in {t.name for t in model.bound_tools}
+    result = next(p for name, p in events if name == "tool_result")
+    assert result["ok"] is True, result.get("summary")
+    assert [name for name, _ in events][-1] == "done"
+    # 「能执行」的**内容证据**:落库的那条 tool 行必须是那个工具真产出的载荷 ——
+    # `ok is True` 只说了"执行器认为它成功了",这一条说的是"回来的就是它"。
+    assert '"status": "保修中"' in client.db.messages[2].content
+
+
+def test_endpoint_starts_with_builtin_tools_when_no_mcp_server_is_up(client_factory):
+    """降级在**端点**这一层的表现(夹具默认 `mcp_specs` 为空)。
+
+    两个 Server 都没起时聊天**照常可走**,只剩内置 —— 而不是 502、
+    也不是「一个工具都没有」。这条与 `tests/test_mcp_client.py` 的
+    `test_both_dead_yields_empty_not_an_exception` 是**接力**关系:
+    那边保证 client 返回 `[]`,这边保证 `[]` 进了端点不会把聊天弄坏。
+    """
+    client, model = client_factory(batches=[[FakeChunk("您好")]])
+    with client as c:
+        resp = c.post("/api/chat/stream", json={"message": "你好"})
+        events = _parse_sse(resp.text)
+
+    assert resp.status_code == 200
+    assert [name for name, _ in events][-1] == "done"
+    assert {t.name for t in model.bound_tools} == {
+        "query_order",
+        "query_product",
+        "query_faq",
+        "create_ticket",
+    }
 
 
 def test_recoverable_tool_failure_is_not_an_error_frame(client_factory):

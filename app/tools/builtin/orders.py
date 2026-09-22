@@ -1,8 +1,14 @@
-"""订单 / 商品 / 物流三个「假装有上游系统」的只读工具。
+"""订单 / 商品两个「假装有上游系统」的只读工具。
 
 数据全部来自 `app.tools.mock_data`(**唯一真相源**,与两个 MCP Server 共用)。
 
-⚠️ `query_logistics` **暂时**还在这里 —— T7 会把它删掉,由物流 MCP Server 接管。
+⚠️ **`query_logistics` 已下线内置**(ch08 T7),由物流 MCP Server
+(`mcp_servers/logistics.py`,独立进程)接管。**名字没变** —— 评估集与提示词
+里的工具名口径不跟着漂。它**只剩一个提供者**:重名的表现是「其中一个静默
+胜出」,而谁胜出取决于排序,没人查得出来(`registry._dedupe` 会抛,
+但那条是兜底,不是设计)。
+
+⚠️ `mock_data.logistics_record` **留着** —— 物流 Server 与既有测试还要用它。
 """
 
 import json
@@ -12,7 +18,6 @@ from langchain.tools import tool
 from app.tools.errors import ToolNotFound
 from app.tools.mock_data import (
     PRODUCT_SPECS,
-    logistics_record,
     order_record,
     require_order_no,
     rng,
@@ -48,13 +53,5 @@ async def query_product(keyword: str) -> str:
     )
 
 
-@tool
-async def query_logistics(order_id: str) -> str:
-    """查询订单的物流状态、当前位置与轨迹。用户问"到哪了""发货没"时使用。"""
-    return json.dumps(
-        logistics_record(require_order_no(order_id)), ensure_ascii=False
-    )
-
-
 def build(*, session, conversation_id, retriever):
-    return [query_order, query_product, query_logistics]
+    return [query_order, query_product]

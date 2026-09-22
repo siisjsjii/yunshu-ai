@@ -13,6 +13,7 @@ from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
 from app.db.session import get_session
 from app.llm import create_chat_model, create_extract_model
+from app.mcp.client import discover_mcp_specs
 from app.memory import budget, journal, layers, summarize
 from app.memory.store import SessionStore
 from app.memory.tasks import log_trigger, run_summary_in_background
@@ -292,8 +293,22 @@ async def chat_stream(
         # 都是"拿到锁之后"这段里的新代码;它们抛异常时漏放锁的后果不是"慢"
         # —— 持锁的锁既不被 TTL 也不被 LRU 回收,该会话从此永久 409,
         # 症状与"泄漏"毫无相似之处。
+        #
+        # ch08 T7:MCP 那两个业务 Server 的工具**每请求现问现拿**(spec §8.4)。
+        # 位置有两条硬约束:
+        #   ① **在锁之后、`EventSourceResponse` 之前** —— 与 `prepare_turn`
+        #      同一条规矩:SSE 一旦 yield 过第一帧,状态码再也改不了;
+        #   ② **超时只由连接配置给**(`settings.mcp_discovery_timeout_seconds`,
+        #      见 `app/mcp/client.py:_connections`),这里**不套 `asyncio.wait_for`**
+        #      —— 两处超时会让人分不清是哪条生效。
+        # 单 Server 挂了在这里已经降级成"少几个工具"(client 内部 skip + warn),
+        # 不抛;两个都挂则 `mcp_specs == []`,聊天只剩内置工具。
+        mcp_specs = await discover_mcp_specs(settings=settings)
         registry = build_registry(
-            session=session, conversation_id=session_id, settings=settings
+            session=session,
+            conversation_id=session_id,
+            settings=settings,
+            extra=mcp_specs,
         )
         # 绑给模型的 = 注册表的**投影**(ch08 T4 起注册表产出的是 `ToolSpec`)。
         tools = [spec.tool for spec in registry.values()]
@@ -310,7 +325,7 @@ async def chat_stream(
             tools=tools,
             registry=registry,
             settings=settings,
-            retriever=build_retriever(session),
+            retriever=build_retriever(session, settings),
             session=session,
             conversation_id=session_id,
             emit=emit,

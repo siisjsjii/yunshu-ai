@@ -96,6 +96,19 @@ class Settings(BaseSettings):
     # 挖知识批次 <= 0 → range() 空转,脚本"成功"但一行没抽,比报错更糟。
     mine_batch_conversations: int = Field(default=5, ge=1)
 
+    # ---- ch08:MCP 接入 ----
+    # ⚠️ 这一节由 ch08 T11 的 Step 1 逐字规定,**因 T7 的实现必须先能跑**而
+    # 提前落到这里(`app/mcp/client.py:_connections` 读这三个字段;
+    # 缺了的话**每一个**聊天请求都在 `discover_mcp_specs` 里 AttributeError)。
+    # T11 执行到 Step 1 时这三个字段已在,不必重复加。
+    #
+    # 两个 URL 给本地演示的默认值(端口与 `mcp_servers/` 两张表一致)。
+    # 发现超时**给界** —— 它挂在**请求路径上**(每请求现问现拿),
+    # 写错会让每个请求都卡住。
+    mcp_logistics_url: str = "http://127.0.0.1:8101/mcp"
+    mcp_aftersales_url: str = "http://127.0.0.1:8102/mcp"
+    mcp_discovery_timeout_seconds: float = Field(default=5.0, gt=0)
+
     # ---- ch07:上下文管理。全部带界 —— 写错要在启动时炸,不能等运行时 ----
     #
     # `model_context_window` / `max_output_tokens` **取代并已删除**了本章之前的

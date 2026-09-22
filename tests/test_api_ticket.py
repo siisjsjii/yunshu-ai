@@ -77,15 +77,29 @@ def _settings(**overrides):
 def _client(session, *, store=None, **settings_overrides):
     """端点级测试客户端:三条依赖缝都替换掉(会话 / 会话存储 / 配置)。
 
-    ⚠️ **替换 `get_settings` 并不能让这个文件摆脱仓库根的 `.env`** ——
-    `build_registry` 内部的 `build_retriever` 是**硬连线**调模块级 `get_settings()`
-    (`app/tools/registry.py`),不走 `Depends`,所以 DI 缝够不到它。
+    ⚠️ **这条注记在 ch08 T7 被推翻了,原文作废**。它原先写着:
 
-    实测(移走 `.env` 后跑,修复轮 1 现数):本文件红 **1** 条 —— 只剩主用例,
-    因为另外 4 条要么被替身换掉了 `build_registry`、要么压根不进端点;而
-    **全量快路径红 24 条**(其余散在 `test_api_chat.py` / `test_api_kb.py` /
-    `test_registry.py`)。这条覆盖的用途是**控制等锁超时与密钥占位值**,
-    不是可移植性。
+        「替换 `get_settings` 并不能让这个文件摆脱仓库根的 `.env` ——
+         `build_registry` 内部的 `build_retriever` 是**硬连线**调模块级
+         `get_settings()`,不走 `Depends`,所以 DI 缝够不到它。
+         实测(移走 `.env` 后跑)本文件红 **1** 条,只剩主用例。」
+
+    那是**真的**:`build_registry` 收了一个 `settings` 参数却从不往下传,
+    `build_retriever` 于是越过 DI 缝读全局配置。T7 把这个「看起来接上、
+    其实没接」的参数**接通了**(`build_retriever(session, settings)`,
+    必传),这条覆盖的用途(控制等锁超时与密钥占位值)现在**真的**落在
+    `get_settings` 的 DI 缝上。
+
+    **实测(2026-09-22,T7 落地后,移走 `.env` 再跑)**:
+        5 passed in 2.79s
+    不再有红。同一轮里仍然依赖 `.env` 的只剩**显式传 `settings=None`**
+    的那几条(「调用方明确表示不关心配置」的入口),如 `tests/test_registry.py`
+    与 `tests/test_mcp_client.py` 里的纯组装用例。
+
+    (顺带记一条与本改动无关的观测:移走 `.env` 后带 `@pytest.mark.db` 的
+     文件会**挂住**而不是快速报错 —— 它们经 `app.db.base.get_sessionmaker`
+     读真实 `.env` 的 `DATABASE_URL`,连不上时卡满前向超时。
+     `tests/test_api_refund.py` 实测 `timeout 60` 用尽。)
     """
     store = store if store is not None else SessionStore(ttl_seconds=60, max_sessions=100)
 

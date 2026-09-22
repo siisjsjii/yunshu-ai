@@ -1,4 +1,13 @@
-"""三个确定性伪随机工具的测试。不联网、不碰 DB。"""
+"""确定性伪随机工具的测试。不联网、不碰 DB。
+
+**物流那半的调用点搬过一次家**(ch08 T7):`query_logistics` 不再是内置工具,
+它现在跑在**独立进程**的物流 MCP Server 里(`mcp_servers/logistics.py`,
+经 Streamable HTTP 调用)。单测全程不联网,够不到那条 HTTP 路,所以下面这些
+用例一律走 `mock_data.logistics_record` —— 它就是**内置与两个 MCP Server 的
+唯一真相源**(`app/tools/mock_data.py` 的模块 docstring),物流 Server 的工具体
+只是一行 `json.dumps(logistics_record(...))` 的透传。Server 那一侧(入参校验、
+序列化、抛出形状)的进程内验证在 `tests/test_mcp_servers.py`。
+"""
 
 import asyncio
 import json
@@ -9,8 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from app.tools.builtin.orders import query_logistics, query_order, query_product
+from app.tools.builtin.orders import query_order, query_product
 from app.tools.errors import ToolNotFound
+from app.tools.mock_data import logistics_record, require_order_no
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,6 +28,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _call(tool, args: dict) -> str:
     tool_call = {"name": tool.name, "args": args, "id": "call_1", "type": "tool_call"}
     return asyncio.run(tool.ainvoke(tool_call)).content
+
+
+def _logistics(order_id: str) -> str:
+    """物流查询的**当前提供者**(见模块 docstring)。
+
+    走的顺序与物流 Server 的工具体**逐字一致**:先 `require_order_no`(入参
+    不合法 ⇒ `ToolNotFound`,而不是编一张单),再 `logistics_record` 取数,
+    最后按 `ensure_ascii=False` 序列化(中文不转义成 \\uXXXX,白烧 token)。
+    """
+    return json.dumps(
+        logistics_record(require_order_no(order_id)), ensure_ascii=False
+    )
 
 
 #: 订单状态 → 该状态下**可能**出现的物流状态。
@@ -57,22 +79,18 @@ def _order_ids(*, shipped: bool) -> list[str]:
 def test_same_order_id_gives_same_result():
     """同一订单号永远返回同样数据。"""
     oid = _order_ids(shipped=True)[0]
-    assert _call(query_logistics, {"order_id": oid}) == _call(
-        query_logistics, {"order_id": oid}
-    )
+    assert _logistics(oid) == _logistics(oid)
 
 
 def test_different_order_ids_differ():
     """不同订单号应有不同数据,否则工具等于常量。"""
     first, second = _order_ids(shipped=True)[:2]
-    assert _call(query_logistics, {"order_id": first}) != _call(
-        query_logistics, {"order_id": second}
-    )
+    assert _logistics(first) != _logistics(second)
 
 
 def test_result_is_json_with_chinese_not_escaped():
     """返回 JSON 字符串,且中文不被转义成 \\uXXXX(白烧 token)。"""
-    raw = _call(query_logistics, {"order_id": _order_ids(shipped=True)[0]})
+    raw = _logistics(_order_ids(shipped=True)[0])
     payload = json.loads(raw)
     assert set(payload) >= {"order_id", "status", "location"}
     assert "\\u" not in raw
@@ -85,16 +103,25 @@ def test_seed_is_stable_across_processes():
     这条是本章最容易写错的断言 —— 内置 hash() 对 str 每进程随机化
     (PYTHONHASHSEED),用它会让同一订单号在重启后返回不同数据,
     而同进程内的任何测试都测不出来。故必须另起两个进程比对。
+
+    ⚠️ **调用点在 ch08 T7 换了,这条测试没有**(它钉的性质与调用点无关):
+    搬到了 `mock_data.logistics_record`。这个真相源现在被**三个进程**共用 ——
+    客服服务(内置 `query_order`)、物流 Server、售后 Server ——
+    种子在每个进程里都必须一样,否则「同一订单号处处同数据」当场不成立。
     """
     oid = _order_ids(shipped=True)[0]
     # 拼字符串而不是 f-string:下面这段代码里全是花括号,用 f-string 得逐个
     # 翻倍转义,读起来全是 `{{`。
+    #
+    # ⚠️ **订单号必须是上面派生的那个,不能写死一个演示号码**:T7 的 brief 里
+    # 这一段的字面值是 `logistics_record('1002')`,而 **1002 是「已取消」** ——
+    # `logistics_record` 对它抛 `ToolNotFound`,子进程非 0 退出,这条会直接红。
+    # (实测确认过。)派生出来的 `oid` 是 `_order_ids(shipped=True)` 筛过的。
     code = (
-        "import asyncio, sys; sys.path.insert(0, '.'); "
-        "from app.tools.builtin.orders import query_logistics; "
-        "print(asyncio.run(query_logistics.ainvoke("
-        "{'name': 'query_logistics', 'args': {'order_id': '" + oid + "'}, "
-        "'id': 'c', 'type': 'tool_call'})).content)"
+        "import json, sys; sys.path.insert(0, r'.');"
+        "from app.tools.mock_data import logistics_record;"
+        "sys.stdout.buffer.write("
+        "json.dumps(logistics_record('" + oid + "'), ensure_ascii=False).encode('utf-8'))"
     )
     # 子进程的输出编码必须显式钉成 UTF-8。本机 locale 是 cp936,Python 会把管道
     # 上的 stdout 按 GBK 编码,而下面按 UTF-8 解码 —— 不钉的话子进程输的中文会
@@ -117,7 +144,7 @@ def test_seed_is_stable_across_processes():
 def test_malformed_order_id_raises_tool_not_found():
     """不像订单号的输入 → ToolNotFound(可恢复),不是随机编一个结果。"""
     with pytest.raises(ToolNotFound):
-        _call(query_logistics, {"order_id": "abc"})
+        _logistics("abc")
 
 
 def test_query_product_uses_keyword():
@@ -153,7 +180,7 @@ def test_non_ascii_digits_are_not_order_numbers():
     """
     for bad in ("١٢٣٤", "²²²²", "１２３４"):  # 阿拉伯-印度、上标、全角
         with pytest.raises(ToolNotFound):
-            _call(query_logistics, {"order_id": bad})
+            _logistics(bad)
 
 
 def test_error_message_does_not_echo_unbounded_input():
@@ -179,7 +206,7 @@ def test_unshipped_order_has_no_logistics():
     而凭空造的那条必然与订单状态矛盾。
     """
     with pytest.raises(ToolNotFound):
-        _call(query_logistics, {"order_id": _order_ids(shipped=False)[0]})
+        _logistics(_order_ids(shipped=False)[0])
 
 
 def test_order_and_logistics_status_never_contradict():
@@ -197,7 +224,7 @@ def test_order_and_logistics_status_never_contradict():
         oid = str(i)
         order = json.loads(_call(query_order, {"order_id": oid}))
         try:
-            logistics = json.loads(_call(query_logistics, {"order_id": oid}))
+            logistics = json.loads(_logistics(oid))
         except ToolNotFound:
             # 未发货的订单**必须**查不到物流。走得到这个分支本身就是耦合的
             # 证据:两条独立随机流下,任何合法订单号都查得到物流,永远不会抛。
@@ -227,7 +254,7 @@ def test_logistics_trace_never_predates_the_order():
         oid = str(i)
         order = json.loads(_call(query_order, {"order_id": oid}))
         try:
-            logistics = json.loads(_call(query_logistics, {"order_id": oid}))
+            logistics = json.loads(_logistics(oid))
         except ToolNotFound:
             continue
         created = datetime.strptime(order["created_at"], "%Y-%m-%d %H:%M")
@@ -248,7 +275,7 @@ def test_logistics_traces_are_a_coherent_timeline():
     """
     fmt = "%Y-%m-%d %H:%M"
     for oid in _order_ids(shipped=True)[:5]:
-        payload = json.loads(_call(query_logistics, {"order_id": oid}))
+        payload = json.loads(_logistics(oid))
 
         times = []
         for entry in payload["traces"]:
