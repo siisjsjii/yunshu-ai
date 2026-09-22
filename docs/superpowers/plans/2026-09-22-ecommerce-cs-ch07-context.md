@@ -865,6 +865,15 @@ git commit -m "feat(ch07): Message.id + conversation_summaries 表 + conversatio
 
 ### Task 4: 分层与截短(纯函数)
 
+> **⚠️ 本任务下面的示例代码有三处缺陷,已在实现时订正。**
+> 发现并验证它们的是实现者(三处都做了变异运行)。**以代码为准,不要照抄下面的片段**:
+> ① `_after` 的区间语义写反 ⇒ 两个锚点都是 0 时(每个新会话)同一条消息**同时落在两层**,
+> 上下文静默翻倍;② `degrade` 把边界设成「被丢弃那一轮的最后一个 id」⇒
+> 某些轮次形状下**死循环**(实测 `timeout 30` → exit=124);
+> ③ 核心测试的第三条断言是 `x < x`,**不可能满足** —— 而它守护的正是
+> 「层 2 按截短后计数」这条全章最容易静默失效的性质。
+> 详见 spec §12.1。
+
 **Files:**
 - Modify: `app/memory/trim.py`(`_to_rounds` → 公开 `to_rounds`)
 - Create: `app/memory/layers.py`
