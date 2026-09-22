@@ -1323,27 +1323,17 @@ from app.tools.executor import (
 from app.tools.spec import READ, WRITE, ToolSpec
 
 
-class _Clock:
-    """可控时钟 —— **不要 `sleep` 真等**:重试的等待会拖慢整个套件。"""
-
-    def __init__(self):
-        self.slept: list[float] = []
-
-    async def sleep(self, seconds):
-        self.slept.append(seconds)
-
-
-@pytest.fixture
-def fake_sleep(monkeypatch):
-    clock = _Clock()
-    monkeypatch.setattr(executor.asyncio, "sleep", clock.sleep)
-    return clock
-
-
 class _Settings:
-    tool_timeout_seconds = 10.0
+    # ⚠️ **超时用真实的小数字,绝不要 monkeypatch `asyncio.sleep`。**
+    # `executor.asyncio` **就是** `asyncio` 模块本身 —— `monkeypatch.setattr(
+    # executor.asyncio, "sleep", ...)` 会把它**全局**换掉,于是被测工具里那句
+    # `await asyncio.sleep(10)` **立刻返回**、`wait_for` 根本不超时,测试会以
+    # 一个看不懂的方式红。这是「替身把被测行为整个取消掉了」——
+    # 本仓第 (g) 类假绿的反面:**不是假绿,是假红**。
+    # (初稿正是这么写的,已订正。)
+    tool_timeout_seconds = 0.01
     tool_retry_attempts = 2
-    tool_retry_delay_seconds = 0.1
+    tool_retry_delay_seconds = 0.0
     tool_result_max_tokens = 1200
 
 
@@ -1356,21 +1346,6 @@ def _spec(*, name="demo", kind=READ, schema=None, tool=None) -> ToolSpec:
         kind=kind,
         source="builtin",
         tool=tool,
-    )
-
-
-async def _run(spec, args, *, write_decision=PENDING, monkeypatch=None, audited=None):
-    if monkeypatch is not None and audited is not None:
-        monkeypatch.setattr(
-            executor, "record_audit",
-            lambda **kw: _collect(audited, kw),
-        )
-    return await execute_tool(
-        tool_call={"name": spec.name, "id": "call_1", "args": args},
-        registry={spec.name: spec},
-        settings=_Settings(),
-        conversation_id="c1",
-        write_decision=write_decision,
     )
 
 
@@ -1399,6 +1374,7 @@ async def test_pending_write_is_not_executed():
         registry={"create_ticket": spec},
         settings=_Settings(),
         conversation_id="c1",
+        write_decision=PENDING,      # 显式写出默认值:Agent 那条路从不传别的
     )
     assert calls == []
     assert outcome.ok is False
@@ -1415,6 +1391,7 @@ async def test_pending_write_preview_carries_the_args():
         registry={"create_ticket": spec},
         settings=_Settings(),
         conversation_id="c1",
+        write_decision=PENDING,
     )
     assert outcome.preview == {"description": "耳机坏了", "ticket_type": "售后"}
 
@@ -1434,6 +1411,7 @@ async def test_pending_write_is_not_audited(monkeypatch):
         registry={"create_ticket": spec},
         settings=_Settings(),
         conversation_id="c1",
+        write_decision=PENDING,
     )
     await asyncio.sleep(0)          # 给可能存在的 fire-and-forget 一点机会
     assert seen == []
@@ -1521,30 +1499,33 @@ async def test_invalid_args_are_caught_before_the_tool_runs(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_invalid_args_is_not_retried(monkeypatch, fake_sleep):
-    """重放同样的参数只会同样失败 —— 重试纯属浪费。"""
+async def test_invalid_args_is_not_retried():
+    """重放同样的参数只会同样失败 —— 重试纯属浪费。**断的是 `retry_count`。**"""
     spec = _spec(name="query_order")
-    await execute_tool(
+    outcome = await execute_tool(
         tool_call={"name": "query_order", "id": "c1", "args": {}},
         registry={"query_order": spec},
         settings=_Settings(),
         conversation_id="c1",
     )
-    assert fake_sleep.slept == []
+    assert outcome.error_kind == ERROR_INVALID_ARGS
+    assert outcome.retry_count == 0
 
 
 # ---- 闸 3:重试规则 -----------------------------------------------------
 
 
 @pytest.mark.anyio
-async def test_read_tool_is_retried_on_timeout(fake_sleep):
+async def test_read_tool_is_retried_on_timeout():
     calls = []
 
     @tool
     async def query_order(order_id: str) -> str:
         """查订单。"""
         calls.append(order_id)
-        await asyncio.sleep(99)      # 被 fake sleep 顶掉,这里不会真等
+        # 真睡 10 秒,由 `_Settings.tool_timeout_seconds = 0.01` 掐掉 ——
+        # **不要**去 patch `asyncio.sleep`(见 `_Settings` 的说明)。
+        await asyncio.sleep(10)
         return "{}"
 
     spec = _spec(
@@ -1565,7 +1546,7 @@ async def test_read_tool_is_retried_on_timeout(fake_sleep):
 
 
 @pytest.mark.anyio
-async def test_write_tool_never_retries_even_when_config_says_two(fake_sleep):
+async def test_write_tool_never_retries_even_when_config_says_two():
     """**结构保证,不是配置恰好为 0。**
 
     `_Settings.tool_retry_attempts` 在上面就是 **2** —— 这条测试要是绿不了,
@@ -1578,7 +1559,7 @@ async def test_write_tool_never_retries_even_when_config_says_two(fake_sleep):
     async def create_ticket(description: str) -> str:
         """建单。"""
         calls.append(description)
-        await asyncio.sleep(99)
+        await asyncio.sleep(10)
         return "{}"
 
     spec = _spec(name="create_ticket", kind=WRITE, tool=create_ticket)
