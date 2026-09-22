@@ -7,6 +7,8 @@
 **`ToolSpec` 三样齐备**:名 / 用途描述 / **原始 JSON Schema**(spec §3.1)。
 """
 
+import logging
+
 from langchain_core.tools import BaseTool
 
 from app.config import get_settings
@@ -17,6 +19,8 @@ from app.retrieval.search import KnowledgeRetriever
 from app.tools import builtin
 from app.tools.policy import kind_of
 from app.tools.spec import ToolSpec
+
+logger = logging.getLogger(__name__)
 
 
 def build_retriever(session, settings) -> KnowledgeRetriever:
@@ -66,19 +70,43 @@ def _spec_from_tool(tool: BaseTool, *, source: str) -> ToolSpec:
 
 
 def _dedupe(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
-    """建表,并在**重名时响亮地失败**。
+    """建表,并处理重名 —— **两条规则,刻意不同**。
 
-    静默去重会让「其中一个胜出」,而谁胜出取决于排序 ——
-    表现是「这个工具偶尔返回另一种数据」,没人查得出来。
+    - **内置 vs 内置 重名 ⇒ 响亮地抛。** 那是**我们自己的**接线 bug;
+      静默去重会让「其中一个胜出」而谁胜出取决于排序 —— 表现是
+      「这个工具偶尔返回另一种数据」,没人查得出来。
+    - **任何涉及 MCP 的重名 ⇒ 丢掉外部那一个 + 一条响亮的 warn,内置留下。**
+
+    ⚠️ 第二条是本章后期定的:`specs` 里现在**混进了外部来源的清单**,
+    而外部的**名字**和它们的**用途声明**一样不可信 ——
+    **外部 Server 只要起一个叫 `query_order` 的工具,上抛就会把每一个聊天请求
+    打成 500**,而外部还能让我们的内置工具消失,方向完全错了。
     """
+
+    def _warn(keep: ToolSpec, drop: ToolSpec) -> None:
+        logger.warning(
+            "工具重名,已丢弃外部来源的那一个:name=%s 保留=%s 丢弃=%s",
+            keep.name, keep.source, drop.source,
+        )
+
     out: dict[str, ToolSpec] = {}
     for spec in specs:
-        if spec.name in out:
-            raise ValueError(
-                f"工具重名:{spec.name} 同时来自 "
-                f"{out[spec.name].source} 与 {spec.source}"
-            )
-        out[spec.name] = spec
+        existing = out.get(spec.name)
+        if existing is None:
+            out[spec.name] = spec
+            continue
+        if existing.source == "builtin" and spec.source == "builtin":
+            raise ValueError(f"内置工具重名:{spec.name} —— 我们自己的接线 bug")
+        # **按 `source` 判胜负,不按顺序** —— 顺序是 `build_registry` 的实现细节,
+        # 而这条规则要的是「内置永远赢」。
+        if existing.source == "builtin":
+            _warn(existing, spec)
+            continue
+        if spec.source == "builtin":
+            _warn(spec, existing)
+            out[spec.name] = spec
+            continue
+        _warn(existing, spec)          # 两边都是外部的:先到先得
     return out
 
 
@@ -120,8 +148,16 @@ def build_registry(
 def build_tools(*, session, conversation_id, settings=None) -> list[BaseTool]:
     """注册表的**投影**:只要绑给模型的那份工具列表。
 
-    给评估脚本(`evals/run_tool_selection_eval.py`)用 —— 它不需要 schema
-    也不需要权限,只要能把工具绑到模型上。
+    ⚠️ **ch08 T7 起生产路径与评估脚本都不再走它**,本函数现在只剩
+    `tests/test_registry.py` 在测(「投影 = 注册表」这条同源不变量)。
+    原先的调用方 `evals/run_tool_selection_eval.py` 已改成与
+    `app/api/chat.py` 同款的两步(`await discover_mcp_specs` → `build_registry`)
+    —— 它需要 **MCP 那一半**,而本函数只投影**内置那一半**:
+    `query_logistics` 下线内置之后,继续用它会让评估集里那 3 条物流用例
+    **在结构上不可能通过**。
+
+    保留它的理由:它是一条有判别力的不变量的载体(见上);删它属计划外的
+    清理,**留给控制者裁定**(现在没有生产调用方了)。
     """
     return [
         spec.tool

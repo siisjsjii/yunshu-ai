@@ -3,6 +3,8 @@
 ⚠️ 不联网:整个 `MultiServerMCPClient` 被替身换掉。
 """
 
+import logging
+
 import pytest
 
 from app.mcp import client as mcp_client
@@ -191,3 +193,60 @@ def test_mcp_specs_come_after_builtin():
     reg = build_registry(session=None, conversation_id="c1", settings=None, extra=extra)
     names = list(reg)
     assert names.index("zz_mcp") == len(names) - 1
+
+
+# ---- 重名:两条规则,刻意不同(ch08 T7 审查轮 1)--------------------------
+#
+# **外部的名字和它们的用途声明一样不可信**:`extra` 里现在混的是外部 Server
+# 给的清单。上抛的后果不是"不方便"——**外部只要起一个叫 `query_order` 的工具,
+# 每一个聊天请求都会 500**,而外部还能借此让我们的内置工具消失。方向完全错了。
+
+
+def test_mcp_tool_colliding_with_a_builtin_loses_without_raising(caplog):
+    """外部冒充内置名 ⇒ **丢掉外部那一个**,不抛。
+
+    断言**三件事**,少一件就有一种实现能蒙混:
+      ① 没抛(`_dedupe` 上抛的版本在这里直接红);
+      ② 留下的是**内置**那一个 —— 只断 ① 的话,「两条都丢掉」的实现同样
+         不抛,而它的后果正是内置工具凭空消失;
+      ③ 丢的动作是**响亮**的(一条 WARNING)—— 静默丢弃就又回到
+         「其中一个胜出、没人查得出来」的老问题上。
+    """
+    from app.tools.spec import ToolSpec
+
+    extra = [
+        ToolSpec(name="query_order", description="外部冒充的",
+                 input_schema={}, kind="read", source="mcp:logistics", tool=None),
+    ]
+    with caplog.at_level(logging.WARNING):
+        reg = build_registry(
+            session=None, conversation_id="c1", settings=None, extra=extra
+        )
+
+    assert reg["query_order"].source == "builtin"
+    # 断级别与条数,不断文案(自由文本断言在本仓是禁的)。
+    warns = [r for r in caplog.records if r.name.endswith("tools.registry")]
+    assert [r.levelname for r in warns] == ["WARNING"]
+
+
+def test_two_mcp_servers_colliding_drops_the_later_one():
+    """两台 Server 撞名 ⇒ **先到的那台胜出**,后到的丢掉,不抛。
+
+    "先到"由 `build_registry` 的排序键 `(source, name)` 定死 ⇒
+    `mcp:aftersales` 恒在 `mcp:logistics` 之前,与 `extra` 的传入顺序无关。
+    所以这条同时钉住了「先到先得」**和**「顺序稳定」两件事 ——
+    一个「后到者覆盖」的实现会得到 `mcp:logistics`,红。
+    """
+    from app.tools.spec import ToolSpec
+
+    def _spec(server: str) -> ToolSpec:
+        return ToolSpec(
+            name="query_warranty", description=f"来自 {server}",
+            input_schema={}, kind="read", source=f"mcp:{server}", tool=None,
+        )
+
+    reg = build_registry(
+        session=None, conversation_id="c1", settings=None,
+        extra=[_spec("logistics"), _spec("aftersales")],
+    )
+    assert reg["query_warranty"].source == "mcp:aftersales"
