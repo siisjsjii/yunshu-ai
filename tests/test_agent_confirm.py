@@ -46,6 +46,11 @@ async def _no_audit(**_kwargs) -> None:
 _AUDIT_TARGET = "app.tools.executor.record_audit"
 
 
+def _silent(payload) -> None:
+    """不给 collector 的 `emit` —— 这些用例断的不是帧。"""
+    return None
+
+
 def _state(**over):
     base = {
         "conversation_id": "c1",
@@ -154,7 +159,7 @@ async def test_approved_writes_once_and_appends_the_tool_message(monkeypatch):
     # `execute_tool` 查找那个名字的地方。)
     monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
-        registry={"create_ticket": spec}, settings=_Settings()
+        registry={"create_ticket": spec}, settings=_Settings(), emit=_silent
     )
     out = await node(_state(write_decision=APPROVED))
     assert len(calls) == 1
@@ -176,7 +181,7 @@ async def test_denied_does_not_write(monkeypatch):
     # 取消这条**也会**落审计(`permission_denied`)—— 同一条写路径,同样要挡。
     monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
-        registry={"create_ticket": spec}, settings=_Settings()
+        registry={"create_ticket": spec}, settings=_Settings(), emit=_silent
     )
     out = await node(_state(write_decision=DENIED))
     assert calls == []
@@ -208,7 +213,7 @@ async def test_turn_messages_are_appended_not_replaced(monkeypatch):
     spec.tool = _Tool()
     monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
-        registry={"create_ticket": spec}, settings=_Settings()
+        registry={"create_ticket": spec}, settings=_Settings(), emit=_silent
     )
     out = await node(_state(write_decision=APPROVED, turn_messages=[prior]))
     assert len(out["turn_messages"]) == 2
@@ -248,11 +253,102 @@ async def test_apply_write_decision_refuses_an_empty_pending_write(monkeypatch):
     spec.tool = _Tool()
     monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
     node = confirm_nodes.make_apply_write_decision_node(
-        registry={"create_ticket": spec}, settings=_Settings()
+        registry={"create_ticket": spec}, settings=_Settings(), emit=_silent
     )
     with pytest.raises(ToolInfrastructureError):
         await node(_state(pending_write={}, write_decision=APPROVED))
     assert calls == [], "空 pending_write 时不该执行任何工具"
+
+
+# ---- 徽标结算:决议之后必须补一条 `tool_result` 帧(T10 的 bundled 修复)----
+#
+# ⚠️ **这条帧是前端那个徽标唯一能停下来的机会。**
+# `agent` 的循环对每个调用**先**发 `tool_call` 帧、**再**执行;撞到待确认的
+# 写调用时它 `continue` 了 ⇒ 那次调用的 `tool_result` **一帧都不发**。而
+# `apply_write_decision` 原先根本不收 `emit`,决议之后也不补 ⇒ 前端徽标
+# **一直转下去**(转着才是诚实的 —— 那次调用确实还没发生)。
+#
+# 为什么不「挂起前先把徽标关掉」:那会把徽标的语义改成「这个工具已经跑完了」,
+# 而它**还在等用户**。结算发生在决议真正落地的那一处,也就是这里。
+
+
+class _Emitter:
+    """收帧替身。**只收不发** —— 断言的是「节点发了什么」。"""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    def __call__(self, payload) -> None:
+        self.frames.append(payload)
+
+    def results_for(self, tool_call_id: str) -> list[dict]:
+        return [
+            f for f in self.frames
+            if f.get("frame") == "tool_result"
+            and f.get("tool_call_id") == tool_call_id
+        ]
+
+
+def _deciding_node(*, tool, emit):
+    spec = _Spec()
+    spec.tool = tool
+    return confirm_nodes.make_apply_write_decision_node(
+        registry={"create_ticket": spec}, settings=_Settings(), emit=emit
+    )
+
+
+@pytest.mark.anyio
+async def test_approved_write_emits_exactly_one_tool_result(monkeypatch):
+    """批准 ⇒ **恰好一条** `tool_result` 帧,`tool_call_id` 与那次调用对上。
+
+    **「恰好一条」是重点**:前端 `settleBadge` 结算的是**最后一个**同名且
+    未结算的徽章 —— 多补一条会把**下一轮**那张徽章提前结算掉(那一轮甚至
+    可能还没开始),于是它明明还在跑、看起来却已经结束。
+    """
+
+    class _Tool:
+        async def ainvoke(self, call):
+            class _M:
+                content = '{"ticket_no": "T-1"}'
+            return _M()
+
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
+    emit = _Emitter()
+    await _deciding_node(tool=_Tool(), emit=emit)(_state(write_decision=APPROVED))
+
+    results = emit.results_for("call_1")
+    assert len(results) == 1, f"批准路径的 tool_result 帧数不为 1:{emit.frames}"
+    # **逐字同款** —— 与 `agent` 循环里那条(`nodes.py`)四个键完全一致。
+    # 少一个键都是真的故障:`ok` 前端要读(徽标画成功还是失败),端点也要读
+    # (`api/chat.py` 拿它判要不要给 `summary` 过 `redact_api_key`)。
+    assert results[0] == {
+        "frame": "tool_result",
+        "tool_call_id": "call_1",
+        "ok": True,
+        "summary": '{"ticket_no": "T-1"}',
+    }
+
+
+@pytest.mark.anyio
+async def test_denied_write_emits_exactly_one_tool_result(monkeypatch):
+    """取消 ⇒ **同样**恰好一条(漏了的话取消路径的徽标**一直转**)。
+
+    `ok=False`:用户取消了,**不是**一次成功的调用 —— 徽标该画成失败态。
+    """
+
+    class _Tool:
+        async def ainvoke(self, call):
+            raise AssertionError("取消的调用**不许被执行**")
+
+    monkeypatch.setattr(_AUDIT_TARGET, _no_audit)
+    emit = _Emitter()
+    await _deciding_node(tool=_Tool(), emit=emit)(_state(write_decision=DENIED))
+
+    results = emit.results_for("call_1")
+    assert len(results) == 1, f"取消路径的 tool_result 帧数不为 1:{emit.frames}"
+    assert results[0]["ok"] is False
+    # 断**键集**而不是 `summary` 的内容:那句是自由文本(本仓不为它写断言)。
+    assert set(results[0]) == {"frame", "tool_call_id", "ok", "summary"}
 
 
 # ---- 通道本身:声明 + 每轮清零 ------------------------------------------

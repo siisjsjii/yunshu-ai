@@ -164,9 +164,13 @@ def build_graph(
     graph.add_node("refund_explain", make_refund_explain_node(emit=emit))
     # ---- 建工单确认流(ch08 T9)----
     graph.add_node("confirm_write", make_confirm_write_node())
+    # `emit` 必传:决议之后那条 `tool_result` 帧是前端徽标唯一能停下来的机会
+    # (挂起时 `agent` 的循环已经 `continue` 掉了,那次调用一帧都不发)。
     graph.add_node(
         "apply_write_decision",
-        make_apply_write_decision_node(registry=registry, settings=settings),
+        make_apply_write_decision_node(
+            registry=registry, settings=settings, emit=emit
+        ),
     )
     graph.add_node("log_turn", make_log_turn_node(session=session, emit=emit))
 

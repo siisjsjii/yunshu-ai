@@ -387,7 +387,7 @@ class _Retriever:
         raise AssertionError("业务数据类不该走检索")
 
 
-def _live_graph(*, calls, rounds, session):
+def _live_graph(*, calls, rounds, session, emit=None):
     from langgraph.checkpoint.memory import InMemorySaver
 
     from app.agent.graph import build_graph
@@ -408,7 +408,7 @@ def _live_graph(*, calls, rounds, session):
         retriever=_Retriever(),
         session=session,
         conversation_id="conv-write",
-        emit=lambda p: None,
+        emit=emit if emit is not None else (lambda p: None),
         checkpointer=InMemorySaver(),
     )
     return graph
@@ -490,3 +490,53 @@ async def test_write_is_executed_exactly_once_across_suspend_and_resume():
     result_ids = [m.tool_call_id for m in turn if isinstance(m, ToolMessage)]
     assert call_ids == ["call_1"]
     assert result_ids == ["call_1"]
+
+
+def _frames_of(frames, name):
+    return [f for f in frames if f.get("frame") == name]
+
+
+@pytest.mark.anyio
+async def test_graph_threads_emit_into_apply_write_decision():
+    """**接线**:`build_graph` 必须把 `emit` 真的递给 `apply_write_decision`。
+
+    这条 `tool_result` 帧是前端那个徽标**唯一**能停下来的机会(挂起时 `agent`
+    的循环已经 `continue` 掉了,那次调用一帧都不发)。节点级用例证明不了它:
+    它们各自把 collector 直接注进节点,**`build_graph` 漏传或传了个 no-op
+    照样全绿** —— 而生产上徽标一直转。这正是本仓记过的「替身/接线没验,
+    守护的断言就是恒真的」。
+
+    两半都在:
+    ① 挂起那一刻**没有**这条帧 —— 那次调用还没发生,**让它转着才诚实**
+       (「挂起前先把徽标关掉」那种改法会让徽标谎报「这个工具跑完了」);
+    ② 决议之后**恰好一条**,`tool_call_id` 与那次调用对上。
+    """
+    from langchain_core.messages import AIMessageChunk
+    from langgraph.types import Command
+
+    calls: list = []
+    frames: list = []
+    round1 = AIMessageChunk(content="", tool_calls=[{
+        "name": "create_ticket", "args": {"description": "耳机坏了"},
+        "id": "call_1", "type": "tool_call",
+    }])
+    round2 = AIMessageChunk(content="已为您建单:T-1")
+    graph = _live_graph(calls=calls, rounds=[round1, round2], session=_Session(),
+                        emit=frames.append)
+
+    await _drive(
+        graph,
+        {"conversation_id": "conv-write", "user_input": "帮我建个工单",
+         "history": [], "trace": []},
+        thread="t-emit",
+    )
+    # `tool_call` 帧在(说明这个 collector 确实接上了),`tool_result` **不在**。
+    assert [f["name"] for f in _frames_of(frames, "tool_call")] == ["create_ticket"]
+    assert _frames_of(frames, "tool_result") == [], (
+        "挂起那一刻就结算了徽标 —— 那次调用还在等用户"
+    )
+
+    await _drive(graph, Command(resume={"approved": True}), thread="t-emit")
+    results = _frames_of(frames, "tool_result")
+    assert [f["tool_call_id"] for f in results] == ["call_1"]
+    assert results[0]["ok"] is True

@@ -61,7 +61,7 @@ def make_confirm_write_node():
     return confirm_write
 
 
-def make_apply_write_decision_node(*, registry, settings):
+def make_apply_write_decision_node(*, registry, settings, emit):
     """决议落地:批准就执行一次,取消就落一条「权限拒绝」审计。
 
     **两条路都往本轮消息里追加一条 ToolMessage** —— 因为那条带 `tool_calls`
@@ -70,6 +70,10 @@ def make_apply_write_decision_node(*, registry, settings):
 
     **入口自己拒空 `pending_write`**(上抛,见函数体里的说明):路由侧也守一次,
     但唯一写口上的这一道才是「不变量」本身。
+
+    `emit` **是必填的**(没有默认的 no-op),理由与 `emit.py` 那条同族:
+    默认值会让「忘了传」退化成一个**静默少一帧**的实现 —— 而那一帧正是
+    前端徽标唯一能停下来的机会。
     """
 
     async def apply_write_decision(state) -> dict:
@@ -116,6 +120,21 @@ def make_apply_write_decision_node(*, registry, settings):
             conversation_id=state["conversation_id"],
             write_decision=decision,
         )
+        # ⚠️ **这条帧必须在「决议之后」发,而且只在这里发**(T10 的 bundled 修复)。
+        #
+        # `agent` 的循环对每个调用**先**发 `tool_call` 帧、**再**执行;撞到待确认
+        # 的写调用时它 `continue` 了 ⇒ 那次调用的 `tool_result` **一帧都不发**。
+        # 而决议落在**下一次** run 里,所以补发的责任在这个节点上 —— 不补的话
+        # 前端那个徽标**一直转**(它只在收到 `tool_result` 时才结算)。
+        #
+        # **不能改成「挂起前先把徽标关掉」**:那会把徽标的语义变成「这个工具已经
+        # 跑完了」,而它**确实还在等用户** —— 让它转着才是诚实的。这条帧发的时刻
+        # 就是那次调用唯一一次真正有结果的时刻(执行完 / 明确被拒)。
+        #
+        # **两条路都要发**:取消同样是「这次调用结束了」,漏掉的话取消路径的
+        # 徽标永远转下去(`ok=False` 让前端把它画成失败态)。
+        emit({"frame": "tool_result", "tool_call_id": outcome.tool_call_id,
+              "ok": outcome.ok, "summary": outcome.summary})
         tool_msg = ToolMessage(content=outcome.content, tool_call_id=call["id"])
         # ⚠️ `turn_messages` 是**覆写**通道,承载「本轮产生的**全部**消息」。
         # 这里只返回 `[tool_msg]` 的话,那条带 `tool_calls` 的 AIMessage
