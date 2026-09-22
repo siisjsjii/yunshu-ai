@@ -2348,14 +2348,41 @@ def test_layer1_within_budget_triggers_neither_degrade_nor_summary(client_factor
 
 - [ ] **Step 3: 实现**
 
+**⚠️ 三件事必须一起做,少一件就是一个静默缺口:**
+
+**(a) 端点**继续调 `prepare_turn`(它现在**已经**在 `app/api/chat.py:118` 被调),
+不要把它换掉 —— 换了它就成了**死代码**,而 `tests/test_chat_service.py` 那几条
+会变成孤儿测试(`tests/test_api_chat.py:703` 还 monkeypatch 着这个名字)。
+
+**(b) 「本轮输入超 `max_user_input_tokens` → 400」的检查移进 `prepare_turn`。**
+T2 之后这个检查**不存在了**:旧口径把 `count_tokens(user_input)` 算进「已用」,
+新口径把它归进峰值的 `max_user_input_tokens` 那一项 —— 于是**实际输入长度
+再也没人比过**,50k token 的一句话会一路送到上游(`prepare_turn` 现在因此
+有一个**读了不用的 `user_input` 参数**)。在 `prepare_turn` 里补:
+
+```python
+    if trim.count_tokens(user_input) > settings.max_user_input_tokens:
+        raise trim.ContextOverflowError(
+            used=trim.count_tokens(user_input), budget=settings.max_user_input_tokens
+        )
+```
+
+放在预算判据**之前**(输入本身超限与历史装不下是两回事,但都归 400)。
+`resume` 分支递进来的 `user_input` 是 `None` —— 那条路**不调** `prepare_turn`
+(端点既有注释已写明),所以这里不必处理 `None`;**但不要假设它永远不是 None**,
+真拿不准就 `if user_input is not None and ...`。
+
+**(c) T2 的空档已经存在(承诺修复点就是这里)**:T2 到 T10 之间,超长输入
+不再被拒。这是**计划没写明的空档,不是 T2 的实现缺陷**(它照计划写的,
+并在 docstring 里如实记了这一点)。本步是它的关闭点。
+
 端点里(持锁内、流开始前)按序串起来:
 
 ```python
         b = budget.derive(settings=settings, system_prompt=render_system_prompt(settings.brand_name))
-        if trim.count_tokens(request.message) > settings.max_user_input_tokens:
-            raise HTTPException(status_code=400, detail=USER_INPUT_TOO_LONG)
         if b.history_budget < 0:
             raise HTTPException(status_code=400, detail=CONTEXT_BUDGET_TOO_SMALL)
+        # ↑ 超长输入的 400 在 prepare_turn 里(上面 (b)),不在这儿
 
         layer1_from = layers.degrade(
             history, summary_upto_msg_id=conv.summary_upto_msg_id,
