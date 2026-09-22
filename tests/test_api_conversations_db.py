@@ -16,9 +16,10 @@
    (锚点 > 0、**没有**梗概行 ⇒ True),再加一个**把两个锚点分开**的探针
    (`summary=0` 而 `layer1=5`,读错列会说 True)。**「两者在正常情况下一致」正是
    假绿最爱藏身的地方,所以这里用真实库造出两者不一致的那个输入。**
-4. **回载顺序与工具行** —— `list_messages` 的 `.order_by(id)` 与「不回载
-   `role='tool'`」在单测里都不可观测(替身自己排、也自己筛);这里逐条插入
-   真消息,并放一行**原始工具载荷**,两条一起钉。
+4. **回载顺序 + 两类「用户没看见过的行」** —— `list_messages` 的 `.order_by(id)`
+   在单测里不可观测(替身自己排);这里逐条插入真消息,并放一行**原始工具载荷**
+   (`role='tool'`)与一条**只申请工具调用、content 为空**的 assistant 行
+   (回给侧栏就是空气泡),顺序与过滤一起钉。
 5. **预览取第一条 user 消息** —— 真实表上放「工具行 + 两条 user 消息」,
    「取最后一条」与「取第一条」给出不同答案。
 
@@ -68,10 +69,11 @@ def _conv(conv_id, user, created_at, *, summary_upto_msg_id=0, layer1_from_msg_i
     )
 
 
-def _msg(conversation_id, role, content):
+def _msg(conversation_id, role, content, *, tool_calls=None):
     """探针消息。`id` 由自增给,**逐条插入**以保证 id 顺序 = 插入顺序。"""
     return MessageRecord(
-        conversation_id=conversation_id, role=role, content=content, created_at=T_OLD
+        conversation_id=conversation_id, role=role, content=content,
+        tool_calls=tool_calls, created_at=T_OLD,
     )
 
 
@@ -220,35 +222,43 @@ async def test_summarized_reads_the_anchor_not_the_summary_rows():
 
 @pytest.mark.anyio
 async def test_list_messages_is_id_ascending_and_hides_tool_rows():
-    """回载**按 id 升序**(spec §5.2),且 `role='tool'` 的行**不在**里面。
+    """回载**按 id 升序**(spec §5.2),且两类内部行**都不在**里面:
+    `role='tool'` 的原始工具载荷、以及 `content=''` 的助手空气泡。
 
     替身验不出顺序:它的 messages 分支自己按 `m.id` 排 ⇒ 端点写成 `.desc()`
-    (「侧栏回载变成新在前」)在单测里全绿。这里逐条插入(自增 id 因此严格递增),
-    端点一旦反过来,两条顺序断言都红。
+    (「侧栏回载变成新在前」)在单测里全绿。这里**一条一 commit 按内容顺序插**
+    (自增 id 因此严格递增、与期望顺序同向),端点一旦反过来,两条断言都红。
 
     ⚠️ 「端点**完全没写** `order_by`」在本用例里与 `ASC` **不可区分** ——
     InnoDB 全表/索引扫描本来就按主键序返回。本用例杀的是**方向错**(`.desc()`),
     也就是单测完全看不见的那个错法。
 
-    工具行同时在这里钉一次(ch07 起它真的落表):`{"order_no": …}` 这种原始载荷
-    被当成消息气泡画出来,是这条过滤存在的原因。
+    两类被滤掉的行都按**生产形状**造:工具行是 `[工具结果]` 那类原始载荷;
+    空 content 那条 assistant **带着 `tool_calls`**(真实库实测 94 行空 content
+    全是这一形态)。
     """
     await _cleanup()
     try:
         await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
         # 逐条插(session.add_all 不保证各行的自增 id 与列表顺序一致)
         await _insert([_msg(PROBE_MSGS, "user", "第一句")])
-        await _insert([_msg(PROBE_MSGS, "assistant", "第一答")])
+        # 只申请工具调用、还没产出文字的那条 assistant:content 是空串、带 tool_calls
+        # (生产形状,见 `app/agent/nodes.py` 的 `content=m.content or ""`)。
+        await _insert([_msg(PROBE_MSGS, "assistant", "", tool_calls=[
+            {"id": "call_1", "name": "query_order", "args": {"order_no": "1002"},
+             "type": "tool_call"}
+        ])])
         await _insert([_msg(PROBE_MSGS, "tool", '{"order_no":"1002","status":"已取消"}')])
         await _insert([_msg(PROBE_MSGS, "assistant", "第二答")])
 
         items = await _messages(PROBE_MSGS)
-        assert [i["role"] for i in items] == ["user", "assistant", "assistant"], (
-            f"工具行不该出现,且顺序应是插入序(== id 升序),实际 "
-            f"{[i['role'] for i in items]}"
+        assert [i["role"] for i in items] == ["user", "assistant"], (
+            f"工具行与空气泡都不该出现,且顺序应是插入序(== id 升序),实际 "
+            f"{[(i['role'], i['content']) for i in items]}"
         )
-        assert [i["content"] for i in items] == ["第一句", "第一答", "第二答"]
+        assert [i["content"] for i in items] == ["第一句", "第二答"]
         assert all("order_no" not in i["content"] for i in items)
+        assert all(i["content"] != "" for i in items)
     finally:
         await _cleanup()
         await get_engine().dispose()

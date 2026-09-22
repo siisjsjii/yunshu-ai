@@ -279,28 +279,38 @@ def test_summarized_flag_reflects_the_anchor_not_the_row_count(conv_client):
     assert items[CONV_C]["summarized"] is False      # ← 这条把「读错锚点」判死
 
 
-def test_messages_endpoint_hides_tool_rows(conv_client):
-    """`role='tool'` 的行**不回载**(spec §5.2 裁定)。
+def test_messages_endpoint_hides_tool_rows_and_empty_assistant_bubbles(conv_client):
+    """**用户没看见过的内部机制**都不回载(spec §5.2 裁定):
 
-    ch07 起工具结果落 `messages` 表,而「用户看见过的对话」里没有它们 ——
-    回给侧栏的话,`{"order_no":"1002","status":"已取消"}` 这种**原始工具载荷**
-    会被当成一条消息气泡画出来。
+    ① `role='tool'` 的行 —— 原始工具载荷(`{"order_no": …}`);
+    ② **`content=''` 的 assistant 行** —— 「只申请调用工具、还没产出文字」那一形态
+       (`app/agent/nodes.py` 写的是 `content=m.content or ""`,它身上只有
+       `tool_calls`);回给侧栏就是一个**空气泡**。
 
-    同时断言**同一批里 user/assistant 的行仍然在**:只断「工具行不在」的话,
+    同时断言**同一批里 user 与带文字的 assistant 仍然在**:只断「那两条不在」的话,
     一个恒返回空列表的实现也满足它。
+
+    构造上刻意让 ② 那条**带 `tool_calls`**(生产上就是这个形状):去掉
+    `content != ''` 这个条件,它就会作为一条 `content=""` 的气泡出现在结果里。
     """
     convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
     msgs = [
         _msg(1, CONV_A, "user", "订单 1002 到哪了"),
-        _msg(2, CONV_A, "assistant", "正在为您查询"),
+        _msg(2, CONV_A, "assistant", ""),          # ← 只申请工具调用,没有文字
         _msg(3, CONV_A, "tool", '{"order_no":"1002","status":"已取消"}'),
         _msg(4, CONV_A, "assistant", "这一单已取消"),
+    ]
+    msgs[1].tool_calls = [
+        {"id": "call_1", "name": "query_order", "args": {"order_no": "1002"},
+         "type": "tool_call"}
     ]
     client = conv_client(conversations=convs, messages=msgs)
     with client as c:
         items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
-    assert [i["role"] for i in items] == ["user", "assistant", "assistant"]
+    assert [i["role"] for i in items] == ["user", "assistant"]
+    assert [i["content"] for i in items] == ["订单 1002 到哪了", "这一单已取消"]
     assert not any("order_no" in i["content"] for i in items)
+    assert not any(i["content"] == "" for i in items)
 
 
 def test_messages_endpoint_returns_raw_text_not_truncated(conv_client):

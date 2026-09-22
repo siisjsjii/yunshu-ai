@@ -22,9 +22,14 @@ DEMO_USER = "demo-user"
 
 #: `messages` 表里**不进对话回载**的那一类行(spec §5.2)。
 #:
-#: ch07 起工具结果也落这张表(`app/memory/journal.py` 那条路),而它们是**模型与
-#: 工具之间**的往返,不是用户看见过的对话。回载给侧栏的话,`{"order_no":"1002",
-#: "status":"已取消"}` 这种**原始工具载荷**会被当成一条消息气泡画出来。
+#: ch07 起工具结果也落这张表 —— 写入方是 `app/agent/nodes.py`(把 ReAct 往返的
+#: LangChain 消息翻成 `app.schemas.Message`,content 取 `m.content or "…"`)
+#: → `app/services/history.py:append_turn`(真正 `session.add` 那几个 `MessageRecord`
+#: 的地方)。**不是** `app/memory/journal.py`:那个模块是 `model_ctx` / `history_ctx`
+#: 那几行 JSON 上下文日志的组装,一条表都不写。
+#:
+#: 这些行是**模型与工具之间**的往返,不是用户看见过的对话。回载给侧栏的话,
+#: `{"order_no":"1002","status":"已取消"}` 这种**原始工具载荷**会被当成一条消息气泡画出来。
 TOOL_ROLE = "tool"
 
 #: 预览取前多少字(spec §5.1)。
@@ -37,10 +42,13 @@ async def _preview(session: AsyncSession, conversation_id: str) -> str:
     """该会话**第一条 `role='user'` 消息**的前 30 字;没有则空串(spec §5.1)。
 
     为什么读**整段**再用 Python 取第一条 user 消息,而不是
-    `WHERE role='user' LIMIT 1`:替身(见 `tests/test_api_conversations.py`)把
-    「`MessageRecord` 上有 where 子句」定义为**按会话查全段**,不支持第二条
-    `where`;`LIMIT` 在替身里也不生效(它按 id 排完就全给回来)。写成
-    「按会话查 + Python 里取」是同一个语义,且在真实库上结果完全一致 ——
+    `WHERE role='user' LIMIT 1`:**`LIMIT` 在替身里不生效** ——
+    `tests/test_api_conversations.py` 的 messages 分支按 where 筛完就**整段**
+    返回(它按 id 排了序,但不认 `LIMIT`),于是「取第一条」这一步在**那个替身上
+    仍然由 Python 完成**;真写 `LIMIT` 的话,单测绿得毫无意义(它根本没有 LIMIT 语义)。
+    (替身**能**解析复合 where —— `BooleanClauseList` 那一支,`list_messages` 的
+    `role != 'tool'` + `content != ''` 就靠它;这里没写 SQL 过滤**不是**因为替身不支持。)
+    写成「按会话查 + Python 里取」是同一个语义,真实库上结果也完全一致 ——
     会话的消息量是演示规模,这一点点多读不构成理由去为它另立一条替身分支。
 
     **必须是第一条 user 消息,不是最后一条、也不是「第一条消息」**:
@@ -124,16 +132,31 @@ async def list_messages(
     它是**替换物**,原文还在库里,回梗概等于让用户看不见自己说过的话。
     本端点因此**不导入 `app.memory.layers`** —— 让它连误用的机会都没有。
 
-    **`role='tool'` 的行不回载**(spec §5.2 裁定)。ch07 起工具结果也落这张表,
-    而「用户看见过的对话」里没有它们:工具往返是**模型与工具之间**的,
-    回给侧栏的话 `{"order_no":"1002","status":"已取消"}` 这类**原始工具载荷**
-    会被当成一条消息气泡画出来。**过滤在 SQL 里**(`role != 'tool'`),
-    不是读回来再筛 —— 与列表的 user 过滤同一条理由:替身验不出「端点有没有
-    传对 SQL」。
+    **两条「用户没看见过的内部机制」都不回载**(spec §5.2 裁定):
 
-    ⚠️ **「按 id 升序」同样由 db 用例钉,单测钉不住** —— 替身的 messages 分支
-    自己就按 `m.id` 排(端点把 `order_by` 反过来它照样绿)。db 用例里探针消息的
-    **插入顺序与 id 升序相反**,`order_by` 一旦反了就现形。
+    ① `role='tool'` 的行 —— ch07 起工具结果也落这张表(见 `TOOL_ROLE` 那段),
+       回给侧栏的话 `{"order_no":"1002","status":"已取消"}` 这类**原始工具载荷**
+       会被当成一条消息气泡画出来;
+    ② **`content` 为空的行** —— 那条 assistant 消息是「**只申请调用工具、还没产出
+       文字**」的形态(`app/agent/nodes.py` 把它写成 `content=m.content or ""`,
+       它身上只有 `tool_calls`),回给侧栏就是**一个空气泡**。
+
+    **为什么 `content != ''` 就够,不必写成「assistant 且不带 tool_calls」**:
+    两者**等价**,而这个写法更简单 ——
+    · `user` 行不可能是空串(`ChatRequest.message` 是 `min_length=1`,续跑那条路
+      根本不写新行);
+    · `assistant` 行 content 为空**只可能**是①那一形态(收尾那次一定带文字;
+      真实库实测 94 行空 content,**全部**是 `role='assistant'`,没有任何别的角色);
+    · `tool` 行已被①挡掉。
+    所以它**不会**顺手滤掉别的东西。
+
+    **两条过滤都在 SQL 里**,不是读回来再筛 —— 与列表的 user 过滤同一条理由:
+    替身验不出「端点有没有传对 SQL」。
+
+    ⚠️ **「按 id 升序」由 db 用例钉,单测钉不住** —— 替身的 messages 分支自己就按
+    `m.id` 排(端点把 `order_by` 反过来它照样绿)。db 用例里探针消息**一条一 commit
+    按内容顺序插入**(自增 id 因此严格递增、与期望顺序同向),端点写成 `.desc()`
+    就与断言反向、当场红。
 
     404 只表示「这个 id 在库里不存在」:前端点的那条会话可能已被删/清库,
     这时该给一个明确的「会话不存在」,而不是 200 + 空列表(空列表是
@@ -153,6 +176,9 @@ async def list_messages(
             .where(
                 MessageRecord.conversation_id == conversation_id,
                 MessageRecord.role != TOOL_ROLE,
+                # 空 content = 「只申请了工具调用、还没产出文字」那条 assistant
+                # (上面 docstring 说明它为什么等价于「不返回空的助手气泡」)。
+                MessageRecord.content != "",
             )
             .order_by(MessageRecord.id)
         )
