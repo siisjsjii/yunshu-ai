@@ -1,8 +1,8 @@
 from app.memory.trim import (
     ContextOverflowError,
-    _to_rounds,
     count_tokens,
     select_history,
+    to_rounds,
 )
 from app.schemas import Message
 
@@ -207,7 +207,7 @@ def test_round_definition_is_user_delimited():
         Message(role="user", content="q2"),
         Message(role="assistant", content="a2"),
     ]
-    rounds = _to_rounds(history)
+    rounds = to_rounds(history)
     assert len(rounds) == 2
     assert [m.role for m in rounds[0]] == ["user", "assistant", "tool", "assistant"]
     assert [m.role for m in rounds[1]] == ["user", "assistant"]

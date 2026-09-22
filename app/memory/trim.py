@@ -35,7 +35,7 @@ def select_history(
 ) -> list[Message]:
     """保留能放下的最近若干整轮历史,按时间正序返回。
 
-    轮的定义见 `_to_rounds`(user 边界)。按整轮裁剪保证历史中不出现
+    轮的定义见 `to_rounds`(user 边界)。按整轮裁剪保证历史中不出现
     "有问无答"的孤立消息 —— 那会让模型以为上一轮它没回复;
     也保证 tool 消息不会被与它的 assistant 父亲切开。
 
@@ -44,7 +44,7 @@ def select_history(
     """
     kept: list[list[Message]] = []
     used = 0
-    for rnd in reversed(_to_rounds(history)):
+    for rnd in reversed(to_rounds(history)):
         cost = sum(count_tokens(msg.content) for msg in rnd)
         if used + cost > available_tokens:
             break
@@ -54,7 +54,7 @@ def select_history(
     return [msg for rnd in kept for msg in rnd]
 
 
-def _to_rounds(history: Sequence[Message]) -> list[list[Message]]:
+def to_rounds(history: Sequence[Message]) -> list[list[Message]]:
     """把消息序列切成整轮。
 
     一轮 = **从一条 user 消息开始,到(不含)下一条 user 消息为止**。
@@ -63,6 +63,9 @@ def _to_rounds(history: Sequence[Message]) -> list[list[Message]]:
     后者会把 tool 消息与它的 assistant 父亲切到不同轮里。OpenAI 兼容 API
     要求 tool 消息前面必须紧跟着带对应 tool_call_id 的 assistant 消息,
     切开就会 400,且只在历史长到触发裁剪时复现,极难定位。
+
+    ch07 起由 `_to_rounds` 改名为 `to_rounds` 公开:分层的降级循环
+    (`app/memory/layers.py::degrade`)也要按轮挪边界 —— 挪到轮中间就是上面那个 400。
     """
     rounds: list[list[Message]] = []
     for msg in history:
