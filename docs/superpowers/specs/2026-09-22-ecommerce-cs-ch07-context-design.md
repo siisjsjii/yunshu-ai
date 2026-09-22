@@ -635,7 +635,7 @@ ch06 的 T4 就是这么丢的(节点写了 `confidence`、通道不存在、**�
 | `max_output_tokens` | 2000 | `ge=1` | 取代 `reserved_output_tokens` |
 | `max_user_input_tokens` | 2000 | `ge=1` | 本轮用户输入上限 |
 | `tool_result_max_tokens` | 1200 | `ge=1` | 单个工具结果上限;也是单轮峰值的一项 |
-| `rerank_top_k` | 5 | `ge=1` | **取代 `retrieval_top_k`**(同一把旋钮:唯一读点是 `app/tools/registry.py:40`) |
+| `rerank_top_k` | 5 | `ge=1` | **取代 `retrieval_top_k`**(同一把旋钮;**两个读点**:`app/tools/registry.py:40` 与 `evals/run_retrieval_eval.py:193` —— 后者不在 `testpaths` 里,漏改不会被单测发现) |
 | `keep_rounds` | 20 | `ge=1` | 想留住的轮数 |
 | `per_round_steady` | **600** | `ge=1` | 每轮稳态占用(**未实测值**,见 9.3) |
 | `layer2_assistant_chars` | 50 | `ge=1` | 层 2 客服答复保留字数 |

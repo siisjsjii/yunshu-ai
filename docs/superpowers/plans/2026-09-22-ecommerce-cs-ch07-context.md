@@ -227,7 +227,10 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'app.memory.budget'`
     # 单个工具结果的上限,同时也是「单轮 ReAct 峰值」的一项。
     # `max_agent_steps`(已有)与它相乘就是峰值。
     tool_result_max_tokens: int = Field(default=1200, ge=1)
-    # 取代 `retrieval_top_k`(同一把旋钮:唯一读点是 app/tools/registry.py)。
+    # 取代 `retrieval_top_k`(同一把旋钮)。**读点有两个,不是一个**:
+    # `app/tools/registry.py:40` 与 `evals/run_retrieval_eval.py:193` ——
+    # 只改前者会在跑评估脚本时 AttributeError,而 `pytest.ini` 的
+    # `testpaths = tests` 不覆盖 `evals/`,所以**单测全绿也发现不了**。
     rerank_top_k: int = Field(default=5, ge=1)
     # 历史预算 = min(keep_rounds × per_round_steady, 窗口匀得出来的)。
     keep_rounds: int = Field(default=20, ge=1)
