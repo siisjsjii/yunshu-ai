@@ -1505,6 +1505,31 @@ from langgraph.graph.message import add_messages
 
 `append_turn` 改为把 ReAct 往返一并写入:
 
+**⚠️ 先做一件容易被漏掉的事:让四个固定话术出口也写 `turn_messages`。**
+
+`log_turn` 落库改成只读 `turn_messages` 之后,凡是**不写这个通道**的节点,
+它的那轮就**只落用户那一句、客服回复永远不落库** —— 而每一轮看起来都正常。
+所以下面四个节点必须各补一行:
+
+```python
+# chitchat_reply / complaint_reply / fallback_reply:
+return {
+    "reply": CHITCHAT_REPLY,
+    "messages": [AIMessage(content=CHITCHAT_REPLY)],
+    "turn_messages": [AIMessage(content=CHITCHAT_REPLY)],
+    "choices": [], "trace": ["chitchat_reply"],
+}
+```
+
+退款子流程的两个出口(`refund_offer` / `refund_explain`)同理 —— 它们各自
+产出一句话术,照同一个形状补。
+
+**不要**在 `log_turn` 里写「`turn_messages` 为空就退回用 `reply`」的兜底分支:
+那会让「某个节点忘了写」**静默退化成看起来正常的旧行为**,
+而本仓的记性里,这类兜底最后都变成了缺陷的藏身处。宁可让漏写的那轮
+落出一条空的 assistant 行(现有那几条「落库是 user+assistant 两条」的
+测试会当场变红),也不要它自己悄悄补上。
+
 在 `log_turn` 里加一个模块级转换函数(**不**复用 `to_lc_messages` —— 那是
 反方向的、且依赖 LangChain;`memory/` 与 `services/` 不依赖 LC 是既有约定):
 
