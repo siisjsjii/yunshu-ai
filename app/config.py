@@ -67,9 +67,8 @@ class Settings(BaseSettings):
     reranker_model_path: str = "models/bge-reranker-v2-m3"
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_collection: str = "knowledge"
-    # top_k <= 0 → 搜索永远空,检索静默失效;阈值越界一个方向等于永远全滤空、
-    # 另一个方向等于没有阈值(不相关也硬凑答案)。都在启动时拒。
-    retrieval_top_k: int = Field(default=3, ge=1)
+    # 阈值越界一个方向等于永远全滤空、另一个方向等于没有阈值(不相关也硬凑答案)。
+    # 都在启动时拒。
     # ⚠️ 0.25 是 **2026-09-20 在混合+重排链路上实测**得出的,不是原值。
     # 原值 0.58 由 ch03 在 **dense 余弦**分数上标定(正例最低 0.609/干扰最高 0.560,
     # 区间仅 0.049 宽),ch04 换混合+重排时原值沿用 —— 而重排器 `compute_score`
@@ -98,6 +97,39 @@ class Settings(BaseSettings):
     chunk_overlap_chars: int = Field(default=100, ge=0)
     # 挖知识批次 <= 0 → range() 空转,脚本"成功"但一行没抽,比报错更糟。
     mine_batch_conversations: int = Field(default=5, ge=1)
+
+    # ---- ch07:上下文管理。全部带界 —— 写错要在启动时炸,不能等运行时 ----
+    #
+    # `model_context_window` / `max_output_tokens` **取代**了本章之前的
+    # `context_budget_tokens` / `reserved_output_tokens`:旧的两个数是「直接给一个
+    # 预算」,新的口径是「从模型窗口倒推」,而两者同时存在就是两个含义重叠的旋钮
+    # —— 本项目已经吃过这个亏(`reranker_use_fp16` 在 GPU 分支落地后无人读,已删)。
+    model_context_window: int = Field(default=18000, ge=1024)
+    max_output_tokens: int = Field(default=2000, ge=1)
+    max_user_input_tokens: int = Field(default=2000, ge=1)
+    # 单个工具结果的上限,同时也是「单轮 ReAct 峰值」的一项。
+    # `max_agent_steps`(已有)与它相乘就是峰值。
+    tool_result_max_tokens: int = Field(default=1200, ge=1)
+    # 取代 `retrieval_top_k`(同一把旋钮:读点是 app/tools/registry.py 与
+    # evals/run_retrieval_eval.py —— 后者常被漏掉,删旋钮时要一起改)。
+    rerank_top_k: int = Field(default=5, ge=1)
+    # 历史预算 = min(keep_rounds × per_round_steady, 窗口匀得出来的)。
+    keep_rounds: int = Field(default=20, ge=1)
+    #
+    # ⚠️ `per_round_steady` 是**估算,不是实测** —— 与 `dedupe_threshold=0.95`
+    # 同族:写下来但还没验证过,**不要当成已验证的**。
+    # 它只要 < 演示配置下的 窗口/keep_rounds,「想留住的轮数」那一支就会胜出,
+    # 历史预算会远小于窗口能匀出来的量,层 1 会**每轮都降级**。
+    # 校准方法:跑一轮真实对话,从 `model_ctx` 日志读每轮实际占用,取中位数回填。
+    per_round_steady: int = Field(default=600, ge=1)
+    # 层 2 的截短:客服答复留几个字、工具结果留几个字。
+    layer2_assistant_chars: int = Field(default=50, ge=1)
+    layer2_tool_chars: int = Field(default=60, ge=1)
+    # 梗概长度上限,**同时也是「注入梗概」这项固定开销的来源**。
+    summary_max_chars: int = Field(default=200, ge=1)
+    # 单块检索证据 / 五个工具定义渲染后的估算开销。同样是估算值。
+    evidence_block_tokens: int = Field(default=250, ge=1)
+    tool_def_tokens: int = Field(default=800, ge=1)
 
     @model_validator(mode="after")
     def _overlap_must_leave_room(self):

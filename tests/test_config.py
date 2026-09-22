@@ -161,7 +161,7 @@ def test_ch03_fields_have_defaults():
     assert s.embedding_batch_size == 16
     assert s.milvus_uri == "http://127.0.0.1:19530"
     assert s.milvus_collection == "knowledge"
-    assert s.retrieval_top_k == 3
+    assert s.rerank_top_k == 5
     # 0.25 是实测定出来的(2026-09-20,混合+重排链路),不是随手取的数:
     # 能命中的正例 top-1 最低 0.389 / 干扰项 top-1 最高 0.114 → 区间 (0.114, 0.389]。
     # 推导细节在字段旁边(app/config.py),这里只钉默认值不被静默改掉。
@@ -187,8 +187,8 @@ def test_non_positive_top_k_is_rejected(bad):
     """top_k <= 0 → Milvus 搜索永远返回空,query_faq 永远走「未收录」——
     检索功能静默失效且无报错。必须启动即拒。"""
     with pytest.raises(ValidationError) as exc:
-        Settings(_env_file=None, **REQUIRED, retrieval_top_k=bad)
-    assert "retrieval_top_k" in str(exc.value)
+        Settings(_env_file=None, **REQUIRED, rerank_top_k=bad)
+    assert "rerank_top_k" in str(exc.value)
 
 
 @pytest.mark.parametrize("bad", [-0.1, 1.1])

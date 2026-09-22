@@ -190,7 +190,7 @@ async def main() -> None:
 
     settings = get_settings()
     threshold = args.threshold if args.threshold is not None else settings.retrieval_score_threshold
-    top_k = args.top_k if args.top_k is not None else settings.retrieval_top_k
+    top_k = args.top_k if args.top_k is not None else settings.rerank_top_k
     cases = load_cases()
     emit(f"用例 {len(cases)} 条 | 阈值 {threshold} | Top-K {top_k} | 重复 {args.repeat} 遍")
 
