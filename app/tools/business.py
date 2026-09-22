@@ -13,16 +13,14 @@ make_create_ticket。
 """
 
 import json
-from datetime import datetime, timedelta
 
 from langchain.tools import tool
 
 from app.tools.errors import ToolNotFound
 from app.tools.mock_data import (
-    CITIES,
     ECHO_LIMIT,
-    LOGISTICS_BY_STATUS,
     PRODUCT_SPECS,
+    logistics_record,
     order_record,
     require_order_no,
     rng,
@@ -61,43 +59,8 @@ async def query_product(keyword: str) -> str:
 @tool
 async def query_logistics(order_id: str) -> str:
     """查询订单的物流状态、当前位置与轨迹。用户问"到哪了""发货没"时使用。"""
-    order_no = require_order_no(order_id)
-    order = order_record(order_no)
-    candidates = LOGISTICS_BY_STATUS.get(order["status"])
-    if candidates is None:
-        # 未发货的单子**没有**物流记录 —— 这是"查无此物",不是上游故障,
-        # 所以走 ToolNotFound(可恢复),不是 ToolInfrastructureError。
-        raise ToolNotFound(
-            f"订单 {order_no} 当前状态是「{order['status']}」,尚未发货、没有物流记录,"
-            f"请如实告知用户,不要自行编造物流信息"
-        )
-
-    r = rng("logistics", order_no)
-    status = r.choice(candidates)
-    city = r.choice(CITIES)
-    # 轨迹时间必须**从下单时间往后推**。另起一条随机流去抽 2026-09-xx 会得到
-    # 早于下单的「已发出」时间 —— 那是与状态矛盾同一类的自相矛盾,实测 2000 个
-    # 订单里 217 个中招。
-    shipped = datetime.strptime(order["created_at"], "%Y-%m-%d %H:%M") + timedelta(
-        days=r.randint(1, 3), hours=r.randint(1, 20)
-    )
-    # 末条轨迹必须带**真实时间戳**并描述当前状态,不能写成 {"time": "当前"}:
-    # 那样整条轨迹无法排序,模型读到的是"最后一次扫描停在『已发出』",于是
-    # status 为「已签收」时它会当场指出"两者信息不太一致"并追问用户是否收到货
-    # —— 验收 4 的真实回复就是这么写的,演示看起来像坏了。
-    latest = shipped + timedelta(days=r.randint(1, 4), hours=r.randint(1, 12))
-    fmt = "%Y-%m-%d %H:%M"
     return json.dumps(
-        {
-            "order_id": order_no,
-            "status": status,
-            "location": city,
-            "traces": [
-                {"time": shipped.strftime(fmt), "desc": f"{city} 已发出"},
-                {"time": latest.strftime(fmt), "desc": f"{city} {status}"},
-            ],
-        },
-        ensure_ascii=False,
+        logistics_record(require_order_no(order_id)), ensure_ascii=False
     )
 
 
