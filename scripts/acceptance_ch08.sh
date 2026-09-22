@@ -144,8 +144,12 @@ trap cleanup EXIT
 # (ch07 实测:TERM 到了 → `cleanup` 以 `FAIL=0 && KEEP=0` 判定「这是一次成功」
 #  ⇒ **把工作目录删掉**;然后脚本接着走到失败分支,那里再读 SSE 就只剩
 #  「No such file or directory」—— 证据在它被需要的前一刻被自己删了。)
+# ⚠️ **`HUP` 也要接**:关掉终端会让 bash 收到 SIGHUP 并**直接退出**,
+# 那条路径**不经过 `EXIT` trap** —— 于是打给 `mcp_servers/logistics.py` 的补丁
+# 与新写的 `app/tools/builtin/zz_echo_note.py` 会**留在树里**,
+# 而下一次运行会从被污染的状态起步(验的就不是出厂代码了)。
 on_signal() { KEEP=1; exit 130; }
-trap on_signal INT TERM
+trap on_signal INT TERM HUP
 
 # preflight 失败的统一出口:**必须用它,不要直接 `exit 1`**(理由见 `cleanup`)。
 fail_exit() { KEEP=1; exit 1; }
@@ -309,6 +313,15 @@ stop_cs() {
   _kill_pid "$CS_PID"
   CS_PID=""
   wait_port_free "$PORT" 20 || echo "  (警告:端口 $PORT 20 秒内没释放,下一次启动大概会 bind 失败)"
+}
+# **OS 级的**监听进程号(Windows PID,取自 `netstat -ano` 的最后一列)。
+#
+# 为什么不能用 `$WORK/cs.pid`:那是**脚本自己写的**一个文件,两次读它之间没有
+# 任何东西写它 ⇒ 读写同一个值**无条件相等**,那样的断言永远红不了,也抓不住它
+# 声称要抓的失败(客服真被外部重启或崩掉时,文件里还是旧值,照样 PASS)。
+# 监听进程号是**外部可观测的事实**,换进程就会变。
+listening_pid() {   # $1=端口 → 监听它的 Windows PID(没有则空)
+  netstat -ano | grep -E ":$1[[:space:]].*LISTENING" | head -1 | awk '{print $NF}'
 }
 start_mcp() {  # $1=模块 $2=控制台输出文件 → 把 pid 打印出来
   nohup "$PYTHON" -m "$1" >> "$2" 2>&1 &
@@ -684,11 +697,11 @@ echo "== 验收 1:往 app/tools/builtin/ 丢一个新模块 → 重启客服服�
 write_temp_builtin
 echo "  已写入 $UNTRACKED_TMP(未跟踪文件,退出时由 git clean 还原)"
 # 重启客服服务。**这一步是题面要求的**,脚本照做。
-# ⚠️ 但别把「必须重启」当成已验证的事实:实测(2026-09-23)不重启也能用 ——
-# `builtin.discover()` 每请求都 `pkgutil.iter_modules` + `import_module` 重新扫一遍
-# 包目录,新增的模块**当场**就进注册表。`app/tools/builtin/__init__.py` 的 docstring
-# 写着「新增内置工具需要重启客服服务」,与这条实测**不符**(已作为发现上报,本脚本
-# 不据此下断言 —— 重启在两种实现下都成立,所以它不构成本项判据)。
+# ⚠️ 但别把这条重启读成「新工具是重启带来的」:实测(2026-09-23)不重启也能用 ——
+# `builtin.discover()` 每请求都重扫包目录,**新增**的模块(新文件名)当场进注册表;
+# 只有**修改**已有模块才必须重启(`sys.modules` 缓存)。
+# (这条订正已写回 `app/tools/builtin/__init__.py` 的 docstring,那里有完整口径。)
+# 重启在两种实现下都成立 ⇒ 它**不构成本项判据**,本项只断「工具可调 + 审计记对了」。
 stop_cs
 if ! start_cs_ready "$WORK/cs_2.log"; then
   echo "预检失败:重启后起不来。控制台输出:"
@@ -755,7 +768,8 @@ echo
 
 # ══════════════════════════════════════════════════════════════════════════
 echo "== 验收 3:给 MCP Server 加工具 → 只重启该 Server → 客服服务不用动 =="
-BEFORE_PID=$(cat "$WORK/cs.pid")
+BEFORE_PID=$(listening_pid "$PORT")          # OS 级事实,不是脚本自己记的那个文件
+BEFORE_MSYS_PID=$(cat "$WORK/cs.pid")        # 脚本起的那个进程(用于「它还活着吗」)
 PATCH_OUT=$(patch_mcp_server)
 echo "  补丁:$PATCH_OUT"
 if [ "$PATCH_OUT" != "patched" ] && [ "$PATCH_OUT" != "already-patched" ]; then
@@ -785,11 +799,25 @@ else
     SID3="$ASK_SID"; cp "$ASK_SSE" "$WORK/acc3.sse"
   fi
   # **进程号先看**:它是本项最硬的一条,而且与模型无关。
-  AFTER_PID=$(cat "$WORK/cs.pid")
-  if [ "$BEFORE_PID" = "$AFTER_PID" ]; then
-    ok "客服服务进程号没变(before=$BEFORE_PID after=$AFTER_PID)—— 新工具是**现问现拿**来的"
+  #
+  # 判据是**两条**,缺一不可(初版只有一条、而且是恒真的,已返工):
+  #   ① 监听 8000 的**那个进程**(netstat 读出来的 Windows PID)前后是同一个
+  #      —— 换进程就会变,外部重启/崩溃都躲不过;
+  #   ② 脚本自己起的那个进程**还活着**(`kill -0` 打在 MSYS pid 上)。
+  #      只有 ① 时还有一种漏网:我们的进程死了、另一个进程**恰好**拿到同一个
+  #      Windows PID 又绑了 8000。pid 复用不常见,但这条是免费的。
+  # ⚠️ `kill -0` **不能**拿 Windows PID 试 —— 实测 MSYS 会回
+  # `kill: (40316) - No such process`(两个 pid 空间不通)。所以 ② 用的是
+  # `$WORK/cs.pid` 里那个 MSYS pid,而 ① 用的是 netstat 的 Windows PID。
+  AFTER_PID=$(listening_pid "$PORT")
+  if [ -z "$BEFORE_PID" ] || [ -z "$AFTER_PID" ]; then
+    bad "端口 $PORT 上没有监听进程(before='$BEFORE_PID' after='$AFTER_PID')—— 客服服务死了,本项没测到它要测的东西"
+  elif [ "$BEFORE_PID" != "$AFTER_PID" ]; then
+    bad "监听 $PORT 的进程换了(before=$BEFORE_PID after=$AFTER_PID)—— 验收 3 要求它不动"
+  elif ! kill -0 "$BEFORE_MSYS_PID" 2>/dev/null; then
+    bad "脚本起的那个进程(MSYS pid $BEFORE_MSYS_PID)已经不存在了 —— 现存监听者不是它"
   else
-    bad "客服服务被重启了(before=$BEFORE_PID after=$AFTER_PID)—— 验收 3 要求它不动"
+    ok "客服服务没被重启过:监听 $PORT 的进程前后都是 $BEFORE_PID(netstat 读的),且脚本起的进程(MSYS pid $BEFORE_MSYS_PID)仍活着"
   fi
   if ! frames_sane "$WORK/acc3.sse"; then
     boom "验收 3 的 SSE 不成形(没有 meta 帧)"
@@ -811,12 +839,36 @@ echo
 
 # ══════════════════════════════════════════════════════════════════════════
 # 确认流(验收 4/5)。**这一段是模型选择工具** —— 题面必须落在业务类意图上,
-# 否则不进 Agent、`create_ticket` 永远不会被调。实测(2026-09-23):
-#   * 「帮我建个工单」→ **其他** → 兜底出口,压根不进 Agent(不能用作题面);
-#   * 「订单 1011 有没有问题,帮我建个工单」→ 投诉 → 固定话术出口,同样不进 Agent;
-#   * 「订单 1011 的物流有问题,帮我建个工单」→ **物流** → Agent → 命中确认流。
-# 题面因此**必须带一个业务类的落点**(这里是订单 1011 的物流)。
-TICKET_ASK="订单 1011 的物流有问题,帮我建个工单"
+# 否则不进 Agent、`create_ticket` 永远不会被调。
+#
+# ── 题面是怎么定下来的:一整天实测的结论(brief 的验收 4 说「不说问题 → Agent 追问
+#    → 补一句 → 出现卡片」,**前半段在本章的意图路由下不可达**)──────────────
+# 逐句试过(2026-09-23,每句一个全新会话,看 `classify_intent` 把它送去哪):
+#
+#   | 题面 | 意图 | 走到哪 | 有卡片吗 |
+#   |---|---|---|---|
+#   | 帮我建个工单 | 其他 | 兜底出口 | 否 |
+#   | 我要建个工单 | 其他 | 兜底出口 | 否 |
+#   | 我想建个工单 | 其他 | 兜底出口 | 否 |
+#   | 帮我建个工单转人工 | 投诉 | 固定话术出口 | 否 |
+#   | 订单 1011 帮我建个工单 | 其他 | 兜底出口 | 否 |
+#   | 订单 1011 我要建个工单 | 其他 | 兜底出口 | 否 |
+#   | 帮我建个工单,订单号是 1011 | 其他 | 兜底出口 | 否 |
+#   | 订单 1011 的物流,帮我建个工单 | 物流 | **Agent** | **是** |
+#   | 订单 1011 的物流情况帮我建个工单跟进一下 | 物流 | **Agent** | **是** |
+#
+# **结论**(与 ch06 那次「验收 1/2/5/6 的题面被判成退款路由」属同一类,如实记账):
+#   1. **不带业务类落点的「建工单」一定到不了 Agent** —— 要么落「其他」进兜底
+#      (连订单号也救不了它),要么落「投诉」进固定话术出口(那个出口给两个按钮,
+#      点「建工单」走的是 `POST /api/ticket`,与确认流**不是同一条路**)。
+#      ⇒ brief 说的「Agent 追问」这一半**在意图路由下不可达**,不是本项没测,
+#        而是**没有这条路**。
+#   2. **带业务类落点的两种说法都到得了**,而且**都没有给问题描述** ——
+#      模型自己调 `query_order` + `query_logistics` 取回数据,**据此合成**了工单
+#      描述直接调 `create_ticket`,**一次都没有追问**。「补一句」那半同样不成立。
+#      ⇒ 本项验的是**确认闸**(卡片 → 决议 → 审计),不是「追问」;题面取
+#        下面这句**不带问题描述**的版本,尽量贴近原创意图。
+TICKET_ASK="订单 1011 的物流,帮我建个工单"
 confirm_flow() {   # $1=标签 $2=approved(true/false)
   local tag="$1" approved="$2"
   local sid ask_sse res_sse
@@ -934,8 +986,13 @@ echo
 echo "== 验收 6:TOOL_TIMEOUT_SECONDS=0.001 —— 只读可重试,写操作**结构性**不重试 =="
 # ⚠️ 这一项**只断审计行**,不断 `tickets` 的增减:超时的写操作**未必没执行**
 # (0.001 秒的窗口里,SQL 可能已经提交了才被取消)。断表里的行数会变成一条靠运气的断言。
+# ⚠️ **`TOOL_RETRY_ATTEMPTS=2` 必须在这里钉死,不能只靠默认值。**
+# `app/config.py` 把 `.env: TOOL_RETRY_ATTEMPTS=1` 写成了「一句话回退」——
+# 谁照那句话做,谁的 `retry_count` 就变成 1,下面那条断言随即变红,
+# 而**那不是缺陷**。本项的判据是「这个旋钮设成 N 就会重试 N 次」,
+# 所以把 N 显式写在这里(而不是「恰好等于今天的默认值」)。
 stop_cs
-if ! start_cs_ready "$WORK/cs_4.log" TOOL_TIMEOUT_SECONDS=0.001; then
+if ! start_cs_ready "$WORK/cs_4.log" TOOL_TIMEOUT_SECONDS=0.001 TOOL_RETRY_ATTEMPTS=2; then
   echo "预检失败:带 TOOL_TIMEOUT_SECONDS=0.001 的服务起不来。控制台输出:"
   show_console_head_tail "$WORK/cs_4.log"
   fail_exit
@@ -956,19 +1013,29 @@ printf '%s\n' "$RR" | sed -n 's/^/    /p'
 if [ -z "$RR" ]; then
   boom "只读那轮在 tool_audit_logs 里一行都没有 —— 下面两条断言恒假"
 fi
-# `retry_count=2` 是**默认值 2 的直接读数**(共 3 次尝试):这条断言同时钉住
-# `tool_retry_attempts=2` 真的生效,以及执行器把「**真实发生的**重试次数」
-# 而不是配置值写进表里(写配置值的话,一个首次就成功的查询会被记成「重试了 2 次」)。
-if printf '%s\n' "$RR" | grep -q '|timeout|2|'; then
-  ok "只读工具超时且重试到用尽:$(printf '%s\n' "$RR" | grep '|timeout|2|' | head -1)"
+# **锚定到那条 MCP 只读工具的行**,不用 `|timeout|2|` 裸 grep:后者任何只读工具的
+# 行都能满足它,包括某个与本次要验的东西无关的工具。门已经保证了这一轮调用过
+# `query_logistics`(而且它在 0.001 秒下必然超时),所以锚定它是有意义的收紧。
+# `retry_count=2` 是本项对外的读数(共 3 次尝试),它钉的是
+# **`tool_retry_attempts=2` 这个值真的传到了执行器**。
+# ⚠️ 别把它说成「证明了执行器记的是**真实重试**而不是配置值」—— 在全超时的一轮里
+# 两者**都是 2**,这里区分不了。那一条由 `tests/test_executor_gate.py` 覆盖
+# (那里有「首次就成功却报 retry=2」会红的用例);初版注释写过头了,已订正。
+HIT=$(printf '%s\n' "$RR" | grep '^query_logistics|mcp:logistics|timeout|2|' | head -1)
+if [ -n "$HIT" ]; then
+  ok "只读工具超时且重试到用尽:$HIT"
 else
-  bad "只读那轮没有 `status=timeout 且 retry_count=2` 的行(实际:$RR)"
+  bad "只读那轮没有 `query_logistics|mcp:logistics|timeout|2|` 的行(实际:$RR)"
 fi
-DUR=$(printf '%s\n' "$RR" | grep '|timeout|2|' | head -1 | cut -d'|' -f5)
-if [ -n "$DUR" ] && [ "$DUR" -gt 0 ] 2>/dev/null; then
-  ok "duration_ms>0($DUR ms)—— 它数的是**整轮尝试**的墙钟,不是单次"
+# 下界是**算得出来的**,不是「大于 0」:3 次尝试之间隔着 2 次
+# `tool_retry_delay_seconds`(默认 0.3)= **至少 600ms**。
+# `-gt 0` 区分不了「整轮尝试」与「只计最后一次」—— 超时是 0.001s,只计最后一次的实现
+# 会报 ~1ms 而**照样通过**,那样这条断言的名义与实际要验的东西就对不上了。
+DUR=$(printf '%s\n' "$HIT" | cut -d'|' -f5)
+if [ -n "$DUR" ] && [ "$DUR" -ge 500 ] 2>/dev/null; then
+  ok "duration_ms=$DUR ≥ 500(整轮尝试的墙钟:3 次尝试 + 2×0.3s 延迟 ⇒ 下界 600ms)"
 else
-  bad "duration_ms 不是正数(${DUR:-缺})"
+  bad "duration_ms=${DUR:-缺} 低于 500 —— 它可能只计了最后一次尝试(超时 0.001s ⇒ ~1ms)"
 fi
 # ---- 写操作:一次都不重试 ----
 confirm_flow acc6_w true
