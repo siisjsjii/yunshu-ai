@@ -232,13 +232,16 @@ async def test_parse_failure_also_carries_zero_confidence():
 
 
 class _RecordingSession:
-    """`append_turn` 只用到 `add` + `commit`。"""
+    """`append_turn` 只用到 `add` + `flush` + `commit`(ch07 起多了 `flush`)。"""
 
     def __init__(self):
         self.added = []
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def flush(self):
+        pass
 
     async def commit(self):
         pass

@@ -19,6 +19,19 @@ class Message(BaseModel):
     """
 
     role: Literal["user", "assistant", "tool"]
+    #: MySQL `messages.id`。**本章起由 `load_history` 填充**。
+    #:
+    #: 为什么必须是它:两个锚点(`summary_upto_msg_id` / `layer1_from_msg_id`)
+    #: 存的就是 MySQL 的主键,而分层是拿消息**逐条比对这两个 id** 做的 ——
+    #: `Message` 没有 id 的话,分层根本无从下手。
+    #:
+    #: 顺带解掉另一个坑:`prompts.to_lc_messages` 用它做 LangChain 消息的 `id`。
+    #: `add_messages` 是 **append-only**,无 id 的消息会被当场赋一个全新 uuid
+    #: ⇒ 重新播种同一批消息会被**再追加一遍**,而每一轮的回复看起来都正常。
+    #: 稳定 id 让重播种变成幂等。
+    #:
+    #: 默认 None:手工构造的消息(如 `log_turn` 里那两条)在落库前没有 id。
+    id: int | None = None
     content: str = ""
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None

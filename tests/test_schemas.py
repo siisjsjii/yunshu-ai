@@ -35,6 +35,17 @@ def test_tool_message_requires_a_non_empty_tool_call_id():
     assert Message(role="assistant", content="您好").tool_call_id is None
 
 
+def test_message_id_defaults_to_none_and_accepts_a_mysql_pk():
+    """ch07:`Message.id` 是可选的 MySQL 主键。
+
+    默认必须**恰好**是 None,不能是「必填」也不能是别的哨兵:`log_turn` 里
+    那两条手工构造的消息在落库前**没有** id,T10 播种时又靠 None 区分
+    「这条还没进库」。分层(两个锚点比大小)则要求读回来的消息**带着** id。
+    """
+    assert Message(role="user", content="你好").id is None
+    assert Message(role="user", content="你好", id=7).id == 7
+
+
 def test_chat_request_session_id_is_optional():
     assert ChatRequest(message="你好").session_id is None
     assert ChatRequest(session_id="s1", message="你好").session_id == "s1"

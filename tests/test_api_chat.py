@@ -308,6 +308,15 @@ class FakeSession:
         else:
             raise AssertionError(f"替身不支持的实体:{type(obj)}")
 
+    async def flush(self):
+        """ch07 起 `append_turn` 落库前会 flush 拿自增主键。
+
+        替身里主键在 `add` 就分配好了,所以这里是空操作 —— 但**必须存在**:
+        真实 AsyncSession 有这个方法,替身没有的话被观测的就不是
+        「append_turn 返回了什么」,而是「替身少了哪个方法」。
+        """
+        pass
+
     async def commit(self):
         self.commits += 1
 

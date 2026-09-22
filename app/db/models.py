@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Integer,
     JSON,
     String,
     Text,
@@ -24,6 +25,17 @@ class Conversation(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    # ch07 两个锚点(`ALTER TABLE` 手写在 db/ch07.sql 里,create_all **不加列**)。
+    # **两侧默认值都要**:`default` 让 ORM 插入时补值,`server_default` 让表本身
+    # 有 DEFAULT(裸 SQL 省略也不至于 1364)—— 只留前者会让 create_all 建的表与
+    # db/ch07.sql 建的表**形状不同**,行为变成「看谁建的库」。
+    # 不变量:0 <= summary_upto_msg_id <= layer1_from_msg_id。
+    summary_upto_msg_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    layer1_from_msg_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -168,6 +180,34 @@ class RefundRequest(Base):
         default="pending",
         server_default="pending",
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+
+class ConversationSummary(Base):
+    """会话梗概(ch07,DDL: db/ch07.sql)。**只追加,不删除、不重写。**
+
+    `seq` 从 1 起(由 `services/history.append_summary_and_advance` 在提交前
+    取 `MAX(seq)+1` 算得);`upto_msg_id` 是这一段覆盖到哪条 `messages.id`(含)。
+
+    ⚠️ **唯一键 `(conversation_id, seq)` 不在 ORM 声明里**(本类只声明了
+    `index=True`),它只在 db/ch07.sql 里 —— 所以 `create_all` 建出来的表
+    **没有这道防线**。这不是疏漏:它是并发保护的第二道(同一会话两个摘要任务
+    同时提交时,后者撞唯一键 ⇒ 失败 ⇒ 锚点不推进 ⇒ 下次重来;内存锁挡不住
+    多进程)。把库当成 db/ch07.sql 建的,`tests/test_db_models.py` 有哨兵。
+    """
+
+    __tablename__ = "conversation_summaries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    upto_msg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # 故意**不给 default**:空梗概是错误状态,写 None 必须被数据库当场拒
+    # (1048),而不是被 Python 侧悄悄补成空串 —— 一张「内容为空」的梗概行
+    # 会永久顶掉那段原文(锚点推过去了,替换物却什么也没说)。
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )

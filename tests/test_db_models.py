@@ -6,6 +6,7 @@ from sqlalchemy import select, text
 from app.db.base import get_engine, get_sessionmaker
 from app.db.models import (
     Conversation,
+    ConversationSummary,
     KnowledgeChunk,
     LowConfidenceQuestion,
     MessageRecord,
@@ -419,3 +420,134 @@ async def test_refund_request_persists_expected_columns():
             {"c": SCRATCH_CONVERSATION},
         )
         await session.commit()
+
+
+# ---- ch07:conversation_summaries + conversations 两个锚点(DDL: db/ch07.sql)----
+
+SCRATCH_SUMMARY_CONV = "ch07probe0000000000000000000000"
+
+
+async def _cleanup_summary_rows() -> None:
+    """**必须 commit** —— `async with session` 退出是 rollback,
+    不 commit 的 DELETE 原地作废,探针行留库,下一轮的 `.one()` 撞
+    MultipleResultsFound。(计划文本里的 DELETE 就没有 commit。)"""
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            text("DELETE FROM conversation_summaries WHERE conversation_id = :c"),
+            {"c": SCRATCH_SUMMARY_CONV},
+        )
+        await session.execute(
+            text("DELETE FROM conversations WHERE id = :c"), {"c": SCRATCH_SUMMARY_CONV}
+        )
+        await session.commit()
+
+
+@pytest.mark.anyio
+async def test_conversation_anchor_columns_default_to_zero():
+    """两个锚点列存在、且有默认值 0 —— 这是「还没压过」的哨兵。
+
+    ⚠️ 这两列**只在 db/ch07.sql 里加**(`ALTER TABLE`),`Base.metadata.create_all`
+    只建表不改表。所以本用例红,最可能的原因是 ch07.sql 没跑到那个库上。
+    """
+    await _cleanup_summary_rows()
+    async with get_sessionmaker()() as session:
+        session.add(Conversation(id=SCRATCH_SUMMARY_CONV, user="tester", status="active"))
+        await session.commit()
+
+    async with get_sessionmaker()() as session:      # 新 session 读回
+        row = (
+            await session.execute(
+                select(Conversation).where(Conversation.id == SCRATCH_SUMMARY_CONV)
+            )
+        ).scalars().one()
+        assert row.summary_upto_msg_id == 0
+        assert row.layer1_from_msg_id == 0
+
+    await _cleanup_summary_rows()
+
+
+@pytest.mark.anyio
+async def test_anchor_columns_have_a_table_level_default_not_only_an_orm_one():
+    """裸 SQL 插入(绕开 ORM)也必须拿到 0 —— 钉的是**表自己的 DEFAULT**。
+
+    与上一条的分工:上一条走 ORM 插入,而 `Conversation` 上有 `default=0`,
+    ORM 会替你把值填上 —— 于是**表里根本没有 DEFAULT 也照样绿**(本仓库
+    记过多次的假绿形态:被断言的值恰好等于兜底值填出来的那个)。
+
+    这条把 ORM 摘掉再插,表没有 DEFAULT 时 MySQL 直接以 1364
+    「Field doesn't have a default value」拒掉 —— 而那个形状正是
+    `create_all` 建的库(没有 db/ch07.sql 的 `DEFAULT 0`)与
+    `db/ch07.sql` 建的库**形状不同**的落点。
+    """
+    await _cleanup_summary_rows()
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            text(
+                "INSERT INTO conversations (id, user, status) "
+                "VALUES (:c, 'tester', 'active')"
+            ),
+            {"c": SCRATCH_SUMMARY_CONV},
+        )
+        await session.commit()
+
+    async with get_sessionmaker()() as session:      # 新 session 读回
+        row = (
+            await session.execute(
+                select(Conversation).where(Conversation.id == SCRATCH_SUMMARY_CONV)
+            )
+        ).scalars().one()
+        assert row.summary_upto_msg_id == 0
+        assert row.layer1_from_msg_id == 0
+
+    await _cleanup_summary_rows()
+
+
+@pytest.mark.anyio
+async def test_summary_rows_roundtrip_and_seq_is_unique_per_conversation():
+    """中文往返 + `(conversation_id, seq)` 唯一键真的在拦人。
+
+    唯一键这条**必须实测**:它是并发保护的第二道,而「我以为建了唯一键」
+    与「真建了」在并发出问题之前完全没有区别。
+
+    ⚠️ 唯一键在 ORM 里**没有对应声明**(`ConversationSummary` 只声明了
+    `index=True`),`create_all` 建出的表**没有它**。所以这条同时是「这张表
+    是 db/ch07.sql 建的、不是 create_all 建的」的判别器 —— 而 DDL 用的是
+    `CREATE TABLE IF NOT EXISTS`:若 create_all 先建了表,这份 DDL 会**静默
+    跳过**,唯一键就永远补不上。本用例正是那个静默失败的哨兵。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    await _cleanup_summary_rows()
+    async with get_sessionmaker()() as session:
+        session.add(Conversation(id=SCRATCH_SUMMARY_CONV, user="tester", status="active"))
+        session.add(
+            ConversationSummary(
+                conversation_id=SCRATCH_SUMMARY_CONV, seq=1,
+                upto_msg_id=12, content="用户问过订单 1002 能不能退,尚未解决。",
+            )
+        )
+        await session.commit()
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(ConversationSummary).where(
+                    ConversationSummary.conversation_id == SCRATCH_SUMMARY_CONV
+                )
+            )
+        ).scalars().one()
+        assert row.content.startswith("用户问过订单 1002")   # 中文往返
+        assert row.upto_msg_id == 12
+        assert row.seq == 1
+
+    async with get_sessionmaker()() as session:
+        session.add(
+            ConversationSummary(
+                conversation_id=SCRATCH_SUMMARY_CONV, seq=1,
+                upto_msg_id=99, content="重复的 seq",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+    await _cleanup_summary_rows()

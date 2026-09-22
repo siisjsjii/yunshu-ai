@@ -198,6 +198,10 @@ class RecordingSession:
     def add(self, obj):
         self.added.append(obj)
 
+    async def flush(self):
+        # ch07 起 `append_turn` 落库前会 flush 拿自增主键(真实 AsyncSession 有)。
+        pass
+
     async def commit(self):
         pass
 
