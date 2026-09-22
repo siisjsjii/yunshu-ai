@@ -703,9 +703,12 @@ class ToolSpec:
     - 内置那份从 `tool.args_schema.model_json_schema()` 派生;
     - MCP 那份从 Server 的 `inputSchema` **原样取**(spec §3.3)。
 
-    后者刻意**不经 adapters 的 pydantic 转换** —— 转换会削平
-    `minimum` / `maxLength` / `enum` 这类约束,于是「统一按 JSON Schema 校验」
-    退化成「只查必填和类型」,闸看起来在工作、实际漏掉一半。
+    后者刻意**不经 adapters 的 pydantic 转换**。⚠️ **真理由是「那条路跑不通」,
+    不是「有损」**(T7 的复审订正过):adapters 的 `args_schema` 对 MCP 工具就是
+    一个 **dict**,而 `registry._spec_from_tool` 走的是
+    `tool.args_schema.model_json_schema()` —— 对 dict 会直接 **`AttributeError`**。
+    (原先写的「转换会削平 `minimum`/`enum`」**已证伪**:adapters 根本没做那个转换,
+    见 spec §3.3 的订正。)所以取原始 `inputSchema` **今天就是承重的**。
 
     `tool` 是绑给模型的那份 `BaseTool`;执行时才用它。
     """
@@ -3059,7 +3062,7 @@ async def test_source_records_which_server(patch_client):
 async def test_raw_schema_survives_untouched(patch_client):
     """**本章最容易静默失效的一条**(spec §3.3)。
 
-    走 adapters 的 pydantic 转换会把 `minLength` 这类约束削平,于是
+    走 `_spec_from_tool` 那条路会 `AttributeError`(MCP 的 args_schema 是 dict),于是
     「统一按 JSON Schema 校验」退化成「只查必填和类型」,闸看起来在工作、
     实际漏掉一半。断言的是**原始约束还在**,不是「有个 schema 键」。
     """
@@ -3206,7 +3209,8 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'app.mcp'`
    **包成一条正常的工具返回**,于是在执行器眼里「物流服务连不上」是**成功** ——
    直接违反本仓那条「基础设施故障绝不伪装成查不到」。
 3. 注册表里的 `input_schema` 用**原始的 `inputSchema`**,不走 adapters 的
-   pydantic 转换 —— 转换会削平 `minimum` / `enum` 这类约束。
+   pydantic 转换 —— 那条路会 `AttributeError`(MCP 的 `args_schema` 是 dict,
+   见 spec §3.3 的订正)。
 """
 
 import logging
