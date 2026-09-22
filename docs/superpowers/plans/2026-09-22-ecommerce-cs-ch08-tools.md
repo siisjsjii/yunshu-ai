@@ -4343,11 +4343,29 @@ git commit -m "feat(ch08): agent 撞到未确认写调用时停循环,决议后�
 
 **Files:**
 - Modify: `app/static/index.html`
+- Modify: `app/agent/confirm_nodes.py`(一条 bundled 修复,见 Step 0)
+- Modify: `app/agent/graph.py`(同上,给那个节点传 `emit`)
 
 **按项目规矩**:纯 UI 页面用 Vibe Coding 直做,不套 brainstorm / TDD / code review。
 但**两条硬约束照旧**:① 不新增构建工具链(单文件、原生 JS);
 ② `resumeWith` 的载荷形状必须与 `confirm_nodes._decision` **逐字对上**
 (它只认 `{"approved": true}`,别的形状一律判成取消)。
+
+- [ ] **Step 0(bundled):把挂起路径上那个永远settle不了的徽标关掉**
+
+⚠️ **T9 复审发现,归本任务收** —— 它是**用户可见**的那一面:
+
+`agent` 的循环里,每个调用**先**发 `tool_call` 帧、**再**执行;撞到待确认的写调用时
+它 `continue` 了 ⇒ **`tool_result` 帧永远不来**。而 `apply_write_decision`
+**不收 `emit`**,所以恢复之后也不会补。⇒ 前端那个徽标**一直转下去**。
+
+**修法**:给 `make_apply_write_decision_node` 加一个 `emit` 参数,
+在它 `execute_tool` 之后发那条 `tool_result`(与 `agent` 循环里那句**同款**),
+并把 `emit` 从 `build_graph` 传进去。
+
+**为什么不改成「挂起前先把徽标关掉」**:那会让徽标的语义变成「这个工具已经跑完了」,
+而它**确实还在等用户**。⇒ **让它转着才是诚实的**;恢复之后由这条帧把它关掉。
+(用户若永远不点卡片,徽标就一直转 —— 与任何被放弃的一轮同款,不是新问题。)
 
 - [ ] **Step 1: 在 `handleFrame` 的 `switch` 里加一个分支**
 
