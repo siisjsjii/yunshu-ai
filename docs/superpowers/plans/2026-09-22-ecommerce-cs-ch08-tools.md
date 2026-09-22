@@ -1214,7 +1214,8 @@ git rm app/tools/business.py
 | `tests/test_tools_query_faq.py:19` | `from app.tools.business import make_query_faq` | `from app.tools.builtin.knowledge import make_query_faq` |
 | `app/agent/graph.py:5`(注释) | `app/tools/business.py` 的说明 | `app/tools/registry.py` 的说明 |
 | `app/agent/nodes.py:3`(注释) | 同 `app/tools/business.py` 的既有做法 | `app/tools/builtin/` 的既有做法 |
-| `app/refund/orders.py:3,39`(注释) | `app/tools/business.py` 的 `_order_record()` / `business.py:_require_order_no` | `app/tools/mock_data.py` 的 `order_record()` / `mock_data.py:require_order_no` |
+| `app/refund/orders.py:3,39,43`(注释) | `app/tools/business.py` 的 `_order_record()` / `business.py:_require_order_no` | `app/tools/mock_data.py` 的 `order_record()` / `mock_data.py:require_order_no` |
+| `tests/test_refund_orders.py:95`(注释) | `_require_order_no` 要 `isascii()` | `require_order_no` 要 `isascii()` |
 | `scripts/acceptance.sh:236-249`(`shipped_order()`) | `from app.tools.business import query_order` + `LOGISTICS_BY_STATUS` | **改写成直接调 `app.tools.mock_data`**(见下方说明) |
 | `scripts/acceptance.sh:257-272`(`expected_logistics_status()`) | `from app.tools.business import query_logistics` | **改写成直接调 `app.tools.mock_data.logistics_record`** |
 
