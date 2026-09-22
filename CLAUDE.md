@@ -16,7 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **ch07(上下文管理:三层滑窗 + 后台摘要 + 多会话)** 交付(分支 `ch07-context`):把 ch01 那条「按整轮裁到 token 预算」的单层裁剪升级成**三层结构** —— 最近**原文**(层 1,预算七成)/ 中间**截短**(层 2,三成)/ 最远**梗概**(后台摘要),两个锚点(`summary_upto_msg_id` / `layer1_from_msg_id`,都是 `messages.id`)划边界,**降级只挪 id、不搬数据**;token 预算**从模型窗口倒推**(`memory/budget.py`),不写死常量;每轮打两行 JSON 上下文日志(`model_ctx` / `history_ctx`);**工具结果本章起落表**(`role='tool'`);前端加**会话侧栏 + 切换回载**。设计源见 ch07 spec。
 
-**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**全程不做**:多轮 Agent Loop、认证。
+- **ch08(工具系统:注册中心 + MCP + 写操作确认流)** 交付(分支 `ch08-tool-registry`):把写死的五个 `@tool` 换成**即插即用的工具系统** —— `ToolSpec`(名 / 用途描述 / **原始 JSON Schema** / `read`|`write` / 来源)进注册中心,内置工具**包内自动发现**(在 `app/tools/builtin/` 里新增一个文件就是一个新工具),**全章唯一**的 JSON Schema 校验器,三态权限闸,唯一执行点 `execute_tool`,新表 `tool_audit_logs`;两个**自建业务 MCP Server**(`mcp_servers/logistics.py` → 8101 / `aftersales.py` → 8102,Streamable HTTP)+ 一个**每请求现问现拿、单 Server 连不上就降级**的客户端(`app/mcp/client.py`,**刻意不缓存**);并把建工单改成**确认流** —— `agent` 撞到未确认的写调用就**停循环** → `interrupt()` 弹卡片 → `Command(resume=…)` 同 thread 续跑 → 执行或拒绝,**挂起的那一轮完全不落库**。设计源见 ch08 spec(§15 订正最多的一章)。
+
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -38,6 +40,17 @@ bash scripts/acceptance.sh                                      # 端到端验�
 bash scripts/acceptance_ch07.sh                                 # ch07 验收 1–5;⚠️ **自己起服务**(8000 演示配置 / 8001 默认配置)
 # ↑ 跑之前先清空 8000/8001;它自己截断 log/app.log(不截断的话断言会命中旧行而恒真)
 
+# ch08(前置:MySQL + 真实 key;**不需要** Milvus)
+.venv/Scripts/python.exe -m mcp_servers.logistics                 # 手动起物流 Server:127.0.0.1:8101/mcp
+.venv/Scripts/python.exe -m mcp_servers.aftersales                # 手动起售后 Server:127.0.0.1:8102/mcp
+bash scripts/acceptance_ch08.sh                                   # ch08 验收 1–6
+# ↑ **验收脚本自己起三样东西** —— 两个 MCP Server(8101/8102)+ 客服服务(8000),
+#   跑完自己收干净;上面那两条 `-m` 是给**手工演示/手工核验**用的,验收不需要先跑它们。
+#   它在 8000 上**反复起停客服服务**(验收 1 装完新工具起一次、还原后再起一次、
+#   验收 6 换一套 env 再起一次),所以跑之前先清掉 8000 的残留进程:
+#   否则会 curl 到旧代码,得到本仓记过的那类**假红**。端口可用 `PORT` / `MCP_*_PORT` 覆盖。
+#   ⚠️ 验收 3 重启的是 **MCP Server**,不是客服服务 —— 它的断言正是「客服服务的进程号没变」。
+
 # 建库 / 升级(Milvus 另需 docker start milvus-standalone;BGE-M3 等权重由 main.py 预热)
 .venv/Scripts/python.exe scripts/init_db.py                     # 建表:create_all,只建**不存在的表**
 # ⚠️ **`init_db.py` 永不加列。** `create_all` 对已存在的表是**空操作** —— 它不会
@@ -53,15 +66,20 @@ bash scripts/acceptance_ch07.sh                                 # ch07 验收 1�
 #    自己**先 ALTER 后 CREATE**,必须在它内部的次序就是那样,别再调。
 #    ⚠️ `db/ch08.sql` 在**全新**库上会响亮地报 `ERROR 1050`(表已存在)—— 因为 ORM 侧有
 #    同名模型,`init_db.py` 的 create_all 已经顺带把这张表建了出来。**这是刻意的**,
-#    与 `db/ch06.sql` 的 refund_requests 是同一个已知取舍,不是脏库。但两条路径建出来的
-#    表**形状不同**,但 T5 修复轮之后**只剩两处**:
+#    与 `db/ch06.sql` 的 refund_requests 是同一个已知取舍,不是脏库。两条路径建出来的
+#    表**形状仍有三处不同**(T5 修复轮把行为差异都对齐了,**剩下的全是文本差异**;
+#    逐列编译 `ToolAuditLog.__table__` 的 `CreateTable` 与 `db/ch08.sql` 对着数出来的):
 #    ① **两个索引名** —— DDL 的 `idx_conv` / `idx_created` 对 SQLAlchemy 自动生成的
 #       `ix_tool_audit_logs_conversation_id` / `ix_tool_audit_logs_created_at`;
-#    ② **表的 `COMMENT`** —— DDL 有 `COMMENT='工具调用审计(ch08)'`,ORM 侧为 None。
-#    **其余都已对齐**(逐列比对 `ToolAuditLog.__table__` 与 `db/ch08.sql` 得出):
-#    `id` 两条路都是 `BIGINT`;带 `DEFAULT ''` 的字符串列**恰好两个**
+#    ② **表的 `COMMENT`** —— DDL 有 `COMMENT='工具调用审计(ch08)'`,ORM 侧为 None;
+#    ③ **七个列级 `COMMENT`** —— DDL 里 `conversation_id` / `tool_call_id` / `source` /
+#       `args` / `result_summary` / `status` / `retry_count` 各带 `COMMENT '…'`,
+#       而 ORM 侧全文没有任何 `comment=`。
+#    **其余都已对齐**:`id` 两条路都是 `BIGINT`;带 `DEFAULT ''` 的字符串列**恰好两个**
 #    (`result_summary`、`error_detail`),`args` 与 `status` 两条路**都没有** `DEFAULT`;
 #    `created_at` 两条路**都有索引**(只是名字不同,即上面 ①)。
+#    ⚠️ **③ 曾被写小成「六个」**(审查员列清单时漏了 `tool_call_id`),而 CLAUDE.md 一度
+#    只写了 ①② —— **「只剩两处」是个源不支持的绝对断言**。数一遍再引用。
 #    所以新库上仍然应当**让 DDL 建表**:要么先跑
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
@@ -88,10 +106,17 @@ app/config.py     pydantic-settings 读 .env;四个必填字段(三个 OPENAI_* 
 app/llm.py        ChatOpenAI 工厂,_build 收口全部硬约束
 app/prompts.py    System/抽取 Prompt + 消息组装;Message -> BaseMessage 转换的**唯一**出口
 app/schemas.py    纯数据模型,唯一被到处引用的类型源
-app/db/           base(引擎/会话工厂)、models(**8 张表**:conversations / messages / tickets /
+app/db/           base(引擎/会话工厂)、models(**9 张表**:conversations / messages / tickets /
                   knowledge_chunks / low_confidence_questions / qa_extraction_staging /
-                  refund_requests / conversation_summaries)、session(FastAPI 依赖)
-app/tools/        business(五个 @tool)、registry(每请求组装)、executor(超时/重试/错误分类)
+                  refund_requests / conversation_summaries / tool_audit_logs)、session(FastAPI 依赖)
+app/tools/        ch08 起是**工具系统**,不再是「五个 @tool 放一个文件」:
+                  spec.py(ToolSpec + **唯一**的 JSON Schema 校验器 validate_args)、
+                  policy.py(权限声明表 kind_of,未声明 = 只读)、
+                  audit.py(审计**唯一写口** record_audit,永不抛)、
+                  builtin/(**包内自动发现**,一文件一工具)、mock_data.py(种子数据源,内置与 MCP 共用)、
+                  registry.py(每请求组装 name → ToolSpec)、executor.py(**唯一执行点**,超时/重试/六类分诊)
+app/mcp/          ch08 在线:client.py —— 每请求现问现拿两个业务 Server 的工具,单 Server 挂了降级
+mcp_servers/      ch08 两个**独立进程**的业务 Server(logistics 8101 / aftersales 8102,Streamable HTTP)
 app/memory/       ch01-06:store.py(锁注册表)、trim.py(token 计数与按整轮切轮);
                   ch07 新增:budget.py(窗口→历史预算→层1/层2)、layers.py(三层切分 + 层2 截短)、
                   summarize.py(摘要 prompt + 触发判定 + 原子落库)、tasks.py(后台摘要执行体)、
@@ -106,6 +131,18 @@ scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)
 ```
 
 ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm, retrieval}`,仍是单向。
+
+ch08 又加了两条边,方向分别是:`tools → {db}`(审计落库,本来就有)与 `mcp → tools`
+(`client.py` 把 MCP 的工具**转成 `ToolSpec`** 再交给注册表),以及一个**不在 `app/` 下的**
+`mcp_servers/ → {tools.mock_data}`(两个 Server 与内置工具**共用同一份种子数据**,
+否则同一个订单号会在两边说两套话)。
+
+> **`app/tools/` 不依赖 `app/mcp/`,两者靠 `ToolSpec` 交接。** 这是本章最关键的一条接缝:
+> 内置工具与 MCP 工具在注册表里**长得一模一样**(同一种 `ToolSpec`),执行器、权限闸、
+> 校验器、审计**都不知道**手里这条是从哪来的。所以 `app/tools/` 里**没有一行** import
+> `langchain_mcp_adapters` 或 `app.mcp` —— 想加 MCP 的话,改的是 `app/mcp/client.py`,
+> 不是执行器。反过来说:`mcp_servers/` **不在请求路径上、也不 import `app/mcp/`**,
+> 它是「别人的进程」在本仓里的模板。
 
 **ch07 又加了两条反向边**(上面那条「严格单向」因此不再完整,而它是本仓最容易被
 后来人当成公理的一条):`app/memory/summarize.py` → `app/services/history.py`
@@ -262,6 +299,36 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 
 **后台摘要任务必须自建 engine**(专用线程 + 线程内 `asyncio.run` + 任务结束 `dispose()`),理由与 ch04 的 `orchestrate.py` 完全相同:`get_engine()` 的 lru_cache 单例绑在**首次使用它的事件循环**上。**在跑标记的摘除必须在 `finally` 里** —— 漏掉不是「多跑一次」,而是那个会话**再也压不了**(每次都被当成「已有任务在跑」),而用户侧每一轮看起来都完全正常。
 
+**ch08 · 工具系统与 MCP 的命门**(细节见 ch08 spec §15 与 `dev-notes/ch08.md`):
+
+**`mcp>=1.24,<2` 是被 `langchain-mcp-adapters==0.3.2` 的 `Requires-Dist` 钉死的**(轮子 `METADATA` 逐字:`mcp<2.0.0,>=1.24.0`;实际解析到 **1.30.0**)。不要装 2.x。**Context7 整站已经迁到 v2**(连标着 v1 的 library id 返回的也是 v2 内容),所以**这一处以锁定版本的轮子源码为准,不以文档为准**:1.x 的入口是 **`mcp.server.FastMCP`**(不是 `MCPServer`),传输参数是**直接关键字参数** `FastMCP(name, *, host=…, port=…, streamable_http_path=…, stateless_http=…, json_response=…)`,**不是** `FastMCP(..., settings=Settings(...))` —— 那个模块里**另一个**也叫 `Settings` 的 pydantic 模型**字段全无默认值**,照猜会踩进去(写实现计划时逐字核对 `__init__` 才挖出来)。
+
+**`convert_mcp_tool_to_langchain_tool` 必须传 `connection=`,不是 `session=`**(`app/mcp/client.py`)。传 session 的话那个 session 一关,造出来的工具就废了;传 connection 则每次调用自建连接。
+
+**`handle_tool_errors=False` 必须显式关**(同上)。默认 `True` 会把 MCP 的调用故障**包成一条正常的工具返回** —— 于是在执行器眼里「物流服务连不上」是**成功**,直接违反本仓那条「基础设施故障绝不伪装成查不到」。关掉后 adapters 抛 `ToolException`,执行器分诊成 **502**(`ToolInfrastructureError("工具执行失败")`)。
+
+> ⚠️ **下面这句一度写错、由 T12 实测订正**:关掉之后**不会**走 `TransientToolError` 那条可重试分支。实测(单测内注入 `ToolException`,`tool_retry_attempts=2`):工具**只被调用了一次**、直接 `ToolInfrastructureError` ⇒ **MCP 传输故障今天不重试**。原因是 `app/tools/errors.py` 的 `TransientToolError` **全仓没有任何生产抛出点**(只有 `errors.py` 的定义、`executor.py` 的 `except`、和 `tests/test_executor_gate.py` 的两处注入)⇒ 那条分支在生产上是**死代码**,而 spec §6.3 设计的「MCP 传输类故障可重试」**没有落地**。详见 spec §15 ㊱。
+
+**写操作决议是三态,不是布尔**(`pending` / `approved` / `denied`,`executor.py`)。用 `approved=False` 一个值表达「没问过」与「问过、用户说不」的话,**取消路径会再拿到一次 `confirmation_required`**,于是取消永远不会被记成「权限拒绝」(验收 5 落空)。同理:认不出的决议值**响亮地抛**、且**不审计** —— 不许用 `!= APPROVED` 当拒绝处理,那会在 `tool_audit_logs` 里写一条**谎报用户点了取消**的行,而那张表正是验收 5 读的表。
+
+**`retry_count` 记的是真实发生过的重试次数(`attempts_made − 1`),不是配置值**(`executor.py`)。写成配置值的话,一个**第一次就成功**的查询会被审计成「重试了 2 次」,而**没有任何断言会红**(验收 6 那条在全超时的一轮里两者都是 2,区分不了;真正守住它的是 `tests/test_executor_gate.py`)。
+
+**`turn_messages` 是覆写通道,承载本轮产生的全部消息**。续跑(`apply_write_decision`)与决议节点都必须「**读旧值再追加**」;只返回新那一条会**丢掉带 `tool_calls` 的 AIMessage**,而那一轮**看起来一切正常**(`log_turn` 只拿它落库 —— 少一条就少落一条)。它与 `pending_write` / `write_decision` 一起进 `resolve_references` 的逐轮重置。
+
+**`agent` 不再是 `_OUTLETS` 的成员**(`app/agent/graph.py`)—— 它现在是**条件出口**(`route_after_agent`:有 `pending_write` 就 `confirm_write`,否则 `log_turn`)。把它**无条件**接回 `log_turn` 会让**挂起的那一轮一半写库、一半没写**(单测看不出来:要显式 resume 才走得到那儿)。同理 `refund_pick_order` 也不在 `_OUTLETS` 里。
+
+**`pending_write` / `write_decision` 必须连同它们的每轮清零一起落地**(通道在 `app/agent/state.py`,清零在 `nodes.make_resolve_references_node`)。checkpointer 是**进程级单例**、`thread_id = session_id`,未写的通道**保留上一轮的值** —— 漏了清零的后果是**上一轮批准过的写操作,这一轮自动放行**。(本仓「通道与它的清零必须同处一地」的第四次应用。)
+
+**`FastMCP.call_tool()` 返回的是 2-tuple `(list[ContentBlock], dict)`,而它的返回注解写的是 `Sequence[ContentBlock] | dict[str, Any]`** —— **注解与实测不符,是个陷阱**。照注解写 `result[0].text` 会得到 `TypeError: Object of type TextContent is not JSON serializable`。正确写法是 `result[0][0].text`(T6 的实现者实测到并订正)。
+
+**`isError: true` 在 mcp 1.30.0 里是通用的,不能当「业务性未找到」的同义词**(`mcp/server/lowlevel/server.py` 的 `_make_error_result`):**工具名不存在**、**入参校验失败**、**出参 schema 不匹配**、**返回类型不认识**全都汇进它,**形状一模一样**(单条 `TextContent` + `isError`)。要分辨只能靠**文案**(或先查 `spec is None`);判错的代价是**把「这一单查不到」变成 502** —— 正是本仓那条「不许拿服务端故障指责用户输入」的反面。
+
+**「内置 vs MCP」的差别不在热重载能力,而在工具从哪来**(`app/tools/builtin/__init__.py`):**新增**一个内置模块(**新文件名**)**当场生效、不用重启客服服务**(`discover()` 每请求重跑 `pkgutil.iter_modules`,FileFinder 的目录缓存按 mtime 失效);**修改**一个**已有**模块**仍必须重启**(`importlib.import_module` 直接返回 `sys.modules` 的缓存项)。两条都实测过。MCP 那两个方向都只要重启**它自己**。
+
+**审计写口一落地,整套测试每轮都往真库的 `tool_audit_logs` 写记录(只追加)**(2026-09-23 实测:一轮全量 `1569 → 1624`,即 **+55 行**;T5 当时的读数是 ~150 行 —— **两个数都是当时的读数,随用例数增长,不是恒定的**)。⇒ **凡是对那张表的「查最近这几条」式断言,必须按 `conversation_id` 过滤**(`scripts/acceptance_ch08.sh` 的 `dbq.py` 每个 mode 都过滤),否则会变成**偶尔红、偶尔绿**,而那正是本仓编目过的「被上次运行的数据污染」那一类。
+
+**本机对一个已关闭的回环端口调裸 `socket.connect()` 要 ~2.05s 才拿到拒绝**(2026-09-23 复测:端口 1 / 9 / 65500 / 54321 / 8101 / 8102 分别是 2.036 / 2.055 / 2.050 / 2.055 / 2.039 / 2.055 秒),而**在监听**的端口是毫秒级(19530 0.4ms、3307 22ms)。⇒ 「两个 MCP Server 都没起时每请求白等 ≈4.8s」**是**本机**的性质,不是这条链路的性质**(两个 Server ≈ 2×2.05 + adapters 的 0.35×2 ≈ 4.83s,与实测吻合)。**引用任何具体秒数都必须带「本机实测」四个字**;可移植的上界只有一个:`mcp_discovery_timeout_seconds × 2 = 10s` —— 而**那个上界本身未实测**(它对应「只吞 SYN 不回」那条路径,实测走的是「立刻拒绝」那条,且一轮发现里未必只有一次请求,所以它未必紧)。
+
 **`mount("/")` 必须在 `include_router` 之后**(`app/main.py`),否则静态目录会抢走 `/api/*`。
 
 ## 写测试的规矩(本项目血的教训)
@@ -299,6 +366,11 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 
 - `evals/tool_selection_cases.jsonl` —— 15 条工具选用例,`expected` 是工具名(闭式精确匹配)或 `null`(不该调工具)。
 - **工具选择准确率 13/15 = 86.7% 可引用**(闭式枚举,与 ch01 那个被样本拟合的 `expected_solution` 关键词口径不同)。但引用时须一并说明:**该数字是在没有生产 system prompt 的条件下测得的**,且**用例集偏弱**(非 null 的 13 条里 11 条从不失误,信息量主要来自 2 条诱饵)。
+  - **⚠️ 追加限定(2026-09-22,ch08 —— 比上一条更弱,因为它有两层)**:**这个 13/15 是在旧配置下测得的,而且测它的脚本在 ch08 改过之后从未被执行过。**
+    - ① **工具定义的顺序变了。** ch08 起由手写的 `[query_order, query_product, query_logistics, query_faq, create_ticket]` 变成 **`(模块名, 工具名)` 排序**(`app/tools/builtin/` 的自动发现,spec §3.4)⇒ 发给模型的工具定义块**逐字节不同**。
+    - ② **`query_logistics` 从内置下线、改由物流 MCP Server 提供**(spec §8.3)。而 `evals/run_tool_selection_eval.py` 原先只用 `build_tools`(**内置那一半**)⇒ 那 **3 条物流用例在结构上不可能通过**。「口径变了」这句话**描述不了「有 3 条根本跑不了」**。
+    - T7 因此把该脚本改成与 `app/api/chat.py` **同款的两步**(`await discover_mcp_specs` → `build_registry(extra=…)`,含 MCP 发现,发现失败时同样降级),否则它测的是一个**与生产不再对应**的工具集。**改的是被测量的配置,用例集一字未动。**
+    - **⚠️ 而那次改动之后脚本没有被重跑**(要真实 key + MySQL + 两个 MCP Server),所以现在的状态是:**一个描述旧配置、且其测量脚本已改而从未执行的数**。引用它时必须把这两层都说出来,或者重跑一次。
 - `evals/extract_cases.jsonl`(ch01)的 `expected_solution` 分数**不可引用** —— 关键词是看到输出措辞后才放宽的。
 - `evals/retrieval_cases.jsonl`(ch03)—— 23 条(19 换说法正例 + 4 干扰项),闭式口径(期望片段取自语料**逐字原文**且须在**同一块**里全部出现,不掺主观判断)。**⚠️「23/23」那一版是 ch03 的 dense 单路;ch04 换混合+重排后从未复核过,现链路是 13/23** —— 引用时必须说清是哪条链路。用例自造、4 条干扰项里 3 条离阈值很远、不构成压力;**「卖手机」是唯一有信息量的近域硬负例**。
   - **⚠️ 追加限定(2026-09-22,ch07 终审):这个 13/23 是 `rerank_top_k = 3`(旧的 `retrieval_top_k`)下测的**。ch07 把该旋钮的默认值改成 **5**(spec §9.1 授权),也就是说**现在放行的块更多**、这条链路的口径与那次测量**不是同一个配置**,而**从未在新默认值下复核过**。引用它时必须一并说明这一点 —— 与上面「dense 单路 vs 混合+重排」是同一类限定:**一个看起来已经验过、其实描述的是另一套配置的数**。
@@ -307,6 +379,23 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - `evals/summary_cases.jsonl`(ch07)—— 11 条**摘要**标注样例,四类:正例 3 / 负例 2 / **幻觉探针** 2 / 四样提炼物(product、identifier、request、unresolved)各 1。口径**闭式**(关键词、字数上限、`\d{4,32}` 正则)。**实测 9/11**:两条负例(纯寒暄)判 MISS —— 模型**不返回空串**,而是吐约 40 字的**元叙述**(「本次对话未涉及任何商品…」)。**它没有编事实,但那句正是 prompt 点名的「对话状态一律不留」** ⇒ 这条既是「prompt 遵从度不满」的读数,也说明 T8 的「空输出退路」在真实模型上**很难触发**。**引用时必须带上这句**,别把 9/11 读成「实现坏了」。
   - **幻觉探针的判别力靠一个前提**:该用例的对话里**本来就没有** `\d{4,32}` 形态的数字。脚本对每条探针**自动核对这个前提**(用例自检),不成立就单独报 `!!!` 而不混进 MISS。另有**探针自检**:`\d{4,32}` 必须能匹配 `20240915`/`13800138000`(真会出现的形态)、**不能**匹配 `99` —— 后者正是 ch06 T1 那条**同义反复断言**(用 `\d{4,32}` 匹配「99」,长度对不上 ⇒ 恒真)的反面教材。
 - `evals/results/` 被 gitignore,是历史运行产物。
+
+## 已知问题与未达成项(如实记账,不许读成「全绿」)
+
+**ch08 · 未达成项:「缺必填项就主动追问」没有实现。** 用户对本章的原始要求里有一条「建工单缺必填项时**主动追问补齐、不许瞎编**」。实测下来**这一条做不到**,而「撞到写调用就卡住 → 弹卡片确认 → 落库 → 带工单号回来」那三段**都是通的**。
+
+- 验收脚本里那条题面**用单轮提示直奔卡片**,「Agent 先追问补齐」那半**从未跑过**。T11 的实现者随后去探**九种说法**,结论是**结构性**的:没有业务落点的建单请求全部走 **其他→兜底** 或 **投诉→固定话术出口**(那个出口的按钮走 `POST /api/ticket`,**不是**确认流);而**能**走到 Agent 的说法都自带业务落点,模型会**从 `query_order` / `query_logistics` 的返回里合成一个描述**直接调 `create_ticket` —— **它不追问**。
+- 换句话说:**「不许瞎编」这一半今天是靠「模型没瞎编」侥幸成立的,不是被守住的性质**。
+- 这条需要用户拍板(接受现状 / 在提示词或图里补一个追问节点)。**引用本章时说「确认流已交付」是可以的,说「缺参追问已实现」是错的。**
+
+**ch08 照出来的 pre-existing 缺陷:写路径超时会往用户可见的 `error` 帧里吐裸的 SQLAlchemy 内部文本。**
+
+- **现象**:验收 6 的写路径(`TOOL_TIMEOUT_SECONDS=0.001` + `create_ticket`)那次续跑会推一条 `error` 帧,文案是 `This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with your Session, first issue Session.rollback(). Original exception was: …`。
+- **两个成因,缺一不成**:① **ch01 起的那个通道** —— `app/api/chat.py` 的 `except Exception as exc:` 直接 `redact_api_key(str(exc))` 推 `error` 帧,它只抹**密钥**,不抹**内部实现细节**;② `create_ticket` **没有 ch03 那种取消路径的 `rollback()`** —— 超时把协程取消在 SQL 中间,session 停在**待回滚**状态,后续任何一次用它都抛 `PendingRollbackError`,而 `str()` 就是上面那一整段。(抛点未逐行定位 —— 现场只留了 error 帧的文案。)
+- **⚠️ 它不是本章引入的回归**:两个成因都在 ch08 之前就在,是**本章的 A6 把它照出来的**(A6 只断审计行,所以它既没判过也没判红)。方向上与本仓「所有出站错误文本必须过 sanitize」「基础设施故障一律固定文案」那两条**不一致**(泄漏的不是密钥,是内部实现细节)。
+- **两条候选修法(择一或都做,未实施)**:
+  1. **给 API 层兜底**:那个 `except Exception` 里不再直接 `str(exc)`,改成固定文案 + 把原文 `logger.error` 出去(与 502 那条路径同款)。改一处,覆盖面最大。
+  2. **给写工具的取消路径补 `rollback()`**:照 ch03 `retrieval/search.py` 在 `except BaseException` 里先 `rollback()` 再抛的样子,给 `create_ticket`(以及任何将来直接用调用方 session 的写工具)补上。**治因**,但只治这一条路径。
 
 ## 平台陷阱(Windows + Git Bash)
 

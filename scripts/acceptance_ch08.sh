@@ -991,8 +991,13 @@ echo "== 验收 6:TOOL_TIMEOUT_SECONDS=0.001 —— 只读可重试,写操作**�
 # 谁照那句话做,谁的 `retry_count` 就变成 1,下面那条断言随即变红,
 # 而**那不是缺陷**。本项的判据是「这个旋钮设成 N 就会重试 N 次」,
 # 所以把 N 显式写在这里(而不是「恰好等于今天的默认值」)。
+# ⚠️ **`TOOL_RETRY_DELAY_SECONDS=0.3` 是同一个道理,必须一起钉**(T11 复审指出)。
+# 下面那条 `duration_ms ≥ 500` 的下界是从 `2 × 0.3s` 推出来的,而 `=0` 是
+# **合法值**(`app/config.py` 的 `Field(ge=0)`)—— 把它设成 0,三次尝试之间不再等待,
+# 这一格会掉到 ~10ms **变红,而那不是缺陷**。(当前 `.env` 里没有这一项,
+# 所以它今天取默认值 0.3;但「恰好等于今天的默认值」不是判据,见上。)
 stop_cs
-if ! start_cs_ready "$WORK/cs_4.log" TOOL_TIMEOUT_SECONDS=0.001 TOOL_RETRY_ATTEMPTS=2; then
+if ! start_cs_ready "$WORK/cs_4.log" TOOL_TIMEOUT_SECONDS=0.001 TOOL_RETRY_ATTEMPTS=2 TOOL_RETRY_DELAY_SECONDS=0.3; then
   echo "预检失败:带 TOOL_TIMEOUT_SECONDS=0.001 的服务起不来。控制台输出:"
   show_console_head_tail "$WORK/cs_4.log"
   fail_exit
