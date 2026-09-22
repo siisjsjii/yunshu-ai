@@ -8,7 +8,7 @@
 import logging
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import ValidationError
 
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
@@ -375,6 +375,12 @@ def make_resolve_references_node(*, model):
     `trace` 通道不在此列 —— 它是 `operator.add` 归约通道,写 `[]` 等于没写,
     清不掉;**它靠 `log_turn` 切片取当轮**(见下)。
 
+    它还负责**把本轮的用户原话送进完整历史**(`messages`,ch07):那是这一轮
+    唯一一条不由 agent / 出口节点产出的消息,而 `messages` 的**唯一**另一个写者
+    是端点那一次「快照为空时」的播种 —— 不放这儿,state 里的历史就会从第二轮起
+    只剩下客服说过的话(静默)。`messages` **不进**上面那份重置清单(累积语义),
+    这里写的是**新增的一条**,不是重置。
+
     **这里返回的每个 key 都必须在 `ChatState` 里声明过**:通道集合由
     `StateGraph(ChatState)` 的注解决定,LangGraph 对未声明通道的写入是
     **静默丢弃**的(T4 的 Critical 就是它)。T7 的 `order_no` / `order_data` /
@@ -407,6 +413,21 @@ def make_resolve_references_node(*, model):
 
         return {
             "resolved_input": resolved,
+            # 本轮的用户原话也要进**完整历史**(`messages`,累积通道)。
+            #
+            # **只在这里加**,不加在端点里:需求 5 的原话是「各节点只管吐**新**
+            # 消息、框架自动按顺序并入」,而这正是那个形状;放进端点会让「谁负责
+            # 往里加」有两处答案。也正因为它在这里,才**不会**被重复加 —— 本节点
+            # 是 START 的唯一出边、每轮只跑一次,而 `resume` 路径**不重跑它**
+            # (图从挂起的那个节点继续),续跑续的是**同一轮**,不该凭空多出一条。
+            #
+            # 少了这一行:`state["messages"]` 与 MySQL 从第二轮起**分叉** ——
+            # 库里 user/assistant 成对,而 state 里只剩客服说过的话,每一轮的
+            # 提问全丢。它完全静默(回复正常、落库正常),只有「拿快照派生精简版」
+            # 的读者会拿到一份**没有用户提问**的上下文(spec §7.4)。
+            # 用**原话**而不是 `resolved_input`:完整历史是**用户真说过什么**的
+            # 记录,不是喂给模型的加工稿(同一轮 `log_turn` 落库的也是原话)。
+            "messages": [HumanMessage(user_input)],
             "trace": ["resolve_references"],
             # 每轮归零的**逐轮**通道:它们描述的是「这一轮」,不是「这段会话」。
             "gate_passed": None,

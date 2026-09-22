@@ -597,10 +597,54 @@ def test_second_turn_on_the_same_session_does_not_duplicate_history(client_facto
     assert len(humans) == 2
     assert [m.content for m in humans] == ["第一句", "第二句"]
 
-    # state 里的完整历史:一轮只该并入一次。
+    # state 里的完整历史:两轮之后必须是「问、答、问、答」四条 ——
+    # 用户原话与客服回复**都在**,各只出现一次,且**按发生顺序**。
+    #
+    # 这一条同时钉住三件事(少任何一件它都会红):
+    #   ① 「重复播种/重复并入」⇒ 多出一条(变异实测见 task-5-report.md §4);
+    #   ② **用户原话根本没进 state** ⇒ 只剩 ['好', '的'] 两条 —— 这正是
+    #      `resolve_references` 那一行存在的理由(缺了它,state 与 MySQL 从第二轮
+    #      起就分叉,而帧、落库、状态码**完全正常**);
+    #   ③ 顺序错(比如把本轮的用户消息并在助手回复之后)⇒ 序列对不上。
+    #      顺序不是装饰:`add_messages` 并入的正是「模型看到的历史顺序」。
     contents = [m.content for m in _state_messages(sid)]
-    assert contents, "state 里一条消息都没有 —— 播种/并入这条路根本没跑"
-    assert len(contents) == len(set(contents)), f"有内容被并入了两遍:{contents}"
+    assert contents == ["第一句", "好", "第二句", "的"]
+
+
+@pytest.mark.anyio
+async def test_resume_does_not_add_a_second_user_message_to_state(client_factory):
+    """续跑**不重跑** `resolve_references` —— 那一轮的 user 消息只该有一条。
+
+    这条守的是「用户消息只在一个地方加」这件事的**位置**选择:本节点是 START 的
+    唯一出边、每轮只跑一次,而 `resume` 的图从**挂起的那个节点**继续,不回到
+    START。若哪天有人把这行挪进一个 resume 会重跑的节点(或挪进端点),同一轮的
+    用户原话就会在 state 里出现两次 —— 而**每一轮的回复看起来都正常**,
+    落库那两条(user + assistant)也照样对(它们走的是 `turn_messages` / `user_input`)。
+
+    判据是「挂起时就已经有了 1 条,续跑之后**仍然**是 1 条」—— 于是它同时钉住
+    「挂起那一轮真的写进去了」(0 条的实现在前半段就红)。
+    """
+    retriever = FakeRetriever([CLAUSE_CHUNK])
+    client, _ = client_factory(batches=[], intent="退款退货", retriever=retriever)
+    with client as c:
+        first = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-resume-msg", "message": "这个能退吗"},
+        )
+        assert "event: order_choice" in first.text
+        suspended = [m.content for m in _state_messages("s-resume-msg")]
+
+        second = c.post(
+            "/api/chat/stream",
+            json={"session_id": "s-resume-msg", "resume": {"order_no": PICKED_ORDER}},
+        )
+        resumed = [m.content for m in _state_messages("s-resume-msg")]
+
+    assert [name for name, _ in _parse_sse(second.text)][-1] == "done"
+    assert suspended.count("这个能退吗") == 1        # 挂起那一轮就写进去了
+    assert resumed.count("这个能退吗") == 1          # 续跑没有再加一遍
+    # 续跑那一轮照常产出客服回复(它由出口节点并入)。
+    assert JUDGE_YES_REPLY in resumed
 
 
 def test_first_request_seeds_the_history_that_is_already_in_mysql(client_factory):
