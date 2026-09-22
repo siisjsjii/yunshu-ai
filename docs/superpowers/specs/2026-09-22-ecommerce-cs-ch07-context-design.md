@@ -220,8 +220,13 @@ messages 表(按 id 升序)
 |---|---|
 | `user` | **原样,一个字不动** |
 | `assistant`(纯文本) | `content` 截到前 **50** 字,加 `…` |
-| `assistant`(带 `tool_calls`) | `content` 保留(通常本来就是空串);**`tool_calls` 原样保留** |
+| `assistant`(带 `tool_calls`) | `content` **按同一规则截到 50 字**(通常本来就是空串,截了也没差);**`tool_calls` 原样保留** |
 | `tool` | `content` 换成一行标识:`[工具结果] <前 60 字>…` |
+
+**`content` 一律按同一条规则截**,不为「带 `tool_calls` 的 assistant」开小灶 ——
+需求 1 的原话是「**客服答复**只留开头几十个字」,而工具调用前那句开场白**就是**客服答复。
+原先那句「`content` 保留」是在**陈述常见情形**(带工具调用的 assistant,turn content
+通常是空串),不是一条豁免规则;写成表格里的一行容易被读成豁免,故订正措辞。
 
 **为什么 `tool_calls` 必须原样保留**:上游要求 `tool` 消息前面紧跟带对应
 `tool_call_id` 的 `assistant`。截断 `tool_calls` 就等于把这对拆开 ⇒ 400,
