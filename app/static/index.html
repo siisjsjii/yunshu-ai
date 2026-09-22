@@ -261,6 +261,17 @@
   .order-card.picked { border-color: var(--brand); background: #dcebf9; opacity: 1; }
   .order-no { font-weight: 700; color: var(--ink); font-size: 13.5px; }
   .order-meta { font-size: 12px; color: #5b7186; }
+  .ticket-preview {
+    margin-top: 10px; padding: 12px 14px;
+    border: 1px solid #d6e4f0; border-radius: 10px; background: #f7fbff;
+  }
+  .ticket-title { font-size: 13px; color: #33526b; margin-bottom: 8px; }
+  .ticket-row { display: flex; gap: 10px; margin-bottom: 6px; font-size: 13px; }
+  .ticket-label { flex: 0 0 64px; color: #7b8a99; }
+  .ticket-value { flex: 1; color: #22303c; word-break: break-all; }
+  .ticket-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .choice-btn.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  .choice-btn.primary:hover:not(:disabled) { background: #1668d0; }
   .refund-form { margin-top: 10px; border: 1.5px dashed #cdd9e4; border-radius: 8px;
     padding: 10px 12px; background: #fbfdff; }
   .refund-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
@@ -541,6 +552,14 @@
         ctx.suspended = true;          // 本轮是挂起,不是答完 —— 见 streamInto 的说明
         renderOrderCards(ctx, payload.options || []);
         break;
+      case "ticket_confirm":
+        // ch08:写操作(建工单)待确认。与 order_choice 一样,本轮是**挂起**
+        // 而不是答完 —— 不置这个标志的话,streamInto 的 finally 会往气泡里
+        // 写一句「(没有返回内容)」,而 resume 复用同一个 ctx、token 走 `+=`,
+        // 那句占位符会**永久粘在**卡片和后续回复前面。
+        ctx.suspended = true;
+        renderTicketPreview(ctx, payload.preview || {});
+        break;
       case "refund_offer":
         renderRefundForm(ctx, payload);
         break;
@@ -789,6 +808,60 @@
       });
       box.appendChild(card);
     });
+
+    ctx.bubble.appendChild(box);
+    scrollToEnd();
+  }
+
+  // ── 工单预览卡(ch08 建工单确认流)────────────────────
+  //
+  // 后端在 `confirm_write` 节点里 `interrupt()` 时发来的一帧。
+  // 点按钮发 resume,**回复流进同一个气泡** —— 与订单选择器同一条路。
+  //
+  // ⚠️ 载荷形状必须与后端 `app/agent/confirm_nodes.py::_decision` **逐字对上**:
+  // 它只认 `{"approved": true}`,**其余一律判成取消**(失败关闭 ——
+  // 认不出来的形状直接建出工单是不可接受的,写操作不可逆)。
+  // 传 `"true"` / `1` 都会把用户的「确认」读成「取消」。
+  function renderTicketPreview(ctx, preview) {
+    const box = document.createElement("div");
+    box.className = "ticket-preview";
+
+    const title = document.createElement("div");
+    title.className = "ticket-title";
+    title.textContent = "工单预览,请确认后提交:";
+    box.appendChild(title);
+
+    const rows = [
+      ["工单类型", preview.ticket_type || "(未填)"],
+      ["问题描述", preview.description || "(未填)"],
+    ];
+    rows.forEach(([label, value]) => {
+      const row = document.createElement("div");
+      row.className = "ticket-row";
+      row.innerHTML =
+        `<span class="ticket-label">${esc(label)}</span>` +
+        `<span class="ticket-value">${esc(value)}</span>`;
+      box.appendChild(row);
+    });
+
+    const bar = document.createElement("div");
+    bar.className = "ticket-actions";
+    const mk = (text, approved, cls) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "choice-btn " + cls;
+      btn.textContent = text;
+      btn.addEventListener("click", () => {
+        // 一次性锁定:点过就不再让点第二个(与订单卡片同款)
+        bar.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        btn.textContent = approved ? "已提交" : "已取消";
+        resumeWith({ approved: approved }, ctx);
+      });
+      return btn;
+    };
+    bar.appendChild(mk("确认提交", true, "primary"));
+    bar.appendChild(mk("取消", false, ""));
+    box.appendChild(bar);
 
     ctx.bubble.appendChild(box);
     scrollToEnd();
