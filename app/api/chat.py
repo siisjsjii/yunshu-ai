@@ -152,12 +152,23 @@ async def chat_stream(
                 settings=settings, budget=context_budget, user_input=request.message
             )
 
+            # 请求**开始时**的锚点,先取到局部变量里。
+            #
+            # ⚠️ 这不是风格:下面那句 `advance_anchors` 是 `session.execute(update(...))`,
+            # SQLAlchemy 默认的 `synchronize_session="auto"` 会**把同 session 里
+            # 那个 `Conversation` ORM 对象一起改掉**(本项目记账过的身份映射行为)。
+            # 所以写库之后再读 `conv.layer1_from_msg_id` 拿到的是**新值** ——
+            # 日志里的 `from` 会与 `to` 相等(实测:`from: 23, to: 23`,一个看起来
+            # 完全正常的「降级没挪」读法,而它恰恰是验收 2 要 grep 的那一行)。
+            # 旧值与新值只有这一个接缝上同时有,取早一步是唯一的取法。
+            old_layer1_from = conv.layer1_from_msg_id
+
             # ---- 降级:层 1 的原文超预算就把边界往后挪(只挪 id,不搬数据)----
             # 挪过的那几轮**自动落进层 2**,下一轮以截短形态出现(spec §3.3)。
             layer1_from = layers.degrade(
                 history,
                 summary_upto_msg_id=conv.summary_upto_msg_id,
-                layer1_from_msg_id=conv.layer1_from_msg_id,
+                layer1_from_msg_id=old_layer1_from,
                 layer1_budget=context_budget.layer1_budget,
                 settings=settings,
             )
@@ -169,7 +180,7 @@ async def chat_stream(
                 settings=settings,
             )
 
-            if layer1_from != conv.layer1_from_msg_id:
+            if layer1_from != old_layer1_from:
                 # 只在**真的动了**的时候写库:每次请求都写一遍会让
                 # 「降级发生了没有」在 DB 层看不出来,也白一次 commit。
                 #
@@ -183,12 +194,25 @@ async def chat_stream(
                 # 另起一种日志形状等于让读日志的人多学一套。
                 # `layer1_tokens` / `layer1_budget` 一起报:只报「挪了」而不报
                 # 「为什么挪」,读的人还得自己去推(本仓「日志里的数必须是真的」)。
+                #
+                # ⚠️ **必须打在 `advance_anchors` 之后**(终审 Important 3):这行
+                # 是全分支**唯一一条「真假取决于后面那句成不成」的日志**。写库抛了
+                # 而日志已经落下 ⇒ 它声称的是一次**没有发生过**的降级,而验收 2
+                # 正是 grep 这一行 ⇒ 一个失败请求会被读成「级联的第一环跑过了」。
+                # 顺序反过来之后,这行只在**锚点真的推进了**之后才存在。
+                #
+                # 旧值因此必须来自上面那个局部变量、**不能**现读 `conv` ——
+                # 这条 UPDATE 已经把会话对象上的锚点改成新值了(见 `old_layer1_from`
+                # 那段的说明;实测现读会打出 `from == to`)。
+                await advance_anchors(
+                    session=session, conversation_id=session_id, layer1_from=layer1_from
+                )
                 logger.info(
                     "layer1 降级 %s",
                     json.dumps(
                         {
                             "conversation_id": session_id,
-                            "from": conv.layer1_from_msg_id,
+                            "from": old_layer1_from,
                             "to": layer1_from,
                             # 挪**之后**的层 1 用量:它就是「装下了」的证据
                             # (所以必然 <= budget)。
@@ -197,9 +221,6 @@ async def chat_stream(
                         },
                         ensure_ascii=False,
                     ),
-                )
-                await advance_anchors(
-                    session=session, conversation_id=session_id, layer1_from=layer1_from
                 )
 
             # ---- 摘要任务:起在后台,**不 await** ----

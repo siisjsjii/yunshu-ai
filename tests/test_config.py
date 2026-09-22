@@ -161,8 +161,11 @@ def test_ch03_fields_have_defaults():
     assert s.milvus_collection == "knowledge"
     assert s.rerank_top_k == 5
     # 0.25 是实测定出来的(2026-09-20,混合+重排链路),不是随手取的数:
-    # 能命中的正例 top-1 最低 0.389 / 干扰项 top-1 最高 0.114 → 区间 (0.114, 0.389]。
+    # 能命中的正例(取「含齐期望片段那一块」的分)最低 0.358 / 干扰项 top-1 最高 0.114
+    # → 区间 (0.114, 0.358]。上界曾被写成 0.389 —— 那是 **top-1 代理量**,偏乐观
+    # (实测有一条正例靠**第 3 名**的 0.358 命中,top-1 却是 0.766)。
     # 推导细节在字段旁边(app/config.py),这里只钉默认值不被静默改掉。
+    # ⚠️ 这两个数同样是 `rerank_top_k = 3` 下测的,而它的默认值现在是 5。
     assert s.retrieval_score_threshold == 0.25
     assert s.dedupe_threshold == 0.95
     assert s.chunk_max_chars == 800

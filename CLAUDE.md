@@ -38,6 +38,20 @@ bash scripts/acceptance.sh                                      # 端到端验�
 bash scripts/acceptance_ch07.sh                                 # ch07 验收 1–5;⚠️ **自己起服务**(8000 演示配置 / 8001 默认配置)
 # ↑ 跑之前先清空 8000/8001;它自己截断 log/app.log(不截断的话断言会命中旧行而恒真)
 
+# 建库 / 升级(Milvus 另需 docker start milvus-standalone;BGE-M3 等权重由 main.py 预热)
+.venv/Scripts/python.exe scripts/init_db.py                     # 建表:create_all,只建**不存在的表**
+# ⚠️ **`init_db.py` 永不加列。** `create_all` 对已存在的表是**空操作** —— 它不会
+#    比对形状,也不会报错。所以**每个带 `db/chNN.sql` 的章都必须在 init_db 之外
+#    再执行那份 DDL**,升级一个老库时尤其:`db/ch03.sql`(knowledge_chunks)、
+#    `db/ch04.sql`(low_confidence_questions)、`db/ch06.sql`(refund_requests)、
+#    **`db/ch07.sql`(新表 conversation_summaries + conversations 的两个锚点列)**。
+#    漏掉 ch07 那份的后果不是「少个功能」:`conversations` 缺两列、`conversation_summaries`
+#    整张表不存在 ⇒ **每一个请求**都在 `ensure_conversation` 或分层读锚点那一步炸,
+#    而报错指向 SQL 列名,读起来像「ORM 写错了」。四份文件都不幂等(重复执行**响亮地失败**,
+#    这是刻意的:静默跳过会让「表已存在但形状不对」永远补不上);顺序上 `db/ch07.sql`
+#    自己**先 ALTER 后 CREATE**,必须在它内部的次序就是那样,别再调。
+#    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07`。
+
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)
 .venv/Scripts/python.exe scripts/build_kb.py --reindex          # 全表打回 pending + 删集合 + 重算
@@ -77,6 +91,17 @@ scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)
 ```
 
 ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm, retrieval}`,仍是单向。
+
+**ch07 又加了两条反向边**(上面那条「严格单向」因此不再完整,而它是本仓最容易被
+后来人当成公理的一条):`app/memory/summarize.py` → `app/services/history.py`
+(记账在 ch07 spec §12.2①),以及 `app/memory/tasks.py` → `app/services/history.py`
+与 `app.db.models`(模块 docstring 也记了一份)。**图仍然无环** ——
+`app/services/history.py` 只依赖 `app.db.models` 与 `app.schemas`,不回头引 `memory`,
+所以这不是缺陷,不需要重构。两条的理由相同:那段读历史的 I/O(`load_history`)
+与「落库 + 推锚点」的**原子动作**只有一份实现,在 `memory/` 里重写一遍就是同一条
+规则两处实现。**代价已记账**:日后若 `services/history.py` 反过来 import `memory`
+就会成环,届时把 `append_summary_and_advance` 换成一个传入的回调即可,
+改动局限在 `summarize_range` 的签名。
 
 两条贯穿性的结构约定:
 
@@ -261,7 +286,8 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - **工具选择准确率 13/15 = 86.7% 可引用**(闭式枚举,与 ch01 那个被样本拟合的 `expected_solution` 关键词口径不同)。但引用时须一并说明:**该数字是在没有生产 system prompt 的条件下测得的**,且**用例集偏弱**(非 null 的 13 条里 11 条从不失误,信息量主要来自 2 条诱饵)。
 - `evals/extract_cases.jsonl`(ch01)的 `expected_solution` 分数**不可引用** —— 关键词是看到输出措辞后才放宽的。
 - `evals/retrieval_cases.jsonl`(ch03)—— 23 条(19 换说法正例 + 4 干扰项),闭式口径(期望片段取自语料**逐字原文**且须在**同一块**里全部出现,不掺主观判断)。**⚠️「23/23」那一版是 ch03 的 dense 单路;ch04 换混合+重排后从未复核过,现链路是 13/23** —— 引用时必须说清是哪条链路。用例自造、4 条干扰项里 3 条离阈值很远、不构成压力;**「卖手机」是唯一有信息量的近域硬负例**。
-- 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。**0.58 是在 dense 余弦分数上标定的**(正例最低 0.609 / 干扰最高 0.560,区间仅 0.049 宽),ch04 换混合+重排时**原值沿用**,而重排器输出的是 **sigmoid** 分数 —— 两把尺子不可通约,0.58 比可用区间上界还高。现链路实测可用区间 **`(0.114, 0.389]`**(宽 0.275),取中点。`dedupe_threshold` = 0.95 **仍是未实测值** —— 真实数据上从未被触发过,不要当成已验证的。
+  - **⚠️ 追加限定(2026-09-22,ch07 终审):这个 13/23 是 `rerank_top_k = 3`(旧的 `retrieval_top_k`)下测的**。ch07 把该旋钮的默认值改成 **5**(spec §9.1 授权),也就是说**现在放行的块更多**、这条链路的口径与那次测量**不是同一个配置**,而**从未在新默认值下复核过**。引用它时必须一并说明这一点 —— 与上面「dense 单路 vs 混合+重排」是同一类限定:**一个看起来已经验过、其实描述的是另一套配置的数**。
+- 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。**0.58 是在 dense 余弦分数上标定的**(正例最低 0.609 / 干扰最高 0.560,区间仅 0.049 宽),ch04 换混合+重排时**原值沿用**,而重排器输出的是 **sigmoid** 分数 —— 两把尺子不可通约,0.58 比可用区间上界还高。现链路实测可用区间 **`(0.114, 0.358]`**(宽 0.244),取中点。**⚠️ 这两个数同样是 `rerank_top_k = 3` 下测的**(见上一条的追加限定)。上界一度被写成 `0.389`:那是按 **top-1 代理量**算的,偏乐观 —— 实测有一条正例靠**第 3 名**的 0.358 命中,而它的 top-1 是 0.766(`_rerank` 返回 Top-K,阈值判的是「含齐期望片段那一块」的分)。订正过程见 `dev-notes/ch05.md` 阶段 21 与 ch03/ch04/ch05 spec 的后记。`dedupe_threshold` = 0.95 **仍是未实测值** —— 真实数据上从未被触发过,不要当成已验证的。
 - **`retrieval_score_threshold` 改一次要动两处,它们是一致的**:`app/tools/registry.py` 传给 retriever(过滤块)与 `app/agent/nodes.py` 的置信度闸(取 max 比阈值)。因为 `retrieve_knowledge` 拿到的块**已经**过同一阈值,闸的 `max(scores) >= threshold` 在有 evidence 时几乎恒真 —— **闸的实际效果约等于「检索是否返回非空」**。
 - `evals/summary_cases.jsonl`(ch07)—— 11 条**摘要**标注样例,四类:正例 3 / 负例 2 / **幻觉探针** 2 / 四样提炼物(product、identifier、request、unresolved)各 1。口径**闭式**(关键词、字数上限、`\d{4,32}` 正则)。**实测 9/11**:两条负例(纯寒暄)判 MISS —— 模型**不返回空串**,而是吐约 40 字的**元叙述**(「本次对话未涉及任何商品…」)。**它没有编事实,但那句正是 prompt 点名的「对话状态一律不留」** ⇒ 这条既是「prompt 遵从度不满」的读数,也说明 T8 的「空输出退路」在真实模型上**很难触发**。**引用时必须带上这句**,别把 9/11 读成「实现坏了」。
   - **幻觉探针的判别力靠一个前提**:该用例的对话里**本来就没有** `\d{4,32}` 形态的数字。脚本对每条探针**自动核对这个前提**(用例自检),不成立就单独报 `!!!` 而不混进 MISS。另有**探针自检**:`\d{4,32}` 必须能匹配 `20240915`/`13800138000`(真会出现的形态)、**不能**匹配 `99` —— 后者正是 ch06 T1 那条**同义反复断言**(用 `\d{4,32}` 匹配「99」,长度对不上 ⇒ 恒真)的反面教材。

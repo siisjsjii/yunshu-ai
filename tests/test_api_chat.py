@@ -1883,8 +1883,12 @@ def test_degrade_is_logged_with_both_the_old_and_the_new_anchor(
        默认的 0 时,「报了真值」与「谁填了个 0」给出同一个观测值);
     ② `to` 与**库里最终那个值**一致 —— 报一个没落库的边界等于说谎;
     ③ `from != to != 0` 是前提:真的挪了、且两个值都不是默认值;
-    ④ `0 < layer1_tokens <= layer1_budget` —— 数的是**挪之后**的层 1 用量
-       (它就是「装下了」的证据)。报挪之前那个数(必然超预算)会在这里红。
+    ④ `layer1_tokens` **对着生产代码现算的层 1 用量**比。原先这里只断
+       `0 < layer1_tokens <= layer1_budget`,而那个尺度下 `layer2_tokens` 也满足
+       它(**两个数都是正的、都小于预算**)⇒ 断言分不出两个字段(终审 Minor 10)。
+       改成与 `summary trigger` 那条同款的 cross-check:拿**写进库的锚点**现切一次,
+       逐字比。写死成常量同样不行 —— 那样「报的是挪**之前**的层 1(必然超预算)」
+       也过得了。
     """
     fired: list[str] = []
     monkeypatch.setattr(
@@ -1905,10 +1909,24 @@ def test_degrade_is_logged_with_both_the_old_and_the_new_anchor(
     assert payload["from"] == 10                                        # ①
     assert payload["to"] == db.conversations[SCRATCH_CONV].layer1_from_msg_id   # ②
     assert payload["from"] != payload["to"] != 0                        # ③
-    assert 0 < payload["layer1_tokens"] <= payload["layer1_budget"]     # ④
     assert payload["layer1_budget"] == memory_budget.derive(
         settings=settings, system_prompt=render_system_prompt(settings.brand_name)
     ).layer1_budget
+    # ④ 日志里那个数必须**等于**生产代码对同一批消息、同一对锚点切出来的层 1 用量。
+    #    (`db.messages[:_SUMMARY_ROWS]` 是这次请求**开始前**库里的全部历史 ——
+    #     本轮新增的那两条由 `log_turn` 在流里追加,晚于这一行日志。)
+    got = layers.split(
+        [Message(id=m.id, role=m.role, content=m.content)
+         for m in db.messages[:_SUMMARY_ROWS]],
+        summary_upto_msg_id=0,
+        layer1_from_msg_id=db.conversations[SCRATCH_CONV].layer1_from_msg_id,
+        settings=settings,
+    )
+    # 前提:`layer1_tokens` 在这个尺度上**真的与 `layer2_tokens` 不同** ——
+    # 不然「报错了字段」与「报对了」会给出同一个观测值(那正是上面那句旧断言的问题)。
+    assert got.layer1_tokens != got.layer2_tokens
+    assert got.layer1_tokens <= payload["layer1_budget"]      # 前提:「装下了」
+    assert payload["layer1_tokens"] == got.layer1_tokens
 
 
 def test_no_degrade_means_no_degrade_log_line(client_factory, monkeypatch, caplog):

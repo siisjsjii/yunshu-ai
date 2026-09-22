@@ -155,37 +155,47 @@ def run_summary_in_background(*, conversation_id: str, settings: Settings, model
     既有约定一致:不在模块层建全局单例)。`model_factory(settings)` 只在
     **真的有东西可压**时才被调用。
     """
+    # ⚠️ **锁里只改状态,不打日志**(终审 Minor 8)。理由不是洁癖:
+    # 日志 handler 是**外部代码**(文件 I/O、格式化、将来可能是网络 handler),
+    # 它的耗时不可控,而 `_INFLIGHT_LOCK` 是**全局**的 —— 一个慢 handler 阻塞的
+    # **不是**这一个会话,而是**所有**会话的摘要准入。所以两条 `skip` 路径都改成
+    # 「锁里置标记、出锁后打日志」。返回值与日志内容都不变。
+    skip_reason: str | None = None
     with _INFLIGHT_LOCK:
         if conversation_id in _INFLIGHT:
-            _emit("skip", conversation_id=conversation_id, reason=SKIP_ALREADY_RUNNING)
-            return False
-        # 登记必须在**起线程之前、且在锁里**:反过来的话,两个几乎同时到达的调用
-        # 都能通过上面那个检查,于是两个线程压同一段原文。
-        _INFLIGHT.add(conversation_id)
-        try:
-            threading.Thread(
-                target=_thread_target,
-                name=f"summary-{conversation_id}",
-                # daemon:摘要是**可以丢的**活。进程退出时不需要等它,而它自己失败
-                # 也无妨(边界不动,下一轮再来)—— 与 ch04 的后台任务同款。
-                daemon=True,
-                kwargs={
-                    "conversation_id": conversation_id,
-                    "settings": settings,
-                    "model_factory": model_factory,
-                },
-            ).start()
-        except Exception:
-            # 起不来 ⇒ 撤销登记(见 docstring),并且**不往上抛**:给一个后台任务
-            # 起的线程失败,不该让用户这一轮的回复变成 500 —— 「摘要失败不影响
-            # 回复」是本模块从头到尾的那条线。
-            #
-            # 只接 `Exception` 不接 `BaseException`:`_INFLIGHT` 是**进程内**的
-            # 内存状态,KeyboardInterrupt 那条路上进程本来就要走,登记跟着一起
-            # 消失 —— 而把 Ctrl-C 吞掉才是真的错(ch04 的 `_spawn` 同款)。
-            _INFLIGHT.discard(conversation_id)
-            _emit("skip", conversation_id=conversation_id, reason=SKIP_THREAD_NOT_STARTED)
-            return False
+            skip_reason = SKIP_ALREADY_RUNNING
+        else:
+            # 登记必须在**起线程之前、且在锁里**:反过来的话,两个几乎同时到达的
+            # 调用都能通过上面那个检查,于是两个线程压同一段原文。
+            _INFLIGHT.add(conversation_id)
+            try:
+                threading.Thread(
+                    target=_thread_target,
+                    name=f"summary-{conversation_id}",
+                    # daemon:摘要是**可以丢的**活。进程退出时不需要等它,而它自己
+                    # 失败也无妨(边界不动,下一轮再来)—— 与 ch04 的后台任务同款。
+                    daemon=True,
+                    kwargs={
+                        "conversation_id": conversation_id,
+                        "settings": settings,
+                        "model_factory": model_factory,
+                    },
+                ).start()
+            except Exception:
+                # 起不来 ⇒ 撤销登记(见 docstring),并且**不往上抛**:给一个后台
+                # 任务起的线程失败,不该让用户这一轮的回复变成 500 ——「摘要失败
+                # 不影响回复」是本模块从头到尾的那条线。
+                #
+                # 只接 `Exception` 不接 `BaseException`:`_INFLIGHT` 是**进程内**的
+                # 内存状态,KeyboardInterrupt 那条路上进程本来就要走,登记跟着一起
+                # 消失 —— 而把 Ctrl-C 吞掉才是真的错(ch04 的 `_spawn` 同款)。
+                _INFLIGHT.discard(conversation_id)
+                skip_reason = SKIP_THREAD_NOT_STARTED
+
+    if skip_reason is not None:
+        _emit("skip", conversation_id=conversation_id, reason=skip_reason)
+        return False
+    # 走到这里只可能是「线程起来了」:上面两条出口都设了 `skip_reason`。
     return True
 
 
@@ -260,11 +270,13 @@ async def _run(
         summary_upto, layer1_from, history = await _reload_state(engine, conversation_id)
 
         # 区间就是**层 2**:`(summary_upto, layer1_from)` 两端都不含。
-        # 这里直接借用 `layers._middle` 而不是自己写一遍 —— 那是**同一条区间规则**
+        # 这里直接借用 `layers.middle` 而不是自己写一遍 —— 那是**同一条区间规则**
         # 的第二处实现,而它的漂移形态(ch07 spec §12.1 ①)正是「同一条消息同时
         # 落在两层里 ⇒ 上下文凭空翻倍」,两边都不报错。`layer1_from == 0`
         # (层 1 起于最早 ⇒ 层 2 为空)的语义也一并由它保证。
-        turns = layers._middle(history, after_id=summary_upto, before_id=layer1_from)
+        # (终审 Minor 7:`layers.middle` 是**公开名** —— 跨模块调私有名是在说
+        #  「这是内部细节」,与事实相反。旧名 `_middle` 保留为别名。)
+        turns = layers.middle(history, after_id=summary_upto, before_id=layer1_from)
 
         if not turns:
             _emit(
@@ -349,7 +361,7 @@ async def _run(
 async def _reload_state(engine, conversation_id: str) -> tuple[int, int, list[Message]]:
     """重读 `(summary_upto, layer1_from, 该会话的全部历史)`。**单测的接缝。**
 
-    返回的是**整段历史**而不是切好的区间:区间由 `_run` 用 `layers._middle` 从
+    返回的是**整段历史**而不是切好的区间:区间由 `_run` 用 `layers.middle` 从
     **重读到的**两个锚点现切。这样「重读」与「切区间」用的是同一份锚点,不可能
     出现「用新锚点判定、用旧锚点切」那种两处答案。
 

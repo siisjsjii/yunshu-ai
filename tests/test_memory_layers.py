@@ -59,6 +59,31 @@ def test_split_with_zero_anchors_puts_everything_in_layer1():
     assert got.layer2 == []
 
 
+def test_messages_without_ids_land_in_layer1_only():
+    """没有 MySQL id 的消息(手工构造 / 尚未落库)**只进层 1**,绝不两层都占。
+
+    它的失效形态**正是** spec §12.1① 修掉的那个重复注入:组装是
+    `layer2 + layer1`,同一条落进两层就是**注入两遍** —— 不报错、不丢消息,
+    只是上下文凭空翻倍,而每一轮的回复看起来都正常(终审 Minor 11:这条规则
+    此前**没有任何用例**)。
+
+    三个锚点组合都覆盖:`0/0`(新会话,层 2 为空)、`0/7`(层 2 非空)、
+    `2/7`(两个锚点都非零)。
+    """
+    s = _settings()
+    pending = Message(role="user", content="刚发出去、还没落库的一句原话")
+    for upto, from_ in ((0, 0), (0, 7), (2, 7)):
+        got = layers.split(
+            [*_history(), pending],
+            summary_upto_msg_id=upto, layer1_from_msg_id=from_, settings=s,
+        )
+        # 「恰好出现一次」按 id 是否为 None 数 —— 比 `list.count(msg)` 稳:
+        # 后者依赖 pydantic 的等值语义,而这里要问的就是**这一条**的去向。
+        assert sum(m.id is None for m in got.layer2 + got.layer1) == 1, (upto, from_)
+        assert all(m.id is not None for m in got.layer2)
+        assert [m.content for m in got.layer1 if m.id is None] == [pending.content]
+
+
 def test_layer2_tokens_are_counted_on_the_truncated_form():
     """**本任务的核心断言**:层 2 的计数必须按截短后。
 
@@ -117,10 +142,11 @@ def test_degrade_moves_the_boundary_forward_only_and_lands_on_a_round_start():
     new_from = layers.degrade(
         h, summary_upto_msg_id=0, layer1_from_msg_id=0, layer1_budget=1, settings=s
     )
-    assert new_from >= 0
-    if new_from:
-        moved = next(m for m in h if m.id == new_from)
-        assert moved.role == "user"
+    # `> 0` 而不是 `>= 0`:后者在「边界压根没挪」(返回入参 0 或任何负数)时
+    # 同样成立 —— 它是一条**恒真**断言,还顺手让下面那句查不到消息(终审 Minor 10)。
+    assert new_from > 0
+    moved = next(m for m in h if m.id == new_from)
+    assert moved.role == "user"
 
 
 def test_degrade_returns_the_same_value_when_already_within_budget():
@@ -134,13 +160,36 @@ def test_degrade_returns_the_same_value_when_already_within_budget():
 
 
 def test_degrade_never_crosses_below_summary_upto():
-    """`layer1_from >= summary_upto` 是不变量,降级也必须守。"""
+    """`layer1_from >= summary_upto` 是不变量;而**返回值永不小于入参**(单调)。
+
+    ⚠️ 这条用例原先**驱动不到它命名的那条分支**:合法入参下
+    `if nxt <= summary_upto_msg_id` 是**不可达**的(`summary_upto <= layer1_from
+    <= cur`,而那里 `nxt > cur`,三者不可能同时成立),所以旧写法
+    `return summary_upto_msg_id` 永远跑不到,断言 `>= 6` 也永远只走正常出口
+    (终审 Minor 6)。要驱动它,必须喂一对**相对不变量不可能出现**的锚点
+    (`summary_upto > layer1_from`)—— 那正是这个防御分支存在的理由:
+    调用方送来坏值时的兜底。
+
+    **为什么兜底值必须是 `cur`**:`return summary_upto_msg_id` 会返回一个
+    **比入参更小**的值,而端点只在 `layer1_from != conv.layer1_from_msg_id`
+    时才写库 ⇒ 那个更小的值会被写进去:层 2 当场清空、已进梗概的原文被拉回
+    层 1 再注入一遍(spec §12.1① 的重复注入形状,**不报错**)。
+    """
     h = _history()
     s = _settings()
+
+    # ① 正常出口:合法入参下它只往前走,不越过 summary_upto。
     assert layers.degrade(
         h, summary_upto_msg_id=6, layer1_from_msg_id=7,
         layer1_budget=0, settings=s,
     ) >= 6
+
+    # ② 防御出口:入参故意违反不变量(8 > 1)⇒ 边界**原样不动**,不是倒退。
+    #    期望值取 1(= 入参)而不是 `>= 1` —— 后者对「返回 8」的旧实现同样成立。
+    assert layers.degrade(
+        h, summary_upto_msg_id=8, layer1_from_msg_id=1,
+        layer1_budget=0, settings=s,
+    ) == 1
 
 
 def test_degrade_lets_the_last_round_overflow_rather_than_emptying_layer1():
@@ -177,7 +226,11 @@ def test_degrade_loops_until_it_converges():
                            layer1_budget=10 ** 6, settings=tight)
     tight_from = layers.degrade(h, summary_upto_msg_id=0, layer1_from_msg_id=0,
                                 layer1_budget=1, settings=tight)
-    assert tight_from >= loose
+    # `loose == 0` 是前提(预算足够大 ⇒ 边界停在原地;`_history()` 的轮数又不止
+    # 一轮,所以"装得下就返回入参"这条与"压根没挪"在这里由它区分)。
+    # 而 `tight_from >= loose` 是 `9 >= 0` —— **恒真**,任何返回值都过得了(终审 Minor 10)。
+    assert loose == 0
+    assert tight_from > loose
     assert layers.split(h, summary_upto_msg_id=0, layer1_from_msg_id=tight_from,
                         settings=tight).layer1_tokens <= 1 or tight_from == 9
 

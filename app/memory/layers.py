@@ -46,13 +46,13 @@ def _tail(history, *, from_id: int) -> list[Message]:
     """层 1:`id >= from_id`(**含**),按原序。`from_id == 0` 表示起于最早。
 
     `id is None` 的消息(手工构造、尚未落库的)**一律算层 1**:它们是最新的,
-    而层 1 正是"最近原文"那一层。`_middle` 的 docstring 说明为什么它们**只能**
+    而层 1 正是"最近原文"那一层。`middle` 的 docstring 说明为什么它们**只能**
     在这一层。
     """
     return [m for m in history if m.id is None or m.id >= from_id]
 
 
-def _middle(history, *, after_id: int, before_id: int) -> list[Message]:
+def middle(history, *, after_id: int, before_id: int) -> list[Message]:
     """层 2:`after_id < id < before_id`,两端都**不含**,按原序。
 
     `before_id == 0` ⇒ **层 2 为空**(spec §3.1 表里 `layer1_from_msg_id` 的 `0` 语义,
@@ -62,10 +62,22 @@ def _middle(history, *, after_id: int, before_id: int) -> list[Message]:
     **不报错、不丢消息,只是上下文凭空翻倍**。
 
     `id is None` 的消息**进不了层 2**(它们在 `_tail` 里),否则同一条会被注入两遍。
+
+    **公开名,不是私有名**(终审 Minor 7):`app/memory/tasks.py` 的摘要任务要切
+    **同一个区间**,而重写一遍这条规则就是同一规则的两处实现 —— 它漂移的形态
+    正是「同一条消息同时落在两层里 ⇒ 上下文凭空翻倍」(spec §12.1①),
+    两边都不报错。跨模块调私有名是在说「这是内部细节」,与事实相反。
+    (同类先例:`trim._to_rounds` 在 ch07 因为 `degrade` 也要用而改名 `to_rounds`。)
     """
     if before_id == 0:
         return []
     return [m for m in history if m.id is not None and after_id < m.id < before_id]
+
+
+#: 兼容别名:`_middle` 这个名字在 ch07 的实现/审查/变异脚本里出现过。
+#: 保留一个别名比让旧引用**静默 ImportError/AttributeError** 便宜 ——
+#: 但新代码一律用 `middle`(它才是公开契约)。
+_middle = middle
 
 
 def _first_id(round_: list[Message]) -> int | None:
@@ -130,7 +142,7 @@ def split(
     「按截短后数」是层 2 存在的全部意义:按原文数的话 §3.4 的截短就退化成
     纯渲染装饰,级联(何时摘要)与截短有没有做**完全无关**。
     """
-    layer2_raw = _middle(
+    layer2_raw = middle(
         history, after_id=summary_upto_msg_id, before_id=layer1_from_msg_id
     )
     layer1 = _tail(history, from_id=layer1_from_msg_id)
@@ -166,7 +178,7 @@ def resplit(
     不接 `Settings`:本函数**不做任何截短**,没有可配的东西。
     """
     return _assemble(
-        _middle(history, after_id=summary_upto_msg_id, before_id=layer1_from_msg_id),
+        middle(history, after_id=summary_upto_msg_id, before_id=layer1_from_msg_id),
         _tail(history, from_id=layer1_from_msg_id),
         summary_upto_msg_id=summary_upto_msg_id,
         layer1_from_msg_id=layer1_from_msg_id,
@@ -214,5 +226,14 @@ def degrade(
         if nxt is None or nxt <= cur:
             return cur
         if nxt <= summary_upto_msg_id:
-            return summary_upto_msg_id      # 守住不变量
+            # 防御分支:在**合法**入参下不可达(`summary_upto <= layer1_from <= cur`,
+            # 而这里 `nxt > cur`,三者不可能同时成立)。它只在调用方送来一对
+            # 违反不变量的锚点时生效 —— 那时**返回 `cur`(原地不动)才是安全的**:
+            # `cur` 是本次的入参或它的前进值,返回它同时保住**单调性**
+            # (返回值永不小于入参)与不变量。
+            # 曾经的写法 `return summary_upto_msg_id` 会返回一个**比入参更小**的值
+            # —— 而端点只在 `layer1_from != conv.layer1_from_msg_id` 时才写库,
+            # 于是那个更小的值会被写进去:层 2 当场清空、已进梗概的原文被拉回层 1
+            # 再注入一遍(spec §12.1① 那种重复注入的形状,不报错)。
+            return cur
         cur = nxt

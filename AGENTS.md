@@ -106,8 +106,8 @@ ch03 前置:`docker start milvus-standalone`(容器名固定,重建时必须带 
 
 - `evals/tool_selection_cases.jsonl`:15 条,**13/15 = 86.7% 可引用**,但引用时须说明:无生产 system prompt 条件下测得、用例集偏弱。
 - `evals/extract_cases.jsonl` 的 `expected_solution` 分数**不可引用**(关键词是看到输出后才放宽的)。
-- `evals/retrieval_cases.jsonl`(ch03):23 条,**闭式口径**(期望片段取自语料逐字原文且须同块命中),不掺主观判断。**⚠️「23/23」是 ch03 的 dense 单路;ch04 换混合+重排后从未复核,现链路 13/23** —— 引用必须说清是哪条链路。用例自造、干扰项 4 条中 3 条离阈值很远。
-- 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。0.58 在 **dense 余弦**上标定,ch04 换混合+重排后原值沿用,而重排器输出的是 **sigmoid** 分数,两把尺子不可通约。现链路可用区间 `(0.114, 0.389]`,取中点。改它要同时想到两处消费者:`app/tools/registry.py`(过滤块)与 `app/agent/nodes.py` 的置信度闸。
+- `evals/retrieval_cases.jsonl`(ch03):23 条,**闭式口径**(期望片段取自语料逐字原文且须同块命中),不掺主观判断。**⚠️「23/23」是 ch03 的 dense 单路;ch04 换混合+重排后从未复核,现链路 13/23** —— 引用必须说清是哪条链路。**⚠️ 追加限定(ch07 终审):13/23 与下面那个区间都是 `rerank_top_k = 3` 下测的**,而 ch07 把默认值改成了 **5** —— 它们描述的不是现在这条链路,且从未在新默认值下复核。用例自造、干扰项 4 条中 3 条离阈值很远。
+- 阈值 `retrieval_score_threshold` = **0.25**(2026-09-20 重定,原 0.58)。0.58 在 **dense 余弦**上标定,ch04 换混合+重排后原值沿用,而重排器输出的是 **sigmoid** 分数,两把尺子不可通约。现链路可用区间 `(0.114, 0.358]`(上界一度写成 `0.389` —— 那是 **top-1 代理量**,偏乐观;真值取「含齐期望片段那块」的分,订正见 ch05 dev-notes 阶段 21),取中点。改它要同时想到两处消费者:`app/tools/registry.py`(过滤块)与 `app/agent/nodes.py` 的置信度闸。
 - `evals/results/` 已 gitignore,是历史运行产物。
 - **ch05/ch06 的关键实测约束**:`astream(stream_mode="custom")` **会静默吞掉 `interrupt()`**(只从 `updates` 浮出);**resume 会让节点从头重跑**(放 `interrupt()` 的节点里不能有别的事);**未在 `ChatState` 声明的通道写入被静默丢弃**(ch06 因此丢过一整个交付物)。
 

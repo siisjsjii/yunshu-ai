@@ -62,10 +62,21 @@ async def append_turn(
     调用方只在**流完整走完后**才调它 —— 与 ch01「半截回复不污染历史」
     的语义一致,也避免留下"有问无答"的孤儿行。
 
-    ch07 起返回值是必需的:ReAct 往返(assistant 带 tool_calls / tool / 收尾
-    assistant)落库后,要把它们的 `messages.id` 写回 state,下一轮分层才认得出
-    哪些消息已经是「库里的历史」。`flush()` 在这里只为一件事 —— 拿自增主键;
-    `commit()` 才让整轮同时生效(半轮历史 = 有问无答的孤儿行)。
+    `flush()` 在这里只为一件事 —— 拿自增主键;`commit()` 才让整轮同时生效
+    (半轮历史 = 有问无答的孤儿行)。
+
+    **返回值的消费者,如实记(终审 Minor 9)**:ch07 曾经把它写成「落库后把
+    `messages.id` 写回 state,下一轮分层才认得出哪些消息已经是库里的历史」——
+    **那条路不存在**。`app/agent/nodes.py` 的 `log_turn` **丢弃**本函数的返回值,
+    而 spec §7.4 已把它订正为:精简版**从 `load_history` 派生**(那一份本来就带
+    `Message.id`),不从 `state["messages"]` 派生(后者除播种那一批外拿到的都是
+    `add_messages` 现赋的 uuid4,与两个锚点不可比)。所以今天**生产代码里没有
+    读者**,只有测试(`tests/test_history.py` 用它逐条比对
+    `load_history` 填回的主键与顺序)。
+    留着返回值不是为了将来,是因为它**免费**(`flush` 本来就要跑)且是
+    「同一事实只有一个来源」的落点:哪个 id 属于刚写进去的行,只有这里知道。
+    与它同族的是 `append_summary_and_advance` 的 `-> int`(`seq` 从落库那一步
+    返回,而不是让调用方再查一遍)。
     """
     records: list[MessageRecord] = []
     for message in messages:

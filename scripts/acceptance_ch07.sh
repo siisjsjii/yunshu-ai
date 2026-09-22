@@ -415,6 +415,17 @@ eb_get() { printf '%s\n' "$1" | sed -n "s/.*$2=\([0-9]*\).*/\1/p"; }
 #   * 不阻塞实现:首帧在摘要还在跑的时候就发出去了 ⇒ 至少有一轮「首帧 < done」。
 # **必须逐对配**,不能写成「存在某一对首帧 < 某一对 done」:后者在阻塞实现下也成立
 # (上一轮的首帧当然早于下一轮的 done)—— 那就是一条恒真的假断言。
+#
+# ⚠️ **配对基准取「这个任务是什么时候开始的」,不是「done 什么时候到」**(2026-09-22 修)。
+# 原实现按「最后一个 `start <= done` 的轮次」配,而这两件事不是一回事:一次摘要要跑
+# 6~11 秒,完全可以**落在两轮之间的空隙里**。实测(终审后第 2 次验收,`turn13_done_gap_ms=-345`,
+# 一个**假红**):那次 done 属于**第 11 轮**触发的任务(它的 `elapsed_ms=6825` ⇒ 任务始于
+# `done-6825`,落在第 11 轮窗口内),却在第 13 轮请求发出后 48 ms、首帧之前 345 ms 落地,
+# 于是被配到了第 13 轮 —— 按正确配对它是 **+6768 ms(PASS)**。
+# 任务起点在**日志行自己身上**(`done` 行带 `elapsed_ms`,它就是 `_run` 的计时起点),
+# 不需要另立时钟:任务起点必然落在**触发它的那一轮**的窗口里(端点在流开始前的守卫段
+# 同步触发它),用它配对才等于 docstring 说的「配到它触发时那一轮」。
+# **判别力不变**:阻塞实现里 done 早于本轮的 meta 首帧 ⇒ gap 仍为负 ⇒ 照样红。
 nonblock_pairs() {   # $1=sid $2=timing 文件
   "$PYTHON" -c '
 import json, sys
@@ -447,13 +458,17 @@ for line in open(log, "rb").read().decode("utf-8").splitlines():
     if not isinstance(obj, dict) or obj.get("conversation_id") != sid:
         continue
     if "covered_from" in obj:
-        dones.append(int(datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").timestamp() * 1000))
+        at = int(datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").timestamp() * 1000)
+        # 任务**起点** = done 那一刻减去它自报的耗时(`_run` 的计时区间)。
+        # 缺 `elapsed_ms`(旧格式/手工拼的行)时退回 done 本身 —— 那是修之前的行为,
+        # 会重新长出上面那条假红,所以它只是保底,不是等价物。
+        dones.append((at - int(obj.get("elapsed_ms") or 0), at))
 pairs_ok = skipped = 0
 gaps = []
-for d in dones:
+for began, d in dones:
     k = None
     for idx, tn in enumerate(turns):
-        if tn["start"] <= d:
+        if tn["start"] <= began:
             k = idx
     if k is None or turns[k]["frame"] is None:
         skipped += 1
@@ -743,7 +758,10 @@ else
   bad "每一次 summary done 都早于它那一轮的首帧(done=${DON:-0} pairs_ok=${PAIRS:-0})—— 这一轮的回复被摘要挡住了"
 fi
 if [ "${MC1:-0}" -ge 1 ] && [ "${HC1:-0}" -ge 1 ]; then
-  ok "两个上下文日志都在打:model_ctx=$MC1 行(每次调模型前一行)/ history_ctx=$HC1 行(每轮必打)"
+  # `model_ctx` 是**每轮一行**(在 Agent 的 ReAct 循环之前打一次),不是「每次调模型
+  # 前一行」—— 多步的那几轮里第 2、3 步模型调用没有独立的一行(spec §7.6 已订正)。
+  # 所以这里的下界是 `>= 1 行/轮` 而不是相等,`$MC1` 因此会**小于**轮数。
+  ok "两个上下文日志都在打:model_ctx=$MC1 行(每轮一行,见 spec §7.6 的订正)/ history_ctx=$HC1 行(每轮必打)"
 else
   bad "上下文日志缺失(model_ctx=${MC1:-0} / history_ctx=${HC1:-0})"
 fi

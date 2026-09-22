@@ -16,7 +16,7 @@ import pytest
 
 from app.config import Settings
 from app.memory import budget
-from app.memory.trim import ContextOverflowError
+from app.memory.trim import ContextBudgetUnavailable, ContextOverflowError
 from app.prompts import render_system_prompt
 from app.services.chat import prepare_turn
 
@@ -86,10 +86,16 @@ def test_prepare_turn_rejects_a_budget_that_cannot_fit_one_round():
     `history_budget` 落在 4537 > 0 上)。
 
     判别力:判据删掉(不检查)或放宽回 `< 0` ⇒ 这条红(实测见报告)。
+
+    断的是**子类** `ContextBudgetUnavailable`,不是父类(终审 Minor 12):本章
+    此前的修复只钉住了「两个类的文本不同」,没有任何东西断言**这条分支真的
+    走到子类上** —— 实现退回 `raise ContextOverflowError(...)` 时,因为
+    `ContextBudgetUnavailable` 是它的子类,凡是 `pytest.raises(父类)` 的断言
+    都照样绿,而用户看到的是「你的话太长」那种与本故障无关的文案。
     """
     settings = _settings(per_round_steady=10000)
     b = _budget(settings)
     assert 0 < b.history_budget < settings.per_round_steady   # ← 前提:那个中间区间
 
-    with pytest.raises(ContextOverflowError):
+    with pytest.raises(ContextBudgetUnavailable):
         prepare_turn(settings=settings, budget=b, user_input="在吗")
