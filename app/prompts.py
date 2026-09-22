@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 
+from app.memory.trim import count_tokens
 from app.schemas import Message
 
 SYSTEM_PROMPT_TEMPLATE = """你是{brand_name}的在线客服助手,负责处理售前咨询与售后问题。
@@ -144,6 +145,83 @@ def build_messages(
     text = user_input if not evidence else f"{render_evidence(evidence)}\n\n用户问题:{user_input}"
     messages.append(HumanMessage(text))
     return messages
+
+
+#: 梗概段的引导语。**必须写明「这是过去的对话」** —— 不写的话,一段第三人称的
+#: 摘要紧跟在用户原话后面(同一内容里),模型会把它读成「用户刚说的」。
+_SUMMARY_HEADER = "以下是本次会话更早内容的梗概(原文已不再给出):"
+
+
+def _render_tail(*, summary: str, evidence: list[dict] | None) -> str:
+    """把梗概与检索证据合成一段文本,附在用户原话**之后**。
+
+    两者都空时返回**空串**(调用方据此走逐字原话那条路)。
+
+    证据段复用 `render_evidence`:编号规则([n] 按 evidence 顺序)必须与发出去的
+    `citations` 帧是同一套 —— 各写一份的话,模型标的 [1] 与前端可点开的第 1 条
+    会指向不同的块,而两边都「看起来正常」。
+
+    顺序是**梗概在前、证据在后**:梗概是背景,证据是回答本问题的直接依据,
+    贴得离「用户问的那句话」越近越好。
+    """
+    parts = []
+    if summary:
+        parts.append(f"{_SUMMARY_HEADER}\n\n{summary}")
+    if evidence:
+        parts.append(render_evidence(evidence))
+    return "\n\n".join(parts)
+
+
+def _lc_token_counter(messages: list) -> int:
+    """`trim_messages` 要 `Callable[[list[BaseMessage]], int]`,本仓的
+    `trim.count_tokens` 收 `str` —— 这就是那个适配器。
+
+    `tool_calls` **不计入**(与 `trim.select_history` 的既有口径一致:
+    结构性元数据不占预算)。
+
+    `content` 不是 `str` 时(LC 1.x 的 content block 列表)整体 `str()` 兜底 ——
+    按字符数近似,仍是高估侧,与 `count_tokens` 的保守方向一致。本仓的
+    历史经 `to_lc_messages` 产出的都是 `str`,这条只是不让它崩。
+    """
+    total = 0
+    for m in messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total += count_tokens(content)
+    return total
+
+
+def build_context_messages(
+    *,
+    brand_name: str,
+    history: Sequence[Message],
+    user_input: str,
+    summary: str,
+    evidence: list[dict] | None = None,
+) -> list:
+    """组装本轮发给模型的上下文。**定序见 spec §7.3。**
+
+    ```
+    [0]   SystemMessage(人设 + 红线)   ← 每轮逐字节相同,前缀缓存命中区
+    [..]  层 2 截短 / 层 1 原文        ← 已经分好层,这里只负责拼
+    [-1]  HumanMessage(用户原话 + 梗概 + 证据)
+    ```
+
+    ⚠️ **`system` 只有第 0 条这一条**。多一条,上游模板会把所有 system 上提合并,
+    工具定义被挤到可变内容之后,前缀缓存整段作废(spec 需求 3)。
+
+    ⚠️ 梗概与证据**并进用户那条消息、附在原话之后**,不另起一条 ——
+    与 `build_messages` 同形状,只是把证据的位置从原话**前**改到原话**后**
+    (用户 2026-09-22 拍板)。两者都没有时,这条消息就是用户原话**逐字**。
+
+    **层 1 的选择(`trim_messages(strategy="last", start_on="human")`)不在本
+    函数里**,由端点经 `_lc_token_counter` 接入(T10):本函数拿到的
+    `history` 已经是精简版,这样它才是纯函数、可单测。
+    """
+    msgs = [SystemMessage(render_system_prompt(brand_name))]
+    msgs.extend(to_lc_messages(history))
+    tail = _render_tail(summary=summary, evidence=evidence)
+    msgs.append(HumanMessage(f"{user_input}\n\n{tail}" if tail else user_input))
+    return msgs
 
 
 def build_extract_messages(text: str) -> list:
