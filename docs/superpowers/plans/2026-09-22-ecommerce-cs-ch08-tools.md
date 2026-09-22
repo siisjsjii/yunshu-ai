@@ -1153,19 +1153,47 @@ def _spec_from_tool(tool: BaseTool, *, source: str) -> ToolSpec:
 
 
 def _dedupe(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
-    """建表,并在**重名时响亮地失败**。
+    """建表,并处理重名 —— **两条规则,刻意不同**。
 
-    静默去重会让「其中一个胜出」,而谁胜出取决于排序 ——
-    表现是「这个工具偶尔返回另一种数据」,没人查得出来。
+    - **内置 vs 内置 重名 ⇒ 响亮地抛。** 那是**我们自己的**接线 bug;
+      静默去重会让「其中一个胜出」而谁胜出取决于排序 —— 表现是
+      「这个工具偶尔返回另一种数据」,没人查得出来。
+    - **任何涉及 MCP 的重名 ⇒ 丢掉外部那一个 + 一条响亮的 warn,内置留下。**
+
+    ⚠️ 第二条是 T7 的实现者上报后定的:`specs` 里现在**混进了外部来源的清单**,
+    而外部的**名字**和它们的**用途声明**一样不可信 ——
+    **外部 Server 只要起一个叫 `query_order` 的工具,`_dedupe` 上抛就会把
+    每一个聊天请求打成 500。** 那是验收 3 的反面(在 Server 侧加工具本该
+    **不需要动客服系统**),而且外部能让我们的内置工具消失,方向完全错了。
     """
+
+    def _warn(keep: ToolSpec, drop: ToolSpec) -> None:
+        logger.warning(
+            "工具重名,已丢弃外部来源的那一个:name=%s 保留=%s 丢弃=%s",
+            keep.name, keep.source, drop.source,
+        )
+
     out: dict[str, ToolSpec] = {}
     for spec in specs:
-        if spec.name in out:
+        existing = out.get(spec.name)
+        if existing is None:
+            out[spec.name] = spec
+            continue
+        if existing.source == "builtin" and spec.source == "builtin":
             raise ValueError(
-                f"工具重名:{spec.name} 同时来自 "
-                f"{out[spec.name].source} 与 {spec.source}"
+                f"内置工具重名:{spec.name} —— 我们自己的接线 bug"
             )
-        out[spec.name] = spec
+        # **按 `source` 判胜负,不按顺序** —— 顺序是 `build_registry` 的实现细节,
+        # 而这条规则要的是「内置永远赢」。
+        if existing.source == "builtin":
+            _warn(existing, spec)
+            continue
+        if spec.source == "builtin":
+            _warn(spec, existing)
+            out[spec.name] = spec
+            continue
+        # 两边都是外部的:先到先得。
+        _warn(existing, spec)
     return out
 
 
@@ -3076,6 +3104,43 @@ async def test_both_dead_yields_empty_not_an_exception(patch_client):
     assert await mcp_client.discover_mcp_specs(settings=_Settings()) == []
 
 
+def test_mcp_tool_colliding_with_a_builtin_loses_without_raising():
+    """⚠️ **这条是 T7 定稿后补的**(实现者上报的可用性风险)。
+
+    外部 Server 的**名字**和它们的用途声明一样不可信。撞上内置名就上抛的话,
+    **外部只要起一个叫 `query_order` 的工具,每一个聊天请求都会 500** ——
+    那是验收 3 的反面(在 Server 侧加工具本该**不需要动客服系统**),
+    而且方向错了:外部能让我们的内置工具消失。
+
+    断两件事:**内置还在**,且**没有抛**。
+    """
+    from app.tools.spec import ToolSpec
+
+    extra = [
+        ToolSpec(name="query_order", description="外部的冒牌货",
+                 input_schema=_SCHEMA, kind="read", source="mcp:logistics", tool=None)
+    ]
+    reg = build_registry(
+        session=None, conversation_id="c1", settings=None, extra=extra
+    )
+    assert reg["query_order"].source == "builtin", "内置必须赢"
+
+
+def test_two_mcp_servers_colliding_drops_the_later_one():
+    from app.tools.spec import ToolSpec
+
+    extra = [
+        ToolSpec(name="dupe", description="a", input_schema=_SCHEMA,
+                 kind="read", source="mcp:logistics", tool=None),
+        ToolSpec(name="dupe", description="b", input_schema=_SCHEMA,
+                 kind="read", source="mcp:aftersales", tool=None),
+    ]
+    reg = build_registry(
+        session=None, conversation_id="c1", settings=None, extra=extra
+    )
+    assert reg["dupe"].source == "mcp:logistics", "先到先得"
+
+
 def test_registry_merges_builtin_and_mcp():
     """`build_registry` 是**纯组装**:MCP 那半由调用方 await 之后喂进来。
 
@@ -4328,6 +4393,13 @@ git commit -m "feat(ch08): 前端工单预览卡片(确认提交 / 取消,复用
 
 - [ ] **Step 1: 改 `app/config.py`**
 
+> ⚠️ **这三个字段 T7 已经加过了。** 我把任务顺序排错了:`app/mcp/client.py` 的
+> `_connections` 读它们,而那时 T11 还没跑 ⇒ **每一个聊天请求都会 AttributeError**。
+> T7 的实现者按本步的代码逐字补上并做了标记。
+> **所以本步的正确动作是「确认它们已存在、值与下面逐字一致」,不是再定义一遍**
+> —— 重复定义在 pydantic 里是**后一个覆盖前一个**,看不出错。
+> 仍然归本任务的是后面那一条:`tool_retry_attempts` 的默认值 **1 → 2**。
+
 ```python
     # ---- ch08:MCP 接入 ----
     # 两个 URL 给本地演示的默认值(端口与 `mcp_servers/` 两张表一致)。
@@ -4470,16 +4542,18 @@ git commit -m "test(ch08): 配置项 + 端到端验收 1–6"
 - **`agent` 不再是 `_OUTLETS` 成员**,它是条件出口;
 - **`pending_write` / `write_decision` 必须连同每轮清零一起落地**。
 
-并在「数据与产物」段给 `evals/tool_selection_cases.jsonl` 那条**追加一句限定**
-(T3 的实现者上报的口径变更,与 ch07 那条 `rerank_top_k` 追加限定同族):
+并在「数据与产物」段给 `evals/tool_selection_cases.jsonl` 那条**追加限定**:
 
-> **⚠️ 追加限定(2026-09-22,ch08):这个 13/15 是在工具定义的 `assert` 下测得的 —— 本章起工具定义的顺序是
-> **(模块名, 工具名) 排序**(`builtin/` 的自动发现),而旧顺序是 `registry.py` 里
-> 手写的 `[query_order, query_product, query_logistics, query_faq, create_ticket]`。
-> 两者**不是同一个配置** —— 发给模型的工具定义块逐字节不同,而位置偏见是真实存在的。
-> 引用 13/15 时必须一并说明这一点,或重跑一次。**
-
-(写进 CLAUDE.md 时把 `assert` 那半句去掉 —— 上面只是为了让你看清差异在哪个位置。)
+> **⚠️ 追加限定(2026-09-22,ch08)**:这个 13/15 是在**旧配置**下测得的。
+> 本章起有两处变了:① 工具定义的顺序由手写的
+> `[query_order, query_product, query_logistics, query_faq, create_ticket]`
+> 变成 **(模块名, 工具名) 排序**(`builtin/` 的自动发现);
+> ② **`query_logistics` 从内置下线、改由物流 MCP Server 提供**——
+> 而 `evals/run_tool_selection_eval.py` 原先只用 `build_tools`(**内置那一半**),
+> 于是那 3 条物流用例**在结构上不可能通过**。
+> ⇒ T7 把该脚本改成**用生产同款的注册表**(含 MCP 发现,发现失败时同样降级),
+> 否则它测的是一个**与生产不再对应**的工具集。
+> **引用 13/15 时必须说明这一点,或重跑一次。**
 
 - [ ] **Step 4: `CLAUDE.md` 的「高频命令」段加 ch08 两条**
 
