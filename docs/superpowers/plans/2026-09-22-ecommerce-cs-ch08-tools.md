@@ -3879,7 +3879,7 @@ ch05 的验收 5 断 `agent_steps >= 2`,而那个名字读作「步数」、实�
 """
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from app.agent import nodes as agent_nodes
 from app.tools.executor import APPROVED, ERROR_CONFIRMATION_REQUIRED
@@ -4001,15 +4001,20 @@ async def test_other_calls_in_the_same_round_still_get_tool_messages(
     少回灌一个 tool 结果就构成「有 tool_calls 没有对应 tool 消息」,
     上游直接 400 —— 这是 CLAUDE.md 里已有的硬约束。
     """
-    read_call = {
-        "name": "query_order", "args": {"order_id": "1002"},
-        "id": "call_r", "type": "tool_call",
-    }
+    # ⚠️ **待确认的写调用排在**前**、只读排在后** —— 次序是刻意的,别"读着顺"
+    # 就把只读那条挪到前面。T9 的实现者实测:初稿那个次序下,
+    # 「撞到写调用就 `break`」这个变异**是绿的**(只读的 ToolMessage 在 break
+    # 之前就追加完了),也就是说**用例的次序让 brief 自己要求的探针失效了**。
+    # 对调之后变异立刻红,而断言本身一字未改。
     write_call = {
         "name": "create_ticket", "args": {"description": "x"},
         "id": "call_w", "type": "tool_call",
     }
-    model = _Model([_Chunk("", [read_call, write_call])])
+    read_call = {
+        "name": "query_order", "args": {"order_id": "1002"},
+        "id": "call_r", "type": "tool_call",
+    }
+    model = _Model([_Chunk("", [write_call, read_call])])
 
     async def fake_execute(**kw):
         from app.tools.executor import ToolOutcome
@@ -4059,7 +4064,20 @@ async def test_continuation_round_is_unbound_and_keeps_turn_messages(
     assert "agent:write_resumed" in out["trace"]
     # 追加而不是替换
     assert len(out["turn_messages"]) == 3
-    assert model.bound is None, "续跑那一轮**不能**绑 tools"
+    # ⚠️ **初稿写的是 `assert model.bound is None`,它按原文不可能通过。**
+    # 两个理由,任一条都足以否掉它(T9 的实现者实测上报):
+    # ① `make_agent_node` **在工厂里**就绑了(`bound = model.bind_tools(...)`
+    #    在 `async def agent_node` **之外**),而 brief 明令那一行不动 ——
+    #    于是这个文件里**每一条**用例的 `model.bound` 都是 `[]`,永远不是 `None`。
+    #    它断的其实是「工厂没绑」,与「续跑」毫无因果关系。
+    # ② 即便把 `bind_tools` 挪进节点,这条断言**依然零判别力**:初稿的 `_Model`
+    #    让 `bind_tools` 返回 `self`,于是两条路调的是**同一个** `astream`、
+    #    同一个计数器 ——「续跑走的是哪一份」在替身里**不可观测**。
+    #    (本仓记过的形状:**替身替被测对象完成了语义**。)
+    #
+    # **修法**:替身补齐到生产形状(`bind_tools` 返回一个**独立的** `_Bound`,
+    # 它有自己的 `astream` 与计数器),然后断那个**可观测的量**:
+    assert model.bound.calls == 0, "续跑那一轮**不能**走绑了 tools 的那份"
 
 
 @pytest.mark.anyio
