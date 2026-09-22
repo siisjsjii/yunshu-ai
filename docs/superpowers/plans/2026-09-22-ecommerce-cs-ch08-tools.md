@@ -1844,7 +1844,13 @@ async def execute_tool(
             message = f"工具 {name} 是写操作,需要用户确认后才能执行。"
             return ToolOutcome(
                 tool_call_id, name, False, message, _summarize(message),
-                ERROR_CONFIRMATION_REQUIRED, preview=dict(args), source=spec.source,
+                # ⚠️ `isinstance` 判定,不是 `dict(args)`:后者在 args 非 dict 时会抛,
+                # 而这个位置**没有 handler 罩着** ⇒ 逃出 `execute_tool`,而不是变成这套
+                # 分类学承诺的可恢复 `invalid_args`。宽容的 `validate_args` 在闸**之后**,
+                # 所以「畸形 args 的写调用」恰好是唯一绕开它的地方。(T4 审查发现的。)
+                ERROR_CONFIRMATION_REQUIRED,
+                preview=args if isinstance(args, dict) else {"_raw": args},
+                source=spec.source,
             )
         if write_decision == DENIED:
             message = f"用户取消了 {name} 的调用,未执行。"
@@ -1857,6 +1863,17 @@ async def execute_tool(
             return ToolOutcome(
                 tool_call_id, name, False, message, _summarize(message),
                 ERROR_PERMISSION_DENIED, source=spec.source,
+            )
+        if write_decision != APPROVED:
+            # 认不出的决议 = **接线 bug**,不是用户动作。
+            # ⚠️ **不许**把它当成「用户取消」:那会在审计表里写一条**谎报用户行为**的行,
+            # 而验收 5 读的正是那张表(`permission_denied` 的语义是「**用户**点了取消」)。
+            # **响亮地抛**(→502)且**不审计** —— 没有任何真实调用发生过。
+            # 与 `tool_missing` 同族:接线 bug 要暴露,不要伪装成一次正常结果。
+            # (T4 审查发现的 fail-open:初稿的 `else → 执行` 会让任何拼错的值
+            #  无确认、无审计地跑完一次**不可逆**写操作。)
+            raise ToolInfrastructureError(
+                f"写操作的决议取值不合法:{write_decision!r}"
             )
 
     # ---- 闸 2:参数校验(**在 ainvoke 之前**)-------------------------
@@ -3527,11 +3544,22 @@ def make_apply_write_decision_node(*, registry, settings):
 
     async def apply_write_decision(state) -> dict:
         pending = state.get("pending_write") or {}
-        decision = state.get("write_decision") or DENIED
+        # ⚠️ **不要写 `or DENIED`。** 空决议说明 `confirm_write` 没跑、或它没写进通道,
+        # 那是接线 bug;按 DENIED 处理会在审计表里**谎报一次用户取消** ——
+        # 与执行器那条 `!= APPROVED` 闸上抛的理由完全相同,只是层数更高一层。
+        # 空串会落进那一支,响亮地抛。
+        decision = state.get("write_decision") or ""
+        # ⚠️ **`"type": "tool_call"` 这个键必须在。** `BaseTool.ainvoke` 判
+        # 「这是不是一次工具调用」**只看它** —— 缺键时它把整个 dict 当成**参数**去
+        # 校验工具 schema,于是这次调用退化成一条「参数不合法」的**可恢复**失败:
+        # **工单永远不会被建出来**,而调用方看起来一切正常。
+        # (T4 的实现者在测试初稿上撞过同一件事,6 条用例红在 pydantic 的
+        #  `Field required` 上 —— 那是**测试**;在这里它是**生产**。)
         call = {
             "name": pending.get("name", ""),
             "id": pending.get("tool_call_id", ""),
             "args": pending.get("args") or {},
+            "type": "tool_call",
         }
         outcome = await execute_tool(
             tool_call=call,
