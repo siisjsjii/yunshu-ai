@@ -23,7 +23,7 @@ DEMO_USER = "demo-user"
 #: `messages` 表里**不进对话回载**的那一类行(spec §5.2)。
 #:
 #: ch07 起工具结果也落这张表 —— 写入方是 `app/agent/nodes.py`(把 ReAct 往返的
-#: LangChain 消息翻成 `app.schemas.Message`,content 取 `m.content or "…"`)
+#: LangChain 消息翻成 `app.schemas.Message`,content 取 `m.content or ""`)
 #: → `app/services/history.py:append_turn`(真正 `session.add` 那几个 `MessageRecord`
 #: 的地方)。**不是** `app/memory/journal.py`:那个模块是 `model_ctx` / `history_ctx`
 #: 那几行 JSON 上下文日志的组装,一条表都不写。
@@ -141,14 +141,25 @@ async def list_messages(
        文字**」的形态(`app/agent/nodes.py` 把它写成 `content=m.content or ""`,
        它身上只有 `tool_calls`),回给侧栏就是**一个空气泡**。
 
-    **为什么 `content != ''` 就够,不必写成「assistant 且不带 tool_calls」**:
-    两者**等价**,而这个写法更简单 ——
+    **为什么取 `content != ''` 这个更窄的条件,而不是「assistant 且不带 tool_calls」**:
+
+    两者**不等价** —— 后者会**误伤用户看见过的东西**。`app/agent/nodes.py` 的
+    `_stream_round` **边累积 chunk 边把文字发 token 帧**(`if chunk.text: emit(...)`),
+    而 `_lc_to_records` 把 `content=m.content or ""` 与 `tool_calls=m.tool_calls or None`
+    **一起**写库 ⇒ **「先说了一句开场白、再申请调用工具」那种 assistant 行是结构上
+    可达的**。对那种行:
+    · `content != ''` ⇒ **返回它**(那段开场白**以 token 帧流出去过,是用户看见过的**);
+    · 「不带 `tool_calls`」⇒ **丢掉它**(把用户见过的一句话抹掉)。
+
+    所以本条件是**更窄、更保守**的那一个:它只滤掉**用户没见过的空气泡**,
+    不误伤任何见过的东西。为什么它不会顺手滤掉别的:
     · `user` 行不可能是空串(`ChatRequest.message` 是 `min_length=1`,续跑那条路
-      根本不写新行);
-    · `assistant` 行 content 为空**只可能**是①那一形态(收尾那次一定带文字;
-      真实库实测 94 行空 content,**全部**是 `role='assistant'`,没有任何别的角色);
+      根本不写新行;真实库实测空 content 的行**全部**是 `role='assistant'`,别的
+      角色 0 条);
     · `tool` 行已被①挡掉。
-    所以它**不会**顺手滤掉别的东西。
+    (更宽的那个写法要排除的正是「只有 tool_calls、一个字都没有」那一小类,
+    而那与「content 为空」在真实数据上重合 —— 但**不要**据此把它当成等价物:
+    它多滤掉的那部分恰恰是用户见过的。)
 
     **两条过滤都在 SQL 里**,不是读回来再筛 —— 与列表的 user 过滤同一条理由:
     替身验不出「端点有没有传对 SQL」。
@@ -176,8 +187,10 @@ async def list_messages(
             .where(
                 MessageRecord.conversation_id == conversation_id,
                 MessageRecord.role != TOOL_ROLE,
-                # 空 content = 「只申请了工具调用、还没产出文字」那条 assistant
-                # (上面 docstring 说明它为什么等价于「不返回空的助手气泡」)。
+                # 空 content = 「只申请了工具调用、一个字都没产出」那条 assistant
+                # ⇒ 空气泡。**不能**改成「assistant 且不带 tool_calls」:
+                # 那会连「先说了开场白、再申请调用工具」的行一起滤掉,而那句
+                # 开场白是**发过 token 帧、用户看见过**的(理由见 docstring)。
                 MessageRecord.content != "",
             )
             .order_by(MessageRecord.id)
