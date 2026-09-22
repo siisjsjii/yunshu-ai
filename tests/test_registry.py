@@ -2,7 +2,7 @@
 
 from langchain.tools import tool
 
-from app.tools.registry import build_tools, registry_for
+from app.tools.registry import build_registry, build_tools, registry_for
 
 
 @tool
@@ -33,3 +33,19 @@ def test_build_tools_includes_all_five_names():
         "query_faq",
         "create_ticket",
     }
+
+
+def test_build_tools_is_the_registry_projection():
+    """`build_tools` 就是注册表的**投影**,两者必须同源。
+
+    绑给模型的那批(投影)与能执行的那批(注册表)各取一次的话,模型会
+    「看得到却执行不到」—— 退化成一条 ok=false 的可恢复失败,事件序列
+    长得一模一样,只是永远查不出东西。
+
+    ch08 起注册表产出的是 `ToolSpec`、`build_tools` 只是它的投影:
+    名字集合必须**逐字相等**(投影漏一个 = 模型调不到;多一个 = 模型调了
+    却没有执行体)。
+    """
+    tools = build_tools(session=None, conversation_id="s1")
+    reg = build_registry(session=None, conversation_id="s1", settings=None)
+    assert set(reg) == set(registry_for(tools))

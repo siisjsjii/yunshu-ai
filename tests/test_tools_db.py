@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 
 from app.db.base import get_sessionmaker
 from app.db.models import Conversation, Ticket
-from app.tools.business import make_create_ticket
+from app.tools.builtin.tickets import make_create_ticket
 
 pytestmark = pytest.mark.db
 

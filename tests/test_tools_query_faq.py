@@ -16,7 +16,7 @@ import json
 import pytest
 
 from app.retrieval.search import RetrievedChunk
-from app.tools.business import make_query_faq
+from app.tools.builtin.knowledge import make_query_faq
 from app.tools.errors import ToolInfrastructureError, ToolNotFound
 
 

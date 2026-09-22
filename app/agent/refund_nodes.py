@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 FETCH_TOOL_CALL_ID = "refund-fetch-order"
 
 #: 查不到单时给用户的话术。**刻意不回显工具的原文**:`query_order` 的
-#: `ToolNotFound` 文案是写给**模型**的(`app/tools/business.py` 里同族的
+#: `ToolNotFound` 文案是写给**模型**的(`app/tools/builtin/orders.py` 里同族的
 #: `query_logistics` 那条甚至写着「请如实告知用户,不要自行编造物流信息」),
 #: 原样吐给用户就是把提示词漏出去。
 _NOT_FOUND_TEMPLATE = (

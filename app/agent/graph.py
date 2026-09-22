@@ -2,7 +2,7 @@
 
 **两个粒度必须分清**:
 - **图按请求组装** —— `query_faq` / `create_ticket` 是每请求闭包(见
-  `app/tools/business.py` 的说明),图必须绑到本请求的那批工具上。
+  `app/tools/registry.py` 的说明),图必须绑到本请求的那批工具上。
   `StateGraph` 构造是纯内存操作,不进请求路径。
 - **checkpointer 是进程级单例** —— 每请求新建的话,thread 状态下一轮就没了。
 """

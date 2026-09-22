@@ -32,7 +32,7 @@ from app.schemas import Message
 from app.refund.orders import DEMO_ORDERS
 from app.retrieval.expand import ExpandQueries
 from app.retrieval.search import RetrievedChunk
-from app.tools import registry as tools_registry
+from app.tools.builtin import knowledge as builtin_knowledge
 from app.tools.errors import ToolNotFound
 from app.tools.mock_data import order_record
 
@@ -981,10 +981,15 @@ def test_tool_build_failure_releases_lock(client_factory, monkeypatch):
     # 签名必须与 make_query_faq 一致(它现在多收一个 retriever)—— 桩函数
     # 少收一个参数时抛的是 TypeError,而下面 pytest.raises 等的是 RuntimeError,
     # 这条用例会以「没抛 RuntimeError」的样子假红。
+    #
+    # 打在 **builtin 模块**上而不是 registry 上:ch08 起注册表不再逐个 import
+    # 工具,而是 `builtin.discover()` 找到模块后调它的 `build`,由 `build` 在
+    # 自己的模块命名空间里取 `make_query_faq` —— 所以这个属性名仍是活体注入点,
+    # 打它一样能拦在生产路径上。
     def boom(session, retriever):
         raise RuntimeError("工具组装失败")
 
-    monkeypatch.setattr(tools_registry, "make_query_faq", boom)
+    monkeypatch.setattr(builtin_knowledge, "make_query_faq", boom)
     client, _ = client_factory(
         batches=[[FakeChunk("您好")]], session_lock_timeout_seconds=0.15
     )

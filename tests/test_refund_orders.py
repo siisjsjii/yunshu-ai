@@ -92,7 +92,7 @@ def test_decimal_prices_and_quantities_are_not_candidates():
 
 
 def test_full_width_digits_are_not_candidates():
-    """全角数字不是订单号:`_require_order_no` 要 `isascii()`,全角号查无此单。
+    """全角数字不是订单号:`require_order_no` 要 `isascii()`,全角号查无此单。
 
     `\\d` 是 Unicode 感知的,写成 `\\d{4,32}` 时「２０２４０９１５」会被选进卡片,
     而工具侧拒收它 —— 又一张点开查无此单的卡。

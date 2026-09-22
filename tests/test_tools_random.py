@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.tools.business import query_logistics, query_order, query_product
+from app.tools.builtin.orders import query_logistics, query_order, query_product
 from app.tools.errors import ToolNotFound
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,7 +91,7 @@ def test_seed_is_stable_across_processes():
     # 翻倍转义,读起来全是 `{{`。
     code = (
         "import asyncio, sys; sys.path.insert(0, '.'); "
-        "from app.tools.business import query_logistics; "
+        "from app.tools.builtin.orders import query_logistics; "
         "print(asyncio.run(query_logistics.ainvoke("
         "{'name': 'query_logistics', 'args': {'order_id': '" + oid + "'}, "
         "'id': 'c', 'type': 'tool_call'})).content)"

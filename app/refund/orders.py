@@ -1,6 +1,6 @@
 """候选订单 —— 补图里没有的一环。
 
-系统里**没有 orders 表**:订单是 `app/tools/business.py` 的 `_order_record()`
+系统里**没有 orders 表**:订单是 `app/tools/mock_data.py` 的 `order_record()`
 用 hashlib 按订单号**现算**的,不存在「某用户的订单」这个概念。
 所以订单选择器的候选要另找来源,顺序如下:
 
@@ -36,11 +36,11 @@ DEMO_ORDERS = _DEMO_POOL[:MAX_CANDIDATES]
 #: 不含「号」—— 「订单 111111 号」这种写法里它是订单的一部分。
 _UNIT_WORDS = "元块角分钱年月日时天周个件台条张只次折米克斤岁人份盒套瓶包箱"
 
-#: 订单号形态:**4–32 位 ASCII 数字**,与 `app/tools/business.py:_require_order_no`
+#: 订单号形态:**4–32 位 ASCII 数字**,与 `app/tools/mock_data.py:require_order_no`
 #: 的 `isascii() and isdigit()` 契约一致。
 #:
 #: 用 `[0-9]` 而不是 `\d`:`\d` 是 Unicode 感知的,全角「２０２４０９１５」会匹配
-#: 并出现在卡片上,而 `_require_order_no` 拒收它 —— 用户拿到一张点开查无此单的卡。
+#: 并出现在卡片上,而 `require_order_no` 拒收它 —— 用户拿到一张点开查无此单的卡。
 #:
 #: ⚠️ 裸 `\b\d{4,32}\b` 会**把金额、日期、数量一起捞进来**。否定环视挡四类:
 #:

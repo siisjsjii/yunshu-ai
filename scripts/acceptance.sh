@@ -235,38 +235,31 @@ sys.stdout.buffer.write(b"yes" if "我没太理解您的意思" in text else b"n
 # 而不是"号码选错了"。
 shipped_order() {
   "$PYTHON" -c '
-import asyncio, json, sys
+import sys
 
-from app.tools.business import query_order
-from app.tools.mock_data import LOGISTICS_BY_STATUS
-
-def status(oid):
-    call = {"name": "query_order", "args": {"order_id": oid}, "id": "p", "type": "tool_call"}
-    return json.loads(asyncio.run(query_order.ainvoke(call)).content)["status"]
+from app.tools.mock_data import LOGISTICS_BY_STATUS, order_record
 
 for i in range(1000, 1040):
-    if status(str(i)) in LOGISTICS_BY_STATUS:
+    if order_record(str(i))["status"] in LOGISTICS_BY_STATUS:
         sys.stdout.buffer.write(str(i).encode("ascii"))
         break
 '
 }
 
-# 从工具实现里取该订单的确定性物流状态。
-# 动态取值而非写死 —— 工具改了种子函数也不必改脚本;
+# 从**数据源**取该订单的确定性物流状态。
+# 动态取值而非写死 —— 数据源改了种子函数也不必改脚本;
 # 而"工具到底返回什么"由 Tier 1 的跨进程确定性测试守护。
+#
+# 这里**刻意直接调 `app.tools.mock_data`、不经过工具** —— 本脚本是 ch01–ch04
+# 的回归网:工具会在后续章节换模块、`query_logistics` 甚至要整个搬进独立进程的
+# MCP Server,跟着工具改一次就得再改一次。而本脚本要的只是那个**确定性的值**。
 expected_logistics_status() {
   ORDER="$1" "$PYTHON" -c '
-import asyncio, json, os, sys
+import os, sys
 
-from app.tools.business import query_logistics
+from app.tools.mock_data import logistics_record
 
-tool_call = {
-    "name": "query_logistics",
-    "args": {"order_id": os.environ["ORDER"]},
-    "id": "probe",
-    "type": "tool_call",
-}
-payload = json.loads(asyncio.run(query_logistics.ainvoke(tool_call)).content)
+payload = logistics_record(os.environ["ORDER"])
 sys.stdout.buffer.write(payload["status"].encode("utf-8"))
 '
 }
