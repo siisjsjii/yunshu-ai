@@ -395,10 +395,21 @@
   })();
   let busy = false;
 
+  // 「切换」的代际令牌,见 switchTo。**放在这里**是因为它不只属于 switchTo:
+  // `setSessionId` 也要递增它(理由见下),而 setSessionId 在文件更前面。
+  let switchToken = 0;
+
   // 写 sessionId 的**唯一**入口。高亮也收在这里 —— 它跟着 sessionId 走,
   // 若留给四个调用点各自记得调,第五个调用点忘一次就正好长出本任务要防的
   // 「两个真相源」(变量说是 A,界面显示 B),而且不报错。
+  //
+  // **代际令牌也在这里递增**:当前会话一旦被任何方式改掉(新对话 / meta 帧 /
+  // 另一次切换),任何**还在路上的**回载就都作废了。只在 switchTo 里递增的话,
+  // 「点侧栏(回载还在路上)→ 点新对话」这条路上,那个回载回来时照样会
+  // `setSessionId(旧会话) + renderHistory` —— 用户刚点的新对话**当场被撤销**,
+  // 而这正是本函数要收口的那个不变量。(真浏览器探针跑出来的。)
   function setSessionId(id) {
+    switchToken++;
     sessionId = id || null;
     try {
       if (sessionId) localStorage.setItem(SID_KEY, sessionId);
@@ -922,9 +933,16 @@
   }
 
   function renderSidebar(items) {
-    // 列表**每一轮回复后都会全量重建**(streamInto 的 finally → loadSidebar)。
-    // 不把滚动位置带过来的话,322 条时滚到深处的用户会被**每轮弹回顶部** ——
-    // 而这条不量 scrollTop 是看不出来的。
+    // 列表**每一轮回复后都会全量重建**(streamInto 的 finally → loadSidebar),
+    // 这里把滚动位置带过去。
+    //
+    // ⚠️ 实测(2026-09-22,真 Chrome,探针 R14/R16/R17):**不做这两行也看不出
+    // 区别** —— 内容完全相同的一次重建,Chrome 自己就保住了 scrollTop
+    // (把正常分支那行删掉,探针照样给 before=1500 after=1500,
+    //  scrollHeight=19126/ clientHeight=485,而 R16 证明重建**确实发生了**)。
+    // 也就是说这两行是**显式的意图 + 防御**(将来若在重建中间插进任何会强制
+    // 布局的操作,或列表变短被夹到顶部),**不是**一条已复现缺陷的修复 ——
+    // 别在别处把它写成「修好了每轮弹回顶部」。
     const keepTop = sbListEl.scrollTop;
     sbListEl.replaceChildren();
     if (!items.length) {
@@ -1014,11 +1032,12 @@
   // 用户气泡**,而 setSessionId(id) 把当前会话悄悄挪走 ⇒ 流继续往**脱离文档的
   // 节点**写 token:回复照常落库(数据层没错),屏幕上**什么都没有**。
   //
-  // 所以用**代际令牌**:进入时领号,两个 await 之后复核。它顺手关掉第二种情况 ——
-  // 两次重叠的切换不再是「最后**解析**的赢」(用户会盯着一个不是他最后点的会话),
-  // 而是「最后**点**的赢」。
-  let switchToken = 0;
-
+  // 所以用**代际令牌**:进入时领号,两个 await 之后复核。令牌在 `setSessionId`
+  // 里也会递增(那是当前会话的唯一写口),于是它一次关掉三种情况:
+  // ① 窗口里开了新的一轮(busy);
+  // ② 窗口里又点了别的条目 —— 从「最后**解析**的赢」变成「最后**点**的赢」;
+  // ③ 窗口里点了「新对话」—— 那个回载回来时已经作废,不会把新对话撤掉。
+  // 详见 `setSessionId` 上方那段。
   async function switchTo(id) {
     if (busy) return;      // 入口快路径:省掉一次注定要作废的请求
     const t = ++switchToken;
