@@ -496,12 +496,26 @@ git commit -m "refactor(ch07): prepare_turn 改用窗口倒推的预算,退役�
 -- 两个锚点必须**手写 ALTER**:scripts/init_db.py 跑的是
 -- `Base.metadata.create_all`,它只建不存在的**表**,不改已有表 ——
 -- 靠它加列会静默什么也不做,而代码里已经在读那两列。
+--
+-- ⚠️ **文件内的顺序是刻意的:ALTER 在前、CREATE 在后。**
+-- mysql 客户端**遇到第一个错误就中止整个脚本**。反过来排的话,
+-- 在「梗概表已存在、但两个锚点列还没加」的库上(先跑过 init_db.py 的
+-- create_all 就是这情形),CREATE 会报 1050 中止 ⇒ **ALTER 永远不执行** ⇒
+-- 库缺两列,而报错读起来像「表已存在 ⇒ 已经装好了」。
+-- ALTER 放前面则三条路径(全新 / 老库升级 / 重跑)里前两条都能跑完。
+
+-- 0 = 尚无梗概(不含任何消息)
+-- 0 = 层 1 起于最早,层 2 为空
+-- 不变量:0 <= summary_upto_msg_id <= layer1_from_msg_id
+ALTER TABLE conversations
+  ADD COLUMN summary_upto_msg_id BIGINT NOT NULL DEFAULT 0,
+  ADD COLUMN layer1_from_msg_id  BIGINT NOT NULL DEFAULT 0;
 
 -- **裸 CREATE TABLE,不加 IF NOT EXISTS** —— 与 ch03/04/06 一致。
 -- 加了它的后果很具体:`scripts/init_db.py` 的 `create_all` 会先按 ORM 建表,
 -- 那时这句**静默跳过**,而 ORM 若没声明 `uk_conv_seq`,唯一键就**永远不存在**
--- 且不报错。裸语句再跑一次会响亮地报错(与后面的 ALTER 一样本来就不幂等),
--- 那是更诚实的失败。
+-- 且不报错(ORM 侧已同时声明,见 `app/db/models.py` 的 `__table_args__`)。
+-- 裸语句再跑一次会响亮地报错,那是更诚实的失败 —— 前提是**它排在 ALTER 之后**。
 CREATE TABLE conversation_summaries (
   id              BIGINT       NOT NULL AUTO_INCREMENT,
   conversation_id VARCHAR(32)  NOT NULL,
@@ -515,13 +529,6 @@ CREATE TABLE conversation_summaries (
   UNIQUE KEY uk_conv_seq (conversation_id, seq),
   KEY idx_conv (conversation_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- 0 = 尚无梗概(不含任何消息)
--- 0 = 层 1 起于最早,层 2 为空
--- 不变量:0 <= summary_upto_msg_id <= layer1_from_msg_id
-ALTER TABLE conversations
-  ADD COLUMN summary_upto_msg_id BIGINT NOT NULL DEFAULT 0,
-  ADD COLUMN layer1_from_msg_id  BIGINT NOT NULL DEFAULT 0;
 ```
 
 - [ ] **Step 2: 写失败测试**

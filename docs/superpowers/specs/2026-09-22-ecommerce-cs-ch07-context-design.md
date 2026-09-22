@@ -329,7 +329,17 @@ messages 表(按 id 升序)
 而没有任何东西报错。加 `IF NOT EXISTS` 更糟:`create_all` 先跑时这一句**静默跳过**,
 唯一键永远不存在。(同类教训:`RefundRequest.status` 的 `default`/`server_default` 两处都要。)
 
+**⚠️ 文件内的顺序是刻意的:`ALTER TABLE conversations` 在前、`CREATE TABLE` 在后。**
+mysql 客户端**遇到第一个错误就中止整个脚本**。反过来排的话,在「梗概表已存在、
+但两个锚点列还没加」的库上(先跑过 `scripts/init_db.py` 的 `create_all` 就是这情形),
+`CREATE` 报 1050 中止 ⇒ **`ALTER` 永远不执行** ⇒ 库缺两列,
+而报错读起来像「表已存在 ⇒ 已经装好了」。
+
 ```sql
+ALTER TABLE conversations
+  ADD COLUMN summary_upto_msg_id BIGINT NOT NULL DEFAULT 0,
+  ADD COLUMN layer1_from_msg_id  BIGINT NOT NULL DEFAULT 0;
+
 CREATE TABLE conversation_summaries (
   id             BIGINT       NOT NULL AUTO_INCREMENT,
   conversation_id VARCHAR(32) NOT NULL,
