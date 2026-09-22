@@ -13,6 +13,7 @@ import pytest
 from app.tools.mock_data import (
     ECHO_LIMIT,
     LOGISTICS_BY_STATUS,
+    logistics_record,
     order_record,
     require_order_no,
     rng,
@@ -35,18 +36,31 @@ def test_order_record_fields_are_stable():
     assert set(rec) == {"order_id", "status", "product", "amount", "created_at"}
 
 
-def test_order_record_never_contradicts_itself():
-    """ch02 的既有不变量:物流候选是从**订单状态**派生的,不是独立抽的。
+def test_logistics_exists_exactly_when_the_order_status_says_so():
+    """ch02 的既有不变量:物流记录**从订单状态派生**,不是另起一条随机流。
 
-    两个工具各自 `_rng(不同前缀, 同一订单号)` 时是两条独立随机流,
+    两个工具各自 `rng(不同前缀, 同一订单号)` 时是两条独立随机流,
     同一个订单可以同时是「已取消」和「已签收」。
+
+    ⚠️ **这一条的初稿是同义反复,零判别力** —— 写成了
+    `if status in TABLE: continue` 后面跟 `assert status not in TABLE`,
+    对任何实现都恒真(实现者在 T1 上报,已订正)。现在它**真的**去调
+    `logistics_record`,于是「按状态派生」与「独立抽一条」这两种实现
+    会在这里分叉。
     """
-    for no in ("1002", "1003", "1004", "2001", "2002"):
-        rec = order_record(no)
-        if rec["status"] in LOGISTICS_BY_STATUS:
-            continue
-        # 未在表里的状态(待付款/已付款/已取消)⇒ 没有物流记录
-        assert rec["status"] not in LOGISTICS_BY_STATUS
+    shipped = unsent = 0
+    for no in (str(1000 + i) for i in range(1, 60)):
+        status = order_record(no)["status"]
+        if status in LOGISTICS_BY_STATUS:
+            assert logistics_record(no)["status"] in LOGISTICS_BY_STATUS[status]
+            shipped += 1
+        else:
+            with pytest.raises(ToolNotFound):
+                logistics_record(no)
+            unsent += 1
+    # **两个分支都要真的走到过** —— 否则这条测试可能整段被跳过
+    # (本仓记过的第 (e) 类假绿:输入小到触发不了被测行为)。
+    assert shipped > 0 and unsent > 0
 
 
 @pytest.mark.parametrize("bad", ["", "12", "abc", "١٢٣٤", "²²²²"])
