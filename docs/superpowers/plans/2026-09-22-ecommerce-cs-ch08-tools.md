@@ -3422,7 +3422,9 @@ git commit -m "feat(ch08): MCP 客户端每请求发现 + 单 Server 降级;quer
   `executor.APPROVED` / `executor.DENIED`(T4)
 - Produces:
   - `confirm_nodes.make_confirm_write_node()`
-  - `confirm_nodes.make_apply_write_decision_node(*, registry, settings)`
+  - `confirm_nodes.make_apply_write_decision_node(*, registry, settings, emit)`
+    ⚠️ `emit` 是 **T10 加的**(挂起路径上那个永远结算不了的徽标,见 T10 Step 0);
+    它是**无默认值的关键字参数** —— 忘了传就是**硬错**,不会静默退化成一个不发帧的节点。
   - `ChatState.pending_write: dict`(空 dict = 无)
   - `ChatState.write_decision: str`(空串 = 未决议)
 
@@ -3747,7 +3749,12 @@ def make_confirm_write_node():
     return confirm_write
 
 
-def make_apply_write_decision_node(*, registry, settings):
+def make_apply_write_decision_node(*, registry, settings, emit):
+    # ⚠️ `emit` 是 **T10 补上的**(本任务初稿没有它)。原因:挂起路径上
+    # `agent` 那条循环**先发 `tool_call` 帧再执行**,撞到待确认的写调用就
+    # `continue` ⇒ 那次调用**永远没有 `tool_result` 帧**,前端徽标一直转。
+    # 修法就是这里:执行/拒绝之后补发一条**与 `agent` 循环同款**的帧。
+    # **`emit` 无默认值**是刻意的:漏传要硬错,不要静默退化。
     """决议落地:批准就执行一次,取消就落一条「权限拒绝」审计。
 
     **两条路都往本轮消息里追加一条 ToolMessage** —— 因为那条带 `tool_calls`
@@ -4300,7 +4307,9 @@ _OUTLETS = (
     graph.add_node("confirm_write", make_confirm_write_node())
     graph.add_node(
         "apply_write_decision",
-        make_apply_write_decision_node(registry=registry, settings=settings),
+        make_apply_write_decision_node(
+            registry=registry, settings=settings, emit=emit
+        ),
     )
 ```
 
