@@ -623,7 +623,6 @@ async def test_summary_rows_roundtrip_and_seq_is_unique_per_conversation():
 
 `tests/test_history.py` 追加:
 
-```python
 **⚠️ 本文件的用例是同步的**(`def test_x()` + 内部的 `asyncio_run(run())`),
 不是 `@pytest.mark.anyio` —— 与本文件既有 8 条保持一致。新加的三条照这个形状写。
 同时把文件顶部 import 补上 `ConversationSummary`、`append_summary_and_advance`、
@@ -1199,7 +1198,6 @@ git commit -m "feat(ch07): 三层切分与层 2 截短(层 2 计数按截短后)
 
 `tests/test_agent_node.py` 追加:
 
-```python
 新增两条(本文件的既有形状:`@pytest.mark.anyio` + `_node(...)` + `_state(...)` +
 `ScriptedModel`;别自己另起一套):
 
