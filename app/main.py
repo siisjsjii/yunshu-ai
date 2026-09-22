@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.chat import router as chat_router
+from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
 from app.api.kb import router as kb_router
 from app.api.refund import router as refund_router
@@ -114,6 +115,9 @@ app.include_router(chat_router)
 app.include_router(extract_router)
 app.include_router(kb_router)
 app.include_router(refund_router)
+# ch07 的两个只读端点(会话侧栏)。**与其余 router 同在 mount("/") 之前** ——
+# 顺序反了的话静态目录会把 /api/* 抢走,表现为"新端点 404 而服务照常起"。
+app.include_router(conversations_router)
 
 # 静态页必须**最后**挂:mount("/") 会接管根路径,先挂会抢走 /api/*。
 _static_dir = Path(__file__).parent / "static"
