@@ -958,7 +958,11 @@ def test_duplicate_tool_name_raises_loudly(monkeypatch):
         )[0]]
 
     monkeypatch.setattr(orders, "build", duplicated)
-    with pytest.raises(ValueError, match="query_product"):
+    # ⚠️ **`match` 里是 `query_order` 不是 `query_product`** —— 初稿写错了。
+    # `duplicated` 复制的是 `original(...)[0]`,而 `orders.build()` 返回的**第一个**
+    # 是 `query_order`(build 的返回顺序,不是排序后的顺序)。照初稿写这条测试
+    # **永远不可能通过**,而它看起来只是「断言写得具体一点而已」。
+    with pytest.raises(ValueError, match="query_order"):
         _registry()
 ```
 
@@ -1080,13 +1084,10 @@ def build(*, session, conversation_id, retriever):
     return [make_create_ticket(session, conversation_id)]
 ```
 
-把函数体里那句 `# executor 的重试白名单不含它,超时也绝不重试,` 改成:
-
-```
-    **本章起这不靠白名单了**:`app/tools/policy.py` 把它声明成写操作,
-    执行器由 `kind == "write"` **结构性地**推出「永不重试」——
-    新注册的写工具自动继承这条,不用回来改执行器。
-```
+**docstring 一字不动。** ⚠️ 原计划在这里让实现者把「重试白名单」那段注释改写成
+「本章起由 `kind` 结构性推出」—— **那是 T4 的事**:此刻 `executor.py` 里
+`RETRYABLE_TOOLS` 还在,注释会**描述一个不存在的机制**。注释与代码的改写必须在
+**同一个提交**里落地,所以这条挪到 T4 Step 5(见那里)。
 
 - [ ] **Step 7: 改写 `app/tools/registry.py`**
 
@@ -1225,6 +1226,18 @@ git rm app/tools/business.py
 | `scripts/acceptance.sh:257-272`(`expected_logistics_status()`) | `from app.tools.business import query_logistics` | **改写成直接调 `app.tools.mock_data.logistics_record`** |
 
 **注释也要改** —— 这份代码库最贵的一类缺陷就是「注释还指着已经搬走的东西」。
+
+> ⚠️ **上面这张表是扫描出来的,实测漏了三处**(T3 的实现者扫出来的,已修):
+> - `tests/test_api_chat.py:987` —— **monkeypatch 的目标字符串**指向
+>   `app.tools.business.make_query_faq`,改名后 patch 会 `AttributeError`。
+>   **这是三处里唯一会响的**,另两处是散文注释。
+> - `app/agent/refund_nodes.py:75`(散文注释)
+> - `scripts/acceptance_ch05.sh:195`(散文注释)
+>
+> 教训与 T1 那次同源:**扫描要覆盖 `.py` / `.sh` / `.md`,并且
+> monkeypatch 目标这类「字符串形式的引用」不在任何 import 图里**。
+>
+> 另:本任务 Step 9 的 `git add` 清单漏了 `scripts/` —— 而 Step 8 要求改它。
 
 > **为什么 `scripts/acceptance.sh` 这两个 helper 要改成直查 `mock_data`**
 > (而不是改成 `from app.tools.builtin.orders import …`):
@@ -1944,6 +1957,26 @@ tools = [spec.tool for spec in registry.values()]
 ```
 
 `evals/run_tool_selection_eval.py` **不动**(它用的是 `build_tools`,本任务保留了)。
+
+**Step 5b:把 `builtin/tickets.py` 那条重试注释改成新机制(T3 挪过来的)**
+
+`make_create_ticket` 的 docstring 里,把
+
+```
+    非幂等写操作 —— executor 的重试白名单不含它,超时也绝不重试,
+    否则会建出两张工单。
+```
+
+改成:
+
+```
+    **非幂等写操作** —— `app/tools/policy.py` 把它声明成写操作,
+    执行器由 `kind == "write"` **结构性地**推出「永不重试」,
+    否则超时重试会建出两张工单。新注册的写工具自动继承这条。
+```
+
+⚠️ **必须与本任务的执行器改动同一个提交**。T3 里提前改它会让注释描述一个
+**还不存在**的机制 —— 与「注释指着已经搬走的东西」是同一类缺陷,只是方向相反。
 
 - [ ] **Step 6: 跑测试**
 
@@ -4212,6 +4245,17 @@ git commit -m "test(ch08): 配置项 + 端到端验收 1–6"
 - **`turn_messages` 是覆写通道** —— 续跑与决议节点都必须**读旧值再追加**;
 - **`agent` 不再是 `_OUTLETS` 成员**,它是条件出口;
 - **`pending_write` / `write_decision` 必须连同每轮清零一起落地**。
+
+并在「数据与产物」段给 `evals/tool_selection_cases.jsonl` 那条**追加一句限定**
+(T3 的实现者上报的口径变更,与 ch07 那条 `rerank_top_k` 追加限定同族):
+
+> **⚠️ 追加限定(2026-09-22,ch08):这个 13/15 是在工具定义的 `assert` 下测得的 —— 本章起工具定义的顺序是
+> **(模块名, 工具名) 排序**(`builtin/` 的自动发现),而旧顺序是 `registry.py` 里
+> 手写的 `[query_order, query_product, query_logistics, query_faq, create_ticket]`。
+> 两者**不是同一个配置** —— 发给模型的工具定义块逐字节不同,而位置偏见是真实存在的。
+> 引用 13/15 时必须一并说明这一点,或重跑一次。**
+
+(写进 CLAUDE.md 时把 `assert` 那半句去掉 —— 上面只是为了让你看清差异在哪个位置。)
 
 - [ ] **Step 4: `CLAUDE.md` 的「高频命令」段加 ch08 两条**
 
