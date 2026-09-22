@@ -2550,8 +2550,32 @@ spec §8 那张表写着「**历史预算装不下一轮** → 400」,对应 `no
 
 - [ ] **Step 4: `journal` 接上**
 
-`history_ctx` 在 `resolve_references` **之前**打(消解与意图都要用它);
-`model_ctx` 在 `agent` 节点组装完消息之后打。两处都带 `conversation_id`。
+**四件事,每一项单独就能让一条验收标准落空:**
+
+**(1)`history_ctx` 在 `resolve_references` 之前打 —— 而 T7 已经接好了。**
+**不要重复接。** 但**必须把那个调用的 `history=` 从 `prepare_turn` 的输出换成
+分层后的 `trimmed`(`got.layer2 + got.layer1`)** —— 否则它传的是
+`trim.select_history` 的输出,而那个函数**只整轮丢弃、从不标注内容**,
+`…` 与 `[工具结果] ` **不可能出现** ⇒ **验收 4b 指定的那条线结构上承载不了 4b**。
+T7 为此留了一条**故意会红的 tripwire**(`assert "bounds" not in payload`):
+你要动那条线时它会变红,那是设计如此 —— 读它的 docstring 再决定,不要直接删。
+
+**(2)`model_ctx` 在 `agent` 节点组装完消息之后打,而且必须用【降级之后的锚点】
+重新 `split` 一次。** 锚点已由 §7.5 播进 `stream_input`,但 state 里放的是
+**扁平的 `trimmed` 列表**;`journal.model_ctx` 要的是一份 `Layers`
+(它从中读 `sliding` 与 `bounds`)。不重新 split 的话,`model_ctx.sliding`
+描述的可能是**与真正发出去的消息不同的一次切分** —— 而**没有任何断言覆盖这种分叉**。
+
+**(3)必须调 `log_trigger(...)`(T9 提供)。** `summary trigger` 那行日志
+**只能在这里发**(那个接缝上才有 `layer2_tokens` 与 `layer2_budget`)。
+不调的话,**验收 2 的 grep 无物可命中** —— 级联的第一环
+(`summary trigger 层2 约 N token > 预算 M`)在日志里根本不存在。
+
+**(4)层 1 的选择(`trim_messages`)走 `prompts.select_layer1(history, *, max_tokens)`。**
+**不要在端点里直接 import `trim_messages`** —— `app/prompts.py` 是 LangChain 的
+唯一面,端点直接调用会把 LLM 库的调用点散出去,而那正是本章花力气避免的。
+
+两处日志都带 `conversation_id`。
 
 - [ ] **Step 5: 跑测试并提交**
 
