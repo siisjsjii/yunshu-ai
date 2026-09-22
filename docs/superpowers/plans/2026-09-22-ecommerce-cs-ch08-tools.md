@@ -2135,16 +2135,27 @@ class ToolAuditLog(Base):
 
     __tablename__ = "tool_audit_logs"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # `BigInteger` 与 DDL 的 `BIGINT` 对齐 —— 见下方形状对齐的说明。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     # 不是 ForeignKey —— 见类 docstring。
     conversation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
     tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     args: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    result_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    # ⚠️ **这两个列在 DDL 里带 `DEFAULT ''`,这里必须补 `server_default`。**
+    # 只留 Python 侧的 `default` 会让 `create_all` 建的表与 `db/ch08.sql` 建的
+    # 表**形状不同** —— 行为变成「看谁建的库」。这条是 ch07 两个锚点列
+    # (`Conversation.summary_upto_msg_id` / `layer1_from_msg_id`)已经吃过一次的亏,
+    # 那里的注释逐字写着「两侧默认值都要」。
+    # (`args` 与 `status` 在 DDL 里**没有** DEFAULT,所以这里也不加 —— 照抄 DDL。)
+    result_summary: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    error_detail: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    error_detail: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
     # 两侧默认值都要:与 Conversation 的两个锚点同款理由 ——
     # 只留 `default` 会让 create_all 建的表与 db/ch08.sql 建的表**形状不同**。
     retry_count: Mapped[int] = mapped_column(
@@ -2154,9 +2165,19 @@ class ToolAuditLog(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now()
+        DateTime, nullable=False, server_default=func.now(), index=True
     )
 ```
+
+> **形状对齐的界线,写清楚** —— 建库有**两条路**(`init_db.py` 的 `create_all`
+> 与 `db/ch08.sql`),而它们必须建出**行为一致**的表。本章对齐这几样:
+> 列类型(`BIGINT`)、列宽、**`server_default`**、`created_at` 索引。
+>
+> **刻意不对齐、已知且可接受的差异**:DDL 里的两个**索引名**(`idx_conv` /
+> `idx_created` vs SQLAlchemy 自动生成的 `ix_tool_audit_logs_*`)与表的
+> `COMMENT`。它们只影响 `SHOW CREATE TABLE` 的观感,不影响任何行为 ——
+> 而**权威路径永远是 `db/ch08.sql`**(CLAUDE.md 明写:带 `db/chNN.sql` 的章
+> 都必须在 `init_db` 之外再执行那份 DDL)。
 
 - [ ] **Step 3: 写失败测试(不连库那层)**
 
@@ -2316,11 +2337,15 @@ logger = logging.getLogger(__name__)
 #: 与 `db/ch08.sql` 的列宽一致。超长必须**截断而不是抛** ——
 #: 一个被模型撑爆的摘要字段不该让整条审计行丢掉
 #: (`create_ticket` 当年就栽过同一件事,它把 `ticket_type` 夹到 64)。
-_SUMMARY_MAX = 500
+_SUMMARY_MAX = 500      # ← 与 db/ch08.sql 的 VARCHAR(500) 逐列对齐
 _DETAIL_MAX = 500
 _NAME_MAX = 64
 _SOURCE_MAX = 64
 _CALL_ID_MAX = 128
+#: `status` 今天的取值全部来自本模块自己的常量(最长 21 字符),
+#: **但它是全表唯一一个「按列宽硬存、却没有截断」的串**。
+#: 夹一下是一行的事,而漏夹的后果是 `DataError` 让**整条审计行**丢掉。
+_STATUS_MAX = 32
 
 
 def _clip(text: str, limit: int) -> str:
@@ -2364,7 +2389,7 @@ async def record_audit(
                     source=_clip(source, _SOURCE_MAX),
                     args=_dump_args(args),
                     result_summary=_clip(result_summary, _SUMMARY_MAX),
-                    status=status,
+                    status=_clip(status, _STATUS_MAX),
                     error_detail=_clip(error_detail, _DETAIL_MAX),
                     retry_count=retry_count,
                     duration_ms=duration_ms,
@@ -4279,6 +4304,13 @@ BEFORE=$(cat "$WORK/cs.pid")
 AFTER=$(cat "$WORK/cs.pid")
 [ "$BEFORE" = "$AFTER" ] || fail "客服服务被重启了(验收 3 要求它不动)"
 ```
+
+> ⚠️ **验收 5/6 查审计表时,必须带上本次会话的 `conversation_id` 过滤。**
+> T5 的实现者上报了一条跨任务影响:审计写口一落地,**整套测试**(6 个既有文件)
+> 每轮会往真库写 ~150 行只追加的审计行。验收脚本若按「查最近这几条」去查,
+> 撞上哪一条全看运气 —— 那正是本仓记过的第 (d) 类假绿
+> (**被上次运行的数据污染**),而且它的表现是「偶尔红、偶尔绿」。
+> 脚本自己知道本次的 `session_id`,过滤它是顺手的。
 
 **验收 1/3 都要临时改文件** —— 用 `trap` 保证**无论成败都还原**,
 并且**还原也走 `git checkout`**(不是手写删文件),这样「还原失败」自身会响亮报错。
