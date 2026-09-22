@@ -4,6 +4,7 @@
 本文件是它的单测版:**动态造一个 builtin 模块,断言它自己进了表**。
 """
 
+import pkgutil
 import sys
 import textwrap
 from pathlib import Path
@@ -70,9 +71,45 @@ def test_write_kind_comes_from_the_policy_table():
         assert spec.kind == kind_of(name)
 
 
-def test_order_is_stable_across_two_builds():
-    """顺序稳定 = 工具定义块逐字节相同 = 前缀缓存命中(spec §3.4)。"""
-    assert list(_registry()) == list(_registry())
+def test_order_is_stable_and_sorted(monkeypatch):
+    """顺序必须**可复现**,与枚举顺序无关 —— 前缀缓存要的正是后者。
+
+    ⚠️ 初稿只断言「两次构建相同」;把 `discover()` 里那句 `found.sort(...)`
+    删掉它照样绿(实测),因为 `pkgutil.iter_modules` 在一个进程内本就给稳定
+    顺序 —— 那条断言测的是「同进程内两次一样」,而那件事**同义反复**。
+
+    ⚠️ 复审给的第二版是 `assert names == sorted(names)` —— **它在正确实现下
+    不可能通过**,实测:
+        实际 ['query_faq', 'query_logistics', 'query_order', 'query_product', 'create_ticket']
+        sorted() ['create_ticket', 'query_faq', 'query_logistics', 'query_order', 'query_product']
+    因为排序键是 `(模块名, 工具名)`(brief 逐字规定),而 `create_ticket` 来自
+    `tickets` 模块 —— 全局按工具名的字母序根本不是这条实现的口径。
+
+    所以这里断言**那句 sort 真正提供的东西**:枚举顺序被搅乱时,注册表顺序不变。
+    它比「写死一张五元素清单」结实 —— 后者在本章的核心场景(新增/搬迁工具)里
+    每次都要跟着改,而验收 1 恰恰是「新增一个文件、别的都不动」。
+    """
+
+    def enumerate_in_order(order):
+        """把 `pkgutil.iter_modules` 换成按指定次序吐模块的版本。"""
+        real = pkgutil.iter_modules
+
+        def fake(path=None, prefix=""):
+            infos = list(real(path, prefix))
+            return iter([infos[i] for i in order(len(infos))])
+
+        return fake
+
+    baseline = list(_registry())
+    assert baseline, "注册表不该是空的 —— 空表会让下面两条断言都恒真"
+
+    # 反向枚举(以及只调换首尾)都必须得到**同一个**顺序。
+    for order in (lambda n: range(n - 1, -1, -1), lambda n: [n - 1, *range(0, n - 1)]):
+        monkeypatch.setattr(pkgutil, "iter_modules", enumerate_in_order(order))
+        assert list(_registry()) == baseline, (
+            f"注册表顺序跟着枚举顺序变了 —— `discover()` 里的 `found.sort(...)` "
+            f"多半没了(枚举被搅乱后得到 {list(_registry())},基准是 {baseline})"
+        )
 
 
 def test_new_module_is_picked_up_without_touching_core_code(tmp_path, monkeypatch):
@@ -83,37 +120,44 @@ def test_new_module_is_picked_up_without_touching_core_code(tmp_path, monkeypatc
     """
     pkg_dir = Path(builtin.__file__).parent
     new_module = pkg_dir / "zz_scratch_probe.py"
-    new_module.write_text(
-        textwrap.dedent(
-            '''
-            """临时探测模块 —— 本测试自己不碰任何核心代码。"""
-
-            from langchain.tools import tool
-
-
-            @tool
-            async def echo_probe(text: str) -> str:
-                """把入参原样回显。测试用。"""
-                return text
-
-
-            def build(*, session, conversation_id, retriever):
-                return [echo_probe]
-            '''
-        ),
-        encoding="utf-8",
+    # 精确删掉这一个键,不整体替换 `sys.modules`:替换整张映射的话,测试期间
+    # 新导入的模块会被注册进一个 monkeypatch 卸载时就丢掉的字典里。
+    monkeypatch.delitem(
+        sys.modules, "app.tools.builtin.zz_scratch_probe", raising=False
     )
-    monkeypatch.setattr(
-        sys,
-        "modules",
-        {k: v for k, v in sys.modules.items() if "zz_scratch_probe" not in k},
-    )
+    # ⚠️ **写文件也必须在 `try` 里**:它一旦落在外面,测试被中止(Ctrl-C /
+    # `delitem` 抛错 / 超时)就会把 `zz_scratch_probe.py` 留在包目录里 ——
+    # 此后 `discover()` 会把它装进**每一个请求**,模型凭空多出一个
+    # `echo_probe` 工具,而 `test_five_builtin_tools_are_registered` 变红;
+    # 一次 `git add -A` 还会把它带进提交。
     try:
+        new_module.write_text(
+            textwrap.dedent(
+                '''
+                """临时探测模块 —— 本测试自己不碰任何核心代码。"""
+
+                from langchain.tools import tool
+
+
+                @tool
+                async def echo_probe(text: str) -> str:
+                    """把入参原样回显。测试用。"""
+                    return text
+
+
+                def build(*, session, conversation_id, retriever):
+                    return [echo_probe]
+                '''
+            ),
+            encoding="utf-8",
+        )
         reg = _registry()
         assert "echo_probe" in reg, "新增 builtin 模块没有被自动发现"
         assert reg["echo_probe"].description.strip()
     finally:
-        new_module.unlink()
+        # `missing_ok=True`:写文件本身就可能失败,清理**不能**在这里再抛一次
+        # FileNotFoundError 把真正的失败盖掉。
+        new_module.unlink(missing_ok=True)
         sys.modules.pop("app.tools.builtin.zz_scratch_probe", None)
 
 
