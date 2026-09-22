@@ -1378,7 +1378,32 @@ from langgraph.graph.message import add_messages
     # ⚠️ 它**不进** `resolve_references` 的逐轮重置清单 —— 把 messages 加进那份
     # 清单等于**每轮清空完整历史**,而单轮测试完全看不出来。
     messages: Annotated[list[AnyMessage], add_messages]
+
+    #: 注入给模型的**梗概全文**(逐轮覆写,由端点播种)。空串 = 还没有梗概。
+    #: 与 `history` 同族:覆写语义 + 每轮重新播种,所以**进的是 `stream_input`**,
+    #: 不进 `resolve_references` 的重置清单。
+    summary_text: str
+
+    #: **本轮**新产生的消息 —— `log_turn` 落库的唯一依据。
+    #:
+    #: 为什么不直接用 `messages`:那个是**累积**通道(全量),拿它落库 = 每轮把
+    #: 整段历史再写一遍 ⇒ **历史翻倍**,而每一轮的回复看起来都正常。
+    #: 这个是**覆写**通道,各节点写它时连同 `messages` 一起写(两个都写)。
+    turn_messages: list[AnyMessage]
 ```
+
+**同时改 `app/agent/nodes.py::make_resolve_references_node` 的逐轮重置清单**,
+加一行 `"turn_messages": []`:
+
+```python
+            "tool_calls_made": [],
+            # 覆写通道,不重置的话「这轮没产生消息」的路径(闲聊/兜底)会继承
+            # 上一轮的值 ⇒ 上一轮的消息被再写一遍。
+            "turn_messages": [],
+            "order_no": "",
+```
+
+(这是 ch05–ch06「**通道与它的清零必须同处一地**」的第三次应用。)
 
 - [ ] **Step 5: 改 `app/agent/nodes.py::make_agent_node`**
 
@@ -1434,13 +1459,18 @@ from langgraph.graph.message import add_messages
         trace.append("agent:converged")
         return {
             "reply": "".join(parts),
-            "messages": new_messages,
+            "messages": new_messages,        # → add_messages(累积进完整历史)
+            "turn_messages": new_messages,   # → log_turn 落库(只写本轮)
             "agent_steps": steps,
             "tool_calls_made": made,
             "usage": {"total_tokens": usage_total},
             "trace": trace,
         }
 ```
+
+**两个键值相同、但语义不同,别只写一个**:`messages` 进 `add_messages` 累积,
+`turn_messages` 是逐轮覆写、供落库。只写前者 ⇒ 落库恒空 / 写重;
+只写后者 ⇒ 完整历史里没有本轮。
 
 **⚠️ 不要**写成 `"messages": [*new_messages, AIMessage(content=reply)]` ——
 无工具那一轮 `acc` **已经**在 `new_messages` 里了,再补一条就是**同一句回复出现两次**,
@@ -1482,20 +1512,26 @@ def _lc_to_records(messages) -> list[Message]:
             conversation_id=state["conversation_id"],
             messages=[
                 Message(role="user", content=state["user_input"]),
-                *_lc_to_records(state.get("messages") or []),
+                *_lc_to_records(state.get("turn_messages") or []),
             ],
         )
 ```
 
-**这里要小心两件事**:
-1. `state["messages"]` 此刻**只含本轮新增的**(播种进来的那批是端点塞进去的,
-   而 `add_messages` 会把它们和新增的**并在一起** —— 所以 state 里其实是全量)。
-   **必须只取本轮新增的部分**:全量写库就是**历史翻倍**,而每一轮的回复看起来都正常。
-   取法是 `state["messages"]` 减去播种时的条数,或更稳:让 `log_turn` 读一个
-   **本轮新增**的专门通道。**实现时任选一种,但这条必须显式处理**,
-   并用上面那条「`len(captured) == 4`」的单测钉住。
-2. `Message(role="tool")` 必须带非空 `tool_call_id`,否则 `schemas.Message` 的
-   validator 会抛 —— 这是 ch01 加的护栏,本章第一次真的用到。
+**这里必须用 `turn_messages`,不能用 `messages`** —— 这条是本章最容易写错、
+且**写错了完全看不出来**的地方:
+
+- `state["messages"]` 是 `add_messages` 通道,**累积的是全量**(播种进来的历史
+  + 本轮新增)。拿它落库 = 每一轮都把整段历史再写一遍 ⇒ **历史翻倍**,
+  而每一轮的回复看起来都正常、每条单测只要不数字数就全绿。
+- 所以另立一个**逐轮覆写**的通道 `turn_messages`,只装**本轮新产生的**消息。
+  各节点写它(`messages` 那份照旧给 `add_messages` 用,**两个都写**)。
+- **它必须进 `resolve_references` 的逐轮重置清单**(与 `gate_passed` 等并列):
+  它是覆写通道,不重置的话「这轮没产生消息」的路径(闲聊/兜底)
+  会继承上一轮的值 ⇒ 上一轮的消息被再写一遍。这正是 ch05–ch06 那条
+  「通道与它的清零必须同处一地」的第三次应用。
+
+另外:`Message(role="tool")` 必须带非空 `tool_call_id`,否则 `schemas.Message` 的
+validator 会抛 —— 这是 ch01 加的护栏,本章第一次真的用到。
 
 - [ ] **Step 7: 改 `app/api/chat.py`**
 
@@ -1925,6 +1961,9 @@ git commit -m "feat(ch07): 日志落盘(log/app.log,显式 utf-8)+ model_ctx/his
   - `app.memory.summarize.should_summarize(layers: Layers, *, layer2_budget: int) -> bool`
   - `app.memory.summarize.render_turns(turns: Sequence[Message]) -> str`
   - `app.memory.summarize.summarize_range(*, model, session, conversation_id, turns, upto_msg_id) -> str | None`
+  - `app.memory.summarize.join_summaries(summaries: Sequence[tuple[int, str]]) -> str`
+    (把 `load_summaries` 的 `(seq, content)` 列表拼成**一段**背景文本;
+    空列表 → 空串。T10 消费它,`summary_text` 通道的值就是它)
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2178,8 +2217,8 @@ git commit -m "feat(ch07): 后台摘要执行体(专用线程 + 自建 engine,�
 ### Task 10: 端点接线 —— 降级 + 起任务 + 播种精简版
 
 **Files:**
-- Modify: `app/api/chat.py`、`app/services/chat.py`、`app/prompts.py`
-- Test: `tests/test_api_chat.py`、`tests/test_chat_service.py`
+- Modify: `app/api/chat.py`、`app/services/chat.py`、`app/prompts.py`、`app/agent/nodes.py`
+- Test: `tests/test_api_chat.py`、`tests/test_chat_service.py`、`tests/test_agent_node.py`
 
 **Interfaces:**
 - Consumes: T1/T4/T6/T7/T8/T9 的全部产物
@@ -2330,11 +2369,51 @@ def test_layer1_within_budget_triggers_neither_degrade_nor_summary(client_factor
             layer1_from_msg_id=layer1_from, settings=settings,
         )
         if summarize.should_summarize(got, layer2_budget=b.layer2_budget):
-            tasks.run_summary_in_background(
-                conversation_id=session_id, settings=settings, model_factory=create_extract_model
+            run_summary_in_background(
+                conversation_id=session_id, settings=settings,
+                model_factory=create_extract_model,
             )   # 不 await
         trimmed = got.layer2 + got.layer1
+        summaries = await load_summaries(session=session, conversation_id=session_id)
+        summary_text = summarize.join_summaries(summaries)
 ```
+
+四个名字(`layers` / `summarize` / `run_summary_in_background` / `load_summaries`)
+都必须是**模块级导入的名字**,不能写成 `tasks.run_summary_in_background(...)` ——
+单测靠 `monkeypatch.setattr(chat_api, "<名字>", ...)` 拦住它们,patch 打不中时
+红法会指向测试而不是实现。
+
+**- [ ] Step 3b: agent 节点改调 `build_context_messages`,并把两个通道播种进去**
+
+这一步**必须做** —— 不做的话 T6 造出来的 `build_context_messages` **没有任何消费者**,
+「定序组装 / system 只有一条 / 梗概并进用户消息」这套机制**在生产里根本不跑**,
+而 T6 的单测**全绿**(它们直接调那个函数)。
+
+`app/agent/nodes.py::make_agent_node` 的消息组装换成:
+
+```python
+        msgs = build_context_messages(
+            brand_name=settings.brand_name,
+            history=state.get("history") or [],          # 已是精简版(层2+层1)
+            user_input=state["resolved_input"],
+            summary=state.get("summary_text") or "",
+            evidence=state.get("evidence") or [],
+        )
+```
+
+并把 `build_messages` 的 import 换成 `build_context_messages`
+(**不要删** `build_messages` —— 它的 4 条 `tests/test_prompts.py` 用例还在,
+而 `build_context_messages` 内部复用它的 evidence 渲染段)。
+
+播种侧(`stream_input`)加两行:
+
+```python
+                "history": trimmed,                       # 精简版
+                "summary_text": summary_text,             # 梗概全文
+```
+
+**`summary_text` 用 `summarize.join_summaries(summaries)` 把多段拼成一段** ——
+它是**背景**,不是逐段清单;拼法在 `summarize.py` 里给出(空列表 → 空串)。
 
 两个 400 文案是**固定文案**,与既有 `RESUME_WITHOUT_PENDING` 同款:
 不得出现 Python 标识符,且要过 `redact_api_key`。
