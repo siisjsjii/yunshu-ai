@@ -6,14 +6,17 @@
 -- 本机 locale 是 cp936,不钉这一行中文 COMMENT 会在客户端侧被重编码(本仓记过这条)。
 SET NAMES utf8mb4;
 
--- ⚠️ **这份文件必须单独手工执行,没有任何自动化的替代。**
---    `scripts/init_db.py` 跑的是 `Base.metadata.create_all`,它只建**表**、**不加列**
---    —— 池子那两个新列只有下面这句 ALTER 能加上(本仓硬约束:「init_db.py 永不加列」)。
---
--- ⚠️ **顺序:先这份文件,再 `scripts/init_db.py`。**
---    反过来的话,`create_all` 会先把 review_queue / eval_runs 建出来(ORM 侧有同名
---    模型),这份文件的 CREATE 再跑就 1050 —— 那是**已知取舍**(与 db/ch08.sql 同一回事,
---    不是脏库)。而**两列 ALTER 一定会成功**,因为 create_all 不加列。
+-- ⚠️ **这份文件是给「已经有 `low_confidence_questions`、但还没有这两列」的库升级用的**
+--    (老库,或 `db/ch04.sql` 建出来的库)。本机实测(2026-09-23,MySQL 8.0.46,临时库上跑):
+--    · **已有那张表、缺这两列的库**:下面的 ALTER **一定会成功** —— `create_all` 不加列,
+--      这两列只有它加得上(本仓硬约束:「init_db.py 永不加列」)。
+--    · **全新空库**:先跑这份文件会在 ALTER 上报 **1146**(表还不存在);而先跑
+--      `scripts/init_db.py` 呢,`create_all` 会**连同这两列一起**把表建出来,这份文件
+--      再来一遍就 1060(列已存在)+ 1050(两张表已存在)三条全红。
+--      ⇒ **全新库的正确走法:只跑 `scripts/init_db.py`,不要跑这份文件**;
+--        它建出来的形状与这里略有出入(索引名 / `unsigned` / COMMENT / 列序,
+--        逐条记在 `app/db/models.py` 的差异清单里,都不影响行为)。
+--    ⇒ 一句话:**升级老库跑它,新建库不跑它。**
 --    核对:`SHOW CREATE TABLE low_confidence_questions\G` 里要出现 evidence_snapshot。
 --
 -- ⚠️ **本文件刻意不幂等**:不带任何幂等守卫(与 db/ch03 / ch04 / ch06 / ch07 / ch08 同规矩)。
@@ -34,11 +37,16 @@ SET NAMES utf8mb4;
 --      ② 又是流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
 --      ⇒ NULL 是**有含义的值**(尚未进流水线),所以这一列必须可空;
 --        流水线的幂等**只靠它**保证:重跑不会重复归并,不需要额外的状态列。
---      ⚠️ 这里**不建索引**:池子是「答不上来才长一行」的小表,全扫足够。
---        ORM 侧写了 `index=True`,⇒ 两条建库路径的形状差异,已在 `app/db/models.py` 记账。
+--
+--    ⚠️ 两列会被**追加到 `created_at` 之后**(ALTER 只能往末尾加),而 ORM / create_all
+--       按声明顺序建表、把这两列排在 `created_at` **之前** ⇒ 两条路径**列序不同**。
+--       SQLAlchemy 一律**按名取列**(不按位置)⇒ 不影响行为,只记账。
 ALTER TABLE low_confidence_questions
   ADD COLUMN evidence_snapshot JSON          NULL COMMENT '落池当轮的召回片段快照(Top-N 的 id/得分/原文)',
-  ADD COLUMN matched_review_id BIGINT UNSIGNED NULL COMMENT '归并到的 review_queue.id;NULL = 尚未进流水线';
+  ADD COLUMN matched_review_id BIGINT UNSIGNED NULL COMMENT '归并到的 review_queue.id;NULL = 尚未进流水线',
+  -- 流水线的选择谓词 `WHERE matched_review_id IS NULL ORDER BY id LIMIT n` 是它唯一的热路径。
+  -- ORM 侧同一列写了 `index=True`(create_all 建的名字不同:`ix_low_confidence_questions_matched_review_id`)。
+  ADD KEY idx_matched_review (matched_review_id);
 
 -- ② 待审队列。一行 = 一个**去重后**的知识缺口;查重命中时累加 occurrences,不新建行。
 --

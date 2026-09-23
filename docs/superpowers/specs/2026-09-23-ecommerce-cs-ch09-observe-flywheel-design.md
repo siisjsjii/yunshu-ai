@@ -643,7 +643,8 @@ SET NAMES utf8mb4;
 -- ① 池子加两列
 ALTER TABLE low_confidence_questions
   ADD COLUMN evidence_snapshot JSON          NULL COMMENT '落池当轮的召回片段快照(Top-N 的 id/得分/原文)',
-  ADD COLUMN matched_review_id BIGINT UNSIGNED NULL COMMENT '归并到的 review_queue.id;NULL = 尚未进流水线';
+  ADD COLUMN matched_review_id BIGINT UNSIGNED NULL COMMENT '归并到的 review_queue.id;NULL = 尚未进流水线',
+  ADD KEY idx_matched_review (matched_review_id);
 
 -- ② 待审队列
 CREATE TABLE review_queue (
@@ -678,6 +679,10 @@ CREATE TABLE eval_runs (
 - **`review_queue` 上没有「标准化问题」的唯一键。** 查重是**语义判断**(模型判是不是同一个意思),而唯一键只能管**字面全等** —— 两者不是同一条规则,加了唯一键会在一次合理的语义归并上**响亮地 1062**。
 - **`matched_review_id` 一个列担两个语义**:既记「这条问题归并到了哪一行」,又是流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。⇒ 流水线天然幂等,重跑不会重复归并。这个双语义在 ORM 的 docstring 里要写出来。
 
+⚠️ **上面 ALTER 里的 `ADD KEY idx_matched_review` 是 T5 修复轮补的**(2026-09-23,评审裁定):流水线的选择谓词 `WHERE matched_review_id IS NULL ORDER BY id LIMIT n` 就是它**唯一的热路径**,而原版 DDL 不建索引、ORM 侧却声明了 `index=True` —— 「ORM 有 / DDL 没有」这个方向不该留。实况库在**同一次修复里用同一条语句、同一个索引名**补过,所以实况库 ≡ 这份文件。
+
+⚠️ **这份 DDL 是给「已有 `low_confidence_questions`、但缺这两列」的库升级用的**;在**全新空库**上它是错的工具(实测:先跑它 ALTER 报 1146;先跑 `init_db.py` 则 create_all 会连同两列一起建,再跑它 1060 + 1050)。全新库只跑 `init_db.py`,形状差异见 §7.3。
+
 ### 7.2 `entry_point` 的三个取值
 
 | 取值 | 产生处 | 状态 |
@@ -696,7 +701,12 @@ CREATE TABLE eval_runs (
 
 - `LowConfidenceQuestion` 加 `evidence_snapshot: Mapped[dict | None] = mapped_column(JSON)` 与 `matched_review_id: Mapped[int | None] = mapped_column(BigInteger, index=True)`。
 - 新 `ReviewQueue`、`EvalRun` 两个模型。
-- **ORM 与 DDL 的形状差异照 ch08 的记法逐条对比并记账**(索引名、COMMENT、`unsigned` 有无)—— 本项目已经栽过一次「只剩两处」是源不支持的绝对断言。
+- **ORM 与 DDL 的形状差异照 ch08 的记法逐条对比并记账**(索引名、COMMENT、`unsigned` 有无、**列序**、`created_at` 的默认值措辞)—— 本项目已经栽过一次「只剩两处」是源不支持的绝对断言。
+
+⚠️ **T5 修复轮的订正(2026-09-23,评审实测)**:
+
+- **`occurrences` / `status` 的 `server_default=` 必须写**(照 `ToolAuditLog.retry_count` 的先例)。只写 `default=` 时它**只是 Python 侧默认**,create_all 建出的表**没有列级 DEFAULT** ⇒ 一条省略这两列的**裸 INSERT** 在 create_all 那条路径上失败、在 DDL 那条路径上成功(行为变成「看谁建的库」)。⚠️ 字符串默认值写**不带引号**的 `"pending"`;写成 `"'pending'"` 会渲染成 `DEFAULT '''pending'''`,而它**看起来像对的**。
+- **索引覆盖两个方向都拉平**:ORM 侧 `status` / `created_at` 补 `index=True`,DDL 侧补 `idx_matched_review`(见 §7.1 的 ⚠️)。拉平后**索引覆盖三处一致,只有名字不同**(create_all 自动生成的 `ix_*` vs DDL 手写的 `idx_*`,ch08 同款已知差异)。
 
 ---
 

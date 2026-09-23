@@ -143,10 +143,13 @@ class LowConfidenceQuestion(Base):
     # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
     # ⇒ 流水线天然幂等,重跑不会重复归并;别只把它当外键用 —— 谁把它写成 NOT NULL,
     # 谁就抹掉了「尚未处理」这个状态(而且不会有任何东西报错)。
-    # `index=True` 是 ORM 侧(create_all 那条路径)与 db/ch09.sql(ALTER 那条路径)
-    # 之间的**已知形状差异**:DDL 那条 ALTER 不建索引 —— 见 `ReviewQueue` docstring
-    # 里那份逐条差异清单第 ④ 条。这一列**刻意不挂
-    # ForeignKey** —— 池子里的行不随 review_queue 的删除而受约束(与 ToolAuditLog 同款理由)。
+    # 这一列**必须两条路径都建索引**:流水线的选择谓词就是
+    # `WHERE matched_review_id IS NULL ORDER BY id LIMIT n`,那是它唯一的热路径。
+    # `index=True` ⇒ create_all 建 `ix_low_confidence_questions_matched_review_id`,
+    # db/ch09.sql 的 ALTER 建**同列**的 `idx_matched_review` —— 覆盖一致、**名字不同**
+    # (与 db/ch08.sql 的 `ix_*` vs `idx_*` 同一处已知差异)。
+    # 这一列**刻意不挂 ForeignKey** —— 池子里的行不随 review_queue 的删除而受约束
+    # (与 ToolAuditLog 同款理由)。
     matched_review_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, index=True
     )
@@ -303,24 +306,33 @@ class ReviewQueue(Base):
     `status` 取值 `pending|approved|rejected`;通过时 `approved_answer` 必填
     (不传就用 `example_answer`,校验在端点层做,DB 不建 CHECK —— 与既有表一致)。
 
-    **与 db/ch09.sql 的形状差异**(照 ch08 的记法,**逐列编译 `CreateTable(...)` 对着数**,
-    不凭印象;两条建库路径 = `scripts/init_db.py` 的 create_all / db/ch09.sql 手工执行):
+    **与 db/ch09.sql 的形状差异**(两条建库路径 = `scripts/init_db.py` 的 create_all /
+    db/ch09.sql 手工执行)。下面这份清单逐条对过**三处**:① 编译出的 `CreateTable(...)`;
+    ② 临时库里 `create_all` 真正建出来的 `SHOW CREATE TABLE`;③ 实况库 ALTER 出来的
+    `SHOW CREATE TABLE` / `SHOW INDEX`。
+
+    **已对齐的**(列名、可空性、类型、`occurrences` / `status` 的**列级 DEFAULT**):
+    `default=`(ORM 插入时补值)与 `server_default=`(表自己的 DEFAULT)**两侧都写**,
+    照 `ToolAuditLog.retry_count` / `duration_ms` 的先例 —— 只写前者的话,create_all
+    建出的表**没有列级 DEFAULT**,一条**省略 `status` / `occurrences` 的裸 INSERT**
+    在严格模式下会失败,而 DDL 建的同一张表会成功(行为变成「看谁建的库」)。
+    **索引覆盖也已拉平**:`status` / `created_at` / `matched_review_id` 三处在两条路径上都有索引
+    (只差索引名,见 ⑤)。
+
+    **差异清单(都是已知的,不影响行为)**:
     ① **`unsigned` 有无**:DDL 里三个 `BIGINT`(`review_queue.id` / `eval_runs.id` /
-       `low_confidence_questions.matched_review_id`)都带 `UNSIGNED`,ORM 侧 `BigInteger`
-       编译成**有符号** `BIGINT` ⇒ 两条路径建出的列**范围不同**(取值上今天碰不到)。
-       ⚠️ 顺带一提:ORM 的 `Integer` 编译成 `INT`(4 字节),所以 id 只能写 `BigInteger`
-       —— 写 `Integer` 是**真的形状不同**,不是记一笔就完事。
-    ② **索引是「有 vs 没有」,不是名字不同**:DDL 有 `KEY idx_status`,而 ORM 侧这些
-       模型**一个索引都没声明**(编译出来的 CREATE TABLE 只有 `PRIMARY KEY`)
-       ⇒ create_all 那条路径建的 `review_queue` 少一个索引。
-       ⚠️ **别照抄 db/ch08.sql 那句「只是索引名不同」** —— 那里两边都有索引,这里不是。
-    ③ **COMMENT**:DDL 有表级 + 列级中文 COMMENT,ORM 侧全文没有 `comment=`。
-    ④ **`matched_review_id` 的索引只在 create_all 那条路径上** —— 方向与 ② 相反:
-       ORM 写了 `index=True`(⇒ `ix_low_confidence_questions_matched_review_id`),
-       而 db/ch09.sql 的 ALTER 不建索引(实测 `SHOW CREATE TABLE` 只有 `KEY idx_entry_point`)。
-    **其余已对齐**(同上,逐列编译比对过):列名与顺序、可空性、类型、
-    `occurrences`/`status` 的默认值(`default=` 与 DDL 的 `DEFAULT` 语义一致)、
-    `created_at` 的 `DEFAULT CURRENT_TIMESTAMP`(`func.now()` 在 MySQL 侧就是它)。
+       `low_confidence_questions.matched_review_id`)都带 `UNSIGNED`,ORM 的 `BigInteger`
+       编译成**有符号** `BIGINT` ⇒ 列范围 2^64-1 vs 2^63-1(取值上今天碰不到)。
+       ⚠️ 但 `id` 只能写 `BigInteger`:ORM 的 `Integer` 编译成 4 字节 `INT`,那是**真的**形状不同。
+    ② **COMMENT**:DDL 有表级 + 列级中文注释,ORM 侧没有 `comment=`。
+    ③ **`created_at` 的默认值措辞**:DDL 建出来是 `DEFAULT CURRENT_TIMESTAMP`,
+       create_all 建出来是 `DEFAULT (now())`(SQLAlchemy 把 `func.now()` 渲染成表达式)。
+       两者都是「插入时取当前时间」,行为一致。
+    ④ **列序**:db/ch09.sql 走的是 ALTER,新列被**追加到末尾**(池子那两列就落在
+       `created_at` 之后),而 create_all 按 ORM 的声明顺序建表 ⇒ 两条路径**列序不同**。
+       这是 ALTER 路径的必然结果,而 SQLAlchemy 一律**按名取列**(不按位置)⇒ 不影响行为。
+    ⑤ **索引名**:create_all 自动生成 `ix_review_queue_status`,DDL 写的是 `idx_status`
+       —— 与 db/ch08.sql 的 `ix_tool_audit_logs_*` vs `idx_*` 是同一处已知差异(列相同、语义相同)。
     """
 
     __tablename__ = "review_queue"
@@ -328,8 +340,22 @@ class ReviewQueue(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     standard_question: Mapped[str] = mapped_column(String(512), nullable=False)
     example_answer: Mapped[str] = mapped_column(Text, nullable=False)
-    occurrences: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # `default=`(ORM 插入时补值)与 `server_default=`(**表自己**的列级 DEFAULT)**两侧都要**
+    # —— 只写 `default=` 的话,create_all 建出的表没有列级 DEFAULT,一条省略 `status` /
+    # `occurrences` 的裸 INSERT 在严格模式下会**失败**,而 DDL 建的同名表会成功:
+    # 行为变成「看谁建的库」。照 `ToolAuditLog.retry_count` / `duration_ms` 的先例。
+    # ⚠️ 字符串默认值写**不带引号**的 `"pending"` —— SQLAlchemy 把普通字符串当**值**,
+    # 自己补引号(编译出来是 `DEFAULT 'pending'`)。**写成 `"'pending'"` 会渲染成
+    # `DEFAULT '''pending'''`**,默认值就成了「带引号的字符串」,而它**长得像对的一样**
+    # (实测,见 T5 报告)。整数 `"1"` 同理(渲染 `DEFAULT '1'`,MySQL 对 INT 列接受)。
+    occurrences: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # `index=True` 对应 db/ch09.sql 的 `KEY idx_status`(审核列表按 status 过滤)。
+    # 索引名不同(SQLAlchemy 自动生成 `ix_review_queue_status`)—— 已知差异,与 db/ch08.sql 同款。
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending", index=True
+    )
     approved_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_raw_question: Mapped[str] = mapped_column(Text, nullable=False)
     source_conversation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -345,12 +371,14 @@ class EvalRun(Base):
     `metrics` 的形状是**闭式**的(ch09 §10.3),各策略 / 各分桶的分数都在这一个 JSON 里;
     `trigger_by` 取值 `manual|scheduled`(ddl 注释同)。
 
-    与 db/ch09.sql 的形状差异(逐列编译比对,同 `ReviewQueue` 那份清单):
+    与 db/ch09.sql 的形状差异 —— 同 `ReviewQueue` docstring 里那份**五条清单**:
     ① `id` 的 `unsigned` 有无(DDL 带 `UNSIGNED`,ORM 有符号);
-    ② **DDL 有 `KEY idx_created`,ORM 侧没有索引**(这条是「有 vs 没有」,
-       **不是**「索引名不同」—— 别照抄 ch08 那句措辞);
-    ③ DDL 的表/列 COMMENT 在 ORM 侧没有对应物。
-    **其余(列名、可空性、类型、`created_at` 默认值)已对齐。**
+    ② DDL 的表/列 COMMENT 在 ORM 侧没有对应物;
+    ③ `created_at` 的 `DEFAULT CURRENT_TIMESTAMP`(DDL)vs `DEFAULT (now())`(create_all);
+    ④ 列序不涉及(本表没走 ALTER);
+    ⑤ 索引名 `ix_eval_runs_created_at` 对 DDL 的 `idx_created`。
+    **已对齐的**:列名、可空性、类型、`created_at` 的默认值、**索引覆盖**
+    (`created_at` 在两条路径上都建索引)。
     """
 
     __tablename__ = "eval_runs"
@@ -359,6 +387,8 @@ class EvalRun(Base):
     trigger_by: Mapped[str] = mapped_column(String(32), nullable=False)
     case_count: Mapped[int] = mapped_column(Integer, nullable=False)
     metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # `index=True` 对应 db/ch09.sql 的 `KEY idx_created`(趋势查询按时间取)。
+    # 索引名不同(SQLAlchemy 自动生成 `ix_eval_runs_created_at`)—— 已知差异,与 db/ch08.sql 同款。
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now()
+        DateTime, nullable=False, server_default=func.now(), index=True
     )
