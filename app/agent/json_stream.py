@@ -222,7 +222,19 @@ class JsonAnswerDecoder:
             if ch == ":":
                 self._state = _EXPECT_VALUE
                 return
+            if ch.isspace():
+                return                       # JSON 允许键与 `:` 之间有空白
             if ch != "}":
+                # ⚠️ **这里不许吞**。原先任何不是 `:` / `}` 的字符都被 `return` 掉 ⇒
+                # `{"answer" {"text": "hi"}}` 里那个 `{` **从未被计数**、深度计数失真、
+                # `_cur_key` 停在 `"answer"`,接着那个 `:` 落进 `_EXPECT_VALUE`,
+                # 于是**嵌套节点里的字符串被当成根答案**吐给用户 —— 而且落**第 3 行
+                # 「一切正常」**,真正的根答案一个字都没送达。
+                # `useful` 侧同族更糟:`{"useful" {"a": false}, …}` ⇒ `useful=False`
+                # ⇒ **第 1 行兜底话术 + 一条 `生成自评` 池记录**,而那是一次**协议破坏**,
+                # 不是「证据不足」—— 正是 spec §5.6 点名的**假池记录**。
+                # 判违规 ⇒ 落第 2 行由调用方降级:**不制造第三种结局,也不制造假池记录**。
+                self._violate(f"expected_colon={ch}")
                 return
             # ⚠️ `}` 出现在**等冒号**的位置 ⇒ 这个键的值**整个缺失**。
             # 旧实现把它**吞掉了**(`return` 掉了),于是 `{"useful": true, "answer"}`
@@ -364,8 +376,17 @@ class JsonAnswerDecoder:
         self._flush_text(ch)
 
     def _flush_text(self, ch: str) -> None:
-        """把一个**已经合法可编码**的字符送去它该去的地方(键名 / 普通值 / answer)。"""
-        if not self._is_key and self._cur_key == "answer":
+        """把一个**已经合法可编码**的字符送去它该去的地方(键名 / 普通值 / answer)。
+
+        ⚠️ `and not self._answer_closed` 是**首胜**规则:重复的 `answer` 键
+        (`{"answer": "x", "answer": "y"}`)**取第一个**。
+        - `json.loads` 给 `'y'`(末胜),**拼接**给 `'xy'` —— `'xy'` **两者都不是**,
+          是一段**没人说过的话**,这是此前实际发生的事。
+        - 取首胜是为了与模块**自己对 `useful` 的约定一致**(`{"useful": false, …,
+          "useful": true}` ⇒ `False`,因为解出 false 就停机了)。**同一个模块里两个字段
+          不能有两种重复键语义。**
+        """
+        if not self._is_key and self._cur_key == "answer" and not self._answer_closed:
             self._answer += ch
             self._out.append(Event("answer_delta", ch))
             return

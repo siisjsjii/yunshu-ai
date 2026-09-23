@@ -459,6 +459,108 @@ def test_extra_root_brace_closes_in_every_in_object_state():
     # 改成「不违规、落第 3 行」—— 它落在 `answer` **闭合之后**,见下面那条用例。
 
 
+MISSING_COLON = [
+    ('{"useful": true, "answer" {"text": "hi"}}', "答案"),
+    ('{"useful": true, "answer" {"x": "NESTED"}, "answer": "REAL"}', "REAL"),
+    ('{"useful" {"a": false}, "answer": "REAL"}', None),      # useful 侧
+]
+
+
+@pytest.mark.parametrize("stream,want_absent", MISSING_COLON)
+def test_extra_missing_colon_is_a_violation_not_a_swallow(stream, want_absent):
+    """**缺冒号时不许吞字符** —— 吞掉一个 `{` 会让嵌套字符串**冒充答案**。
+
+    `_EXPECT_COLON` 原先把任何不是 `:` / `}` 的字符 `return` 掉,于是
+    `{"answer" {"text": "hi"}}` 里那个 `{` **从未被计数**、深度计数失真、
+    `_cur_key` 停在 `"answer"`;接着那个 `:` 落进 `_EXPECT_VALUE`,后面嵌套里的
+    字符串就走 `_flush_text` **被当成根答案**吐给用户,还落**第 3 行「一切正常」**
+    —— **真正的根答案一个字都没送达**。带尾随真答案时更糟:根答案被整个丢掉。
+
+    `useful` 侧同族更糟:`{"useful" {"a": false}, …}` ⇒ `useful=False` ⇒
+    **第 1 行兜底话术 + 一条 `生成自评` 池记录** —— 而那是一次**协议破坏**,
+    不是「证据不足」,**正是 spec §5.6 点名的假池记录**。
+
+    ⇒ 判违规,落第 2 行由调用方降级。**与切分无关**(把完整片段一次性喂进来也一样)。
+    """
+    d, ev = _run([stream])
+    assert d.violation is not None, f"{stream}: 缺冒号必须判违规"
+    assert "expected_colon" in d.violation, f"{stream}: got {d.violation!r}"
+    assert d.answer == "", f"{stream}: 嵌套里的字符串不许冒充答案"
+    assert _deltas(ev) == "", f"{stream}: 一个 delta 都不许出去"
+    # `useful` 侧那支的要害:**不许**变成一个假的 `useful=False`
+    assert d.useful is not False, f"{stream}: 这是协议破坏,不是「证据不足」"
+    if want_absent is None:
+        assert d.useful is None
+    else:
+        assert want_absent not in d.answer
+
+
+def test_extra_valid_json_whitespace_around_the_colon_is_still_fine():
+    """对照:合法 JSON 允许键与 `:` 之间有空白 ⇒ 照常放行(**别把正常形态打成违规**)。"""
+    for stream in ('{"useful": true, "answer" : "x"}',
+                   '{"useful": true, "answer"\n:\t"x"}',
+                   '{"useful": true,\n  "answer": "x"}'):
+        d, ev = _run([stream])
+        assert d.violation is None, f"{stream}: 合法 JSON 不许判违规"
+        assert d.answer == "x", f"{stream}"
+        assert d.done is True, f"{stream}"
+
+
+def test_extra_duplicate_answer_key_is_first_wins_not_concatenated():
+    """重复的 `answer` 键 ⇒ **首胜**(与模块对 `useful` 的约定一致)。
+
+    旧行为是**拼接**:`{"answer": "x", "answer": "y"}` ⇒ `'xy'` ——
+    `json.loads` 给 `'y'`(末胜),首胜会给 `'x'`,**`'xy'` 两者都不是**,
+    是一段**没人说过的话**。同一个模块里 `useful` 是首胜
+    (`{"useful": false, …, "useful": true}` ⇒ `False`,因为解出 false 就停机了),
+    **两个字段不能有两种重复键语义**。
+    """
+    d, ev = _run(['{"useful": true, "answer": "x", "answer": "y"}'])
+    assert d.answer == "x", "必须是首胜"
+    assert d.answer != "xy", "拼接是一段没人说过的话"
+    assert d.answer != "y", "末胜与 useful 的约定不一致"
+    assert _deltas(ev) == "x"
+    assert d.done is True
+    assert d.useful is True
+
+
+def test_extra_nested_missing_value_does_not_kill_the_root():
+    """`_mark_missing_value` 的 `_depth != 1` 守卫**有牙**。
+
+    嵌套层里一个半截的键(`"f0": {"a"}` —— 内层键 `a` 没有值)**不该把根判死**:
+    根对象本身是好的,`useful` 已解出、`answer` 完整、`}` 也配平。
+
+    ⚠️ 这条用例是复审点名的「零覆盖」补丁:去掉那个 `_depth != 1` 判断,
+    **其余 58 条全绿**,而行为**实质改变** —— 这个输入从
+    「好答案 + 正常收尾」变成「**中止** + `missing_value=?` + `answer=''`」。
+    """
+    d, ev = _run(['{"useful": true, "f0": {"a"}, "answer": "hi"}'])
+    assert d.answer == "hi", "根答案完整,不该被嵌套里的半截键殃及"
+    assert _deltas(ev) == "hi"
+    assert d.violation is None, "嵌套层的畸形不该把根判死"
+    assert d.done is True, "根对象的 `}` 配平了,应当正常收尾"
+    assert d.useful is True
+
+
+def test_extra_plain_terminal_state_is_the_documented_exception():
+    """`mode == PLAIN` 的终态**正好符合契约表第 2 行的字面描述** —— 但那不是违规。
+
+    `useful is None`、`done is False`、`answer == ""`,而 `deltas ≡ raw`
+    (`plain` 把每个片段原样透出,`raw` 收的也是同样那些片段)。
+    ⇒ T10 若照表第 2 行**字面**实现,会在**每一个非协议轮**上把**已经实时透出的
+    整段回复用 `raw` 重发一遍**、还把这条**被认可的正常路径**记成 `protocol_violation`。
+    而那是**最常见**的形态:「模型先说一句『让我查一下』再调工具」,以及模型根本没用协议作答。
+
+    **`plain` 是今天的行为(ch08 的纯文本流),不是违约** —— 契约表第 2 行已加例外。
+    """
+    d, ev = _run(["好的,", "我来查一下这单物流。"])
+    assert d.mode == "plain"
+    assert d.useful is None and d.done is False and d.answer == ""
+    assert _deltas(ev) == d.raw, "plain 的增量流就是 raw 本身 ⇒ 不许重发"
+    assert d.violation is None
+    assert not any(e.kind == "violation" for e in ev)
+
+
 def test_extra_residue_after_the_answer_closed_is_not_a_violation():
     """**裁定 C**:`answer` 的字符串值**闭合之后**,后续一切畸形**都不作数**。
 
