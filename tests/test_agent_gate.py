@@ -113,28 +113,40 @@ async def test_infrastructure_failure_propagates_to_502():
 
 @pytest.mark.anyio
 async def test_gate_passes_at_threshold_boundary_inclusive():
-    """0.58 恰好等于阈值 → 通过(语义是 **`>=`**,边界含等号)。
+    """**恰好等于阈值** → 通过(语义是 `>=`,边界含等号)。
 
-    ⚠️ 这里的 `0.58` 是**本用例自己传进去的局部阈值**,不是生产默认值
-    (生产默认值由 `tests/test_config.py` 钉,与这里无关)。本用例要验的只是
-    `>=` 这个边界,**换成任何数都成立** —— 别把它读成「生产阈值是 0.58」。
+    ch09 起闸比的是 `evidence_confidence(...)`,所以这里的边界值**由那条算术
+    算出来**,不再是「传一个分数进去、拿它当阈值」:
+
+        单条 score=0.5 ⇒ top1=0.5、条数=1(count_signal=min(1/3,1))、gap=0.5
+        confidence = 0.6*0.5 + 0.2*(1/3) + 0.2*0.5 = 0.46666… → round(…,4) = 0.4667
+
+    所以 0.4667 是"恰好等于",0.4668 是"高一点点" —— **两个方向都要断**,
+    只断"等于时通过"的话,一个写成 `>` 的实现照样绿。
     """
     session = RecordingSession()
-    node = make_confidence_gate_node(
-        settings=_settings(retrieval_score_threshold=0.58),
+    at = make_confidence_gate_node(
+        settings=_settings(evidence_confidence_threshold=0.4667),
         session=session, conversation_id="conv-1",
     )
-    out = await node({"user_input": "q", "evidence": [{"score": 0.58}]})
+    out = await at({"user_input": "q", "evidence": [{"score": 0.5}]})
     assert out["gate_passed"] is True
     assert out["trace"] == ["confidence_gate:pass"]
     assert session.added == []          # 通过时不落池
+
+    above = make_confidence_gate_node(
+        settings=_settings(evidence_confidence_threshold=0.4668),
+        session=session, conversation_id="conv-1",
+    )
+    out = await above({"user_input": "q", "evidence": [{"score": 0.5}]})
+    assert out["gate_passed"] is False
 
 
 @pytest.mark.anyio
 async def test_gate_fails_below_threshold_and_records_low_confidence():
     session = RecordingSession()
     node = make_confidence_gate_node(
-        settings=_settings(retrieval_score_threshold=0.58),
+        settings=_settings(evidence_confidence_threshold=0.5),
         session=session, conversation_id="conv-1",
     )
     out = await node({"user_input": "怎么退货", "evidence": [{"score": 0.31}]})
@@ -145,7 +157,13 @@ async def test_gate_fails_below_threshold_and_records_low_confidence():
     assert row.entry_point == "置信度闸"
     assert row.question == "怎么退货"
     assert row.source_conversation_id == "conv-1"
-    assert "0.31" in row.reject_reason
+    # ch09:判据从"取最高分"换成 evidence_confidence,**三个信号都要写进 reason**,
+    # 审核人才看得出为什么被拦。文案变了,判据没变。
+    assert "置信度" in row.reject_reason
+    assert "低于阈值" in row.reject_reason
+    assert "top1=" in row.reject_reason
+    assert "条数=" in row.reject_reason
+    assert "分差=" in row.reject_reason
     assert session.commits == 1
 
 
@@ -162,10 +180,20 @@ async def test_gate_fails_on_empty_evidence_and_records_that_reason():
 
 @pytest.mark.anyio
 async def test_gate_uses_max_score_not_top1_position():
-    """判据是**最高分**,不是「第一条的分」—— 顺序由重排决定,取 max 更稳。"""
+    """判据取的是**最高分**,不是「第一条的分」—— 顺序由重排决定,取 max 更稳。
+
+    ch09 起这条性质落在 `evidence_detail` 的 `top1 = 过滤后的 max(score)` 上。
+    阈值 0.5 是**刻意夹在两种实现的输出之间**的:
+
+        取 max:top1=0.9、条数=2、gap=0.7 ⇒ 0.6*0.9 + 0.2*(2/3) + 0.2*0.7 = 0.8133 ⇒ 过
+        取第一条:top1=0.2、条数=1、gap=0.2 ⇒ 0.6*0.2 + 0.2*(1/3) + 0.2*0.2 = 0.2267 ⇒ 拦
+
+    所以「按位置取第一条」的实现会让这条用例红。阈值若落在 0.8133 之上或
+    0.2267 之下,两种实现都一样 —— 用例就失去判别力。
+    """
     session = RecordingSession()
     node = make_confidence_gate_node(
-        settings=_settings(retrieval_score_threshold=0.58),
+        settings=_settings(evidence_confidence_threshold=0.5),
         session=session, conversation_id="c",
     )
     out = await node({"user_input": "q", "evidence": [{"score": 0.2}, {"score": 0.9}]})

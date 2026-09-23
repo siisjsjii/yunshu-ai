@@ -15,6 +15,7 @@ from app import observability
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
+from app.kb.evidence import evidence_detail
 from app.memory import journal, layers
 from app.memory.budget import ContextBudget
 from app.memory.trim import count_tokens
@@ -24,6 +25,7 @@ from app.prompts import (
     build_resolve_messages,
     render_evidence,
 )
+from app.retrieval.search import RetrievedChunk
 from app.schemas import Message
 from app.services.history import append_turn
 from app.tools.executor import ERROR_CONFIRMATION_REQUIRED, execute_tool
@@ -221,6 +223,35 @@ def make_retrieve_knowledge_node(*, retriever, emit, settings):
     return retrieve_knowledge
 
 
+def _evidence_chunks(evidence: list[dict]) -> list[RetrievedChunk]:
+    """通道里的证据(**dict**)→ `evidence_detail` 要的 `RetrievedChunk`。
+
+    ⚠️ **这一步必须显式做,不能"看着像就传过去"** —— 两个形状不一样:
+    `state["evidence"]` 装的是 `retrieve_knowledge` 写进去的**键值 dict**
+    (`render_evidence` 与 citations 帧共用同一份),而 `app/kb/evidence.py` 读的是
+    **属性 `c.score`**。把 dict 直接传过去是 `AttributeError`,而它**只在真机上炸**:
+    单测若把 `RetrievedChunk` 塞进 state,那条属性访问照样绿,生产上每一次
+    知识问答都 500。这正是本仓记过的「替身的形状必须等于生产的形状」。
+
+    只投影判据真正读的那个字段(分数);其余字段填**通道里那份的同名值**,
+    不另行加工 —— `question` / `answer` / `category` 在 dict 里缺键时给空串:
+    它们是**另一个读者**(prompt 渲染)的输入,闸这里一个都不用。
+    `score` 用 `e["score"]`(**不给默认值**):通道里没有分数说明上游写坏了,
+    那时候要响亮地炸,不是当成 0 分静默拦下。
+    """
+    return [
+        RetrievedChunk(
+            question=e.get("question", ""),
+            answer=e.get("answer", ""),
+            category=e.get("category", ""),
+            chunk_id=e.get("chunk_id") or 0,
+            section_path=e.get("section_path"),
+            score=e["score"],
+        )
+        for e in evidence
+    ]
+
+
 def make_confidence_gate_node(*, settings, session, conversation_id):
     """置信度闸:卡在检索之后、进 Agent 之前。
 
@@ -228,25 +259,41 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
     (ch04 的自评正是那个位置,本章把它撤掉)。证据弱就直接回兜底话术、
     不进 Agent,同时把问题落池留给后面的数据飞轮。
 
-    判据是纯**检索分数阈值**(取最高分),零额外模型调用 —— 最简版;
-    正式的置信度检查留给「可观测」那章。
+    **判据(ch09 起)**:`app/kb/evidence.py:evidence_detail` 的三信号合成分
+    (top1 / 条数 / 分差)—— 零额外模型调用,与它比的是
+    `settings.evidence_confidence_threshold`(标定出来的,见 spec §4.2)。
+    旧判据是「最高分 ≥ `retrieval_score_threshold`」,**单条高分就能过**;
+    而"单条高分可能是巧合"正是这次要挡的那一类(spec §4.1)。
+    `retrieval_score_threshold` 此后仍归**检索器内部**用(它筛块),
+    闸不再读它 —— 两条链路各自一个旋钮,别再让它们互相借。
     """
 
     async def confidence_gate(state) -> dict:
-        scores = [e["score"] for e in (state.get("evidence") or [])]
-        passed = bool(scores) and max(scores) >= settings.retrieval_score_threshold
+        evidence = state.get("evidence") or []
+        detail = evidence_detail(_evidence_chunks(evidence), settings=settings)
+        # `bool(evidence)` **不能删**:空证据时 `detail["confidence"]` 是 0.0,
+        # 而阈值被标定成 0 的话 `0.0 >= 0.0` 为真 ⇒ 空着知识进 Agent。
+        passed = bool(evidence) and detail["confidence"] >= settings.evidence_confidence_threshold
 
         if not passed:
+            # 三个信号**都写进 reason** —— 审核页旁边就是这段文字,它要回答的是
+            # "为什么这条被判成答不了",不是一个分数(spec §4.3)。
+            reason = (
+                "检索为空"
+                if not evidence
+                else (
+                    f"置信度 {detail['confidence']} 低于阈值 "
+                    f"{settings.evidence_confidence_threshold}"
+                    f"(打分:top1={detail['top1']} 条数={detail['count']} "
+                    f"分差={detail['gap']})"
+                )
+            )
             await record_low_confidence(
                 session,
                 question=state["user_input"],
                 source_conversation_id=conversation_id,
                 entry_point="置信度闸",
-                reject_reason=(
-                    "检索为空"
-                    if not scores
-                    else f"最高分 {max(scores):.2f} 低于阈值 {settings.retrieval_score_threshold}"
-                ),
+                reject_reason=reason,
             )
 
         return {
