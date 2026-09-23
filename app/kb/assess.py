@@ -62,26 +62,50 @@ async def assess_sufficiency(question: str, chunks: list, model) -> dict:
 
 async def record_low_confidence(session, *, question: str, source_conversation_id: str | None,
                                 entry_point: str, reject_reason: str,
-                                evidence_snapshot: list | None = None) -> None:
-    """问题落低置信度池。
+                                evidence_snapshot: list | None = None) -> int:
+    """问题落低置信度池。**返回新行的 id。**
+
+    返回 id 的理由:ch09 起这张表不再是「只落不读」的池子,而是**数据飞轮的
+    入口**(spec §6)。流水线要沿着「刚归并的是哪一行」往下走(`review_queue`
+    的 `matched_review_id` 得指回它),审核页要按 id 定位;测试也用它**就地
+    清理**自己写的那一行,不必再按问题文本反查(文本是自由文本,反查容易
+    误伤别人写的行)。
 
     `evidence_snapshot` 是 ch09 加的:落池当轮的召回片段(Top-N 的
     id / 得分 / 章节 / 原文)。审核人靠它判「知识库真缺这块,还是有、但没检到」——
     没有它,池子里只有一句问题,那两件事看起来一模一样(ch09 spec §7.1)。
+    不传 ⇒ 落 **JSON null**(不是空列表):「当轮零召回」与「没人记这件事」
+    在审核页上是两件事。
 
-    ⚠️ **本参数由 T10 先落**(2026-09-23)。计划把「加这个参数**并返回新行 id**」
-    整条记在 T11 名下,而 T10 的契约里已经写着「Consumes T5 的
-    `record_low_confidence(evidence_snapshot=…)`」—— T5 只落了 ORM 那一列,
-    函数签名没动,而 T10 排在 T11 前面。⇒ T10 只补**它当下就需要的那一半**
-    (收下快照);**返回新行 id 仍是 T11 的活**。详见 task-10-report.md 的 concerns。
+    ⚠️ **它落的是 JSON 的 `null`,不是 SQL 的 NULL**(实测 2026-09-23:
+    `evidence_snapshot IS NULL` = **0**、`JSON_TYPE(evidence_snapshot)` = `'NULL'`)。
+    这是 SQLAlchemy `JSON` 列的默认行为(`none_as_null=False`:Python 的 `None`
+    被写成 JSON `null`)。后果:**别拿 `WHERE evidence_snapshot IS NULL` 筛
+    「这条没记快照」** —— 一行都筛不出来。经 ORM 读回是 Python `None`,
+    所以审核页那侧看不出差别。
+
+    ⚠️ **这两半是分两次落地的**(2026-09-23)。计划把「加 `evidence_snapshot`
+    参数**并返回新行 id**」整条记在 T11 名下,而 T10 的契约里已经写着
+    「Consumes T5 的 `record_low_confidence(evidence_snapshot=…)`」——
+    T5 只落了 ORM 那一列,函数签名没动,而 T10 排在 T11 前面。
+    ⇒ **T10 补了「收下快照」那半,T11(本次)补「返回新行 id」那半**。
+    连带的覆盖度也分两次补:T10 那次只在**替身 session** 上验了「形参进了
+    ORM 对象」,**真列上一条用例都没有**(T11 实测:把形参写死成 `None`,
+    既有那条 db 用例照样绿),T11 补了真库往返那条。
     """
-    session.add(
-        LowConfidenceQuestion(
-            question=question,
-            source_conversation_id=source_conversation_id,
-            entry_point=entry_point,
-            reject_reason=reject_reason,
-            evidence_snapshot=evidence_snapshot,
-        )
+    row = LowConfidenceQuestion(
+        question=question,
+        source_conversation_id=source_conversation_id,
+        entry_point=entry_point,
+        reject_reason=reject_reason,
+        evidence_snapshot=evidence_snapshot,
     )
+    session.add(row)
     await session.commit()
+    # 提交后取 id:本仓的 session 工厂是 `expire_on_commit=False`
+    #(`app/db/base.py` 的注释写明了理由),属性在提交后仍可读,不会再发一次
+    # SELECT。**不调 `session.flush()`**:那会加宽本函数对 session 的接口要求,
+    # 而七条既有用例(置信度闸 / 协议那几处)用的是只实现 `add` + `commit` 的
+    # 替身 session —— 多要一个方法就把那些用例全打红,而它们与「返回 id」
+    # 这件事毫无关系(踩过:见 task-11-report.md 的返工记录)。
+    return row.id
