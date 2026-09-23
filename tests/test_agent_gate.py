@@ -53,7 +53,9 @@ def _chunk(score, answer="七天无理由退货"):
 async def test_retrieval_uses_the_resolved_input_and_builds_citations():
     frames = []
     retriever = FakeRetriever([_chunk(0.91)])
-    node = make_retrieve_knowledge_node(retriever=retriever, emit=frames.append)
+    node = make_retrieve_knowledge_node(
+        retriever=retriever, emit=frames.append, settings=_settings()
+    )
     out = await node({"resolved_input": "怎么退货"})
     assert retriever.calls == ["怎么退货"]
     assert out["evidence"][0]["score"] == 0.91
@@ -73,7 +75,7 @@ async def test_citations_are_emitted_as_a_frame():
     """
     frames = []
     node = make_retrieve_knowledge_node(retriever=FakeRetriever([_chunk(0.91)]),
-                                        emit=frames.append)
+                                        emit=frames.append, settings=_settings())
     out = await node({"resolved_input": "怎么退货"})
     # 载荷键是 `items` —— ch04 前端读的就是 `payload.items`(见 index.html:368)。
     # 断言写成 `{"citations": ...}` 的话,把键改错也照样绿。
@@ -83,7 +85,9 @@ async def test_citations_are_emitted_as_a_frame():
 @pytest.mark.anyio
 async def test_empty_retrieval_is_recorded_in_trace_not_an_error():
     frames = []
-    node = make_retrieve_knowledge_node(retriever=FakeRetriever([]), emit=frames.append)
+    node = make_retrieve_knowledge_node(
+        retriever=FakeRetriever([]), emit=frames.append, settings=_settings()
+    )
     out = await node({"resolved_input": "没有的问题"})
     assert out["evidence"] == []
     assert out["citations"] == []
@@ -97,6 +101,7 @@ async def test_infrastructure_failure_propagates_to_502():
     node = make_retrieve_knowledge_node(
         retriever=FakeRetriever(error=ToolInfrastructureError("检索不可用")),
         emit=lambda p: None,
+        settings=_settings(),
     )
     with pytest.raises(ToolInfrastructureError):
         await node({"resolved_input": "q"})

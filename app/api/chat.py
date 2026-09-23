@@ -8,6 +8,7 @@ from fastapi.sse import EventSourceResponse, format_sse_event
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import observability
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
@@ -438,89 +439,144 @@ async def chat_stream(
         raise
 
     async def generate():
-        try:
-            yield _frame("meta", {"session_id": session_id, "model": settings.openai_model})
+        # ch09:外层 trace 作用域「包住整段流」。会话 id 必须在 `astream`
+        # **之前**建,而意图要等 `classify_intent` 跑完才知道 —— 那一半走下面
+        # 的「中途进入」,理由与实测依据见 spec §3.4。
+        with observability.trace_scope(
+            conversation_id=session_id, settings=settings
+        ):
+            # `intent_cm` 必须在 `try` **之前**初始化:它在循环体里才被赋值,
+            # 而首帧之前就抛异常的话下面那个 `finally` 会去读一个**未绑定**的名字
+            # (NameError 会把原始异常顶掉 —— 本仓「报错指向别处」那一类)。
+            intent_cm: observability.TagScope | None = None
+            try:
+                yield _frame("meta", {"session_id": session_id, "model": settings.openai_model})
 
-            final = {"trace": [], "intent": None, "gate_passed": None, "agent_steps": 0}
-            suspended = False
-            # `stream_mode` **必须带上 `updates`**(ch06,spec F1)。实测
-            # (langgraph 1.2.11):只给 `custom` 时 `interrupt()` 被**整个吞掉**
-            # —— run 照常结束、`state.next` 停在待续节点、一个帧不吐、不报任何错。
-            # 用户侧的表现是"问退款之后什么都没发生",连报错都没有。
-            #
-            # `updates` 只用于**认 interrupt**,其余一律不外推:那是图的原始
-            # update 载荷(里面是节点返回值,可能含模型自由文本),前端不认识它。
-            async for mode, chunk in graph.astream(
-                stream_input,
-                config={"configurable": {"thread_id": session_id}},
-                stream_mode=["custom", "updates"],
-            ):
-                if mode == "updates":
-                    if "__interrupt__" in chunk:
-                        # 挂起:载荷原样是 `{"frame": "order_choice", "options": [...]}`
-                        # (spec §5.2),帧名与载荷由它自己说 —— 端点只做搬运,不认
-                        # "order_choice" 这个字面量(将来多一种挂起,这里不用改)。
-                        value = chunk["__interrupt__"][0].value
-                        if not isinstance(value, dict):
-                            # 下面两句要 `payload.get(...)` / `payload.items()`,
-                            # 非 dict 会变成一句 `AttributeError` 的 error 帧。
-                            # **只有我们自己的节点会 `interrupt(...)`,它们一律给
-                            # dict**(见 `app/agent/refund_nodes.py`),所以走到这里
-                            # 是接线/实现 bug —— 响亮地抛,别让它长成
-                            # 「用户看不懂、我们也没法查」的样子。
-                            raise TypeError(
-                                f"interrupt 载荷必须是 dict,收到 {type(value).__name__}"
+                final = {"trace": [], "intent": None, "gate_passed": None, "agent_steps": 0}
+                suspended = False
+                # `stream_mode` **必须带上 `updates`**(ch06,spec F1)。实测
+                # (langgraph 1.2.11):只给 `custom` 时 `interrupt()` 被**整个吞掉**
+                # —— run 照常结束、`state.next` 停在待续节点、一个帧不吐、不报任何错。
+                # 用户侧的表现是"问退款之后什么都没发生",连报错都没有。
+                #
+                # `updates` 只用于**认 interrupt**,其余一律不外推:那是图的原始
+                # update 载荷(里面是节点返回值,可能含模型自由文本),前端不认识它。
+                #
+                # ch09:回调跟着**调用**走,不是编译期(`compile` 处不传 callbacks)——
+                # 每请求一个 handler,它自动覆盖**全部 LangChain run**(意图分类、
+                # 消解、agent 每一轮、退款判定)。
+                #
+                # 位置在首帧**之后**:`make_handler` 要 import langfuse(冷启动
+                # 上百毫秒),放在 meta 帧之前会让那点延迟直接压在"用户看到会话
+                # 已建立"上,而它换不来任何东西。
+                handler = observability.make_handler(settings)
+                extra: dict = {}
+                if handler is not None:
+                    extra["callbacks"] = [handler]
+
+                async for mode, chunk in graph.astream(
+                    stream_input,
+                    config={
+                        "configurable": {"thread_id": session_id},
+                        **extra,
+                    },
+                    stream_mode=["custom", "updates"],
+                ):
+                    # ---- ch09:意图一出现就给它打 tag(**中途**进入)----
+                    # 意图要 `classify_intent` 跑完才知道,那时 `astream` 已经在跑了
+                    # ⇒ 不可能像 session_id 那样在外层包住。实测语义:进入**之后**
+                    # 新建的观测带 tag、之前的没有(spec §3.4-2);而花销的大头在
+                    # 分类**之后**的 agent 轮次,这个语义够用。`enter()` 是**同步**
+                    # 的 —— `_AgnosticContextManager` 没有 `__aenter__`(实测)。
+                    #
+                    # **只进一次**(`intent_cm is None` 就是那个判据):每批 updates
+                    # 都建一个新 CM 的话,前一个的 `__exit__` 永远不会被调用。
+                    # 所以这里**不写** `if got:` 那种守卫 —— `intent_scope("")`
+                    # 返回的是一个**空壳** `TagScope`(`enter()` 自己不做事),
+                    # 照样把 `intent_cm` 置上;加了守卫反而会让每一批 updates
+                    # 都重算一遍(白活),结果一模一样。
+                    if (
+                        intent_cm is None
+                        and mode == "updates"
+                        and isinstance(chunk, dict)
+                        and "classify_intent" in chunk
+                    ):
+                        got = (chunk["classify_intent"] or {}).get("intent") or ""
+                        intent_cm = observability.intent_scope(got, settings=settings)
+                        intent_cm.enter()
+                    if mode == "updates":
+                        if "__interrupt__" in chunk:
+                            # 挂起:载荷原样是 `{"frame": "order_choice", "options": [...]}`
+                            # (spec §5.2),帧名与载荷由它自己说 —— 端点只做搬运,不认
+                            # "order_choice" 这个字面量(将来多一种挂起,这里不用改)。
+                            value = chunk["__interrupt__"][0].value
+                            if not isinstance(value, dict):
+                                # 下面两句要 `payload.get(...)` / `payload.items()`,
+                                # 非 dict 会变成一句 `AttributeError` 的 error 帧。
+                                # **只有我们自己的节点会 `interrupt(...)`,它们一律给
+                                # dict**(见 `app/agent/refund_nodes.py`),所以走到这里
+                                # 是接线/实现 bug —— 响亮地抛,别让它长成
+                                # 「用户看不懂、我们也没法查」的样子。
+                                raise TypeError(
+                                    f"interrupt 载荷必须是 dict,收到 {type(value).__name__}"
+                                )
+                            suspended = True
+                            yield _frame(
+                                value.get("frame", "interrupt"),
+                                {k: v for k, v in value.items() if k != "frame"},
                             )
-                        suspended = True
-                        yield _frame(
-                            value.get("frame", "interrupt"),
-                            {k: v for k, v in value.items() if k != "frame"},
+                        continue
+
+                    payload = chunk
+                    event = payload.get("frame")
+                    if event == "trace":
+                        # 内部证据链:折进 done 帧,不外推 —— 前端不认识这个帧。
+                        final = payload
+                        continue
+                    data = {k: v for k, v in payload.items() if k != "frame"}
+                    if event == "tool_result" and not data.get("ok", True):
+                        data["summary"] = redact_api_key(
+                            data.get("summary", ""), settings.openai_api_key
                         )
-                    continue
+                    yield _frame(event, data)
 
-                payload = chunk
-                event = payload.get("frame")
-                if event == "trace":
-                    # 内部证据链:折进 done 帧,不外推 —— 前端不认识这个帧。
-                    final = payload
-                    continue
-                data = {k: v for k, v in payload.items() if k != "frame"}
-                if event == "tool_result" and not data.get("ok", True):
-                    data["summary"] = redact_api_key(
-                        data.get("summary", ""), settings.openai_api_key
-                    )
-                yield _frame(event, data)
+                if suspended:
+                    # 挂起的一轮**不发 done**:done 帧自报的是"这一轮跑完了"(它带
+                    # trace / intent / agent_steps),而挂起时这些全是初值 —— 发出去
+                    # 是在撒谎,而且 `log_turn` 也没跑(这一轮不落库,spec §5.1)。
+                    # 前端不读 done 帧,响应结束即恢复输入框。
+                    return
 
-            if suspended:
-                # 挂起的一轮**不发 done**:done 帧自报的是"这一轮跑完了"(它带
-                # trace / intent / agent_steps),而挂起时这些全是初值 —— 发出去
-                # 是在撒谎,而且 `log_turn` 也没跑(这一轮不落库,spec §5.1)。
-                # 前端不读 done 帧,响应结束即恢复输入框。
-                return
-
-            yield _frame("done", {
-                "finish_reason": "stop",
-                # `usage` **刻意写死 None**:`ChatState.usage` 只有 Agent 节点写,
-                # 而它**不在** `resolve_references` 的每轮重置清单里 —— 一旦把
-                # `state["usage"]` 接到这里,非 Agent 的那几轮(闲聊/投诉/兜底/
-                # 退款子流程)就会报**上一轮的 token 数**。今天没有任何读者
-                # (前端不读、验收脚本不读),所以先留死值;真要接,必须连
-                # 「在每轮重置里把 usage 清掉」一起做。
-                "usage": None,
-                "trace": final.get("trace") or [],
-                "intent": final.get("intent"),
-                "confidence": final.get("confidence"),
-                "gate_passed": final.get("gate_passed"),
-                "agent_steps": final.get("agent_steps") or 0,
-            })
-        except Exception as exc:
-            # 上游异常文本可能带着密钥(见 app/sanitize.py),出站前抹掉。
-            yield _frame(
-                "error",
-                {"message": redact_api_key(str(exc), settings.openai_api_key)},
-            )
-        finally:
-            lock.release()
+                yield _frame("done", {
+                    "finish_reason": "stop",
+                    # `usage` **刻意写死 None**:`ChatState.usage` 只有 Agent 节点写,
+                    # 而它**不在** `resolve_references` 的每轮重置清单里 —— 一旦把
+                    # `state["usage"]` 接到这里,非 Agent 的那几轮(闲聊/投诉/兜底/
+                    # 退款子流程)就会报**上一轮的 token 数**。今天没有任何读者
+                    # (前端不读、验收脚本不读),所以先留死值;真要接,必须连
+                    # 「在每轮重置里把 usage 清掉」一起做。
+                    "usage": None,
+                    "trace": final.get("trace") or [],
+                    "intent": final.get("intent"),
+                    "confidence": final.get("confidence"),
+                    "gate_passed": final.get("gate_passed"),
+                    "agent_steps": final.get("agent_steps") or 0,
+                })
+            except Exception as exc:
+                # 上游异常文本可能带着密钥(见 app/sanitize.py),出站前抹掉。
+                yield _frame(
+                    "error",
+                    {"message": redact_api_key(str(exc), settings.openai_api_key)},
+                )
+            finally:
+                # ch09:意图标签作用域必须**显式**收尾 —— 它是手动 `__enter__` 的,
+                # 没有 `with` 替我们 `__exit__`(而它自己吞掉一切异常,所以这里
+                # 不需要再包 try)。**两条退出路径共用一个 `finally`**:
+                # 正常收尾、挂起 `return`、异常、客户端断开的 `GeneratorExit`
+                # 全都经过它 —— 漏掉的话,那条路径上的观测永远不摘上下文。
+                if intent_cm is not None:
+                    intent_cm.exit()
+                lock.release()
 
     # 这一句刻意留在守卫之外:`EventSourceResponse(...)` 只是构造一个对象,
     # 不做 IO,也不启动生成器(generate 的第一个 yield 发生在响应发送时,

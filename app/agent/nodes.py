@@ -11,6 +11,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import ValidationError
 
+from app import observability
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
@@ -150,7 +151,7 @@ def make_complaint_reply_node(*, emit):
 # ---- 知识类:强制预检索 + 置信度闸 ----
 
 
-def make_retrieve_knowledge_node(*, retriever, emit):
+def make_retrieve_knowledge_node(*, retriever, emit, settings):
     """知识类意图的**强制**预检索(确定性骨架的一步,不走 query_faq 工具)。
 
     检索器的故障语义原样透传:`KnowledgeRetriever` 把 Milvus/嵌入的故障翻成
@@ -159,10 +160,35 @@ def make_retrieve_knowledge_node(*, retriever, emit):
 
     `citations` **同时**写进 state 并发一帧:state 那份给 Agent 组装引用编号,
     帧那份给前端渲染可点击的来源。少发帧 = ch04 的引用 UI 静默失效。
+
+    `settings` 只为观测而收(ch09):`KnowledgeRetriever` **不是** LangChain
+    run(Langfuse 的 callback 只挂在 LangChain 的 Runnable 上),所以这一段的
+    span 只能手工开 —— 见 spec §3.3。「每个节点的检索结果都能铺开看」那条需求
+    的**唯一**落点就是这里。**依赖走显式注入,不留会自己兜底的默认值。**
     """
 
     async def retrieve_knowledge(state) -> dict:
-        chunks = await retriever.search(state["resolved_input"])
+        # span 只包住**检索本身**:证据清单、citations 帧、trace 都是纯内存加工,
+        # 没有可观测的东西;把它们圈进来只会让 span 的耗时读数不再是"检索花了多久"。
+        #
+        # ⚠️ `span` **不吞业务异常**(它只在 finally 里吞自己的 `__exit__`)——
+        # 这是刻意的:`ToolInfrastructureError` 必须原样穿出去变 502。
+        with observability.span(
+            "retrieval", as_type="retriever",
+            input={"query": state["resolved_input"]}, settings=settings,
+        ) as sp:
+            chunks = await retriever.search(state["resolved_input"])
+            if sp is not None:
+                # 只记「怎么找到的」这几个字段:id / score / section_path。
+                # **不把 chunk 的正文塞进去** —— 那是知识库原文,而这条 trace
+                # 会出网(spec §2.1 已记账),记 entry 的规模没有收益。
+                sp.update(output={
+                    "chunks": [
+                        {"id": c.chunk_id, "score": round(c.score, 4),
+                         "section_path": c.section_path}
+                        for c in chunks
+                    ]
+                })
         evidence = [
             {
                 "chunk_id": c.chunk_id,
@@ -369,10 +395,27 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
                 # 登记项上的 `kind` 推权限与重试,`input_schema` 做校验前置。
                 # `write_decision` 走默认的 `pending`:Agent 这条正常路径从不传,
                 # 写调用因此**停在这里**(不执行),由确认流决定下一步。
-                outcome = await execute_tool(
-                    tool_call=call, registry=registry, settings=settings,
-                    conversation_id=state["conversation_id"],
-                )
+                #
+                # ch09:工具执行**不是** LangChain run(`execute_tool` 是自写的
+                # 执行器)⇒ Langfuse 的 callback 一个 span 都不会给它,手工开
+                # (spec §3.3)。名字带工具名,于是同一轮里哪个工具花了多久、
+                # 结果是什么,在 trace 上直接可读。
+                with observability.span(
+                    f"tool:{call['name']}", as_type="tool",
+                    input=call["args"], settings=settings,
+                ) as sp:
+                    outcome = await execute_tool(
+                        tool_call=call, registry=registry, settings=settings,
+                        conversation_id=state["conversation_id"],
+                    )
+                    if sp is not None:
+                        # `summary` 是给用户看的一句话(失败时是固定文案),
+                        # 不是原始异常文本 —— 出站这点由执行器保证过了。
+                        sp.update(output={
+                            "ok": outcome.ok,
+                            "summary": outcome.summary,
+                            "error_kind": outcome.error_kind,
+                        })
                 if outcome.error_kind == ERROR_CONFIRMATION_REQUIRED:
                     # 写操作待确认:那次调用**根本没发生** ⇒ 不回灌 tool 结果,
                     # 由 `apply_write_decision` 在决议之后补上。

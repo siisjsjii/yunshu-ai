@@ -20,6 +20,7 @@
 from langchain_core.messages import ToolMessage
 from langgraph.types import interrupt
 
+from app import observability
 from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import APPROVED, DENIED, execute_tool
 
@@ -113,13 +114,27 @@ def make_apply_write_decision_node(*, registry, settings, emit):
             "args": pending.get("args") or {},
             "type": "tool_call",
         }
-        outcome = await execute_tool(
-            tool_call=call,
-            registry=registry,
-            settings=settings,
-            conversation_id=state["conversation_id"],
-            write_decision=decision,
-        )
+        # ch09:这一处是那次写调用**真正执行**的地方(agent 循环里那次已经
+        # `continue` 掉了,它的 `tool:*` span 记的是「待确认」)。不给它开 span
+        # 的话,trace 上就**看不到写操作到底执行了没有** —— 而这正是确认流
+        # 唯一值得看的一步。名字与 agent 循环里那条同形,便于对照。
+        with observability.span(
+            f"tool:{call['name']}", as_type="tool",
+            input=call["args"], settings=settings,
+        ) as sp:
+            outcome = await execute_tool(
+                tool_call=call,
+                registry=registry,
+                settings=settings,
+                conversation_id=state["conversation_id"],
+                write_decision=decision,
+            )
+            if sp is not None:
+                sp.update(output={
+                    "ok": outcome.ok,
+                    "summary": outcome.summary,
+                    "error_kind": outcome.error_kind,
+                })
         # ⚠️ **这条帧必须在「决议之后」发,而且只在这里发**(T10 的 bundled 修复)。
         #
         # `agent` 的循环对每个调用**先**发 `tool_call` 帧、**再**执行;撞到待确认

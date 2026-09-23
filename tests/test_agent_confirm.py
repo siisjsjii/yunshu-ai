@@ -15,6 +15,14 @@ class _Settings:
     tool_timeout_seconds = 10.0
     tool_retry_attempts = 2
     tool_retry_delay_seconds = 0.0
+    # ch09:三个 LANGFUSE_* 任一为空 ⇒ 观测整套 no-op(「单测全程不联网」靠它守)。
+    # **替身必须与生产 `Settings` 同形**:`observability.enabled()` 直接读这三个
+    # 属性,而那次读发生在 `span()` 的 try **之外** —— 替身漏掉它们不是"降级",
+    # 是一个 `AttributeError`,报错指向观测模块而不是"你的替身少字段"。
+    # (本仓既定的修法是**扩替身、不给实现加兜底**。)
+    langfuse_public_key = ""
+    langfuse_secret_key = ""
+    langfuse_base_url = ""
 
 
 async def _no_audit(**_kwargs) -> None:

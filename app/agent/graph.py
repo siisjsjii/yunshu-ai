@@ -115,9 +115,13 @@ def build_graph(
     # 已在 T5 报告里记账。
     graph.add_node("resolve_references", make_resolve_references_node(model=model))
     graph.add_node("classify_intent", make_classify_intent_node(model=intent_model))
+    # ch09:多传一个 `settings=` —— 检索节点要手工开 `retrieval` span(检索器
+    # 不是 LangChain run,回调覆盖不到)。**这是 ch09 唯一改到本文件的地方**:
+    # 节点、边、`_OUTLETS` 一字未动(spec §14 那句「不改 graph.py」的语义是
+    # 「**拓扑**一字不改」,而依赖显式注入是本仓的硬规矩)。
     graph.add_node(
         "retrieve_knowledge",
-        make_retrieve_knowledge_node(retriever=retriever, emit=emit),
+        make_retrieve_knowledge_node(retriever=retriever, emit=emit, settings=settings),
     )
     # ⚠️ 这个 `conversation_id` 必须与 state 里的 `conversation_id` 是**同一个值**。
     # 闸用它写 `low_confidence_questions.source_conversation_id`(即「这问题是从哪段
