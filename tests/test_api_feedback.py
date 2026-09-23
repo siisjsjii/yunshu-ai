@@ -43,6 +43,7 @@ PROBE_DOWN = "t12probe-down"
 PROBE_DUP = "t12probe-dup"
 PROBE_FAIL = "t12probe-fail"
 PROBE_BAD = "t12probe-bad"
+PROBE_EMPTY = "t12probe-empty"
 
 #: 探针问题文本。**每个探针一句独有的** —— 顺带当第二个过滤条件(见文件头)。
 Q_UP = "t12 探针:这句话只该在日志里,不该进池子"
@@ -50,6 +51,7 @@ Q_DOWN = "t12 探针:这一单我没被答上"
 Q_DUP = "t12 探针:同一个 👎 连点两次"
 Q_FAIL = "t12 探针:检索挂了也得进池子"
 Q_BAD = "t12 探针:非法 value 一个字都不许落"
+Q_EMPTY = "t12 探针:知识库里没有这一条"
 
 _REQUIRED_SETTINGS = dict(
     openai_base_url="https://example.invalid/v1",
@@ -124,15 +126,21 @@ def client_factory(monkeypatch):
         app.dependency_overrides[get_settings] = lambda: Settings(
             _env_file=None, **{**_REQUIRED_SETTINGS, **settings_overrides}
         )
-        # 形参按生产签名对齐(`(session, settings)`);少收一个抛的是 TypeError,
-        # 而用例期待的是 200 —— 红法会指向这行 lambda,不指向被测代码。
-        monkeypatch.setattr(
-            feedback_api,
-            "build_retriever",
-            lambda session, settings=None: (
-                retriever if retriever is not None else FakeRetriever()
-            ),
-        )
+        # ⚠️ 形参**与生产逐个对齐,而且不许给默认值**
+        # (`app/tools/registry.py:26`:`def build_retriever(session, settings)`)。
+        #
+        # 这里原先写的是 `lambda session, settings=None:` —— 那个 `=None` **只放宽了测试**:
+        # 端点哪天漏传 `settings`(写成 `build_retriever(session)`),单测**照样全绿**,
+        # 而生产会 `TypeError` 500。这正是本仓那条「**看起来接上、其实没接**」的形状,
+        # 也是本文件自己要防的假绿 —— **变异实测过**(task-12-report §4 追加:
+        # 同一个「端点漏传」的变异,在宽替身下 8 条全绿、在严替身下当场红)。
+        #
+        # 两个方向都不许:少收一个形参会替端点把错吃掉(严过头反而红在脚手架上),
+        # 多给一个默认值则让**被测的那次调用**永不被行使。
+        def _fake_build_retriever(session, settings):
+            return retriever if retriever is not None else FakeRetriever()
+
+        monkeypatch.setattr(feedback_api, "build_retriever", _fake_build_retriever)
         return httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         )
@@ -286,7 +294,8 @@ async def test_up_writes_nothing_to_the_pool(client_factory):
     问题文本也数一次:只按会话过滤的话,「端点忽略 `conversation_id`、
     把行写到别的会话上」这种漏照不出来(本仓那条「字段的语义要读它的赋值处」)。
     """
-    client = client_factory()
+    retriever = FakeRetriever()
+    client = client_factory(retriever=retriever)
     await _delete_probe(PROBE_UP)          # 防上一次崩在断言中间留下的行
     try:
         r = await client.post("/api/feedback",
@@ -296,6 +305,10 @@ async def test_up_writes_nothing_to_the_pool(client_factory):
         assert r.json()["pooled"] is False, "up 的答复自己也该说「没落池」"
         assert await _rows(PROBE_UP) == [], "up 一行都不许落"
         assert await _count_by_question(Q_UP) == 0, "落到了别的会话上(会话 id 没用上)"
+        # `up` **一次检索都不该跑**:跑了的话,一个「无论 up/down 都先回捞一遍」
+        # 的实现会白烧一次 Milvus 往返 + 一次重排(用户点了 👍 却去查知识库),
+        # 而上面那些断言**全都照样绿**(它确实没落池)。替身的 `calls` 就为这个闲着。
+        assert retriever.calls == [], f"up 不该调检索器,实际搜了 {retriever.calls}"
     finally:
         await _teardown(PROBE_UP)
 
@@ -326,7 +339,10 @@ async def test_down_writes_one_row_with_user_feedback_entry_point(client_factory
         assert len(rows) == 1, f"down 必须落且只落一行,实际 {len(rows)} 行:{rows}"
         assert rows[0]["entry_point"] == "用户反馈"
         assert rows[0]["question"] == Q_DOWN, "落池的必须是**用户原话**那一条问题"
-        assert rows[0]["reject_reason"], "reject_reason 是非空列,审核页要读它"
+        # reject_reason **钉字面量**,不是只查非空:只查非空的话,写别的任何一句
+        # (比如把闸那句「检索为空」的文案抄过来)都会过,而审核页要靠它区分
+        # 「用户自己说没用」与「闸/自评拦下的」—— 那是**能不能信这条数据**的问题。
+        assert rows[0]["reject_reason"] == "用户点了 👎(未解决)"
         assert json.loads(rows[0]["evidence_snapshot"]) == EXPECTED_SNAPSHOT, (
             "快照是审核页判「真缺 / 没检到」的唯一依据,必须按契约的形状落全"
         )
@@ -370,6 +386,40 @@ async def test_repeated_down_for_the_same_message_writes_only_one_row(client_fac
         assert rows[0]["entry_point"] == "用户反馈"
     finally:
         await _teardown(PROBE_DUP)
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_empty_recall_writes_a_json_null_snapshot(client_factory):
+    """检索**正常返回空**(不抛异常)⇒ 快照是 JSON `null` —— 这是**另一条路**。
+
+    与下一条(检索**炸了**)共用同一个观测(快照为空),而**语义相反**:
+    正常空召回 =「知识库真缺这块」,炸了 =「没能回捞」(spec §6.2 那对区分正是
+    回捞这件事的全部意义)。只测抛异常那一支的话,一个把「空列表」当成故障
+    (或把故障当成「真缺」)的实现不会被任何断言发现。
+
+    顺带钉住**回捞真的跑了**(`calls == [Q_EMPTY]`):一个「干脆不回捞、快照恒空」
+    的实现能满足本用例其余全部断言,而那会让审核页永远读到「真缺这块」——
+    这是本条最容易长的假绿,所以 `calls` 必须断。
+    """
+    retriever = FakeRetriever([])          # 空召回,但**不抛**
+    client = client_factory(retriever=retriever)
+    await _delete_probe(PROBE_EMPTY)
+    try:
+        r = await client.post("/api/feedback",
+                              json=_body(PROBE_EMPTY, Q_EMPTY, value="down"))
+        assert r.status_code == 200, f"实际 {r.status_code}:{r.text}"
+        rows = await _rows(PROBE_EMPTY)
+        assert len(rows) == 1, f"空召回一样要落池,实际 {len(rows)} 行"
+        assert json.loads(rows[0]["evidence_snapshot"]) is None, (
+            f"空召回的快照是 JSON null(不是 []、也不是一行空快照),"
+            f"实际 {rows[0]['evidence_snapshot']!r}"
+        )
+        assert retriever.calls == [Q_EMPTY], (
+            f"空召回也得**真的搜过**一次,实际 {retriever.calls}"
+        )
+    finally:
+        await _teardown(PROBE_EMPTY)
 
 
 @pytest.mark.db
