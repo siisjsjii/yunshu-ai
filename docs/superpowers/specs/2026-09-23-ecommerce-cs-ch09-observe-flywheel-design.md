@@ -993,3 +993,65 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 本仓已经收过「未声明的通道写入被静默丢弃」(ch06)、「`add_messages` 给无 id 消息赋 uuid4」
 (ch07)、「`response_format` 走 beta 路径」(ch09 §2.2)。**这一次是第四次同一个形状**:
 **一个看起来会生效的赋值,什么都没做,而且不报错。**
+
+### 15.4 订正:§12.3-0 的「唯一挡路的未知」**已结清(成)**,而 §3.3 的前提**被实测推翻了一半**
+
+（T3 的真机冒烟结果,2026-09-23。**§3.4 / §12.3-0 原文一律不改,订正追加在这里。**）
+
+**① §12.3-0 问的那件事:成。**
+
+「中途进入的 `propagate_attributes` 能不能穿透 LangGraph 的上下文,让 **graph 内部**的
+generation 带上 `intent:<x>` 标签」——探针里模型调用是直接 `ainvoke` 的,没验过;真机跑一次
+商品咨询请求后,`GET /api/public/v2/metrics` 按 `tags` 分组读回:
+
+```
+{"tags": ["ch09", "intent:商品咨询"], "sum_totalTokens": "1485", "count_count": "8"}
+{"tags": [],                          "sum_totalTokens": "646",  "count_count": "8"}
+```
+
+- tag 行**出现了**,token **1485 > 0**;**`intent:*` 那一行没落空 ⇒ §3.4 末尾那条退路不启用**。
+- **8 / 8 这个切法本身就是证据**:整条 trace 16 条观测,进入作用域**之前**恰好 8 条、
+  **之后**也恰好 8 条,边界**正好**落在 `classify_intent` 上 —— 与 §3.4 的设计语义逐条对上,
+  不是"整体都带上了 tag"那种分不出判别力的读数。
+- 第二个请求(订单意图)复现:`intent:订单` / 2207 tokens / 7 条。
+  **顺带把验收 5 的前提也验到了:两行不同意图、token 不同,可分。**
+
+**② §3.3 的前提「工具执行与知识检索一个 span 都不会自动出现」——只对了一半。**
+
+- **对的一半**:`retrieve` 走的是自写的 `KnowledgeRetriever`,**确实**一个 span 都不会有,
+  手工 `retrieval` span 是它唯一的落点。
+- **错的一半**:**内置工具**的执行(`app/tools/executor.py:execute_tool` → `spec.tool.ainvoke`)
+  **是**一个 LangChain run ⇒ 回调**已经**给了它一条 `TOOL 'query_order'`,而且**嵌套正确**
+  (在 `agent` 之下)。手工那条 `tool:*` 的价值因此**不在"有没有"**,而在它带
+  `ok` / `summary` / `error_kind` 这三个 LangChain run 拿不到的字段。
+
+**③ 新发现(比 ② 更要紧):手工 span 落进的是**另一条 trace**,不是请求那条。**
+
+按 `sessionId` 读回那次商品咨询请求的 16 条观测,里面有 **2 个 `traceId`**:
+
+| 观测 | `traceId` | `parentObservationId` |
+|---|---|---|
+| `LangGraph` 根及其下全部(包括 `ChatOpenAI` generation 与 `TOOL 'query_order'`) | `879bf705…` | —(根) |
+| 手工 `retrieval`(RETRIEVER) | `6ff9033e…` | **null** |
+| 手工 `tool:query_order`(TOOL) | `07ab51df…` | **null** |
+
+- **成因**:`start_as_current_observation` 的父级取自 **OTel 当前 span**,而 Langfuse 的
+  LangChain 回调**不把观测挂成 current**(它靠 LangChain 的 run tree 定父子)⇒
+  `graph.astream` 内部**没有"当前 span"**,手工 span 只能**自己开一条新 trace**。
+  两条 trace 的 `sessionId` 与 `tags` 都是对的(所以 §3.5 的按 tag 聚合**照样是对的**),
+  但它们**不在同一条 trace 上**。
+- **后果**:§12.3-2 与 §12.4 验收 1 那句「**子观测**里同时有 `retrieval`、`tool:*`、generation」
+  **按字面断不出来** —— `generation` 在请求那条 trace 上,两个手工 span 在另外两条上。
+  用户需求里「点开任意一条请求,看到完整链路」也**只满足了大半**。
+- **候选修法(未实施,待主控裁定)**:在 `app/api/chat.py` 把 `graph.astream` 再包一层
+  `with observability.span("chat", as_type="span", settings=settings):` —— 有了 current span,
+  手工 span 会挂进去、LangChain 的 `LangGraph` 根也会挂进去,顺带对上 §12.3-2 里
+  「`chat`(根)」那个描述。**代价**:改的是**请求路径上的 trace 拓扑**,
+  而 §3.2「挂点:**一处**」与 R5 的授权都只到「多传一个 `settings=`」为止 ——
+  所以 T3 **只报不改**。
+
+**④ 顺带记一条环境事实(不是设计问题,但会让人误判成数据坏)**:本机 Milvus 容器
+(`milvus-standalone`,`ETCD_USE_EMBED=true`,1s 选举超时)**在 CPU 被占满时起不来** ——
+实测症状是 `panic: etcdserver: leader changed` + SIGABRT(exit 134)。成因是嵌入 etcd 没等到
+ReadIndex 就换了 leader。**机器空下来再 `docker start`,一次就起,存储卷完好**(实测:集合
+`knowledge` 90 行,一字未丢)。**别急着删数据。**
