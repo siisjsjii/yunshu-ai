@@ -400,7 +400,11 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
     bound = model.bind_tools(list(tools))
 
     async def _stream_round(target, msgs, parts, *, decode: bool):
-        """一轮模型调用:推 token 帧、累积 chunk、返回 (累积 chunk, 用量, 解码器)。
+        """一轮模型调用:推 token 帧、累积 chunk。
+
+        返回 `(累积 chunk, 用量, 解码器, **这一轮真正发出去的文本**)` ——
+        第四个值是 `_persist_round_text` 的依据:落库的 `content` 必须是
+        「用户看到的那段」,**逐轮**取,不能只取最后那条(见那个函数的说明)。
 
         `decode` 为真时(知识轮)文本先过解码器,出去的仍然只有 token 帧,
         但**只推 `answer_delta`** —— `useful` 之前用户一个字都看不到、
@@ -413,6 +417,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
         """
         acc = None
         used = 0
+        start = len(parts)          # ← 「这一轮发了多少」靠切片量,不靠猜
         dec = JsonAnswerDecoder() if decode else None
         async for chunk in target.astream(msgs):
             acc = chunk if acc is None else acc + chunk
@@ -429,7 +434,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                 if event.kind == "answer_delta":
                     parts.append(event.value)
                     emit({"frame": "token", "text": event.value})
-        return acc, used, dec
+        return acc, used, dec, "".join(parts[start:])
 
     async def agent_node(state) -> dict:
         # ⚠️ `state.get("history")` 是**精简版**(层 2 截短段 + 层 1 原文段,
@@ -508,35 +513,42 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                 return
             if getattr(acc, "tool_calls", None):
                 return          # 调工具的那一轮是**正常形态**(spec §5.6 自己说的)
+            logger.warning(
+                "协议违规(plain 轮、无 tool_calls,降级为纯文本)conv=%s raw_chars=%d",
+                state["conversation_id"], len(dec.raw),
+            )
             trace.append("agent:protocol_violation")
 
-        def _persist_what_the_user_saw(new_messages, dec) -> None:
-            """把**要落库**的那条 assistant 的正文换成「用户真正看到的那段」。
+        def _persist_round_text(msg, text: str, dec) -> None:
+            """把**这一轮**那条 assistant 落库用的 `content` 换成「用户看到的那段」。
 
-            ⚠️ 协议 JSON 是**包装**,不是回答。不换的话:`messages` 表里存的是
-            `{"useful": true, …, "answer": "…"}`,而
-            `GET /api/conversations/{id}/messages`(会话回载)**原样把它显示给用户**
-            (真机实测,见 task-10-report §7-②),下一轮的上下文里也是它。
+            ⚠️ **判据是「本轮产生的每一条」,不是「最后那一条」。** 协议 JSON 是
+            **包装**、不是回答,任何一条都不许进库:回载接口
+            (`GET /api/conversations/{id}/messages`)会把任何 `content` 非空的
+            assistant 行**原样显示给用户**(真机实测,见 task-10-report §7-②),
+            下一轮的上下文里也是它。
 
-            **只换 `content`,不动这两个通道的覆写语义** —— 列表本身一个元素都不增删。
-            **就地改**而不是另建一条副本:续跑那条路上 `messages` 与
-            `turn_messages` 装的是**同一个对象、两个不同的列表**,换成一个副本会让
+            **只改 `content`,`tool_calls` 原样保留**(tool 消息靠它配对,少一个
+            上游直接 400)。**就地改**而不是另建副本:续跑那条路上 `messages` 与
+            `turn_messages` 装的是**同一个对象、两个不同的列表**,换副本会造出
             「同一件事两个形状」。
 
-            判据是「这一轮实际发出去了什么」,不是模式:
-              - 可用(第 3 行)⇒ `"".join(parts)` 就是 `dec.answer`(逐字符流出);
-              - `useful is False` ⇒ `parts` 已被换成兜底话术;
-              - 降级(第 2 行)⇒ `parts` 已被换成整段 `raw`;
-              - `PLAIN` ⇒ `parts` 本来就是逐片透出的那段文本。
+            `text` 由 `_stream_round` **按轮切片**量出来(`parts[start:]`)——
+            不是「累计到这一刻的全部」:工具轮那句「让我查一下」属于**它自己那条**
+            消息,抄进后面每一条就是同一个气泡重放三遍。
 
-            `dec is None`(业务轮)或这一轮一个字节都没有 ⇒ **原样不动**(业务轮零回归)。
+            `dec is None`(业务轮)⇒ **原样不动**:业务轮零回归。
             """
-            if dec is None or not dec.raw or not new_messages:
+            if dec is None or msg is None:
                 return
-            new_messages[-1].content = "".join(parts)
+            msg.content = text
 
-        async def _finish_verdict(dec) -> str:
-            """按 T9 交付的**三行契约表**处理这一轮的终态,返回要追加的 trace 项。
+        async def _finish_verdict(dec) -> tuple[str, str | None]:
+            """按 T9 交付的**三行契约表**处理这一轮的终态。
+
+            返回 `(要追加的 trace 项, 这一轮**交给用户的那段文本**)` ——
+            第二个值为 `None` 表示「不用覆盖落库的 `content`」(已经由
+            `_persist_round_text` 按轮写好,就是用户看到的那段)。
 
             **判据是「终态」,不是过程中某一刻的属性。**(表在 task-9-report.md
             §11-③,另有 §11-⑩ 与 §11-⑪-D 两条注。)
@@ -560,7 +572,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             与今天的行为一致(今天那个空 chunk 也被 `if chunk.text` 挡掉)。
             """
             if dec is None or not dec.raw:
-                return ""
+                return "", None
             if dec.useful is False:
                 # 用户看到的是兜底话术 —— `parts` 要**清空重写**:协议保证这时
                 # 一个 answer_delta 都没出去(解码器的不变量 2),但清空是**结构
@@ -588,20 +600,27 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                         reject_reason="生成自评:模型判定召回的证据不足,无法作答",
                         evidence_snapshot=_snapshot(evidence, settings=settings),
                     )
-                return "agent:self_assess_insufficient"
+                # ⚠️ 落库的是**兜底话术**(用户看到的就是它)—— 覆盖掉
+                # `_persist_round_text` 刚按轮写的那份(它写的是模型交的答案)。
+                return "agent:self_assess_insufficient", FALLBACK_REPLY
             if dec.mode == PLAIN:
                 # `plain` 的**动作**在这里归零(不重发、这里也不记违约)——
                 # 「记不记」由 `_note_plain_violation` 在**每一轮**上判(裁定①),
                 # 判据是那一轮有没有 `tool_calls`,而 `_finish_verdict` 手上没有它。
-                return ""
+                # 落库不用覆盖:按轮写下的就是**逐片透出去的那段文本**。
+                return "", None
             if dec.violation or dec.useful is None or (
                 dec.done is False and not dec.answer
             ):
                 parts.clear()
                 parts.append(dec.raw)
                 emit({"frame": "token", "text": dec.raw})
-                return "agent:protocol_violation"
-            return ""
+                logger.warning(
+                    "协议违规(降级:raw 当纯文本发一遍)conv=%s mode=%s violation=%s",
+                    state["conversation_id"], dec.mode, dec.violation,
+                )
+                return "agent:protocol_violation", dec.raw
+            return "", None
 
         # ---- ch08:续跑判定(复用**已有的**不变量,不新增通道)----------
         # `turn_messages` 已被 ch07 放进 `resolve_references` 的每轮重置清单,
@@ -615,19 +634,21 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             # ⚠️ 用**未绑**的 `model`,不是 `bound`。
             # 协议**照样带**:这一轮就是本轮的最终作答(少带它,模型吐出的
             # 协议 JSON 会**原样给用户看**,而其余断言全都照绿)。
-            final_acc, used, dec = await _stream_round(
+            final_acc, used, dec, text = await _stream_round(
                 model, msgs, parts, decode=is_knowledge)
             usage_total += used
             _note_plain_violation(dec, final_acc)
             final_acc = (
                 final_acc if final_acc is not None
-                else AIMessage(content="".join(parts))
+                else AIMessage(content=text)
             )
             new_messages = existing_turn + [final_acc]
-            verdict = await _finish_verdict(dec)
+            _persist_round_text(final_acc, text, dec)
+            verdict, delivered = await _finish_verdict(dec)
             if verdict:
                 trace.append(verdict)
-            _persist_what_the_user_saw(new_messages, dec)
+            if delivered is not None:
+                _persist_round_text(final_acc, delivered, dec)
             return {
                 "reply": "".join(parts),
                 "messages": [final_acc],
@@ -648,7 +669,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
 
         for step in range(1, settings.max_agent_steps + 1):
             steps = step
-            acc, used, dec = await _stream_round(
+            acc, used, dec, text = await _stream_round(
                 bound, msgs, parts, decode=is_knowledge)
             usage_total += used
             # 裁定①:PLAIN 轮的违约**逐轮判**(判据是这一轮的 `tool_calls`)——
@@ -661,11 +682,19 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                 needs_final = False
                 msgs.append(acc)
                 new_messages.append(acc)     # ← 这一轮的输出就是最终回复,收下
+                _persist_round_text(acc, text, dec)
                 break
 
             needs_final = True
             msgs.append(acc)
             new_messages.append(acc)         # ← 带 tool_calls 的 assistant
+            # ⚠️ **这一条也要换。** 它同样会落库,而它**可能既吐了协议对象、又带
+            # `tool_calls`**(模型完全可能先按协议作答、同一轮里再申请调工具)——
+            # 只修「最后那条」的做法够不着它,评审用内存 harness 复现过。
+            # 待确认的写调用更隐蔽:这一条的 `pending` 分支**在下面直接 return**,
+            # 压根走不到任何「最后那条」的处理,而它会随 `existing_turn` 进续跑轮、
+            # 最后被 `log_turn` 落库 ⇒ **在这里按轮换掉是唯一能覆盖它的地方**。
+            _persist_round_text(acc, text, dec)
             for call in tool_calls:
                 emit({"frame": "tool_call", "name": call["name"],
                       "args": call["args"], "tool_call_id": call["id"]})
@@ -740,18 +769,19 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             #
             # 这一轮的输出**不在上面任何一条消息里**,必须自己收下来,
             # 否则下一轮的完整历史里**没有客服说过的话**。
-            final_acc, used, dec = await _stream_round(
+            final_acc, used, dec, text = await _stream_round(
                 model, msgs, parts, decode=is_knowledge)
             usage_total += used
             _note_plain_violation(dec, final_acc)
-            new_messages.append(
-                final_acc if final_acc is not None else AIMessage(content="".join(parts))
-            )
+            final_acc = final_acc if final_acc is not None else AIMessage(content=text)
+            new_messages.append(final_acc)
+            _persist_round_text(final_acc, text, dec)
 
-        verdict = await _finish_verdict(dec)
+        verdict, delivered = await _finish_verdict(dec)
         if verdict:
             trace.append(verdict)
-        _persist_what_the_user_saw(new_messages, dec)
+        if delivered is not None and new_messages:
+            _persist_round_text(new_messages[-1], delivered, dec)
         trace.append("agent:converged")
         # 两个键值**相同、语义不同**,别只写一个:
         #   `messages`      → add_messages 累积进完整历史(跨轮)

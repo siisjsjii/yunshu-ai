@@ -138,7 +138,14 @@ class LowConfidenceQuestion(Base):
     # ---- 以下两列是 ch09 加的(db/ch09.sql 的 ALTER,create_all 不会加)----
     # 落池当轮的召回片段快照(Top-N 的 id / 得分 / 原文)。可空 —— 置信度闸那条
     # 路径未必总有快照;用户点「没用」时后端会重跑一次检索尽力回捞(ch09 §6.2)。
-    evidence_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #
+    # ⚠️ **形状是 `list[dict]`,不是 `dict`**(2026-09-23 订正):写它的两处
+    # (`app/agent/nodes.py:_snapshot` 与 `app/api/feedback.py` 的同名函数)
+    # 都返回**列表**,每项是 `{"chunk_id", "score", "section_path", "answer"}`。
+    # 注解原先写的是 `dict | None` —— 运行时无害(JSON 列照收),但**注解与事实
+    # 不符会误导后来人**(审核页 T15/T16 是照这个形状读的)。
+    # 与 `ReviewQueue` / `EvalRun` 的 JSON 列不同,那两张表的确实是对象。
+    evidence_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # ⚠️ **一个列担两个语义**(ch09 §7.1):既记「这条问题归并到了 review_queue 的
     # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
     # ⇒ 流水线天然幂等,重跑不会重复归并;别只把它当外键用 —— 谁把它写成 NOT NULL,

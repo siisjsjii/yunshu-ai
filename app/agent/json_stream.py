@@ -16,7 +16,8 @@ ch09 spec §5.3 / §5.4。**纯状态机**:输入 ``str`` 片段序列,输出事
     还没定形态。首个**非空白**字符是 ``{`` ⇒ ``protocol``;不是 ⇒ ``plain``。
     **全空白/空片段留在 lead**(边界 13),什么都不 emit(不变量 1)。
 ``protocol``
-    在解协议对象。首键不是 ``useful`` ⇒ ``violation``(调用方据此重试一次)。
+    在解协议对象。首键不是 ``useful`` ⇒ ``violation`` —— 调用方据此**降级成纯文本**
+    (spec §5.6;早期设计里的「重试一次」**已取消**,见 §15.11)。
 ``plain``
     **今天的行为**(ch08 的纯文本流):每个片段原样透出。它存在的意义是让协议
     违规**不产生任何回归** —— 这是本章的兜底不变量。
@@ -411,7 +412,8 @@ class JsonAnswerDecoder:
                 self._saw_key = True
                 if key != "useful":
                     # §5.6 全章**唯一**一处「我们确信这是作答轮、且还没吐过任何
-                    # 东西」的时刻 —— 调用方据此重试一次。此处必须零 emit。
+                    # 东西」的时刻 —— 此处必须零 emit。调用方据此**降级**
+                    # (**不是**重试:早期那处「重试一次」已取消,spec §15.11)。
                     self._violation = f"first_key={key}"
                     self._out.append(Event("violation", self._violation))
                     return

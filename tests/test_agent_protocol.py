@@ -20,9 +20,12 @@
 (见 task-10-report.md 的 RED 一节),不是照着新实现反推的。
 """
 
+import logging
+
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
+from app.agent import nodes
 from app.agent.nodes import FALLBACK_REPLY, PROTOCOL_MESSAGE, make_agent_node
 from app.config import Settings
 from app.memory import budget
@@ -484,6 +487,98 @@ async def test_persisted_assistant_message_is_still_the_tool_call_round():
     assert [tc["name"] for tc in out["turn_messages"][0].tool_calls] == ["query_faq"]
     assert out["turn_messages"][1].content == '{"answer": "七天无理由"}'
     assert out["turn_messages"][2].content == "七天无理由。"
+
+
+@pytest.mark.anyio
+async def test_a_tool_round_that_also_emitted_the_protocol_does_not_persist_json():
+    """⚠️ 评审逮到的一条:**既吐协议对象、又带 `tool_call` 的那一轮**也会落库原始 JSON。
+
+    `_persist_what_the_user_saw` 只看 `new_messages[-1]`,够不着**中间**那条
+    带 `tool_calls` 的 assistant;而 `_lc_to_records` 拿的是它的 `content`(原始 JSON),
+    回载接口照样会把它显示给用户 —— **正是裁定②存在要防的那件事**。
+
+    ⚠️ **这一轮必须吐文本**:紧邻的那条 `…is_still_the_tool_call_round` 里,
+    工具轮的 `content` 是 `""`(没吐文本)⇒ 它对这条缺陷**恒真**。
+    这正是评审点名的盲区,别把这两条混成一个。
+    """
+    tool = _Tool()
+    model = _Model([
+        [_Chunk(text='{"useful": true, "confidence": 0.9, "answer": "ok"}',
+                tool_calls=[{"name": "query_faq", "args": {"q": "退货"},
+                             "id": "c1"}])],
+        ['{"useful": true, "confidence": 0.9, "answer": "七天无理由。"}'],
+    ])
+    out = await _make(model, tools=[tool],
+                      registry={"query_faq": tool}).__call__(_state(intent="商品咨询"))
+
+    for i, msg in enumerate(out["turn_messages"]):
+        assert "useful" not in (msg.content or ""), f"第 {i} 条把协议 JSON 落库了"
+    # 那一轮**发出去**的文本是解码器交出来的答案,不是包装
+    assert out["turn_messages"][0].content == "ok"
+    # `tool_calls` **原样保留**(少它 = 「有 tool 消息、没有前置的 assistant」⇒ 上游 400)
+    assert [tc["name"] for tc in out["turn_messages"][0].tool_calls] == ["query_faq"]
+    assert out["turn_messages"][-1].content == "七天无理由。"
+
+
+@pytest.mark.anyio
+async def test_a_suspended_write_round_does_not_persist_json(monkeypatch):
+    """⚠️ 评审逮到的第二条,**更隐蔽**:挂起建单那一轮在 `_finish_verdict` /
+    `_persist_what_the_user_saw` **之前**就 `return` 了。
+
+    那条消息随 `existing_turn` **进续跑轮**,最后被 `log_turn` 落库
+    ⇒ 修「最后一条」的做法**永远够不着它**。
+
+    本用例把**两半**都断:挂起那一刻、以及**续跑之后**落库的那份。
+    """
+    from app.tools.executor import ERROR_CONFIRMATION_REQUIRED, ToolOutcome
+
+    async def fake_execute(**kw):
+        return ToolOutcome(
+            kw["tool_call"]["id"], kw["tool_call"]["name"], False,
+            "需要确认", "需要确认", ERROR_CONFIRMATION_REQUIRED,
+            preview=kw["tool_call"]["args"],
+        )
+
+    monkeypatch.setattr(nodes, "execute_tool", fake_execute)
+    tool = _Tool(name="create_ticket")
+    model = _Model([
+        [_Chunk(text='{"useful": true, "confidence": 0.9, "answer": "ok"}',
+                tool_calls=[{"name": "create_ticket", "args": {"description": "x"},
+                             "id": "call_1"}])],
+    ])
+    node = _make(model, tools=[tool], registry={"create_ticket": tool})
+    first = await node(_state(intent="商品咨询"))
+
+    assert first["pending_write"]["tool_call_id"] == "call_1"
+    assert [m.content for m in first["turn_messages"]] == ["ok"]
+
+    # ---- 续跑:那一轮的消息随 `existing_turn` 原样进来,最后被 log_turn 落库 ----
+    resume_model = _Model([['{"useful": true, "confidence": 0.9, "answer": "已建单。"}']])
+    second = await _make(resume_model, tools=[tool],
+                         registry={"create_ticket": tool}).__call__(
+        _state(intent="商品咨询", turn_messages=first["turn_messages"],
+               pending_write={}, write_decision="approved")
+    )
+    for i, msg in enumerate(second["turn_messages"]):
+        assert "useful" not in (msg.content or ""), f"续跑后第 {i} 条仍带协议 JSON"
+    assert [m.content for m in second["turn_messages"]] == ["ok", "已建单。"]
+
+
+@pytest.mark.anyio
+async def test_protocol_violation_is_logged(caplog):
+    """spec 的§5.6 订正段 / §13 第 13 行 / §15.11 **三处**都写着「日志里有告警」
+    —— 那三处必须真的有对应的 `logger.warning`,否则它们就是**不存在的日志**。
+    """
+    caplog.set_level(logging.WARNING)
+    # ① 降级(首键违规)
+    await _make(_Model(['{"answer": ', '"您好", "useful": true}'])).__call__(
+        _state(intent="商品咨询"))
+    # ② plain 轮、没有 tool_calls
+    await _make(_Model([["好的,我来查一下"]])).__call__(_state(intent="商品咨询"))
+
+    logs = [r.getMessage() for r in caplog.records if r.name == "app.agent.nodes"]
+    assert sum("协议违规" in line for line in logs) == 2, logs
+    assert any("c1" in line for line in logs), "告警里必须能认出是哪一段会话"
 
 
 @pytest.mark.anyio
