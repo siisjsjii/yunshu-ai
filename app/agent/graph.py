@@ -136,11 +136,16 @@ def build_graph(
             settings=settings, session=session, conversation_id=conversation_id
         ),
     )
+    # ch09:`session` 是知识轮自评落池那条路要的(`useful=false` 且知识类 ⇒
+    # `record_low_confidence(entry_point="生成自评")`)。与 `confidence_gate`、
+    # `log_turn` 拿的是**同一个** session —— 端点每请求建一份。
+    # 与上面 `retrieve_knowledge` 收 `settings=` 同一条理由(spec §14 那句
+    # 「不改 graph.py」的语义是「**拓扑**一字不改」,依赖显式注入是本仓的硬规矩)。
     graph.add_node(
         "agent",
         make_agent_node(
             model=model, tools=tools, registry=registry, settings=settings, emit=emit,
-            context_budget=context_budget,
+            session=session, context_budget=context_budget,
         ),
     )
     graph.add_node("complaint_reply", make_complaint_reply_node(emit=emit))

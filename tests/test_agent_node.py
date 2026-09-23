@@ -134,11 +134,29 @@ def _reg(mapping: dict) -> dict:
     return {name: _spec_from_tool(tool, source="builtin") for name, tool in mapping.items()}
 
 
+class _Session:
+    """ch09:`agent` 收一个 `session`,知识轮自评不足时用它落池。
+
+    本文件的用例都不带 `intent`(⇒ 不是知识轮 ⇒ 那条路走不到),所以这只是
+    **把替身补齐到生产形状** —— 本仓的规矩:替身缺字段不是「降级」,是一个
+    指向别处的 `AttributeError`。
+    """
+
+    def __init__(self):
+        self.added: list = []
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        pass
+
+
 def _node(model, tools=(), registry=None, settings=None, frames=None):
     settings = settings or _settings()
     return make_agent_node(
         model=model, tools=list(tools), registry=_reg(registry or {}),
-        settings=settings,
+        settings=settings, session=_Session(),
         # 生产路径由端点经 `build_graph` 传下来(每次请求只推一次)—— 单测这里
         # 现算一份:同一个纯函数、同一份输入,结果相同。
         context_budget=budget.derive(

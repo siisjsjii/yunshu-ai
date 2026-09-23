@@ -71,6 +71,24 @@ class _Model:
         yield self._rounds.pop(0)
 
 
+class _Session:
+    """ch09:`agent` 收一个 `session`(知识轮自评不足时落池那条路要它)。
+
+    本文件的 state 都不带 `intent` ⇒ 不是知识轮 ⇒ 那条路走不到;这里只是
+    **把替身补齐到生产形状**(本仓规矩:替身缺字段不是「降级」,是一个
+    指向别处的 `AttributeError`)。
+    """
+
+    def __init__(self):
+        self.added: list = []
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        pass
+
+
 class _Settings:
     brand_name = "本店"
     max_agent_steps = 3
@@ -140,7 +158,7 @@ async def test_write_call_stops_the_loop_and_records_pending(monkeypatch, patch_
     monkeypatch.setattr(agent_nodes, "execute_tool", fake_execute)
     node = agent_nodes.make_agent_node(
         model=model, tools=[], registry={}, settings=_Settings(),
-        emit=lambda f: None, context_budget=None,
+        emit=lambda f: None, session=_Session(), context_budget=None,
     )
     out = await node(_state())
 
@@ -192,7 +210,7 @@ async def test_other_calls_in_the_same_round_still_get_tool_messages(
     monkeypatch.setattr(agent_nodes, "execute_tool", fake_execute)
     node = agent_nodes.make_agent_node(
         model=model, tools=[], registry={}, settings=_Settings(),
-        emit=lambda f: None, context_budget=None,
+        emit=lambda f: None, session=_Session(), context_budget=None,
     )
     out = await node(_state())
     ids = [m.tool_call_id for m in out["turn_messages"] if isinstance(m, ToolMessage)]
@@ -215,7 +233,7 @@ async def test_continuation_round_is_unbound_and_keeps_turn_messages(
 
     node = agent_nodes.make_agent_node(
         model=model, tools=[], registry={}, settings=_Settings(),
-        emit=lambda f: None, context_budget=None,
+        emit=lambda f: None, session=_Session(), context_budget=None,
     )
     out = await node(
         _state(turn_messages=[prior, result_msg], pending_write={},
@@ -242,7 +260,7 @@ async def test_continuation_does_not_reset_agent_steps(monkeypatch, patch_ctx):
     model = _Model([_Chunk("已建单")])
     node = agent_nodes.make_agent_node(
         model=model, tools=[], registry={}, settings=_Settings(),
-        emit=lambda f: None, context_budget=None,
+        emit=lambda f: None, session=_Session(), context_budget=None,
     )
     out = await node(
         _state(turn_messages=[prior], pending_write={}, write_decision=APPROVED,

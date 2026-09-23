@@ -8,10 +8,16 @@
 import logging
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from pydantic import ValidationError
 
 from app import observability
+from app.agent.json_stream import PLAIN, JsonAnswerDecoder
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.kb.assess import record_low_confidence
@@ -312,7 +318,56 @@ def _total_tokens(chunk) -> int:
     return int(meta.get("total_tokens") or 0)
 
 
-def make_agent_node(*, model, tools, registry, settings, emit, context_budget: ContextBudget):
+#: 知识轮的**协议消息**(ch09 spec §5.2)。它是**追加的一条 system 消息**,
+#: 挂在 `agent` 节点的知识轮上,不进 `prompts.render_system_prompt` ——
+#: 后者的输出是 `budget.derive(...)` 的入参之一,动它会连带改**预算推导**,
+#: 并让一批既有的预算/分层测试跟着动(收益为零,风险不小)。
+#:
+#: 三件事缺一不可:
+#: 1. **逐字出现 `JSON` 字样** —— 本仓对结构化出参的通行纪律;
+#: 2. **字段顺序是 `useful` → `confidence` → `answer`**,而且顺序**是协议不是风格**:
+#:    「`useful=false` 时一个 token 都不放出去」完全靠 `useful` 排在 `answer`
+#:    前面才成立(§5.4 的不变量 2);
+#: 3. **不得出现裸花括号** —— 与 `ChatPromptTemplate` 按 f-string 解析那条约束同源
+#:    (本文本今天不过那个模板,但别给后来人留一颗雷)。
+PROTOCOL_MESSAGE = (
+    "需要调用工具时照常调用。**不需要工具时,只输出一个 JSON 对象**,"
+    "不要任何前言、不要 ``` 围栏。字段与顺序**必须**是:\n"
+    "1. useful:布尔值。上面的证据足以回答用户问题为 true,不足为 false。\n"
+    "2. confidence:0 到 1 的小数。\n"
+    "3. answer:字符串。**useful 为 false 时必须是空字符串**;"
+    "证据不足时不得编造、不得用常识补。\n"
+    "先判定,后作答。"
+)
+
+
+def _snapshot(evidence: list[dict], *, settings) -> list[dict]:
+    """`state["evidence"]` → 落池用的召回片段快照(Top-N)。
+
+    ⚠️ **这里吃的是 dict,不是 `RetrievedChunk`** —— `state["evidence"]` 是
+    `make_retrieve_knowledge_node` 序列化进通道的那份**键值 dict**
+    (`render_evidence` 与 citations 帧共用同一份),所以用 `c.get(...)`。
+    `app/api/feedback.py` 里那个同名函数吃的是 `retriever.search()` 刚返回的
+    **对象**、用 `c.chunk_id` —— 两处形状不同,**刻意不抽公共函数**
+    (抽的话要么给 `RetrievedChunk` 加适配、要么让节点侧多一层转换,都不划算)。
+
+    只投影审核页真正要看的四个字段:哪一块、多像、哪一节、原文。
+    `answer` 按 `snapshot_answer_chars` 截 —— 池子是给审核人看的窄表,
+    整块原文塞进去只会让那一行读不动。
+    """
+    return [
+        {
+            "chunk_id": c.get("chunk_id"),
+            "score": c.get("score"),
+            "section_path": c.get("section_path"),
+            "answer": (c.get("answer") or "")[: settings.snapshot_answer_chars],
+        }
+        for c in (evidence or [])[: settings.snapshot_top_n]
+    ]
+
+
+def make_agent_node(*, model, tools, registry, settings, emit, session,
+                    context_budget: ContextBudget):
     """主力 Agent 的 ReAct 循环。
 
     **不用 ToolNode / create_react_agent**:工具执行必须走 `execute_tool`,
@@ -327,19 +382,54 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
     `journal.model_ctx` 记用量与预算)。**刻意没有默认值**:有默认值的话,
     端点忘了传也能跑,而日志里那份预算就是另一个来源算的 —— 本仓的规矩是
     依赖走显式注入(`services/` 收 llm 实例同款),不留会自己兜底的参数。
+
+    ---- ch09:知识轮挂**自评协议**(spec §5)----
+
+    `intent == "商品咨询"` 的那一轮多一条协议消息,文本流出过一次
+    `JsonAnswerDecoder` —— 一次调用里既作答、又自评。**只有两处改动**:
+    `msgs` 末尾多一条消息、文本出口多一次解码。工具绑定、工具执行、
+    `pending_write`、`turn_messages`、每轮清零**全不碰**。
+
+    **业务轮一个字节都不改**,而这不是靠自觉:那两处都挂在同一个 `decode`
+    开关上,开关就是 `is_knowledge`(§12.1 的逐帧用例是它的硬证据)。
+
+    `session` 就是为落池收的(`useful=false` 且知识类 ⇒
+    `record_low_confidence(entry_point="生成自评")`)。它与 `confidence_gate`
+    拿的是**同一个** session —— 端点每请求建一份,没有第二处来源。
     """
     bound = model.bind_tools(list(tools))
 
-    async def _stream_round(target, msgs, parts) -> tuple[object, int]:
+    async def _stream_round(target, msgs, parts, *, decode: bool):
+        """一轮模型调用:推 token 帧、累积 chunk、返回 (累积 chunk, 用量, 解码器)。
+
+        `decode` 为真时(知识轮)文本先过解码器,出去的仍然只有 token 帧,
+        但**只推 `answer_delta`** —— `useful` 之前用户一个字都看不到、
+        `useful=false` 之后一个 delta 都不再出去(§5.4 的两条不变量在**调用侧**
+        的落点;它们各自在解码器里也有一处实现,两边都要有)。
+
+        解码器**每轮一个**(不是每轮对话一个):协议约束的是「作答那一轮」,
+        而工具轮里那句「让我查一下」本来就该照常透出去 —— 它落 `plain` 态,
+        逐片原样 emit,与今天一模一样(§5.6)。
+        """
         acc = None
         used = 0
+        dec = JsonAnswerDecoder() if decode else None
         async for chunk in target.astream(msgs):
             acc = chunk if acc is None else acc + chunk
             used += _total_tokens(chunk)
-            if chunk.text:
+            if not chunk.text:
+                # **不发空 token 帧**的唯一屏障(前端会先画出一个空气泡)。
+                # 业务轮与知识轮都得留着它 —— 带 tool_calls 的那一轮文本就是空的。
+                continue
+            if dec is None:
                 parts.append(chunk.text)
                 emit({"frame": "token", "text": chunk.text})
-        return acc, used
+                continue
+            for event in dec.feed(chunk.text):
+                if event.kind == "answer_delta":
+                    parts.append(event.value)
+                    emit({"frame": "token", "text": event.value})
+        return acc, used, dec
 
     async def agent_node(state) -> dict:
         # ⚠️ `state.get("history")` 是**精简版**(层 2 截短段 + 层 1 原文段,
@@ -357,6 +447,21 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
             summary=summary_text,
             evidence=evidence,
         )
+        # ---- ch09:知识轮挂协议。**业务轮一个字不加** ----
+        # 需求说的是「**知识**不够答」,落池也只该发生在知识类(§5.5);而业务 /
+        # 退款 / 闲聊三条路径的输出形状因此**与今天逐字节相同** —— ch08 的写确认流
+        # (挂起 / 续跑 / `turn_messages` 覆写 / `pending_write` 每轮清零)零风险。
+        #
+        # ⚠️ 协议消息**追加在 `msgs` 上、加一次**,不是每轮在循环里加:
+        # `msgs` 跨轮累积,写在循环里就变成第二轮两条、第三轮三条,而模型照样
+        # 答得出来 —— 只有 `model.rounds[i].count(PROTOCOL_MESSAGE)` 看得见。
+        #
+        # `intent` 由 `classify_intent` 写进 state;`agent` 只在业务类与知识类
+        # 两条路上被走到(退款走子流程、投诉/闲聊走固定话术出口),
+        # 所以这一行同时把 `decode` 也定死了。
+        is_knowledge = state.get("intent") == "商品咨询"
+        if is_knowledge:
+            msgs = [*msgs, SystemMessage(content=PROTOCOL_MESSAGE)]
         # ---- ch07 §7.6:主力 Agent 每次组装完上下文,一行 `model_ctx` ----
         # **用真的用过的那对锚点重新切分**(端点播进 state),因为 state 里是
         # 扁平的精简版,而 `journal.model_ctx` 要一份 `Layers`(读 `sliding`
@@ -388,6 +493,71 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
         # 交给 add_messages 并入 state,再由 log_turn 落库。
         new_messages: list = []
 
+        async def _finish_verdict(dec) -> str:
+            """按 T9 交付的**三行契约表**处理这一轮的终态,返回要追加的 trace 项。
+
+            **判据是「终态」,不是过程中某一刻的属性。**(表在 task-9-report.md
+            §11-③,另有 §11-⑩ 与 §11-⑪-D 两条注。)
+
+            1. `useful is False` ⇒ **兜底话术**;知识类才落池。**不降级、不显示原文。**
+            2. `violation` 非空 / `useful is None` / (流已结束 且 `done is False`
+               且 `answer` 为空)⇒ **降级**:把 `raw` 整段当纯文本发一遍,
+               `trace` 记 `protocol_violation`,**不落池**。
+            3. 其余 ⇒ 正常:已经流出去的就是答案。
+
+            ⚠️ **`mode == PLAIN` 是第 2 行的例外(承重)**:`plain` 的终态**正好符合**
+            第 2 行的字面描述,但它是**今天的行为**、是**被认可的正常路径**
+            ——「模型先说一句『让我查一下』再调工具」正是最常见的那一轮。
+            照字面实现会在**每一个非协议轮**上 (i) 把已经实时透出的整段回复
+            用 `raw` **重发一遍**、(ii) 把这条正常路径记成**违约**。**先看 `mode`。**
+
+            ⚠️ 还有一处**表没覆盖**的入口:`dec.raw` 是空串(这一轮模型一个字节
+            都没吐)。表第 2 行的动作是「把 `raw` 整段发出去」,而空的 `raw` 意味着
+            **没有东西可发** —— 发出去就是一条空 token 帧(本仓另一条硬约束:
+            前端会先画出一个空气泡),而「零字节」谈不上违约。⇒ 什么都不做,
+            与今天的行为一致(今天那个空 chunk 也被 `if chunk.text` 挡掉)。
+            """
+            if dec is None or not dec.raw:
+                return ""
+            if dec.useful is False:
+                # 用户看到的是兜底话术 —— `parts` 要**清空重写**:协议保证这时
+                # 一个 answer_delta 都没出去(解码器的不变量 2),但清空是**结构
+                # 保证**它不会因为将来某处放松而把半截答案拼在兜底话术后面。
+                parts.clear()
+                parts.append(FALLBACK_REPLY)
+                emit({"frame": "token", "text": FALLBACK_REPLY})
+                if is_knowledge:
+                    # **只有知识类落池**(§5.5):池子的下游是「标准化 → 审核 →
+                    # 写进知识库」,一笔查不到的物流单不是知识缺口,写进去只会
+                    # 污染它。`reject_reason` 与闸那条同风格 —— 审核页旁边就是
+                    # 这段文字,它要回答「为什么这条被判成答不了」。
+                    await record_low_confidence(
+                        session,
+                        question=state["user_input"],
+                        source_conversation_id=state["conversation_id"],
+                        entry_point="生成自评",
+                        # ⚠️ 这里**不写** `dec.confidence`:协议顺序是
+                        # `useful → confidence → answer`,而解码器解出
+                        # `useful=false` 的**那一刻就停**(§5.4 的不变量 2 ——
+                        # 「一个 answer_delta 都不许再出去」靠它成立)——
+                        # 排在它后面的 `confidence` **结构上永远解不出来**。
+                        # 真机实测过:10 条里 2 条走这条路,reason 里的
+                        # `confidence=None` 是恒真的噪声,读起来却像「模型没给」。
+                        reject_reason="生成自评:模型判定召回的证据不足,无法作答",
+                        evidence_snapshot=_snapshot(evidence, settings=settings),
+                    )
+                return "agent:self_assess_insufficient"
+            if dec.mode == PLAIN:
+                return ""
+            if dec.violation or dec.useful is None or (
+                dec.done is False and not dec.answer
+            ):
+                parts.clear()
+                parts.append(dec.raw)
+                emit({"frame": "token", "text": dec.raw})
+                return "agent:protocol_violation"
+            return ""
+
         # ---- ch08:续跑判定(复用**已有的**不变量,不新增通道)----------
         # `turn_messages` 已被 ch07 放进 `resolve_references` 的每轮重置清单,
         # 所以「进场时非空」只可能是**一轮的中途**(`apply_write_decision` 刚
@@ -398,13 +568,19 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
             trace.append("agent:write_resumed")
             # **一轮不绑 tools**:结构上不可能再触发第二次写调用。
             # ⚠️ 用**未绑**的 `model`,不是 `bound`。
-            final_acc, used = await _stream_round(model, msgs, parts)
+            # 协议**照样带**:这一轮就是本轮的最终作答(少带它,模型吐出的
+            # 协议 JSON 会**原样给用户看**,而其余断言全都照绿)。
+            final_acc, used, dec = await _stream_round(
+                model, msgs, parts, decode=is_knowledge)
             usage_total += used
             final_acc = (
                 final_acc if final_acc is not None
                 else AIMessage(content="".join(parts))
             )
             new_messages = existing_turn + [final_acc]
+            verdict = await _finish_verdict(dec)
+            if verdict:
+                trace.append(verdict)
             return {
                 "reply": "".join(parts),
                 "messages": [final_acc],
@@ -419,10 +595,14 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
 
         needs_final = False
         pending: dict = {}
+        # 作答那一轮的解码器(见 `_finish_verdict`)。每轮被覆盖一次 ——
+        # 循环里最后留下的那份就是「用户看到的答案是哪个终态」。
+        dec = None
 
         for step in range(1, settings.max_agent_steps + 1):
             steps = step
-            acc, used = await _stream_round(bound, msgs, parts)
+            acc, used, dec = await _stream_round(
+                bound, msgs, parts, decode=is_knowledge)
             usage_total += used
             tool_calls = list(getattr(acc, "tool_calls", None) or [])
 
@@ -509,12 +689,16 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
             #
             # 这一轮的输出**不在上面任何一条消息里**,必须自己收下来,
             # 否则下一轮的完整历史里**没有客服说过的话**。
-            final_acc, used = await _stream_round(model, msgs, parts)
+            final_acc, used, dec = await _stream_round(
+                model, msgs, parts, decode=is_knowledge)
             usage_total += used
             new_messages.append(
                 final_acc if final_acc is not None else AIMessage(content="".join(parts))
             )
 
+        verdict = await _finish_verdict(dec)
+        if verdict:
+            trace.append(verdict)
         trace.append("agent:converged")
         # 两个键值**相同、语义不同**,别只写一个:
         #   `messages`      → add_messages 累积进完整历史(跨轮)

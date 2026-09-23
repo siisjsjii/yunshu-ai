@@ -61,14 +61,27 @@ async def assess_sufficiency(question: str, chunks: list, model) -> dict:
 
 
 async def record_low_confidence(session, *, question: str, source_conversation_id: str | None,
-                                entry_point: str, reject_reason: str) -> None:
-    """问题落低置信度池。"""
+                                entry_point: str, reject_reason: str,
+                                evidence_snapshot: list | None = None) -> None:
+    """问题落低置信度池。
+
+    `evidence_snapshot` 是 ch09 加的:落池当轮的召回片段(Top-N 的
+    id / 得分 / 章节 / 原文)。审核人靠它判「知识库真缺这块,还是有、但没检到」——
+    没有它,池子里只有一句问题,那两件事看起来一模一样(ch09 spec §7.1)。
+
+    ⚠️ **本参数由 T10 先落**(2026-09-23)。计划把「加这个参数**并返回新行 id**」
+    整条记在 T11 名下,而 T10 的契约里已经写着「Consumes T5 的
+    `record_low_confidence(evidence_snapshot=…)`」—— T5 只落了 ORM 那一列,
+    函数签名没动,而 T10 排在 T11 前面。⇒ T10 只补**它当下就需要的那一半**
+    (收下快照);**返回新行 id 仍是 T11 的活**。详见 task-10-report.md 的 concerns。
+    """
     session.add(
         LowConfidenceQuestion(
             question=question,
             source_conversation_id=source_conversation_id,
             entry_point=entry_point,
             reject_reason=reject_reason,
+            evidence_snapshot=evidence_snapshot,
         )
     )
     await session.commit()
