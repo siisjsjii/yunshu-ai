@@ -42,6 +42,37 @@ class Settings(BaseSettings):
     tool_retry_attempts: int = Field(default=2, ge=0)
     tool_retry_delay_seconds: float = Field(default=0.3, ge=0)
 
+    # ---- ch09 · Langfuse 观测。三个值任一为空 ⇒ 整套观测 no-op ----
+    # **单测"全程不联网"这条硬约束就靠它守**:测试的 Settings 不传这三个键,
+    # 于是 observability 全部走空壳,一个字节都不出网。
+    # ⚠️ 默认值是 **Langfuse Cloud(美国区)**;要"链路数据不出自家服务器"
+    #    就换成自部署地址 —— 只改这一个值,代码不动。
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://us.cloud.langfuse.com"
+
+    # ---- ch09 · 置信度闸(spec §4)----
+    # 判据 = w_top1*top1 + w_count*min(条数/max_count,1) + w_gap*clamp(top1-top2,0,1)
+    # 三个权重之和为 1 ⇒ 输出天然落在 0–1。
+    #
+    # ⚠️ `evidence_confidence_threshold` 的默认值**是占位,不是标定值**。
+    #    真值由 `scripts/calibrate_evidence.py` 在 evals/测试集.md(300 条 / 含
+    #    D_absent 应拒答桶 60 条)上扫出来,依据是"应拒答桶拦截率 vs 正常桶误杀率"。
+    #    标定前**不许**把这个数写进任何文档当已验证值。
+    evidence_confidence_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
+    evidence_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
+    evidence_max_count: int = Field(default=3, ge=1)
+    w_evidence_top1: float = Field(default=0.6, ge=0.0, le=1.0)
+    w_evidence_count: float = Field(default=0.2, ge=0.0, le=1.0)
+    w_evidence_gap: float = Field(default=0.2, ge=0.0, le=1.0)
+
+    # ---- ch09 · 召回片段快照(spec §6)----
+    snapshot_top_n: int = Field(default=5, ge=1)
+    snapshot_answer_chars: int = Field(default=400, ge=1)
+
+    # ---- ch09 · 飞轮(spec §8)----
+    flywheel_batch_size: int = Field(default=10, ge=1)
+
     # ch05 编排。两个数都加了界:写错要在启动时炸,不能等运行时变成
     # 「ReAct 循环一次都不跑」或「预算恒超 → 第一步就强制收敛」这种静默故障。
     max_agent_steps: int = Field(default=5, ge=1)

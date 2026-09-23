@@ -17,3 +17,4 @@ langgraph==1.2.11
 mcp>=1.24,<2
 langchain-mcp-adapters==0.3.2
 jsonschema==4.26.0
+langfuse==4.15.4
