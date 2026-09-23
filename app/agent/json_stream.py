@@ -220,14 +220,27 @@ class JsonAnswerDecoder:
         elif self._state == _EXPECT_COLON:
             if ch == ":":
                 self._state = _EXPECT_VALUE
-            return
+                return
+            if ch != "}":
+                return
+            # ⚠️ `}` 出现在**等冒号**的位置 ⇒ 这个键的值**整个缺失**。
+            # 旧实现把它**吞掉了**(`return` 掉了),于是 `{"useful": true, "answer"}`
+            # 这条**括号配平的完整输出**停在 `done=False`、`violation=None`、`answer=''`
+            # ⇒ 用户得到**零字节、无兜底、无 trace** —— 与 `empty_answer` 那条**同一个
+            # 形态**,只是触发条件从「值是空串」换成「对象没闭合」。
+            # 既判违规**也**收尾:落下去,由花括号那一段真正收尾。
+            self._mark_missing_value()
         else:                                    # _EXPECT_VALUE
             if ch == '"':
                 self._begin_string(is_key=False)
                 return
             if ch.isspace():
                 return
-            if self._cur_key == "answer":
+            if ch == "}":
+                # 同上:**本该有值**的位置出现 `}`(深度 0 时这既是值缺失也是收尾)。
+                self._mark_missing_value()
+                # 落到花括号那一段去收尾
+            elif self._cur_key == "answer":
                 # ⚠️ **`answer` 的值必须是字符串。** 不是 ⇒ 协议不合 ⇒ 违规(fail-open)。
                 # 放行的话调用方拿到的是 `useful=True` + `answer=""` + **无 violation**
                 # ⇒ **什么都不发** —— 正是 Critical 那条里被认定「比任何一种兜底都糟」
@@ -237,11 +250,11 @@ class JsonAnswerDecoder:
                 self._violation = f"answer_type={_value_kind(ch)}"
                 self._out.append(Event("violation", self._violation))
                 return
-            if ch not in "{}":
+            elif ch != "{":
                 self._scalar_buf = ch
                 self._state = _IN_SCALAR
                 return
-            # 非 answer 的键:值整个是个对象/数组,落到下面按结构字符处理
+            # 非 answer 的键、值整个是个对象:落到下面按结构字符处理
 
         # ---------- 花括号:**结构字符,与位置无关;只有深度 0 的 `}` 才收尾** ----------
         # ⚠️ 这里是本轮修掉的那个 Critical 的所在。原先标量后遇到的 `}` 会被
@@ -367,8 +380,13 @@ class JsonAnswerDecoder:
         if self._is_key:
             key, self._string_buf = self._string_buf, ""
             self._is_key = False
-            self._cur_key = key
-            if not self._saw_key:
+            # ⚠️ **键语义只在根对象那一层成立**(`_depth == 1`):协议字段(`useful` /
+            # `confidence` / `answer`)就长在根上。嵌套对象里的**同名键一律不作数**。
+            # 深度闸让解码器**走进**嵌套对象之后,`_cur_key` 是**扁平**的,它会照样
+            # 驱动 `_finish_scalar` / `_finish_string` / `_flush_text` —— 这一行把
+            # 「走进去了」与「读懂它的键」分开。四条反例见下面那两个用例的 docstring。
+            self._cur_key = key if self._depth == 1 else None
+            if self._depth == 1 and not self._saw_key:
                 self._saw_key = True
                 if key != "useful":
                     # §5.6 全章**唯一**一处「我们确信这是作答轮、且还没吐过任何
@@ -387,6 +405,19 @@ class JsonAnswerDecoder:
             self._out.append(Event("violation", self._violation))
             return
         self._state = _EXPECT_KEY
+
+    def _mark_missing_value(self) -> None:
+        """`}` 出现在**本该有值**的位置 ⇒ 值缺失。
+
+        只对**根**判(`self._depth == 1`):嵌套层里一个半截的键不该把根判死。
+        只记**第一个**违规(`_violation` 已被占就不再覆盖)——
+        `{"useful": true, "answer"}` 会先在这里记 `missing_value=answer`,
+        收尾那一刻的 `empty_answer` 判定因此自动让位,违规文案保持可诊断。
+        """
+        if self._depth != 1 or self._violation is not None:
+            return
+        self._violation = f"missing_value={self._cur_key or '?'}"
+        self._out.append(Event("violation", self._violation))
 
     # ---- useful 的值 ------------------------------------------------------
     def _finish_useful(self, raw: str) -> None:

@@ -403,6 +403,75 @@ def test_extra_answer_value_that_is_an_object_is_now_a_violation():
     assert d.feed("x") == []
 
 
+@pytest.mark.parametrize("stream,want_answer,want_useful", [
+    ('{"useful": true, "f0": {"useful": false}, "answer": "hi"}', "hi", True),
+    ('{"useful": true, "answer": "hi", "meta": {"useful": false}}', "hi", True),
+    ('{"useful": true, "f0": {"answer": "nested"}, "answer": "real"}', "real", True),
+    ('{"useful": {"answer": "x"}}', "", None),
+])
+def test_extra_nested_keys_do_not_count(stream, want_answer, want_useful):
+    """**键语义只在根对象那一层成立**(`self._depth == 1`)。嵌套里的同名键一律不作数。
+
+    深度闸让解码器**走进**嵌套对象之后,`_cur_key` 是**扁平**的,会照样驱动
+    `_finish_scalar` / `_finish_string` / `_flush_text`。四条反例,全部 `done=True`、
+    全部静默、**全部在不变量之外**:
+
+    1. `{"f0": {"useful": false}}` ⇒ `useful=False` + `answer=''` + 零 delta
+       ⇒ 一个**完全正确的回答被丢弃**,调用方走**第 1 行(兜底话术)**,
+       而且**与一次合法的 `useful=false` 无法区分**。
+    2. `{"answer": "hi", "meta": {"useful": false}}` ⇒ delta `'hi'` **已经发出去了**,
+       终态却是 `useful=False` ⇒ **第 1 行对着用户已经看到的那段回答说话**。
+    3. `{"f0": {"answer": "nested"}, "answer": "real"}` ⇒ `answer='nestedreal'`
+       ⇒ **在「一切正常」那一行上投递拼造出来的文本**。
+    4. `{"useful": {"answer": "x"}}` ⇒ **在 `useful is None` 时就吐了 `answer_delta`**,
+       直接推翻 docstring 里那条「解出 `useful` 之前一个 delta 都不许出去」。
+    """
+    d, ev = _run([stream])
+    assert d.answer == want_answer, f"{stream}: answer 被嵌套键污染"
+    assert d.useful is want_useful, f"{stream}: 嵌套键改写了 useful"
+    assert _deltas(ev) == want_answer, f"{stream}: 增量流对不上"
+    assert d.violation is None, f"{stream}: 合法的嵌套值不是协议不合"
+    assert d.done is True
+    if want_useful is None:
+        # 第 4 条的要害:不变量「解出 useful 之前零 delta」
+        assert _deltas(ev) == "", f"{stream}: useful 还没解出就吐了 delta"
+
+
+def test_extra_root_brace_closes_in_every_in_object_state():
+    """**深度 0 的 `}` 在对象内的任何状态里都收尾根对象**(等键 / 等冒号 / 等值三处)。
+
+    `{"useful": true, "answer"}` 是一条**括号配平、完全合法形态**的模型输出,
+    而旧实现把「等冒号」状态里的 `}` **吞掉了** ⇒ 停在 `done=False`、`violation=None`、
+    `answer=''` ⇒ 用户得到**零字节、无兜底、无 trace**。
+    ⚠️ 这与 §11-⑧ 立论的那条**是同一个形态**,只是触发条件从「值是空串」换成「对象没闭合」。
+
+    **出现在本该有值的位置 ⇒ 同时也是协议不合(值缺失)**:**既设 violation 也收尾**。
+    """
+    for stream in ('{"useful": true, "answer"}',            # 等冒号
+                   '{"useful": true, "answer": }',          # 等值
+                   '{"useful": true, "answer": "x", "confidence"}'):
+        d, ev = _run([stream])
+        assert d.done is True, f"{stream}: 括号配平的完整输出必须收尾"
+        assert d.violation is not None, f"{stream}: 值缺失同时也是协议不合"
+        assert "missing_value" in d.violation, f"{stream}: got {d.violation!r}"
+        assert d.feed("x") == [], f"{stream}: 违规后 feed 必须冻结"
+
+
+def test_extra_truncated_before_the_root_brace_still_does_not_violate():
+    """**对照组**:同样缺 `}`,但流是**被截断**的 ⇒ 走第 3 行,**不**违规。
+
+    与上一条的区分仍然是 `done`:上一条的 `}` **到了**(括号配平),
+    这一条的 `}` **从来没来**。截断时用户看到已生成的那半截 —— fail-open 的应有之义。
+    """
+    for stream in ('{"useful": true, "answer": "半截',
+                   '{"useful": true, "answer": "half'):
+        d, ev = _run([stream])
+        assert d.done is False, f"{stream}"
+        assert d.violation is None, f"{stream}: 截断不是协议不合"
+        assert d.answer != "", f"{stream}: 这条走第 3 行靠的就是 answer 非空"
+        assert not any(e.kind == "violation" for e in ev), f"{stream}"
+
+
 def test_extra_useful_true_with_empty_answer_is_a_violation_at_object_close():
     """`useful=true` 却一个字没答 ⇒ `violation == "empty_answer"`。
 
