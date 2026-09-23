@@ -66,9 +66,12 @@ def test_ch09_fields_have_defaults():
     assert s.langfuse_public_key == ""
     assert s.langfuse_secret_key == ""
     assert s.langfuse_base_url == "https://us.cloud.langfuse.com"
-    # ⚠️ 0.42 **是占位,不是标定值**(见 app/config.py 字段旁的注释):
-    # 真值由 scripts/calibrate_evidence.py 扫出来,届时这个 `==` 要一起改。
-    assert s.evidence_confidence_threshold == 0.42
+    # T8 已标定,占位值 0.42 换成 0.2(spec §15.9)—— 这条 `==` 按它**自己**
+    # 上面那句「届时这个 `==` 要一起改」跟着改。**断言形式一个字没动**:
+    # 仍然是"逐字钉住那个数",所以它守的"默认值不被静默改掉"这个性质没有变弱;
+    # 变的只是被钉的那个值从"占位"变成"标定值"。
+    # 标定读数:阈值 0.2 ⇒ 拦截率 0.967 / 误杀率 0.175(evals/测试集.md 300 条)。
+    assert s.evidence_confidence_threshold == 0.2
     assert s.evidence_min_score == 0.15
     assert s.evidence_max_count == 3
     assert s.w_evidence_top1 == 0.6

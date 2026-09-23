@@ -55,11 +55,20 @@ class Settings(BaseSettings):
     # 判据 = w_top1*top1 + w_count*min(条数/max_count,1) + w_gap*clamp(top1-top2,0,1)
     # 三个权重之和为 1 ⇒ 输出天然落在 0–1。
     #
-    # ⚠️ `evidence_confidence_threshold` 的默认值**是占位,不是标定值**。
-    #    真值由 `scripts/calibrate_evidence.py` 在 evals/测试集.md(300 条 / 含
-    #    D_absent 应拒答桶 60 条)上扫出来,依据是"应拒答桶拦截率 vs 正常桶误杀率"。
-    #    标定前**不许**把这个数写进任何文档当已验证值。
-    evidence_confidence_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
+    # `evidence_confidence_threshold` = **0.2,2026-09-23 标定**(spec §15.9)。
+    #    标定物:`scripts/calibrate_evidence.py` 在 `evals/测试集.md`(300 条 /
+    #    D_absent 应拒答桶 60 条)上跑**真实检索链路**扫出来的。读数:
+    #      阈值 0.2 ⇒ 拦截率 0.967(D_absent 60 条拦下 58)误杀率 0.175(240 条误杀 42)
+    #    ⚠️ **这个数在 (0, 0.2894] 整段上读数完全相同** —— 300 条里没有一条的
+    #    置信度落在这个开区间内(正常桶非零最小 0.2894,D_absent 非零最小 0.5420),
+    #    所以标定只定出了**平台段**,平台内的取值是**设计判断**不是量出来的:
+    #    取 0.2 而不是扫出来的网格下沿 0.05,是为了离 0 和离正常桶下沿(0.2894)
+    #    各留一段余量。整张表与选值理由见 spec §15.9 / dev-notes/ch09.md。
+    #    ⚠️ **误杀率的 0.175 与阈值无关**:那 42 条是**检索返回空**的正常问题,
+    #    闸的 `bool(evidence)` 在**任何**阈值下都拦它们(连 0 也拦)。
+    #    所以"17.5% 的正常问题会拿到兜底话术"是**检索覆盖率**的问题,不是这个旋钮。
+    #    一句话回退:改回 0.42 只影响平台之外的用例,对本章评估集读数无影响。
+    evidence_confidence_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
     evidence_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
     evidence_max_count: int = Field(default=3, ge=1)
     w_evidence_top1: float = Field(default=0.6, ge=0.0, le=1.0)
