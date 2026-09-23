@@ -55,7 +55,9 @@ LANGFUSE_BASE_URL=https://us.cloud.langfuse.com
 
 ### 2.2 ⚠️ `response_format` 与 `bind_tools` **不能同时用** —— 四条路逐条实测
 
-`app/agent/json_stream.py`(§5.3)的存在理由全在这一节。探针 `.superpowers/probe_ch09_json.py`,模型 `deepseek-flash`、`base=https://api.deepseek.com/v1`。
+**结论先说**:本章**不用 `response_format`**,`useful` 协议**纯提示词驱动 + §5.3 的增量解析器**。这一节是那个结论的依据,也是它为什么**没有硬保证**的依据(§5.7-1)。
+
+探针 `.superpowers/probe_ch09_json.py`,模型 `deepseek-flash`、`base=https://api.deepseek.com/v1`。
 
 | 组合 | 实测结果 |
 |---|---|
@@ -85,7 +87,7 @@ if "response_format" in payload:
 - `KNOWLEDGE_ANSWER_SYSTEM_PROMPT` 里必须**逐字出现 `JSON`**(提示词自己会说明「只输出一个 JSON 对象」,天然满足,但**要有一条测试钉它** —— 别人删掉那句话时,红在单测而不是红在线上)。
 - 同一处还有 ch01 的老坑:**描述结构时不得使用裸花括号**(`ChatPromptTemplate` 按 f-string 解析)。
 
-### 2.4 `KNOWLEDGE` 出口**只来自「商品咨询」** —— 这是 §5 拓扑的前提
+### 2.4 `KNOWLEDGE` 出口**只来自「商品咨询」** —— 这是 §5 落池范围的前提
 
 `app/agent/routing.py:25-36` 的 `INTENT_TO_ROUTE` 是全局唯一的意图→出口映射表:
 
@@ -95,9 +97,21 @@ if "response_format" in payload:
 闲聊     → CHITCHAT       其他     → FALLBACK
 ```
 
-**订单 / 物流 / 退款 / 售后全部不走 `KNOWLEDGE`。** 所以知识类问题里**不会**出现「我要查我这一单」这类必须现场取数的诉求 —— 留个口子的是**商品属性**(`query_product`)。
+**订单 / 物流 / 退款 / 售后全部不走 `KNOWLEDGE`。**
 
-实测证据的边界也如实说:`log/app.log` 里 7 条 `chat_turn` **全是 ch08 验收留下的物流轮**,**没有任何一条商品咨询轮**,所以「知识类今天会不会真的调工具」**没有证据**。§5.7 按「会」的最坏情况记账。
+> ⚠️ **这条曾被我用错了地方。** 我据它论证「知识路径不需要工具,所以可以不绑 tools」——
+> 而用户 2026-09-23 后半段**否掉了那个论证**:「知识路径作答还是要绑定 tools……多路检索
+> 之后进主力 agent 可能还是要调工具」。用户的例子(退款售后)其实走 `REFUND` 子流程、
+> 落在 `KNOWLEDGE` 之外,**但方向是对的:这张表只说明「走哪个出口」,不说明「那个出口
+> 需不需要工具」**。一个出口要不要工具,该由那句需求与实现者的判断定,不该由这张
+> 映射表**倒推**。
+>
+> 结论:这张表的**真正**用处是 §5.5 的**落池范围**(只有 `KNOWLEDGE` 那一类问题
+> 才该进知识池),**不是**「要不要绑 tools」论据。`agent` 保留 `bind_tools`(§5.1)。
+
+实测证据的边界也如实说:`log/app.log` 里 7 条 `chat_turn` **全是 ch08 验收留下的物流轮**,
+**没有任何一条商品咨询轮**,所以「知识类今天会不会真的调工具」**仍然没有证据** ——
+这也正是采纳用户方向的原因:**没有证据支持去掉一个能力时,就不去掉。**
 
 ### 2.5 现状盘点:低置信度池**只写不读**
 
@@ -285,39 +299,59 @@ passed = conf >= settings.evidence_confidence_threshold
 
 ## §5 生成阶段自评(飞轮入口 ②)
 
-### 5.1 图拓扑:知识路径的作答换成一个**新节点**
+### 5.1 图拓扑**一字不改**,协议加在 `agent` 节点的知识轮上
 
 ```
-retrieve_knowledge → confidence_gate ─通过→ knowledge_answer ─→ log_turn
-                                     └不通过→ fallback_reply ──→ log_turn
+retrieve_knowledge → confidence_gate ─通过→ agent ─→ log_turn
+                                     └不通过→ fallback_reply ─→ log_turn
 ```
 
-- 新节点 `knowledge_answer`(`app/agent/answer_nodes.py` 的 `make_knowledge_answer_node`)。
-- **`agent` 节点一行不动**,`confidence_gate` 的出边只把 `"agent"` 改成 `"knowledge_answer"`。
-- **`_OUTLETS` 要加它**:`_OUTLETS` 的定义就是「出口节点 —— 它们统一汇进 `log_turn` 再结束」,而 `fallback_reply` 同样是 `confidence_gate` 的条件边目标、照样在里面。`knowledge_answer` 与它对称,加进去之后靠 `for outlet in _OUTLETS: graph.add_edge(outlet, "log_turn")` 那一个循环接上。
-  - ⚠️ 反过来说,**`agent` / `refund_pick_order` 不能加** —— 前者撞到未确认写调用时要去 `confirm_write`(把它也接上 `log_turn` 会让挂起那一轮**一半写库、一半没写**),后者可能停在 `interrupt()` 上。这是 ch08 已记的边界,本章**不碰**。
+- **`agent` 保留 `bind_tools`,工具可用性零损失。**(用户 2026-09-23 后半段拍板:
+  「知识路径作答还是要绑定 tools……多路检索之后进主力 agent 可能还是要调工具」。)
+- `confidence_gate` 的出边不动,`_OUTLETS` 不动,图**一个字都不改**。
+- 只在 `make_agent_node` **组装 `msgs` 时**按 `state["intent"]` 追加一条**协议消息**,
+  并让**文本流出**走一次解码(§5.4)。
 
-**为什么值得单开一个节点**(而不是在 `agent` 里加分支):
+**协议只加在知识轮(`intent == "商品咨询"`)。** 理由:
 
-1. `agent` 承担 ch08 的写确认流 —— **挂起、续跑、`turn_messages` 覆写、`pending_write` 清零**全在里面。往里加一条「另一种回答协议」的分支,是在全仓最复杂的一段代码上做条件叠加。
-2. 知识路径**不需要工具**(§2.4),所以它本来就不该付 `bind_tools` 的代价(每轮 prompt 里那 800 token 的工具定义)。
-3. 分开之后,「不绑 tools」是**结构保证** —— 这个节点构造 session 时**根本没有 tools 参数**,模型在结构上不可能发 `tool_calls`。
+1. 需求说的是「**知识**不够答」;落池也只该发生在知识类(§5.5)。
+2. **业务 / 退款 / 闲聊三条路径的输出形状与今天逐字节相同** ⇒ ch08 的写确认流
+   (挂起 / 续跑 / `turn_messages` 覆写 / `pending_write` 每轮清零)**零风险** ——
+   这是上一版方案(新节点)想要的收益,现在用一个 `if` 就拿到了。
+
+**协议消息是追加的第三条 system 消息,不进 `render_system_prompt`。**
+后者是 `budget.derive(...)` 的入参之一,动它就会连带改**预算推导**,并让一批
+既有的预算/分层测试跟着动 —— 收益为零、风险不小。
 
 ### 5.2 一次调用,三个字段,**顺序是协议的一部分**
 
 ```python
-class KnowledgeAnswer(BaseModel):
+class KnowledgeAnswer(BaseModel):        # 只作**协议文档**,不作解析器
     useful: bool        # 证据是否足以回答
     confidence: float   # 0–1,自评置信度
     answer: str         # useful 为 false 时必须是空串
 ```
 
-- 走 `response_format={"type":"json_object"}`(`json_mode` 家族,本仓在图之外唯一的先例是 `app/kb/assess.py`)。
-- **提示词强制三件事**(逐条对应 §2.2/§2.3 的实测与 §5.4 的行为):
-  1. 逐字出现 **`JSON`** 字样(网关硬要求);
-  2. **顺序必须是 `useful` → `confidence` → `answer`**,并说明理由(「先判定,后作答」);
-  3. **证据不足以回答时,`useful` 必须为 `false` 且 `answer` 必须为空字符串**;不得编造、不得用常识补。
-- `answer` 的空串约束是**协议的一部分而不是礼貌**:§5.4 靠它保证「`useful=false` 的用户一个字都看不到」。
+⚠️ **不用 `response_format`,也不用 `with_structured_output`** —— §2.2 实测:
+
+- 本节点的轮次**绑着 tools**(§5.1),而 `response_format` 与 `bind_tools` 在
+  langchain-openai 1.6.2 上**互斥**(非 strict 工具直接客户端 `ValueError`)。
+- 唯一的硬组合方式是 `strict=True`,而它**会改写每一个工具的 schema**,
+  含两个 MCP Server 原样透传的 `inputSchema`。**否。**
+
+⇒ 协议**纯提示词驱动**,`KnowledgeAnswer` 这个 Pydantic 类**只用来写文档与测试**,
+**不进运行时**。解析由 §5.3 的增量状态机负责。
+
+**协议消息必须做到三件事:**
+
+1. 逐字出现 **`JSON`** 字样(§2.3 的网关硬约束;`response_format` 虽然不发了,
+   但这句约束在本仓是**通行纪律**,而且协议文本本来就要说「JSON 对象」)。
+2. **顺序必须是 `useful` → `confidence` → `answer`**,并说明理由(「先判定,后作答」)。
+   **顺序不是风格,是协议** —— §5.4 的「`useful=false` 时一个 token 都不放出去」
+   完全靠它成立。
+3. **证据不足以回答时,`useful` 必须为 `false` 且 `answer` 必须为空字符串**;
+   不得编造、不得用常识补、**不得在前言里先给答案再说 useful=false**。
+4. **需要调工具时照常调**;不需要工具时**只输出那一个 JSON 对象,不要任何前言、不要 ``` 围栏**。
 
 ### 5.3 `app/agent/json_stream.py` —— 增量解析器(**自写**,理由见下)
 
@@ -339,6 +373,8 @@ class JsonAnswerDecoder:
     """吃 token 片段,吐事件。**纯函数式**:没有 await、没有 IO、没有随机。"""
     def feed(self, fragment: str) -> list[Event]: ...
     @property
+    def mode(self) -> str: ...            # "lead" | "protocol" | "plain" —— 见 §5.4
+    @property
     def useful(self) -> bool | None: ...
     @property
     def confidence(self) -> float | None: ...
@@ -346,7 +382,13 @@ class JsonAnswerDecoder:
     def answer(self) -> str: ...          # 已解出的 answer 全文(供落库)
     @property
     def done(self) -> bool: ...
+    @property
+    def raw(self) -> str: ...             # 收到过的**全部**原文(降级路径要用)
 ```
+
+解码器自带一个**三态**状态机:**`lead`(还没定形态)→ `protocol`(在解协议对象)
+/ `plain`(不是协议对象)**。三态的**退出条件与行为**在 §5.4;这里只强调一件事 ——
+**`plain` 态是「今天的行为」的原样保留**,它存在的意义是让协议违规**不产生任何回归**。
 
 **必须钉死的边界(每条一个用例)**:
 
@@ -358,54 +400,100 @@ class JsonAnswerDecoder:
 | 4 | `answer` 是**最后一个键**,收尾 `"` 与 `}` 分在两个 chunk | `done` 在收到 `}` 后才为真 |
 | 5 | **小数跨 chunk**:`"confidence": 0.` / `85` | `confidence == 0.85` |
 | 6 | `useful` 的值跨 chunk:`tru` / `e` | `useful is True` |
-| 7 | **首键不是 `useful`**(先出现 `answer`) | `violation("first_key=answer")`,**且一个 token 都没吐过** |
-| 8 | 顶层不是 `{` | `violation("not_object")` |
+| 7 | **首键不是 `useful`**(先出现 `answer`) | `protocol` 态下 `violation("first_key=answer")`,**且一个 token 都没吐过** |
+| 8 | **前导空白后第一个非空白字符不是 `{`** | `mode` 变 `plain`(§5.4),**不是 violation** |
 | 9 | 流提前结束(没有 `}`) | 收尾时 `done is False` ⇒ 调用方按「不完整」处理 |
 | 10 | `useful=false` 且 `answer=""` | `useful=False` 后立刻 `done`,**零个 `answer_delta`** |
-| 11 | 模型加 ```json 围栏 | 见 §5.5 的围栏剥离 |
+| 11 | `useful=false` **但 `answer` 非空**(违规流) | 解出 `useful=False` 的**那一刻**停,**后续 answer 一个 delta 都不再吐** |
+| 12 | 模型加 ```json 围栏 | 前缀 `` ```json `` 的首个非空白是 `` ` `` ⇒ **落 `plain`**(§5.4)。**这是刻意的**:围栏意味着模型没守协议,按今天的纯文本行为处理并把 JSON 原样显示,比猜着剥壳**更可预测、更好记账** |
+| 13 | 前导空白(片段是 `""` / `"  "` / `"\n"`) | 留在 `lead` 态,不判定 |
 
-**语义约束**:`feed` 是**追加**语义(片段按到达顺序喂),不是替换;`answer_delta` 事件里的 `value` 是**本次新增**的那段文本,不是累计。
+**语义约束**:`feed` 是**追加**语义(片段按到达顺序喂),不是替换;`answer_delta` 事件里的 `value` 是**本次新增**的那段文本,不是累计。`feed("")` 必须是**空事件表**,不许因为空片段而误判 `plain`。
 
-### 5.4 消费与行为
+### 5.4 三态状态机:一轮文本怎么变成 token 帧
+
+`_stream_round` 今天做的事是 `if chunk.text: emit({"frame":"token", ...})`。
+知识轮改成喂解码器,**业务轮一个字不改**。
 
 ```
-第一轮 feed 出 useful 之前  → 什么都**不 emit**(用户此刻看不到任何字)
-useful=True                → 此后每个 answer_delta 立刻 emit 一个 token 帧(原样)
-useful=False               → **停止消费**,丢弃 remainder,emit 兜底话术的 token 帧
-                             落池(entry_point="生成自评")+ 存召回片段快照
-流结束仍没解出 useful       → 按「不完整」处理,见 §5.5
+lead(缓冲中,还没定形态)
+ ├ 首个**非空白**字符是 `{`        → protocol
+ ├ 首个非空白字符不是 `{`          → plain   ← 把缓冲与后续**全部实时 emit**
+ └ 片段全是空白 / 空串             → 留在 lead
+
+protocol(在解协议对象)
+ ├ 解出 useful=true   → 先 flush 缓冲里 `{` 之前的字节(若有),此后每个
+ │                      answer_delta **立刻** emit 一个 token 帧
+ ├ 解出 useful=false  → **立刻停止消费**、丢弃 remainder、emit 兜底话术的 token 帧
+ │                      (§5.5 决定要不要落池)
+ ├ 首键不是 useful    → **中止本轮 → 重试一次**(此时零 emit,见 §5.6)
+ └ 流结束仍没 useful  → 与 plain 同路:把全部原文当普通答复 emit + 记账
+
+plain → 每个 chunk.text **立刻** emit(↔ 今天的行为,**零回归**)
 ```
 
-**「`useful` 之前不 emit」是一致性的必要条件**:`answer` 在协议里排在第三位,所以在解出 `useful` 之前**不可能**有 `answer` 的字节 —— 这条不成立时是协议违规(§5.5),不是正常路径。
+**两条不变量,都要有测试:**
 
-`confidence` **只记录,不做第二个阈值**(用户只点名了 `useful` 一个判据):它进 state、进 `log_turn` 的日志行、进 `trace` 帧。
+1. **`lead` 态下什么都不 emit。** 用户此刻看不到任何字。
+2. **`useful=false` 之后,一个 `answer_delta` 都不许再出去。** 协议第 3 条
+   (`answer` 必须为空串)是这条的**正常路径**保证,而 §5.3 的边界 11
+   (`useful=false` 但 `answer` 非空)是它的**违规路径**保证 —— 两条都要测。
 
-### 5.5 协议违规:重试一次 → 再不行**降级**,不阻断
+**「`useful` 之前不 emit」是协议顺序的直接推论**:`answer` 排在第三位,
+所以解出 `useful` 之前**不可能**有 `answer` 的字节。
 
-`violation` 或流结束仍没 `useful`:
+`confidence` **只记录,不做第二个阈值**(用户只点名了 `useful` 一个判据):
+它进 state、进 `log_turn` 的日志行、进 `trace` 帧。
 
-1. **首键不是 `useful`、或顶层不是对象 ⇒ 重试一次。** 此时**一个 token 都没吐过**(§5.4 的纪律),重试对用户完全不可见。
-2. **重试仍违规 ⇒ 降级**:把收到的**全部文本**当作答案(去掉可能存在的 ```json 围栏),按普通 token 帧推给用户,**不落池**,并在 `state["trace"]` 里记 `knowledge_answer:protocol_violation`,日志 `logger.warning`。
+### 5.5 落池范围:`useful=false` 一律兜底,但**只有知识类落池**
 
-**为什么是 fail-open**(与闸的 fail-closed 相反):闸拦下的是「**还没生成**的回答」,代价是用户再看一次兜底话术;这里拦下的是「**已经生成完、只是包装不合协议**的回答」,按 `useful=false` 处理等于**把一段可能完全正确的回答扔掉**并落一条假的池记录。两处的代价不对称,所以方向相反。**这条方向差异要在 spec 里写死**,否则后来人会「为了一致性」把它改反。
+| 情形 | 用户看到 | 落池? |
+|---|---|---|
+| `useful=false`,且 `intent == "商品咨询"` | 兜底话术 | ✅ `entry_point="生成自评"` + 存召回片段快照 |
+| `useful=false`,其它意图 | 兜底话术 | ❌ **不落** |
 
-**围栏剥离**只在降级路径与「重试后仍带围栏」时做:**极简规则** —— 取第一个 `{` 到最后一个 `}` 之间的子串。不写通用 Markdown 解析器。
+**为什么业务类不落池**:池子是**知识缺口**的池子,它的下游是「标准化 → 审核 →
+写进知识库」。一笔查不到的物流单**不是知识缺口**,写进知识库只会污染它。
+业务类 `useful=false` 只记日志行。
 
-### 5.6 被否的方案,以及否它的证据
+### 5.6 协议违规:**只在一处重试**,其余一律降级成「今天的行为」
 
-| 方案 | 否它的**实测**证据 |
-|---|---|
-| 在 `agent` 节点里加「知识类走 JSON」的分支 | `agent` 承载 ch08 写确认流(挂起/续跑/覆写通道/每轮清零)。改它 = 在**全仓最复杂的一段**上叠条件,而 ch08 的验收 4/5/6 全靠它 —— 收益(省一个节点)与风险不成比例 |
-| `bind_tools(strict=True)` + `response_format`,全路径统一 | §2.2:**strict 会改写每个工具 schema**,包括两个 MCP Server 原样透传的 `inputSchema`(对方写的,我们没有编辑权)。为一个字段动整个工具系统的序列化形状 —— 否 |
-| 纯 prompt 驱动 JSON + 保留 `bind_tools` | **能流式、覆盖所有路径**,但**没有硬保证**(模型可能加围栏或前言)。作为 §5.7 那条退路的形态保留 |
-| 跑两次调用(先作答、后自评) | 用户 2026-09-23 明确要「自评和回答**一起**」。而且第二次调用拿到的是已经推给用户的文本,判 `useful=false` 也收不回来 |
-| 生成完再判、把回答换成兜底话术 | 回答**已经流式推给用户了**,收不回来。这是「与回答一起」这条要求在流式下的必然推论 |
+| 违规形态 | 处理 | 为什么 |
+|---|---|---|
+| `protocol` 态下**首键不是 `useful`** | **中止本轮,重试一次**(此时**零 emit**,用户完全看不见);再违规 ⇒ 降级 | 这是**唯一**一处「我们确信这是作答轮、且还没吐过任何东西」的时刻 —— 重试的代价与收益在这里才成立 |
+| `lead` 态首个非空白不是 `{`(含 ```json 围栏、含前言) | **不重试**,直接 `plain` | 它常常意味着「模型先说了句『让我查一下』再调工具」—— 那是**正常行为不是违规**;重试会把这种最常见的形态也打成一轮额外的模型调用 |
+| 流结束仍没 `useful` | 不重试,按 `plain` 收尾 + `trace` 记 `agent:protocol_violation` + `logger.warning` | 同上 |
+
+**降级 = 今天的行为**,这是本章的**兜底不变量**:协议怎么坏,最差也就是回到
+ch08 的纯文本流,**不会让任何一条既有路径变差**。`trace` 里的标记供验收与事后排查。
+
+**为什么降级是 fail-open**(与闸的 fail-closed 相反):闸拦下的是「**还没生成**的回答」,
+代价是用户再看一次兜底话术;这里面对的是「**已经生成完、只是包装不合协议**的回答」,
+按 `useful=false` 处理等于**把一段可能完全正确的回答扔掉**并落一条**假的池记录**。
+两处的代价不对称,所以方向相反。**这条方向差异写死在本节**,否则后来人会
+「为了一致性」把它改反。
+
+**不做围栏剥离。** 上一版曾打算「取第一个 `{` 到最后一个 `}`」。**去掉了**:
+剥壳意味着我们要猜模型的意图,而剥错了的后果是把一段残缺 JSON 当答案推给用户;
+`plain` 降级把 JSON 原样显示**丑但可预测**,且 `trace` 里有标记、日志里有告警 ——
+对一个**本就不该发生**的形态,可预测比好看重要。
 
 ### 5.7 ⚠️ 代价与已知取舍(如实记账,不许读成「没损失」)
 
-1. **商品咨询失去现场调 `query_product` 的能力。** 知识路径不再经过带工具的 ReAct。依据是 §2.4(该出口只来自商品咨询,证据已强制预检索),但**「今天到底用没用过」没有证据** —— `log/app.log` 里没有商品咨询样本。**这是本章最可能被事后认为做错的一处。**
-   - **退路**:保留 `agent`,改用「纯 prompt 驱动 JSON + 首键检查 + 违规重试一次」。能流式、覆盖所有路径,代价是**没有硬保证**。改动范围:`knowledge_answer` 节点删掉、`confidence_gate` 出边改回 `"agent"`、协议检查搬进 `agent`。
-2. **`response_format` 会让 langchain 走 beta 路径并弹掉 `stream`。** 那份路径下 **`stream_options.include_usage` 还回不回来未实测** ⇒ `knowledge_answer` 的 token 计数可能拿不到。**这是计划里的第一个冒烟项**(§12.3),不通就在 trace 里记 `usage_missing` 并如实记账,不许编一个数。
+1. **协议没有硬保证。** 因为它与 `bind_tools` 互斥(§2.2),只能靠提示词。
+   ⇒ 模型不守协议时,降级成纯文本(§5.6),**`useful` 那一轮就丢了**。
+   **这是本章最可能被事后认为「不稳」的一处。**
+   - 兜底是结构性的:降级路径 = 今天的 ch08 行为,**不会更差**;`trace` 里有标记,
+     违约率是可观测的(Langfuse 上按 `agent:protocol_violation` 一搜就有)。
+2. **知识轮多一段协议消息的 token 开销**(约 150 token/轮)。它**只进 `msgs`,
+   不进 `render_system_prompt`** ⇒ **不影响 `budget.derive` 的推导**,也不动
+   既有的预算/分层测试(`prompt 预算`那套是照 system prompt 算的)。
+3. **`usage` 统计不受影响。** 上一版那条「`response_format` 会让 langchain 走 beta
+   路径、`stream_options.include_usage` 可能丢」的风险**随方案一起消失了** ——
+   现在走的是**普通 `astream` 路径**,与 ch05–ch08 每一轮完全相同。
+4. **知识类问题若在某一轮里既想调工具、又想作答**:协议的写法是「需要工具就照常调」,
+   模型会先发 `tool_calls`(那一轮没有文本或只有前言),工具执行完在**下一轮**作答。
+   这与今天的 ReAct 行为一致。
 
 ---
 
@@ -499,7 +587,7 @@ CREATE TABLE eval_runs (
 | 取值 | 产生处 | 状态 |
 |---|---|---|
 | `置信度闸` | `confidence_gate`(§4.3) | **沿用旧值**,不重命名(ch04/ch05 的测试与验收都断它) |
-| `生成自评` | `knowledge_answer`(§5.4) | 新增 |
+| `生成自评` | `agent` 节点的知识轮(`useful=false` 且 `intent=商品咨询`,§5.5) | 新增 |
 | `用户反馈` | `POST /api/feedback`(§6.1) | 新增 |
 
 列宽 `VARCHAR(32)`,三个取值都放得下(MySQL 的 VARCHAR 长度按**字符**算)。
@@ -560,7 +648,7 @@ await session.commit()
 
 ### 8.4 落池后触发的时序(如实记)
 
-「落池」发生在 `confidence_gate` / `knowledge_answer` 节点里,而**那时请求还没结束**。后台任务在**同一进程**里另起线程 + 自建 engine 读同一张表。⇒ 存在一个**短暂的可见性窗口**:落池那一行提交之后、后台任务读它之前。这**不构成正确性问题**(流水线只看 `matched_review_id IS NULL`,晚一轮也会被处理到),但**验收脚本必须容忍这个窗口** —— 脚本一律用「轮询 + 超时」而不是「落池后立刻断言队列里有」。
+「落池」发生在 `confidence_gate`(闸拦下)与 `agent` 的知识轮(`useful=false`)里,而**那时请求还没结束**。后台任务在**同一进程**里另起线程 + 自建 engine 读同一张表。⇒ 存在一个**短暂的可见性窗口**:落池那一行提交之后、后台任务读它之前。这**不构成正确性问题**(流水线只看 `matched_review_id IS NULL`,晚一轮也会被处理到),但**验收脚本必须容忍这个窗口** —— 脚本一律用「轮询 + 超时」而不是「落池后立刻断言队列里有」。
 
 ---
 
@@ -673,15 +761,20 @@ flywheel_batch_size: int = Field(default=10, ge=1)
 
 **按 TDD 走的**(确定性逻辑):
 
-- `app/agent/json_stream.py` —— §5.3 表里 11 条边界,**每条一个用例**,另加一组 **chunk 边界 fuzz**(把一段完整 JSON 按**每一个可能的切点**切成两段,以及随机切成 3–8 段,**结论必须与不切时逐字节相同**)。这是本章测试价值最高的一处。
+- `app/agent/json_stream.py` —— §5.3 表里 **13 条边界,每条一个用例**,另加一组 **chunk 边界 fuzz**(把一段完整 JSON 按**每一个可能的切点**切成两段,以及随机切成 3–8 段,**结论必须与不切时逐字节相同**)。这是本章测试价值最高的一处。
 - `app/kb/evidence.py` —— 三个信号的取值、空证据、只有一条、分数并列(top1−top2=0)、条数封顶。
 - `confidence_gate` —— 判据换成 `evidence_confidence` 后:通过/不通过两支、`reject_reason` 含三个信号、落池的 `entry_point` 仍是 `置信度闸`。
-- `knowledge_answer` 节点 —— 注入一个**可控的假流**(按需吐片段):正常路径(useful=true,逐片 emit)、`useful=false`(停吐 + 兜底话术 + 落池 + 快照)、首键违规(重试一次)、两次都违规(降级为纯文本 + trace 记 `protocol_violation`)。
+- **`agent` 节点的协议路径**(注入一个**可控的假流**,按需吐片段):
+  - **知识轮**走 `protocol`:首键 `useful` 正常 ⇒ line-by-line 的 token 帧与 answer 逐字节一致;**中途的分片不影响结果**(拿 §5.3 的 fuzz 再来一遍,这次在**节点层**)。
+  - `useful=false`(**且 `answer` 非空**的违规流)⇒ 一个 answer 帧都没发出去、发了兜底话术、`intent=商品咨询` 时落池 + 存快照。
+  - `useful=false` 且 `intent=物流` ⇒ 同样的兜底话术,**但不落池**(§5.5 的两行**各一个用例**)。
+  - **首键违规** ⇒ 恰好重试 **1** 次(模型替身记录调用次数),第二次合规 ⇒ 正常作答。
+  - **两次都违规 / 首字符不是 `{`** ⇒ 降级 `plain`:token 帧与今天**逐字节相同**,`trace` 里有 `agent:protocol_violation`。
+  - **业务轮(`intent=物流`)** ⇒ **逐字节等于今天的输出**(这是「零回归」这条不变量的**唯一**硬证据,必须单独一个用例)。
 - `observability` —— §3.6 那条 no-op 测试(关掉时不 import langfuse、`handler()` 为 `None`、`span()` 里跑代码不炸)。
 - `flywheel/pipeline.py` —— 幂等(同批跑两次,`review_queue` 行数不变)、查重命中累加 `occurrences` 且回填 `matched_review_id`、逐行失败不拖垮整批。
 - `POST /api/feedback` —— `down` 落池、`up` 不落、重复 `down` 幂等。
 - 审核端点 —— approve 会调 `write_chunks` + `vectorize_rows`(替身计数)、reject 不改知识库。
-- `_gate_route` 的出口从 `agent` 改成 `knowledge_answer` —— **表驱动穷举**(与 ch05/ch06 的意图路由同款)。
 
 **db 标记**:`tests/test_review_api_db.py`、`tests/test_flywheel_db.py` 等带真实 MySQL 的用例一律 `pytestmark = pytest.mark.db`。
 
@@ -690,13 +783,13 @@ flywheel_batch_size: int = Field(default=10, ge=1)
 本仓的头号风险是假绿,下面四条按**本章的具体形状**写:
 
 1. **增量解析器的测试输入切得太粗** ⇒ 转义**不跨边界**,于是「跨 chunk 转义」这条根本不被验。⇒ 必须有**穷举切点**的用例(§12.1),不许只测「整段喂进去」。
-2. **`response_format` 那条路被替身屏蔽** ⇒ 假流无论怎么吐都是我们喂的,真实网关的 `usage` 丢没丢**测不出来**。⇒ §12.3 的**真机冒烟**是必需的,不许用单测绿代替。
+2. **「业务轮零回归」用一句 `assert reply == ...` 断不出来** —— 业务轮与知识轮走的是**同一个节点**,而「零回归」说的是**推出去的 token 帧序列**逐字节相同。⇒ 用例必须比**帧序列**,不比对最终 `reply`。
 3. **`useful=false` 的用例里 `answer` 本来就是空的** ⇒ 「停吐」这一步**不被验**(没有可吐的东西)。⇒ 用例必须构造 **`useful=false` 但 `answer` 非空**的违规流,断「一个 answer_delta 都没发出」。
 4. **落池断言不按会话过滤** ⇒ 被上一次运行留下的行污染(ch08 已记过:审计表每轮 +55 行)。⇒ 凡是对 `low_confidence_questions` / `review_queue` 的断言**一律按 `source_conversation_id` 或本轮生成的主键过滤**。
 
 ### 12.3 真机冒烟(单测绿了也要跑)
 
-1. **`response_format` + `astream` 在真实网关上拿不拿得到 usage**(§5.7-2)—— 这一条**决定** `knowledge_answer` 的 token 计数是真数还是 `None`。
+1. **真实网关上的回答轮真的会吐协议 JSON** —— 单测里的假流是我们喂的,**测不出模型守不守协议**。跑 N 次真实的商品咨询问题,统计 `agent:protocol_violation` 出现几次。**这个数要如实进 dev-notes**,它是 §5.7-1 那条「没有硬保证」的**唯一**证据。
 2. **Langfuse trace 真能落在 Cloud 上**:跑一次 `/api/chat/stream`,去 Langfuse 用 `session_id` 搜到它,确认**巢状结构**(模型 span 在节点 span 下)、`intent:*` tag 在、工具 span 与 retrieval span 都在。**探针跑通不算数,要在 UI 里看见。**
 3. **`scripts/intent_cost.py` 打真实 Metrics API** 拿到非空结果(验收 5 的前置)。
 
@@ -720,8 +813,9 @@ flywheel_batch_size: int = Field(default=10, ge=1)
 ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 
 - `tests/test_agent_gate.py` 断的是 `entry_point == "置信度闸"` 与 `"0.31" in reject_reason` —— **`reject_reason` 的文案变了**(§4.3),这条测试**要按新文案改**,而**改的是文案不是判据**(仍要断三个信号都在)。这是一处**必须显式处理的既有测试**,不许绕过。
-- `tests/test_agent_graph.py` 的「弱证据 → 不进 Agent、落池」—— 出口从 `agent` 变成 `knowledge_answer`,断言要跟着改。
-- 任何断「知识类问答案会走到 `agent` 节点」的用例,都要重新审一遍(§5.1 的拓扑变了)。
+- **图拓扑没变** ⇒ 没有一条既有测试因为「出口换了」而要改。这是 §5.1 选「不动图」的直接收益。
+- **但要逐个审「跑 `agent` 节点的用例里有没有用商品咨询意图的」**:那些轮的 token 帧会经过解码器。业务意图的用例**预期逐字节不变**,商品咨询意图的用例**预期改形态** —— 后者要显式改成协议用例(§12.1),**不许为了让老测试绿而把协议关掉**。
+- `app/agent/nodes.py` 的 `_stream_round` 签名会变(多一个文本出口)。全仓搜它的调用点(3 处)与测试替身,逐个确认。
 
 ---
 
@@ -731,9 +825,9 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 |---|---|---|
 | 1 | **Langfuse 4.15.4 的 API 未按 wheel 核对就写** —— `propagate_attributes` / `update_current_trace` / `CallbackHandler` 的确切签名 | 计划期**第一个阅读项**:读 `.venv/Lib/site-packages/langfuse/` 的 `__init__.py` 与 `langchain/` 子模块,**探针跑通再写实现**(ch08 §2.1 的教训:文档整站迁版) |
 | 2 | `.env` 指向 **Cloud**,与需求写的自部署不符 | 已由用户 2026-09-23 拍板;§2.1 记账;换自部署只需改一个值 |
-| 3 | **商品咨询失去 `query_product`** | §5.7-1;退路已写明;这是本章最可能被事后认为做错的一处 |
-| 4 | **`response_format` 走 beta 路径,usage 可能丢** | §5.7-2;§12.3-1 真机冒烟;丢了就如实记 `usage_missing`,**不编数** |
-| 5 | **增量解析器的转义跨 chunk** | §5.3 的 11 条边界 + §12.1 的穷举切点 fuzz |
+| 3 | **协议没有硬保证**(`response_format` 与 `bind_tools` 互斥,§2.2)⇒ 模型不守协议时该轮拿不到 `useful` | §5.6 降级 = 今天的 ch08 行为,**不会更差**;`trace` 记 `agent:protocol_violation`,违约率可观测;§12.3-1 真机跑 N 次把违约率量出来 |
+| 4 | **改动落在 `agent` 节点上**(全仓最复杂的一段,ch08 的确认流在里面) | 改动面**只有两处**:`msgs` 多一条协议消息、文本出口多一次解码。**工具绑定、工具执行、`pending_write`、`turn_messages`、每轮清零全不碰**;§12.1 的「业务轮逐字节不变」用例是这条的硬证据 |
+| 5 | **增量解析器的转义跨 chunk** | §5.3 的 13 条边界 + §12.1 的穷举切点 fuzz |
 | 6 | **👎 回捞是「重跑」不是「当轮」** | §6.2 的两条偏差如实记 |
 | 7 | **`eval_runs` 两轮的规模可能不同**(`--limit`) | §10.2-2:`case_count` 单独一列,趋势表把它打出来 |
 | 8 | **验收 3 的「答对了」可能是假绿** | §12.4 末尾那条:先断 Milvus 条数增长 |
@@ -746,11 +840,12 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 
 | 类别 | 路径 |
 |---|---|
-| 新增 | `app/observability.py`、`app/agent/json_stream.py`、`app/agent/answer_nodes.py`、`app/kb/evidence.py`、`app/flywheel/{__init__,normalize,dedupe,pipeline}.py`、`app/api/review.py`、`db/ch09.sql` |
+| 新增 | `app/observability.py`、`app/agent/json_stream.py`、`app/kb/evidence.py`、`app/flywheel/{__init__,normalize,dedupe,pipeline}.py`、`app/api/review.py`、`db/ch09.sql` |
 | 新增(脚本) | `scripts/calibrate_evidence.py`、`scripts/intent_cost.py`、`scripts/eval_trend.py`、`scripts/acceptance_ch09.sh` |
 | 新增(评估) | `evals/flywheel_cases.jsonl` |
 | 新增(端点) | `app/api/feedback.py` —— `POST /api/feedback`(不塞进 `app/api/chat.py`,那个文件已经 600 行) |
-| 改动 | `app/config.py`、`app/db/models.py`、`app/agent/nodes.py`(闸的判据 + 检索 span)、`app/agent/graph.py`(一条出边 + `_OUTLETS` 加一个)、`app/api/chat.py`(**只加 `config` 里的 callbacks/metadata**)、`app/main.py`(include 两个新 router)、`app/static/index.html`(👎 接后端)、`app/static/admin.html`(待审标签页)、`scripts/run_eval.py`(两个参数 + 写 `eval_runs`)、`requirements.txt`、`.env.example` |
+| 改动 | `app/config.py`、`app/db/models.py`、`app/agent/nodes.py`(**三处**:闸的判据、检索 span、`agent` 的协议消息 + `_stream_round` 的文本出口)、`app/api/chat.py`(**只加 `config` 里的 callbacks/metadata**)、`app/main.py`(include 两个新 router)、`app/static/index.html`(👎 接后端)、`app/static/admin.html`(待审标签页)、`scripts/run_eval.py`(两个参数 + 写 `eval_runs`)、`requirements.txt`、`.env.example` |
+| **不改** | `app/agent/graph.py`(拓扑一字不动)、`app/prompts.py`(**协议消息不进 `render_system_prompt`**)、`app/tools/**`(ch08 零改动) |
 | 文档 | `CLAUDE.md`(章节条目 + 硬约束 + 命令)、`AGENTS.md`、`dev-notes/ch09.md` |
 
 ---
@@ -766,3 +861,31 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 - **写错的原因**:把「一次调用失败」直接读成了「这个组合不行」,没有看错误文本说的是什么。**本仓那条「先写结论后没跑」的老毛病换了个壳**。
 - **影响**:不影响本章选型(§5 本来就不走 strict 路径),但**结论句是错的**,按本仓规矩必须订正而不是删掉。
 - **另**:同一次探针的**首版**还有一个更严重的假绿 —— `kwargs={}` 那两个分支**压根没把 `response_format` 挂上去**,把「裸 `bind_tools`」当成了「两者同时用」,输出看起来完全正常。**验证装置自己产假绿,这是本仓记过的形态,这次又中了。**
+
+### 15.2 待订正:§5 整节 —— 「新节点 + 不绑 tools」被用户否掉,改成「`agent` 内挂协议」
+
+- **最初写的**:知识路径的作答换成一个**新节点 `knowledge_answer`**(`app/agent/answer_nodes.py`),
+  不绑 tools + `response_format=json_object`,拿硬保证;`confidence_gate` 的出边改指向它;
+  `_OUTLETS` 加一个成员。代价栏写的是「商品咨询失去 `query_product`」,并给了退路。
+- **实际是**:用户 2026-09-23 后半段否掉了它 ——
+  > 「知识路径作答还是要绑定 tools 我觉得,比如退款售后问题的时候多路检索之后进主力 agent
+  > 可能还是要调工具」
+- **为什么会写错**:我用 §2.4 的 `INTENT_TO_ROUTE` 表去**倒推**「知识路径不需要工具」。
+  那张表只决定**走哪个出口**,不决定**那个出口需不需要工具**;而且我**自己写着**
+  「`log/app.log` 里没有任何商品咨询样本,所以知识类今天会不会真的调工具**没有证据**」——
+  **证据没有,结论却下了**。这与 §15.1 是同一种毛病的两种壳:**把「看起来合理」当成「已成立」。**
+  用户举的例子(退款售后)其实落在 `KNOWLEDGE` 之外,但**他的方向是对的**。
+- **订正后的形态**(本节起,§5 全节以新形态为准):
+  - 图拓扑**一字不改**;`agent` **保留 `bind_tools`**;协议只加在**知识轮**
+    (`intent == "商品咨询"`)的 `msgs` 里,文本流出走三态解码器。
+  - `response_format` **用不上了**(与 `bind_tools` 互斥,§2.2)⇒ 协议**纯提示词驱动**,
+    §5.7-1 如实记「没有硬保证」,§12.3-1 真机量违约率。
+  - `app/agent/answer_nodes.py` **不建**;`app/agent/graph.py` **不改**;
+    `_OUTLETS` **不动**;`app/prompts.py` **不动**(协议消息不进 `render_system_prompt`,
+    以免连带改 `budget.derive` 的推导)。
+  - **上一版那条「`response_format` 走 beta 路径、usage 可能丢」的风险随之消失**(§5.7-3)。
+  - **业务 / 退款 / 闲聊三条路径的输出形状与今天逐字节相同** —— 上一版方案想要的
+    「ch08 确认流零风险」,新形态用一个 `if` 就拿到了,而且比新节点更小。
+- **代价(如实记)**:新形态把改动落到了 `agent` 节点上(全仓最复杂的一段)。
+  缓解是改动面**只有两处**(`msgs` 多一条消息、文本出口多一次解码),
+  且 §12.1 加了「业务轮 token 帧逐字节不变」这条硬证据。
