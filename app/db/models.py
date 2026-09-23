@@ -139,12 +139,19 @@ class LowConfidenceQuestion(Base):
     # 落池当轮的召回片段快照(Top-N 的 id / 得分 / 原文)。可空 —— 置信度闸那条
     # 路径未必总有快照;用户点「没用」时后端会重跑一次检索尽力回捞(ch09 §6.2)。
     #
-    # ⚠️ **形状是 `list[dict]`,不是 `dict`**(2026-09-23 订正):写它的两处
-    # (`app/agent/nodes.py:_snapshot` 与 `app/api/feedback.py` 的同名函数)
-    # 都返回**列表**,每项是 `{"chunk_id", "score", "section_path", "answer"}`。
-    # 注解原先写的是 `dict | None` —— 运行时无害(JSON 列照收),但**注解与事实
-    # 不符会误导后来人**(审核页 T15/T16 是照这个形状读的)。
-    # 与 `ReviewQueue` / `EvalRun` 的 JSON 列不同,那两张表的确实是对象。
+    # ⚠️ **形状是 `list[dict]`,不是 `dict`**(2026-09-23 订正):写它的
+    # `app/agent/nodes.py:_snapshot` 返回**列表**,每项是
+    # `{"chunk_id", "score", "section_path", "answer"}`。注解原先写的是
+    # `dict | None` —— 运行时无害(JSON 列照收),但**注解与事实不符会误导后来人**
+    # (审核页 T15/T16 是照这个形状读的)。**另一处写入方是 T12 起的
+    # `POST /api/feedback`(它今天还不存在,形状按这一条对齐)。**
+    #
+    # ⚠️ **别拿这两条反推形状**(都核过、都写准):
+    # - `tests/test_ch09_orm.py` 的往返用例塞的是 **dict**(`{"chunks": [...]}`)——
+    #   JSON 列两种都存得下,那条用例**说不出来**生产写的是哪种;别读成
+    #   「dict 才是历来唯一的形状」;
+    # - 同为 JSON 列的 `EvalRun.metrics` 是 **`Mapped[dict]`**(确实是对象);
+    #   而 `MessageRecord.tool_calls` 是 **`Mapped[list]`** ⇒ **不能按表推**,一列一核。
     evidence_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # ⚠️ **一个列担两个语义**(ch09 §7.1):既记「这条问题归并到了 review_queue 的
     # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
