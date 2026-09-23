@@ -116,9 +116,14 @@ class KnowledgeChunk(Base):
 
 
 class LowConfidenceQuestion(Base):
-    """低置信度问题池(ch04,DDL: db/ch04.sql)。
+    """低置信度问题池(ch04 建表:db/ch04.sql;ch09 加两列:db/ch09.sql)。
 
-    检索为空 / 自评不足时,问题落此池留痕,供数据飞轮消费(本章只落不消费)。
+    检索为空 / 自评不足时,问题落此池留痕。ch04/ch05 只落不消费,**ch09 起它是
+    数据飞轮的入口之一** —— 下面两列就是为此加的。`entry_point` 的三个生产取值
+    见 ch09 spec §7.2(旧值 `置信度闸` 沿用,另有 `生成自评` / `用户反馈`)。
+
+    ⚠️ **两列只能靠 db/ch09.sql 的 ALTER 加上**:本仓硬约束「`init_db.py` 永不加列」
+    —— `create_all` 对**已存在**的表是空操作,它既不比形状也不报错。
     """
 
     __tablename__ = "low_confidence_questions"
@@ -130,6 +135,21 @@ class LowConfidenceQuestion(Base):
     )
     entry_point: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     reject_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # ---- 以下两列是 ch09 加的(db/ch09.sql 的 ALTER,create_all 不会加)----
+    # 落池当轮的召回片段快照(Top-N 的 id / 得分 / 原文)。可空 —— 置信度闸那条
+    # 路径未必总有快照;用户点「没用」时后端会重跑一次检索尽力回捞(ch09 §6.2)。
+    evidence_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # ⚠️ **一个列担两个语义**(ch09 §7.1):既记「这条问题归并到了 review_queue 的
+    # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
+    # ⇒ 流水线天然幂等,重跑不会重复归并;别只把它当外键用 —— 谁把它写成 NOT NULL,
+    # 谁就抹掉了「尚未处理」这个状态(而且不会有任何东西报错)。
+    # `index=True` 是 ORM 侧(create_all 那条路径)与 db/ch09.sql(ALTER 那条路径)
+    # 之间的**已知形状差异**:DDL 那条 ALTER 不建索引 —— 见 `ReviewQueue` docstring
+    # 里那份逐条差异清单第 ④ 条。这一列**刻意不挂
+    # ForeignKey** —— 池子里的行不随 review_queue 的删除而受约束(与 ToolAuditLog 同款理由)。
+    matched_review_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -269,4 +289,76 @@ class ToolAuditLog(Base):
     # `ix_tool_audit_logs_created_at`)—— 那处是**已知差异**,不影响行为。
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), index=True
+    )
+
+
+class ReviewQueue(Base):
+    """待审队列(ch09,DDL: db/ch09.sql)。
+
+    一行 = 一个**去重后**的知识缺口。查重命中时累加 `occurrences` 而不是新建行 ——
+    **查重是语义判断**(模型判「两句话是不是同一个意思」),所以 DDL 上**刻意没有
+    「标准化问题」的唯一键**:唯一键只能管**字面全等**,加了会在一次合理的语义归并上
+    响亮地 1062(该报「归并成功」,得到「插入失败」)。
+
+    `status` 取值 `pending|approved|rejected`;通过时 `approved_answer` 必填
+    (不传就用 `example_answer`,校验在端点层做,DB 不建 CHECK —— 与既有表一致)。
+
+    **与 db/ch09.sql 的形状差异**(照 ch08 的记法,**逐列编译 `CreateTable(...)` 对着数**,
+    不凭印象;两条建库路径 = `scripts/init_db.py` 的 create_all / db/ch09.sql 手工执行):
+    ① **`unsigned` 有无**:DDL 里三个 `BIGINT`(`review_queue.id` / `eval_runs.id` /
+       `low_confidence_questions.matched_review_id`)都带 `UNSIGNED`,ORM 侧 `BigInteger`
+       编译成**有符号** `BIGINT` ⇒ 两条路径建出的列**范围不同**(取值上今天碰不到)。
+       ⚠️ 顺带一提:ORM 的 `Integer` 编译成 `INT`(4 字节),所以 id 只能写 `BigInteger`
+       —— 写 `Integer` 是**真的形状不同**,不是记一笔就完事。
+    ② **索引是「有 vs 没有」,不是名字不同**:DDL 有 `KEY idx_status`,而 ORM 侧这些
+       模型**一个索引都没声明**(编译出来的 CREATE TABLE 只有 `PRIMARY KEY`)
+       ⇒ create_all 那条路径建的 `review_queue` 少一个索引。
+       ⚠️ **别照抄 db/ch08.sql 那句「只是索引名不同」** —— 那里两边都有索引,这里不是。
+    ③ **COMMENT**:DDL 有表级 + 列级中文 COMMENT,ORM 侧全文没有 `comment=`。
+    ④ **`matched_review_id` 的索引只在 create_all 那条路径上** —— 方向与 ② 相反:
+       ORM 写了 `index=True`(⇒ `ix_low_confidence_questions_matched_review_id`),
+       而 db/ch09.sql 的 ALTER 不建索引(实测 `SHOW CREATE TABLE` 只有 `KEY idx_entry_point`)。
+    **其余已对齐**(同上,逐列编译比对过):列名与顺序、可空性、类型、
+    `occurrences`/`status` 的默认值(`default=` 与 DDL 的 `DEFAULT` 语义一致)、
+    `created_at` 的 `DEFAULT CURRENT_TIMESTAMP`(`func.now()` 在 MySQL 侧就是它)。
+    """
+
+    __tablename__ = "review_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    standard_question: Mapped[str] = mapped_column(String(512), nullable=False)
+    example_answer: Mapped[str] = mapped_column(Text, nullable=False)
+    occurrences: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    approved_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_raw_question: Mapped[str] = mapped_column(Text, nullable=False)
+    source_conversation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class EvalRun(Base):
+    """评估流水线的一轮(ch09,DDL: db/ch09.sql)。一行一轮,按时间连成趋势。
+
+    `metrics` 的形状是**闭式**的(ch09 §10.3),各策略 / 各分桶的分数都在这一个 JSON 里;
+    `trigger_by` 取值 `manual|scheduled`(ddl 注释同)。
+
+    与 db/ch09.sql 的形状差异(逐列编译比对,同 `ReviewQueue` 那份清单):
+    ① `id` 的 `unsigned` 有无(DDL 带 `UNSIGNED`,ORM 有符号);
+    ② **DDL 有 `KEY idx_created`,ORM 侧没有索引**(这条是「有 vs 没有」,
+       **不是**「索引名不同」—— 别照抄 ch08 那句措辞);
+    ③ DDL 的表/列 COMMENT 在 ORM 侧没有对应物。
+    **其余(列名、可空性、类型、`created_at` 默认值)已对齐。**
+    """
+
+    __tablename__ = "eval_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trigger_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
     )
