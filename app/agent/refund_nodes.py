@@ -46,6 +46,7 @@ from langchain_core.messages import AIMessage
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
+from app import observability
 from app.agent.state import RefundJudgement
 from app.prompts import build_refund_judge_messages
 from app.refund.categories import REFUND_REASON_CATEGORIES
@@ -387,7 +388,29 @@ def make_refund_expand_retrieve_node(*, model, retriever, emit, settings):
             text=f"{text}(这一单:{context})" if context else text,
             max_queries=settings.query_expansion_max_queries,
         )
-        chunks = await multi_search(retriever, queries)
+        # ch09:与 `retrieve_knowledge` 那条**同形**(键名与字段逐字一致)——
+        # 退款这一路**也调 retriever**,而 `multi_search` / `KnowledgeRetriever`
+        # 都不是 LangChain run,回调覆盖不到 ⇒ 不给它开 span 的话,
+        # **一条退款请求在界面上看不到任何检索**(验收 1「点开任意一条请求,
+        # 看到完整链路」对退款请求就断不出来)。两条检索在界面上必须是同一种读法,
+        # 所以 `input` / `output` 的形状照抄,不另起一种。
+        #
+        # `input` 用**真正喂进 retriever 的那个值**:`multi_search` 收的是
+        # **扩写之后**的多路查询(列表),不是 `state["resolved_input"]` ——
+        # 记原话会让"这一路到底搜了什么"这件事在 trace 上说谎。
+        with observability.span(
+            "retrieval", as_type="retriever",
+            input={"query": queries}, settings=settings,
+        ) as sp:
+            chunks = await multi_search(retriever, queries)
+            if sp is not None:
+                sp.update(output={
+                    "chunks": [
+                        {"id": c.chunk_id, "score": round(c.score, 4),
+                         "section_path": c.section_path}
+                        for c in chunks
+                    ]
+                })
 
         evidence = _evidence_of(chunks)
         citations = _citations_of(evidence)

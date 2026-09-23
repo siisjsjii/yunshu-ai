@@ -1,7 +1,11 @@
 """强制预检索 + 置信度闸:阈值边界、落池、以及「闸不过就不进 Agent」。"""
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 
+import app.observability as observability
 from app.agent.nodes import make_confidence_gate_node, make_retrieve_knowledge_node
 from app.config import Settings
 from app.retrieval.search import RetrievedChunk
@@ -166,3 +170,57 @@ async def test_gate_uses_max_score_not_top1_position():
     )
     out = await node({"user_input": "q", "evidence": [{"score": 0.2}, {"score": 0.9}]})
     assert out["gate_passed"] is True
+
+
+# ---- 观测:检索必须留下 span(ch09 T3)--------------------------------------
+
+
+class _SpanSpy:
+    """捕获 `observability.span` 的实参,并 yield 一个记录 `update` 的假 handle。
+
+    断言打在**这个边界上**: `name` / `as_type` / `input` 键名 / `output` 字段
+    是「检索结果都能铺开看」这条需求的落点,而它**在节点返回的 dict 里一个字
+    都看不见**(`evidence` 是给 state 与 prompt 用的,与观测无关)。
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.updates: list[dict] = []
+
+    def __call__(self, name, *, as_type="span", input=None, settings):
+        self.calls.append({"name": name, "as_type": as_type, "input": input})
+        updates = self.updates
+
+        @contextmanager
+        def _cm():
+            yield SimpleNamespace(update=lambda **kw: updates.append(kw))
+
+        return _cm()
+
+
+@pytest.mark.anyio
+async def test_retrieval_node_opens_a_span_with_the_resolved_input(monkeypatch):
+    """检索节点必须手工开 `retrieval` span —— `KnowledgeRetriever` **不是**
+    LangChain run,回调一个 span 都不会给它。
+
+    形状与退款那一路(`tests/test_agent_refund.py` 的同名用例)逐字对齐:
+    两条检索在界面上必须是同一种读法。`input` 断的是**真正喂给 retriever**
+    的那个值(`resolved_input`,不是 `user_input` 原话)。
+    """
+    spy = _SpanSpy()
+    monkeypatch.setattr(observability, "span", spy)
+    node = make_retrieve_knowledge_node(
+        retriever=FakeRetriever([_chunk(0.91)]), emit=lambda p: None, settings=_settings()
+    )
+    await node({"resolved_input": "怎么退货"})
+
+    assert spy.calls == [{
+        "name": "retrieval",
+        "as_type": "retriever",
+        "input": {"query": "怎么退货"},
+    }]
+    assert spy.updates == [{
+        "output": {"chunks": [{
+            "id": 7, "score": 0.91, "section_path": "退换货 > 退货政策",
+        }]}
+    }]

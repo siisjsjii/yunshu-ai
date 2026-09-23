@@ -26,6 +26,8 @@
 
 import asyncio
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from langchain.tools import tool
@@ -35,6 +37,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from sqlalchemy.exc import SQLAlchemyError
 
+from app import observability
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph
 from app.agent.nodes import make_resolve_references_node
@@ -784,3 +787,59 @@ async def test_refund_flow_is_not_reached_for_other_intents():
     assert got == []
     assert h.model.calls["judge"] == 0
     assert h.session.added
+
+
+# ---- 11. 观测:退款这一路的检索必须留下 span(ch09 T3)---------------------
+
+
+class _SpanSpy:
+    """捕获 `observability.span` 的实参,并 yield 一个记录 `update` 的假 handle。
+
+    断言打在**这个边界上**是刻意的:span 的 `name` / `as_type` / `input` 键名 /
+    `output` 字段是需求「检索结果都能铺开看」的落点,而它**在节点的返回值里
+    一个字都看不见**(节点返回的 `evidence` 是给 state 与 prompt 用的)。
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.updates: list[dict] = []
+
+    def __call__(self, name, *, as_type="span", input=None, settings):
+        self.calls.append({"name": name, "as_type": as_type, "input": input})
+        updates = self.updates
+
+        @contextmanager
+        def _cm():
+            yield SimpleNamespace(update=lambda **kw: updates.append(kw))
+
+        return _cm()
+
+
+@pytest.mark.anyio
+async def test_refund_retrieval_opens_a_span_with_the_expanded_queries(monkeypatch):
+    """退款这一路**也调 retriever** ⇒ 必须留下 `retrieval` span,与知识那一路同形。
+
+    **判别力实测**:把这条 span 整块删掉,全量 709 条**没有一条会红** ——
+    也就是说在此之前它**没有任何东西守着**,而少了它,一条退款请求在界面上
+    看不到任何检索(验收 1 对退款请求断不出来)。这条用例是唯一能红的。
+
+    `input` 断的是**真正喂进 `multi_search` 的那个列表**(扩写之后的),不是
+    `state["resolved_input"]` —— 记原话会让「这一路到底搜了什么」在 trace 上说谎。
+    """
+    spy = _SpanSpy()
+    monkeypatch.setattr(observability, "span", spy)
+    h = _build_refund_graph(judgement=_Judgement(True, YES_REPLY))
+    await h.start(f"订单 {IN_CONTEXT} 能退吗", thread="t-refund-span")
+
+    # 整轮里**只有**这一条手工 span(工具那条已按裁定删除)—— 顺手钉住
+    # 「不许再长出第三种形状的手工 span」。
+    assert spy.calls == [{
+        "name": "retrieval",
+        "as_type": "retriever",
+        "input": {"query": ["退款政策", "退货时效"]},
+    }]
+    assert spy.updates == [{
+        "output": {"chunks": [{
+            "id": 7, "score": 0.71, "section_path": "退货政策 > 例外",
+        }]}
+    }]
