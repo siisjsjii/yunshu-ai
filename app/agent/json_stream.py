@@ -107,6 +107,7 @@ class JsonAnswerDecoder:
         self._cur_key: str | None = None   # 当前这个值属于哪个键
         self._saw_key = False        # 协议对象里是否已出现第一个键
         self._depth = 0              # 花括号深度:只有回落到 0 的那个 `}` 才收尾
+        self._answer_closed = False  # `answer` 的字符串值已完整交付(裁定 C 的那扇门)
         self._pending_high: str | None = None   # 扣住的高代理,等可能跟着的低代理
         self._escape = False         # 上一个字符是字符串内的 `\`
         self._unicode_hex: str | None = None   # 非 None = 正在攒 \uXXXX
@@ -247,8 +248,7 @@ class JsonAnswerDecoder:
                 # 的形态。**「模型真没给字符串答案」与「模型给了、我们解错了」在调用方
                 # 眼里长得一模一样**,所以两者都必须走同一条可预测的路(裁定 ④ 同理)。
                 # 文案写清是**类型**不是**键**。
-                self._violation = f"answer_type={_value_kind(ch)}"
-                self._out.append(Event("violation", self._violation))
+                self._violate(f"answer_type={_value_kind(ch)}")
                 return
             elif ch != "{":
                 self._scalar_buf = ch
@@ -401,10 +401,33 @@ class JsonAnswerDecoder:
             # `"useful": "true"` —— 字符串**不是**布尔,与 `1` / `nul` 同一类
             # 「协议不合」,走同一条 fail-open 的路(理由见 `_finish_useful`)。
             text, self._string_buf = self._string_buf, ""
-            self._violation = f"useful_value={text!r}"
-            self._out.append(Event("violation", self._violation))
+            self._violate(f"useful_value={text!r}")
             return
+        if self._cur_key == "answer":
+            # ⚠️ **回答到此完整交付。** 裁定 C:之后的任何残留(缺值 / 收尾错位 /
+            # 别的什么)一律**不作数** —— 见 `_violate` 的 docstring。
+            self._answer_closed = True
         self._state = _EXPECT_KEY
+
+    def _violate(self, reason: str) -> None:
+        """设一个**新**违规。⚠️ 回答一旦**完整交付**,这扇门就关了。
+
+        裁定 C:`answer` 是协议里**最后一个**字段 ⇒ **它闭合之后出现的任何东西,
+        按定义都不是我们的字段**。`confidence` 跑到 `answer` 后面本身就是**乱序**,
+        它的值缺不缺、收尾错不错位,与**那段已经交付的回答无关**。
+
+        语义上也对:**没有任何机制能把已经发出去的回答收回来** —— 所以
+        「答案完整之后又出幺蛾子」与「答案完整」在**用户看到的东西**上完全等价。
+        把这类残留判成违规,只会让调用方**把已经给过用户的那段回答再发一遍**
+        (`raw` 整段的 JSON 原文)。
+
+        **不是**这条规则管辖的:`empty_answer`(回答**本身**是空的,发生在闭合之**时**)
+        走自己的路,不过这扇门 —— 见对象收尾那一段。
+        """
+        if self._answer_closed:
+            return
+        self._violation = reason
+        self._out.append(Event("violation", self._violation))
 
     def _mark_missing_value(self) -> None:
         """`}` 出现在**本该有值**的位置 ⇒ 值缺失。
@@ -416,8 +439,7 @@ class JsonAnswerDecoder:
         """
         if self._depth != 1 or self._violation is not None:
             return
-        self._violation = f"missing_value={self._cur_key or '?'}"
-        self._out.append(Event("violation", self._violation))
+        self._violate(f"missing_value={self._cur_key or '?'}")
 
     # ---- useful 的值 ------------------------------------------------------
     def _finish_useful(self, raw: str) -> None:
@@ -439,8 +461,7 @@ class JsonAnswerDecoder:
         elif raw == "false":
             self._useful = False
         else:
-            self._violation = f"useful_value={raw}"
-            self._out.append(Event("violation", self._violation))
+            self._violate(f"useful_value={raw}")
             return
         self._out.append(Event("useful", self._useful))
         if self._useful is False:

@@ -448,13 +448,40 @@ def test_extra_root_brace_closes_in_every_in_object_state():
     **出现在本该有值的位置 ⇒ 同时也是协议不合(值缺失)**:**既设 violation 也收尾**。
     """
     for stream in ('{"useful": true, "answer"}',            # 等冒号
-                   '{"useful": true, "answer": }',          # 等值
-                   '{"useful": true, "answer": "x", "confidence"}'):
+                   '{"useful": true, "answer": }'):         # 等值
         d, ev = _run([stream])
         assert d.done is True, f"{stream}: 括号配平的完整输出必须收尾"
         assert d.violation is not None, f"{stream}: 值缺失同时也是协议不合"
         assert "missing_value" in d.violation, f"{stream}: got {d.violation!r}"
         assert d.feed("x") == [], f"{stream}: 违规后 feed 必须冻结"
+
+    # ⚠️ 第 3 条(`"answer": "x", "confidence"`)曾经也断「违规」,现按**裁定 C**
+    # 改成「不违规、落第 3 行」—— 它落在 `answer` **闭合之后**,见下面那条用例。
+
+
+def test_extra_residue_after_the_answer_closed_is_not_a_violation():
+    """**裁定 C**:`answer` 的字符串值**闭合之后**,后续一切畸形**都不作数**。
+
+    `answer` 是协议里**最后一个**字段 ⇒ 它闭合之后出现的任何东西,**按定义都不是
+    我们的字段**。`confidence` 跑到 `answer` 后面本身就是**乱序**,它的值缺不缺,
+    与**那段已经交付的回答无关**。
+
+    语义上也对:**没有任何机制能把已经发出去的回答收回来** —— 所以「答案完整之后
+    又出幺蛾子」与「答案完整」在**用户看到的东西**上完全等价。判成违规只会让调用方
+    **把已经给过用户的那段回答再发一遍**(`raw` 整段的 JSON 原文)。
+    ⇒ 落**第 3 行**:用户看到的就是那段回答,**不重复、不降级**。
+    """
+    d, ev = _run(['{"useful": true, "answer": "x", "confidence"}'])
+    assert d.answer == "x"
+    assert _deltas(ev) == "x"
+    assert d.violation is None, "回答已完整交付 —— 之后的残留不构成违规"
+    assert d.done is True, "第 3 行的前提:流正常收尾"
+    assert d.useful is True
+
+    # **边界对照**:同样是「缺值」,但缺的是**答案本身** ⇒ **仍然违规**。
+    d2, ev2 = _run(['{"useful": true, "answer"}'])
+    assert d2.violation is not None and "missing_value" in d2.violation
+    assert d2.answer == ""
 
 
 def test_extra_truncated_before_the_root_brace_still_does_not_violate():
