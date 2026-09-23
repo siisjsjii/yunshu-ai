@@ -202,13 +202,18 @@ class _CancelledError(BaseException):
 
 
 def _patch_seams(monkeypatch, cm):
-    """把 enabled 路径的**三条**接缝全换成假的,返回 `_setup_env` 的调用记录。
+    """把 enabled 路径的**四条**接缝全换成假的,返回 `_setup_env` 的调用记录。
 
-    三条都要换,少一条就会真的联网 / 真的 import langfuse:
+    四条都要换,少一条就会真的联网 / 真的 import langfuse:
 
     - `_setup_env` —— 否则会往 `os.environ` 里灌配置;
     - `_outer_cm` —— `trace_scope` 的外层上下文;
+    - `_root_cm` —— `trace_scope` 的**根观测**(T3 起才有的第二条接缝);
     - `_observation_cm` —— `span` 的观测上下文。
+
+    ⚠️ `_root_cm` 换成的是**另一个**假 CM(不是 `cm`)—— 本文件既有的断言全是
+    「`cm.entered == 1`」,两条接缝共用一个对象的话它们会变成 2。**根观测自己的
+    断言在下面对应的用例里拿 `root_cm` 做**(用 `_patch_root_seam` 显式传)。
     """
     seen = []
     monkeypatch.setattr(
@@ -218,11 +223,58 @@ def _patch_seams(monkeypatch, cm):
         observability, "_outer_cm", lambda settings, conversation_id: cm
     )
     monkeypatch.setattr(
+        observability, "_root_cm", lambda settings, conversation_id: _FakeCM()
+    )
+    monkeypatch.setattr(
         observability,
         "_observation_cm",
         lambda settings, name, as_type, input: cm,
     )
     return seen
+
+
+def _patch_root_seam(monkeypatch, root_cm):
+    """只换根观测那条接缝,并把 `_root_cm` 收到的实参记下来。
+
+    记实参不是凑数:根观测**必须拿到 `conversation_id`**(它要写进 `input`),
+    而这条断言在"根观测建对了但参数传错/没传"的实现下会红。
+    """
+    calls = []
+
+    def _fake(settings, conversation_id):
+        calls.append(conversation_id)
+        return root_cm
+
+    monkeypatch.setattr(observability, "_root_cm", _fake)
+    return calls
+
+
+class _OrderedCM:
+    """把 enter/exit 按名字记进**同一个**列表 —— 用来钉**两层的包裹顺序**。
+
+    ⚠️ 顺序是语义:`propagate_attributes` 必须在外、根观测必须在里。
+    反过来写(trace 属性套在根观测里面)时,"属性生效了没有"在真机上表现为
+    **根观测自己不带 session**,而 `entered`/`exited` 的计数**一模一样** ——
+    只数次数是分辨不出来的,只有顺序分得开。
+    """
+
+    def __init__(self, name, events):
+        self._name = name
+        self._events = events
+        self.entered = 0
+        self.exited = 0
+        self.exit_exc = None
+
+    def __enter__(self):
+        self.entered += 1
+        self._events.append(f"enter:{self._name}")
+        return self
+
+    def __exit__(self, *exc):
+        self.exited += 1
+        self.exit_exc = exc
+        self._events.append(f"exit:{self._name}")
+        return False
 
 
 def test_trace_scope_enabled_path_propagates_business_exception(monkeypatch):
@@ -321,6 +373,98 @@ def test_trace_scope_enabled_path_does_not_touch_os_environ(monkeypatch):
     assert dict(os.environ) == before, "不许把配置灌进单测进程的 os.environ"
     # ⚠️ 进程级断言(本文件第三处):T3 起若别的测试 import 了 langfuse 会假红。
     assert "langfuse" not in sys.modules, "这条用例也不许把 langfuse 引进单测进程"
+
+
+# ── `trace_scope` 的**根观测**(T3 加的第二条接缝)──────────────────────
+#
+# 为什么它有专门的用例:第一次真机冒烟实测到,**只调 `propagate_attributes`
+# 而不开"当前 span"**时,每个观测各自成一条 trace(`traceId` 互不相同、
+# `parentObservationId` 全是 `null`)—— 于是「点开一条请求看到完整链路」断不出来。
+# 它是个**承重**动作,不能只靠真机跑一次来守。
+
+
+def test_trace_scope_opens_the_root_observation_inside_the_attribute_scope(monkeypatch):
+    """根观测**必须开**,而且必须在 `propagate_attributes` 的**里面**。
+
+    两个错误写法都在这条上红:
+    ① 压根不开根观测(改动前)⇒ `events` 里没有 `enter:root`,并且下面那条
+       `calls == ["c1"]` 也落空(接缝一次都没被调到);
+    ② 顺序写反(根在外、属性在里)⇒ `events` 的进入顺序不同。
+    """
+    s = _enabled_settings()
+    events: list = []
+    outer = _OrderedCM("outer", events)
+    root = _OrderedCM("root", events)
+    _patch_seams(monkeypatch, outer)
+    calls = _patch_root_seam(monkeypatch, root)
+
+    with trace_scope(conversation_id="c1", settings=s):
+        events.append("body")
+
+    assert events == ["enter:outer", "enter:root", "body", "exit:root", "exit:outer"]
+    assert calls == ["c1"], "根观测必须拿到 conversation_id(它要写进 input)"
+    assert (root.entered, root.exited) == (1, 1)
+
+
+def test_trace_scope_root_enter_failure_degrades_and_unwinds_outer(monkeypatch):
+    """根观测进不去 ⇒ 降级,但**外层那半截必须退回去**。
+
+    不退的后果是静默的:`propagate_attributes` 的 token 一直挂在当前任务上,
+    后面的请求/观测会被当成它的孩子(跨请求串味),而**没有任何日志**。
+    判据取 `exited`:进入失败之后根**一次都不许**被 `__exit__`。
+    """
+    s = _enabled_settings()
+    outer = _FakeCM()
+    root = _EnterBoomCM()
+    _patch_seams(monkeypatch, outer)
+    _patch_root_seam(monkeypatch, root)
+    ran = []
+
+    with trace_scope(conversation_id="c1", settings=s):
+        ran.append(True)
+
+    assert ran == [True], "观测进不去绝不许拦住业务"
+    assert root.entered == 1
+    assert root.exited == 0, "从未进入过的根观测不许被 __exit__"
+    assert outer.exited == 1, "外层已经进去了,降级时必须回收"
+
+
+def test_trace_scope_root_business_exception_reaches_both_exits(monkeypatch):
+    """业务异常原样穿出,且**两层都拿到**它 —— 只断言"穿出去了"是分辨不出来的。"""
+    s = _enabled_settings()
+    events: list = []
+    outer = _OrderedCM("outer", events)
+    root = _OrderedCM("root", events)
+    _patch_seams(monkeypatch, outer)
+    _patch_root_seam(monkeypatch, root)
+
+    with pytest.raises(_BusinessError):
+        with trace_scope(conversation_id="c1", settings=s):
+            raise _BusinessError("业务异常必须原样穿出去")
+
+    assert root.exit_exc[0] is _BusinessError
+    assert outer.exit_exc[0] is _BusinessError
+    assert events[-2:] == ["exit:root", "exit:outer"]
+
+
+def test_trace_scope_root_cleanup_failure_does_not_mask_business_exception(monkeypatch):
+    """根观测**清理**也炸 ⇒ 出去的仍必须是业务异常本身,外层照样被回收。
+
+    清理由 `_safe_exit` 收口:它吞掉异常并告警。少了那一层,根观测的 `__exit__`
+    抛出的 `RuntimeError` 会把 `_BusinessError` 顶掉 —— 本仓「报错指向别处」那一类。
+    """
+    s = _enabled_settings()
+    outer = _FakeCM()
+    root = _ExitBoomCM()
+    _patch_seams(monkeypatch, outer)
+    _patch_root_seam(monkeypatch, root)
+
+    with pytest.raises(_BusinessError):
+        with trace_scope(conversation_id="c1", settings=s):
+            raise _BusinessError("业务异常必须原样穿出去")
+
+    assert root.exited == 1
+    assert outer.exited == 1, "根观测清理失败不许把外层也漏掉"
 
 
 # ── `span` 的 enabled 路径 ───────────────────────────────────────────────

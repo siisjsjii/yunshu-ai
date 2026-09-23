@@ -396,26 +396,18 @@ def make_agent_node(*, model, tools, registry, settings, emit, context_budget: C
                 # `write_decision` 走默认的 `pending`:Agent 这条正常路径从不传,
                 # 写调用因此**停在这里**(不执行),由确认流决定下一步。
                 #
-                # ch09:工具执行**不是** LangChain run(`execute_tool` 是自写的
-                # 执行器)⇒ Langfuse 的 callback 一个 span 都不会给它,手工开
-                # (spec §3.3)。名字带工具名,于是同一轮里哪个工具花了多久、
-                # 结果是什么,在 trace 上直接可读。
-                with observability.span(
-                    f"tool:{call['name']}", as_type="tool",
-                    input=call["args"], settings=settings,
-                ) as sp:
-                    outcome = await execute_tool(
-                        tool_call=call, registry=registry, settings=settings,
-                        conversation_id=state["conversation_id"],
-                    )
-                    if sp is not None:
-                        # `summary` 是给用户看的一句话(失败时是固定文案),
-                        # 不是原始异常文本 —— 出站这点由执行器保证过了。
-                        sp.update(output={
-                            "ok": outcome.ok,
-                            "summary": outcome.summary,
-                            "error_kind": outcome.error_kind,
-                        })
+                # ⚠️ **这里刻意不开手工 span**(ch09 T3 订正,spec §15.4)。
+                # spec §3.3 原先断言「工具执行一个 span 都不会自动出现」,真机实测
+                # **只对了一半**:`execute_tool` 最后落到 `spec.tool.ainvoke`,
+                # **那是一个 LangChain run** ⇒ 回调**已经**给了一次
+                # `TOOL '<name>'`,而且嵌套正确(在 `agent` 之下)。
+                # 再手工开一条 `tool:<name>` 就是**同一个事件表示两遍**
+                # (Langfuse 自己的最佳实践原话:Don't emit duplicate
+                # dispatch + execution nodes)⇒ 只保留自动那一条。
+                outcome = await execute_tool(
+                    tool_call=call, registry=registry, settings=settings,
+                    conversation_id=state["conversation_id"],
+                )
                 if outcome.error_kind == ERROR_CONFIRMATION_REQUIRED:
                     # 写操作待确认:那次调用**根本没发生** ⇒ 不回灌 tool 结果,
                     # 由 `apply_write_decision` 在决议之后补上。

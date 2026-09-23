@@ -18,13 +18,19 @@
 > 它抓的是"有没有人**写下**这行 import",而不是"这次跑到没跑到" ——
 > 这正是那条纪律的字面意思。
 
-⚠️ **两条实测出来的坑,改动前先读 spec §3.4:**
+⚠️ **三条实测出来的坑,改动前先读 spec §3.4 / §15.4:**
 
 - `LangfuseSpan.update(**kwargs)` 的 kwargs 被**静默丢弃**
   (源码 docstring 逐字:`**kwargs: Additional keyword arguments (ignored)`)。
   ⇒ **不要**用 `span.update(**{"langfuse.trace.tags": [...]})` 设 trace 属性。
 - `langfuse.propagate_attributes(...)` 返回的 `_AgnosticContextManager`
   **没有 `__aenter__`** ⇒ 中途进入只能用**同步** `__enter__`。
+- **只调 `propagate_attributes` 而不开"当前 span"的话,每个观测各自成一条 trace。**
+  `start_as_current_observation` 的父级取自 **OTel 当前 span**,而 Langfuse 的
+  LangChain 回调**不把观测挂成 current**(它靠 LangChain 的 run tree 定父子)⇒
+  没有当前 span 时,回调建的观测与我们的手工 span **全都各自开新 trace**
+  (`traceId` 互不相同、`parentObservationId` 全是 `null`)。
+  ⇒ **`trace_scope` 里的根观测(`_root_cm`)是必需品,不是装饰**(T3 真机实测)。
 """
 
 import logging
@@ -82,12 +88,47 @@ def _outer_cm(settings: Settings, conversation_id: str) -> Any:
     return propagate_attributes(trace_name="cs-chat", session_id=conversation_id)
 
 
+def _root_cm(settings: Settings, conversation_id: str) -> Any:
+    """建**根观测**(`chat`)。**单独抽出来是为了能测**,理由同 `_outer_cm`。
+
+    ⚠️ **它不是一个装饰**:T3 的第一次真机冒烟实测到,只调
+    `propagate_attributes` 而**不开当前 span** 时,**所有观测都各自成一条 trace**
+    —— 请求那条 trace 上只有 LangChain 回调建的那些,而 `retrieval` / `tool:*`
+    这两个手工 span(以及 LangChain 回调建的观测)各自开新 trace,`traceId` 互不相同、
+    `parentObservationId` 全是 `null`。成因:`start_as_current_observation` 的父级
+    取自 **OTel 当前 span**,而 Langfuse 的 LangChain 回调**不把观测挂成 current**
+    (它靠 LangChain 的 run tree 定父子)⇒ 没有"当前 span"就没有东西可挂。
+
+    ⇒ 有了它,回调建的观测与手工 span 才会落进**同一条** trace、`chat` 之下。
+
+    `input` 只放 `conversation_id`:**用户原话由端点决定要不要放**(谁手里有谁放),
+    这一层保持最小 —— 与 `journal` 那几行日志同一个口径:只记这一层真的知道的。
+    """
+    from langfuse import get_client
+
+    return get_client().start_as_current_observation(
+        name="chat", as_type="span", input={"conversation_id": conversation_id}
+    )
+
+
 @contextmanager
 def trace_scope(*, conversation_id: str, settings: Settings) -> Iterator[None]:
-    """包住整段流,把会话 id 挂到 trace 上。
+    """包住整段流:开**根观测**(`chat`)+ 把会话 id 挂到 trace 上。
 
-    实测:`propagate_attributes(session_id=...)` 在**这一层**是有效的,
-    而且它覆盖**全部**观测(包括进入之前创建的 —— 因为它是外层)。
+    两层,**顺序是语义的一部分**:
+
+    ```
+    propagate_attributes(trace_name, session_id)   ← 外层:trace 级属性
+    └── start_as_current_observation("chat")       ← 内层:根观测 + **当前 span**
+        └── 整段业务流(图、回调建的观测、手工 span)
+    ```
+
+    外层在里层**外侧**是刻意的:trace 级属性要能传播给根观测**及其全部孩子**。
+    反过来(trace 属性套在根观测里面)的话,属性会在根观测之后才生效 ——
+    根观测自己就不带 session。
+
+    内层那个根观测是 T3 冒烟实测出来的**必需品**,不是装饰:没有"当前 span"时,
+    Langfuse 的 LangChain 回调与我们的手工 span **各自成一条 trace**(详见 `_root_cm`)。
 
     ⚠️ **每条路径只允许 `yield` 一次** —— 这是 `@contextmanager` 的硬约束:
     业务异常是被 `throw()` 进生成器的,若被 `except` 抓住后再 `yield` 一次,
@@ -100,20 +141,31 @@ def trace_scope(*, conversation_id: str, settings: Settings) -> Iterator[None]:
         yield
         return
 
-    cm = None
+    outer = None
+    root = None
+    outer_in = False
     entered = False
     try:
         _setup_env(settings)
-        cm = _outer_cm(settings, conversation_id)
-        cm.__enter__()
-        entered = True             # ← **只有 __enter__ 成功之后才算"进了"**
+        outer = _outer_cm(settings, conversation_id)
+        outer.__enter__()
+        outer_in = True            # ← 只有 `__enter__` **返回了**才算进了
+        root = _root_cm(settings, conversation_id)
+        root.__enter__()
+        entered = True             # ← **两层都进成功之后才算"进了"**
     except Exception:  # noqa: BLE001
         logger.warning("langfuse trace_scope 进入失败,降级为无观测", exc_info=True)
+        # ⚠️ **进了一半必须退回去**:外层已经 `__enter__` 过、而建根观测那步抛了
+        # ⇒ 不 unwind 的话 `propagate_attributes` 的 token **一直挂在这个任务上**,
+        # 后续观测会继续被当成它的孩子(跨请求串味)。
+        # (根只可能在外层**之后**进入,所以这里只需要回收外层 —— 根没进过就没东西要收。)
+        if outer_in:
+            _safe_exit(outer, "trace_scope 降级时回收外层上下文失败")
 
     if not entered:
-        # ⚠️ 判据是 `entered` 而不是 `cm is not None`:`__enter__` 抛了的话 `cm`
-        # 早已被赋值,拿它当"进了"会落到正常分支,**对一个从未进入过的 CM 调
-        # __exit__**(实测 `_AgnosticContextManager.__exit__` 在未进入时会抛
+        # ⚠️ 判据是 `entered` 而不是 `outer is not None`:`__enter__` 抛了的话
+        # `outer` 早已被赋值,拿它当"进了"会落到正常分支,**对一个从未进入过的 CM
+        # 调 __exit__**(实测 `_AgnosticContextManager.__exit__` 在未进入时会抛
         # `RuntimeError: generator didn't stop`)—— 虽被 finally 吞掉、无业务影响,
         # 但"降级"是假的、日志在说谎。
         yield                      # ← 降级路径:**只 yield 这一次**
@@ -126,10 +178,17 @@ def trace_scope(*, conversation_id: str, settings: Settings) -> Iterator[None]:
         exc_info = __import__("sys").exc_info()
         raise                      # 业务异常原样穿出去
     finally:
-        try:
-            cm.__exit__(*exc_info)
-        except Exception:  # noqa: BLE001
-            logger.warning("langfuse trace_scope 退出失败", exc_info=True)
+        # 退出顺序与进入**相反**(根在外层里面)。
+        _safe_exit(root, "langfuse trace_scope 退出根观测失败", exc_info)
+        _safe_exit(outer, "langfuse trace_scope 退出失败", exc_info)
+
+
+def _safe_exit(cm: Any, message: str, exc_info=(None, None, None)) -> None:
+    """`__exit__` 失败一律吞成 warning —— 观测不许盖掉业务异常。"""
+    try:
+        cm.__exit__(*exc_info)
+    except Exception:  # noqa: BLE001
+        logger.warning(message, exc_info=True)
 
 
 class TagScope:
