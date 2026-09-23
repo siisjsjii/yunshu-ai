@@ -65,6 +65,15 @@ async def record_low_confidence(session, *, question: str, source_conversation_i
                                 evidence_snapshot: list | None = None) -> int:
     """问题落低置信度池。**返回新行的 id。**
 
+    ⚠️ **边界:真 session 上返回新行 id,替身 session 上返回 `None`。**
+    主键是 `commit()` 那一刻分配的,而本仓一大批单测替身 session(闸 / ch09 闸 /
+    协议 / 节点 / 写流程,九处以上)的 `commit()` 只把对象收进 `added` 列表,
+    **不 flush、也不给 id** ⇒ **照本仓惯例写的单测会从一个正确的实现上拿到
+    `None`**。T12/T13 若在替身上断言返回值,先看这一条,别去查那个不存在的
+    缺陷:要么把用例换成真 session(`@pytest.mark.db`,本文件那两条就是这么做的),
+    要么就在替身上认下 `None`(那些用例该断的是「落池的对象长什么样」,
+    不是 id —— 那条由真库用例守)。
+
     返回 id 的理由:ch09 起这张表不再是「只落不读」的池子,而是**数据飞轮的
     入口**(spec §6)。流水线要沿着「刚归并的是哪一行」往下走(`review_queue`
     的 `matched_review_id` 得指回它),审核页要按 id 定位;测试也用它**就地
@@ -105,7 +114,11 @@ async def record_low_confidence(session, *, question: str, source_conversation_i
     # 提交后取 id:本仓的 session 工厂是 `expire_on_commit=False`
     #(`app/db/base.py` 的注释写明了理由),属性在提交后仍可读,不会再发一次
     # SELECT。**不调 `session.flush()`**:那会加宽本函数对 session 的接口要求,
-    # 而七条既有用例(置信度闸 / 协议那几处)用的是只实现 `add` + `commit` 的
-    # 替身 session —— 多要一个方法就把那些用例全打红,而它们与「返回 id」
+    # 而**九条**既有用例(闸 3 + ch09 闸 4 + 协议 2)用的是只实现 `add` + `commit`
+    # 的替身 session —— 多要一个方法就把那些用例全打红,而它们与「返回 id」
     # 这件事毫无关系(踩过:见 task-11-report.md 的返工记录)。
+    #
+    # ⚠️ 这个数**重跑数过**(`pytest` 全量 → 9 failed, 873 passed;明细在报告 §3)。
+    # 它一度被写成「七条」;在把「引用没数过的数」列为复发型缺陷的仓库里,
+    # 留一个错的数比不留数更坏。
     return row.id

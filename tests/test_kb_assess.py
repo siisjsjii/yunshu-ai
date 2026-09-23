@@ -115,6 +115,38 @@ async def test_record_low_confidence_writes_row():
 _T11_Q = "ch09-T11-探针-返回行 id"
 
 
+async def _delete_probe_row(rid):
+    """删掉本用例刚写的那一行,并断言真的删干净了。
+
+    **两条 T11 用例共用这一个出口**(而不是各写一份):清理这件事在本文件里
+    只该有一种写法,否则「删没删干净」的判据会随用例漂移。
+
+    - 优先按**返回的 id** 删 —— 这正是本章要这个 handle 的理由之一:
+      测试不必再按问题文本反查(文本是自由文本,反查容易误伤别人写的行);
+    - RED 时 `rid` 还是 `None`(实现还没返回 id)⇒ 退化成按问题文本删,
+      **红的时候也不许留垃圾**;
+    - 删完复查一次计数:`left == 0` 同时证明「这个 id 确实定位到了那一行」
+      (删了个空气的话,行还在,计数不为 0)。
+    """
+    if rid is not None:
+        stmt, params = (
+            text("DELETE FROM low_confidence_questions WHERE id = :i"), {"i": rid})
+    else:
+        stmt, params = (
+            text("DELETE FROM low_confidence_questions WHERE question = :q"),
+            {"q": _T11_Q})
+    async with get_sessionmaker()() as session:
+        await session.execute(stmt, params)
+        await session.commit()
+        left = (
+            await session.execute(
+                text("SELECT COUNT(*) FROM low_confidence_questions WHERE question = :q"),
+                {"q": _T11_Q},
+            )
+        ).scalar_one()
+    assert left == 0
+
+
 @pytest.mark.db
 @pytest.mark.anyio
 async def test_record_low_confidence_returns_new_row_id_and_stores_snapshot():
@@ -180,25 +212,7 @@ async def test_record_low_confidence_returns_new_row_id_and_stores_snapshot():
             assert row[0] == _T11_Q
             assert json.loads(row[1]) == snapshot
     finally:
-        # RED 时 rid 还是 None ⇒ 退化成按问题文本删,免得留垃圾
-        if rid is not None:
-            stmt, params = (
-                text("DELETE FROM low_confidence_questions WHERE id = :i"), {"i": rid})
-        else:
-            stmt, params = (
-                text("DELETE FROM low_confidence_questions WHERE question = :q"),
-                {"q": _T11_Q})
-        async with get_sessionmaker()() as session:
-            await session.execute(stmt, params)
-            await session.commit()
-            left = (
-                await session.execute(
-                    text("SELECT COUNT(*) FROM low_confidence_questions WHERE question = :q"),
-                    {"q": _T11_Q},
-                )
-            ).scalar_one()
-        # 清理真的生效(id 确实定位到了那一行,不是删了个空气)
-        assert left == 0
+        await _delete_probe_row(rid)
         await engine.dispose()
 
 
@@ -242,10 +256,8 @@ async def test_record_low_confidence_snapshot_defaults_to_null():
             assert raw == "null" and jtype == "NULL"
             assert is_null == 0          # ← 不是 SQL NULL(别拿 IS NULL 筛它)
     finally:
-        async with get_sessionmaker()() as session:
-            await session.execute(
-                text("DELETE FROM low_confidence_questions WHERE question = :q"),
-                {"q": _T11_Q},
-            )
-            await session.commit()
+        # 与上一条用例**同一个出口**:按返回的 id 删 + 删后复查计数
+        # (这里原来按 `question` 反查 —— 而上一条的 docstring 批评的正是
+        #  这个模式,且它当时还没有删后检查 ⇒ 对称性补齐)
+        await _delete_probe_row(rid)
         await engine.dispose()
