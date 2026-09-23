@@ -44,6 +44,11 @@ from pathlib import Path
 import httpx
 
 REPO = Path(__file__).resolve().parents[1]
+# `python scripts/x.py` 时 sys.path[0] 是 **scripts/**、不是仓库根,所以要先补上
+# (照 scripts/ 里其余脚本的老样子),否则 `from app.sanitize import …` 直接 ImportError。
+sys.path.insert(0, str(REPO))
+
+from app.sanitize import redact_api_key  # noqa: E402  (必须在 sys.path 之后)
 
 
 def emit(text: str) -> None:
@@ -65,7 +70,12 @@ def _dotenv(name: str) -> str:
 
 async def _fetch(query: dict) -> dict:
     base = _dotenv("LANGFUSE_BASE_URL").rstrip("/")
-    auth = (_dotenv("LANGFUSE_PUBLIC_KEY"), _dotenv("LANGFUSE_SECRET_KEY"))
+    # 脱敏要用**这个脚本自己那把密钥**。本仓其余 17 处调用传的都是 `openai_api_key`,
+    # 那是因为它们处理的是**上游 openai SDK** 的异常文本;这条规矩的**目的**是
+    # 「出站文本不许回显凭据」,所以按**碰的是哪把**来传 —— 这里碰的是 Langfuse 那把。
+    # 顺带:本脚本**不需要** `OPENAI_API_KEY`,不引入那个无关依赖。
+    secret = _dotenv("LANGFUSE_SECRET_KEY")
+    auth = (_dotenv("LANGFUSE_PUBLIC_KEY"), secret)
     last = None
     for i in range(4):
         try:
@@ -82,13 +92,16 @@ async def _fetch(query: dict) -> dict:
             # ⇒ 查询写错时只能看到一个 30 行的 traceback,真正的原因(哪个字段、合法值是什么)
             # 一个字都看不到。今天定位 arrayOptions 的合法算子正是靠这段 body,所以把它抬上来。
             # 这类 400 是**确定性**的(查询形状不对),不进重试白名单。
+            # 出站文本过脱敏:回显的是**响应体原文**,谁也不知道网关哪天会不会在里面
+            # 带上它自己认识的凭据 —— 一律过一遍。
             raise SystemExit(
-                f"Langfuse 拒绝了这个查询:{exc.response.status_code} {exc.response.text[:800]}"
+                "Langfuse 拒绝了这个查询:"
+                f"{exc.response.status_code} {redact_api_key(exc.response.text[:800], secret)}"
             )
         except (httpx.ConnectError, httpx.ReadError) as exc:
             last = exc
             await asyncio.sleep(1.5 * (i + 1))
-    raise SystemExit(f"连不上 Langfuse:{last}")
+    raise SystemExit(f"连不上 Langfuse:{redact_api_key(str(last), secret)}")
 
 
 async def main() -> None:

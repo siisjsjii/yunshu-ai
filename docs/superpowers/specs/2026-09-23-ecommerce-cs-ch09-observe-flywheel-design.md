@@ -263,7 +263,8 @@ with propagate_attributes(trace_name="cs-chat", session_id=conversation_id):
 query = {
     "view": "observations",                        # v2 只支持 observations / scores-*
     "metrics": [{"measure": "totalTokens", "aggregation": "sum"},
-                {"measure": "count", "aggregation": "count"}],
+                {"measure": "count", "aggregation": "count"},
+                {"measure": "totalCost", "aggregation": "sum"}],   # ← 见下面第 2 条,漏了它 cost 那句是断言
     "dimensions": [{"field": "tags"}],             # ← 按 tag 分组,实测可用
     "filters": [],
     "fromTimestamp": …,  "toTimestamp": …,         # ← **两个都必填**
@@ -274,16 +275,36 @@ resp = await http.get(f"{base}/api/public/v2/metrics",
                       auth=(pk, sk))
 ```
 
-三条实测出来的坑,逐条记:
+**五条实测出来的坑**,逐条记(第 2、4、5 条是 T4 的实现者对着**真实网关**补的,见 §15.7):
 
 1. **`query` 必须是 JSON 字符串参数**,把 `view`/`metrics` 平铺成独立 query 参数会 400
    (`Invalid input: expected string, received undefined` 指向 `query`)。
-2. **`sum_totalCost` 恒为 0** —— 模型 `deepseek-flash` 没在 Langfuse 里配价格。
+2. **`metrics` 里必须显式请求 `totalCost`** —— 不请求的话 `sum_totalCost` 这个键
+   **根本不在响应行里**,`r.get("sum_totalCost")` 恒为 `None` ⇒ 那句「cost 恒为 0」
+   就退化成**断言**而不是**读数**,而脚本里 `total_cost > 0` 那条分支是**死代码**。
+   (实测:键名就是 `sum_totalCost`,**值是数字 `0`,不是字符串**。)
+3. **`sum_totalCost` 恒为 0** —— 模型 `deepseek-flash` 没在 Langfuse 里配价格。
    ⇒ **统计表报 token,不报钱**;脚本对 cost 字段**只在非零时才打印**,并且在文档里写清
    「为什么是 0」。**不许把 0 当成本报出去。**
-3. **按 `tags` 过滤时 `type` 不能是 `"string"`** —— 网关原话:
-   `Filter type 'string' is not supported for dimension type 'string[]'. Expected 'arrayOptions'`。
-   (本章的分组统计不需要 filter,但脚本的 `--intent` 可选参数会用到,先记下。)
+4. **按 `tags` 过滤时三个字段都有约束,缺一个就 400**(本章的分组统计不需要 filter,
+   但脚本的 `--intent` 可选参数会用到)。网关原话逐字:
+   - **`operator` 必须是 `"any of"` / `"none of"` / `"all of"`** ——
+     **`"contains"` 不是 arrayOptions 的合法算子**(那是 `"string"` 那一组的,该组的合法值是
+     `"="` / `"contains"` / `"does not contain"` / `"starts with"` / `"ends with"` / `"is not empty"`,
+     与 arrayOptions 那组**不重叠**)。给 `"contains"` 回:
+     `Invalid option: expected one of "any of"|"none of"|"all of"`。
+   - **`type` 必须是 `"arrayOptions"`**(不是 `"string"`):`Filter type 'string' is not
+     supported for dimension type 'string[]'. Expected 'arrayOptions'`。
+     而且**这个键不能省** —— 少给时回
+     `{"code":"invalid_union","note":"No matching discriminator","discriminator":"type"}`。
+   - **`value` 必须是数组**:给字符串回 `expected array, received string`。
+5. **`dimensions` 被清空时,响应行里没有 `tags` 键** —— 那一版回来的是**一行总聚合**
+   (实测 `{"sum_totalTokens": "4850", "count_count": "26"}`)。
+   ⇒ 拿 `r.get("tags") or []` 去挑 intent 行的写法会**恒判 False**,于是脚本
+   **永远打印「没有找到任何 intent 观测」,而且不报任何错**。过滤其实已经在**服务端**
+   做完了,**按 tag 挑行的分支在 `--intent` 这条路上根本不该跑**。
+   同理:**过滤命中 0 条时网关回的是一行 `0/0`**(`{"sum_totalTokens": "0", "count_count": "0"}`),
+   **不是空数组** ⇒ 还要滤掉 count 为 0 的空桶,否则表里会多一行「最烧 token 的意图:XXX(0 tokens)」。
 
 其他实测事实:
 
@@ -293,6 +314,13 @@ resp = await http.get(f"{base}/api/public/v2/metrics",
 - **ingestion 有延迟**:首次读回 0 条、隔一会儿再读就有了。⇒ 脚本与验收**一律轮询**,
   不许读一次就断言。
 - 凭证从 `.env` 读,走 `httpx.AsyncClient`(**不引新依赖**);出站错误文本过 `redact_api_key`。
+  ⚠️ **传的是这个脚本自己的凭据 `LANGFUSE_SECRET_KEY`,不是 `openai_api_key`** ——
+  本仓那 17 处调用传的都是 `openai_api_key`,那是因为它们处理的是**上游 openai SDK** 的异常文本;
+  这条规矩的**目的**是「出站文本不许回显凭据」,所以按**碰的是哪把密钥**来传。
+  覆盖面:**每一个**会把响应体或异常字符串打出去的地方(`连不上 Langfuse` 那条、
+  以及 400 分支里回显 `resp.text` 的那一段)。**不要**因此引入 `OPENAI_API_KEY` 的依赖。
+- 命令行的两条流**都要钉编码**:`emit()` 走 stdout,而 `SystemExit` / traceback 走 **stderr**
+  —— 只钉 stdout 时,那几条中文报错在 cp936 管道上会输出成乱码(**不崩,但一个字都读不出来**)。
 - **不写进任何端点** —— 它是「拿出统计」的交付物,不是在线功能。
 - 验收 5 就断它:输出里必须**至少两个不同意图的行**,且能看出哪个 token 最多。
 
@@ -1164,3 +1192,49 @@ LangGraph 也不给节点级 span 钩子;要硬做就得自己把整个图重包
 两条用例都建在 `observability.span` 这个**边界**上(捕获实参 + 一个记录 `update` 的假 handle):
 `name` / `as_type` / `input` 的形状与**取值**、`output` 的字段 —— 这些在节点返回的
 dict 里一个字都看不见。
+
+### 15.7 订正:§3.5 的「按 tags 过滤」与 cost 两句 —— **计划里那段代码没有对着真实网关跑过**
+
+（T4 的真机验证结果,2026-09-23。**§3.5 原文的 1/3 两条保留,其余在 §3.5 就地改了。**）
+
+**最初写的**(T4 的 brief 与 §3.5 原文):`--intent` 的 filter 只记了 `type` 与 `value` 两个字段
+—— `{"column": "tags", "operator": "contains", "value": [...], "type": "arrayOptions"}`;
+`metrics` 里只请求 `totalTokens` 与 `count`。
+
+**实际是**(实测,探针 `.superpowers/probe_t4_filter.py` / `probe_t4_cost.py`,两个都**已删**;
+网关原话逐字抄在 §3.5 第 4/5 条):
+
+| 我写的 | 实测 |
+|---|---|
+| `operator: "contains"` | ❌ **400** —— arrayOptions 那组的合法算子是 `any of` / `none of` / `all of`,**`contains` 是 string 那一组的**。改 `"any of"` 之后 200 |
+| `type` / `value` 两个字段我记对了 | ✅ 网关逐字背书:`Expected 'arrayOptions'`、`expected array, received string` |
+| `--intent` 拿到响应后按 `r.get("tags")` 挑行 | ❌ `dimensions` 清空时行里**没有 `tags` 键** ⇒ 恒判 False ⇒ **永远打印「没有找到任何 intent 观测」,不报错** |
+| `metrics` 不含 `totalCost`,却打印「cost 恒为 0」 | ❌ 该键**不在响应里** ⇒ 那句话是**断言**;`total_cost > 0` 是**死代码** |
+
+**为什么会写错**:这三处**都不是「记错了」**,而是**记漏了**/**没跑过**——
+`type` 与 `value` 我记对了,只是把**三个字段里的两个**当成了全部;
+而「cost 恒为 0」那句我实测过一次(单独发过一次带 `totalCost` 的查询),
+但**写进 brief 的代码里没有带上那个 measure**,于是代码里的 0 退化成空值兜底。
+**根因是同一句话:计划里的代码片段没有对着真实网关端到端跑过一遍。**
+本仓已两次记过「先写结论、后没跑」(ch05 的 `confidence_gate`、ch07 的「冷启动必然超时」),
+**这是第三次**,而且这次错的是**交给实现者的代码本身** —— 实现者照抄就必踩,
+只有他去真机跑一次才会发现。
+
+**订正后的形态**:见 §3.5 第 2/4/5 条与订正后的代码块。
+脚本侧的三处修改在 `scripts/intent_cost.py`(T4),**逐字对得上网关**:
+`--intent 商品咨询` → `26 / 4850`、`--intent 订单` → `14 / 4405`,
+与**不分组那一版的同名行逐字节一致** —— 过滤既不漏也不多。
+
+**顺带钉住的两条(都被实测撞到)**:
+
+- **`raise_for_status()` 的异常文本只带 URL、不带 body** —— 400 的原因(哪个字段、合法值是什么)
+  在**响应体**里。计划里那段代码直接把它甩给 traceback,于是第一步排查看到的是 30 行栈,
+  **一个字的原因都没有**。⇒ `_fetch` 里把 `resp.text[:800]` 抬上来。
+- **`SystemExit` 与 traceback 走 stderr** —— 计划里只 `reconfigure` 了 stdout,
+  于是三条中文报错在 cp936 管道上是乱码(**不崩**,比崩更难发现)。⇒ 两个流都钉。
+
+**顺带记一条「静默错」的新成员**:`r.get("tags")` 在 `dimensions` 清空时**恒为空**
+⇒ 脚本**输出一句看起来完全合理的「没有找到任何观测」**,退出码 0,没有任何异常。
+与 §15.3 那条 `span.update(**kwargs)` 是同一个形状(「做了,但什么都没发生,而且不报错」),
+**这是本章第二次**,也是全仓第五次。它比 400 **危险得多** —— 400 会逼你去查,
+它只会让你得到「窗口内确实没数据」这个**错误结论**。
