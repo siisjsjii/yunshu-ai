@@ -351,23 +351,65 @@ def test_extra_nested_value_split_across_chunks():
     assert [e.kind for e in ev].count("done") == 1
 
 
-def test_extra_answer_value_that_is_an_object_yields_no_answer():
-    """⚠️ **记账**:`answer` 的值是**对象**时,`answer` 为空且**不违规**。
+NON_STRING_ANSWERS = [
+    ('{"useful": true, "answer": {"text": "hi"}}', "object"),
+    ('{"useful": true, "answer": [1, 2]}', "array"),
+    ('{"useful": true, "answer": 42}', "number"),
+    ('{"useful": true, "answer": true}', "bool"),
+    ('{"useful": true, "answer": null}', "null"),
+    ('{"useful": true, "answer": , "confidence": 0.5}', "non-string"),   # 值整段缺失
+]
 
-    这是裁定里明确给的期望(`violation is None` / `done is True`)。但要说清楚:
-    它与上面那条 Critical 的**形态相同** —— `useful=True + answer=""` 到了调用方
-    就是一条静默空回复。区别在于这次是**模型真的没给字符串答案**(协议违规),
-    而不是我们把已经收到的答案弄丢了。
 
-    **本用例只钉「当前行为」,不是「已认可的行为」**;要不要按裁定 ④ 的同一条
-    fail-open 逻辑(非字符串 `answer` ⇒ `violation` ⇒ 调用方降级成纯文本)处理,
-    见报告 §10 的 concern,需要控制器拍板 —— 届时改的是这个断言,那是**有意**的改动。
+@pytest.mark.parametrize("stream,kind", NON_STRING_ANSWERS)
+def test_extra_non_string_answer_is_a_violation(stream, kind):
+    """**`answer` 的值必须是字符串。** 不是 ⇒ `violation`(**类型**不是**键**)、零 delta。
+
+    与裁定 ④ 是**同一条 fail-open 逻辑**:放行的话调用方拿到的是
+    `useful=True` + `answer=""` + **无 violation** ⇒ **什么都不发** ——
+    正是 Critical 那条里被认定「比任何一种兜底都糟」的形态。
+    **「模型真没给字符串答案」与「模型给了、我们解错了」在调用方眼里长得一模一样**,
+    所以两者都必须走同一条**可预测**的路:违规 ⇒ 调用方降级成纯文本。
+    """
+    at = stream.index(": ", stream.index('"answer"')) + 2      # 值的第一个字符
+    d = JsonAnswerDecoder()
+    ev = []
+    # 再切一刀(就切在坏值的第一个字符之后),证明违规不依赖「看到整段值」
+    for fragment in (stream[:at + 1], stream[at + 1:]):
+        ev.extend(d.feed(fragment))
+    assert d.violation, f"{stream}: 应当 violation"
+    assert "first_key" not in d.violation, f"{stream}: 这是**类型**的违规,不是**键**的"
+    assert kind in d.violation, f"{stream}: 文案该说明类型,got {d.violation!r}"
+    # `useful` 已经被合法地解出为 True,违规**不许**把它抹掉成 False / None
+    assert d.useful is True, f"{stream}: useful 不该被动过"
+    assert d.answer == "", f"{stream}: 一个字符都不该进 answer"
+    assert _deltas(ev) == "", f"{stream}: 违规时一个 answer_delta 都不许出去"
+    assert d.feed('" 更多"') == [], f"{stream}: 违规后 feed 必须冻结"
+    assert _deltas(ev) == ""
+
+
+def test_extra_answer_value_that_is_an_object_is_now_a_violation():
+    """⚠️ **这条用例在评审第三轮被有意改过**(它原先钉的是「不违规」的旧行为)。
+
+    旧行为:`{"useful": true, "answer": {"text": "hi"}}` ⇒ `answer == ""` 且
+    `violation is None`、`done is True`。它当时就被**标注**为「当前行为、**非**已认可行为」
+    并挂给控制器拍板,裁定结果:**非字符串 `answer` 是协议不合 ⇒ violation**。
+    这就是那句标注说的「将来改它是一次**有意**的断言改动」的时刻。
     """
     d, ev = _run(['{"useful": true, "answer": {"text": "hi"}}'])
+    assert d.violation == "answer_type=object"
     assert d.answer == ""
-    assert d.violation is None
-    assert d.done is True
     assert _deltas(ev) == ""
+    assert d.feed("x") == []
+
+
+def test_extra_answer_value_that_is_a_json_string_is_still_fine():
+    """对照:值**看着像** JSON 但外面有引号 ⇒ 就是普通字符串,照常放行(防过度判违)。"""
+    d, ev = _run(['{"useful": true, "answer": "{\\"text\\": \\"hi\\"}"}'])
+    assert d.violation is None
+    assert d.answer == '{"text": "hi"}'
+    assert _deltas(ev) == d.answer
+    assert d.done is True
 
 
 # ---- 代理对:非 BMP 字符必须拼回一个码点 ----------------------------------

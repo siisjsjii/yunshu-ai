@@ -50,6 +50,21 @@ _SIMPLE_ESCAPES = {
 
 _HEX_DIGITS = "0123456789abcdefABCDEF"
 
+
+def _value_kind(ch: str) -> str:
+    """只看**值的首字符**给违规文案起个类型名(够诊断用,不求严谨)。"""
+    if ch == "{":
+        return "object"
+    if ch == "[":
+        return "array"
+    if ch in "-0123456789":
+        return "number"
+    if ch in "tf":
+        return "bool"
+    if ch == "n":
+        return "null"
+    return "non-string"
+
 # ---- protocol 态下字符级扫描的四个位置(字符串内另由 _in_string 表示)----
 _EXPECT_KEY = "expect_key"      # 对象内:等键名的开引号,或对象收尾的 `}`
 _EXPECT_COLON = "expect_colon"  # 键名读完,等 `:`
@@ -212,11 +227,21 @@ class JsonAnswerDecoder:
                 return
             if ch.isspace():
                 return
+            if self._cur_key == "answer":
+                # ⚠️ **`answer` 的值必须是字符串。** 不是 ⇒ 协议不合 ⇒ 违规(fail-open)。
+                # 放行的话调用方拿到的是 `useful=True` + `answer=""` + **无 violation**
+                # ⇒ **什么都不发** —— 正是 Critical 那条里被认定「比任何一种兜底都糟」
+                # 的形态。**「模型真没给字符串答案」与「模型给了、我们解错了」在调用方
+                # 眼里长得一模一样**,所以两者都必须走同一条可预测的路(裁定 ④ 同理)。
+                # 文案写清是**类型**不是**键**。
+                self._violation = f"answer_type={_value_kind(ch)}"
+                self._out.append(Event("violation", self._violation))
+                return
             if ch not in "{}":
                 self._scalar_buf = ch
                 self._state = _IN_SCALAR
                 return
-            # 值整个是个对象/数组:落到下面按结构字符处理
+            # 非 answer 的键:值整个是个对象/数组,落到下面按结构字符处理
 
         # ---------- 花括号:**结构字符,与位置无关;只有深度 0 的 `}` 才收尾** ----------
         # ⚠️ 这里是本轮修掉的那个 Critical 的所在。原先标量后遇到的 `}` 会被
