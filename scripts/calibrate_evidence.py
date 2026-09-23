@@ -16,7 +16,10 @@
 **线上那条路**。跑一次要加载 2.2GB 权重并跑 300 次检索,前几分钟是它的正常耗时。
 
 ⚠️ **本脚本不写配置**:它只打印全表 + 选中的那个,由人写回 `app/config.py`
-(标定值属设计授权内的调参,按工作要求第 4 条记账)。曾有一版 docstring 写了
+(选定值属设计授权内的调参,按工作要求第 4 条记账)。
+⚠️ 再说一遍口径,**因为它决定别人怎么引用这个脚本的输出**:选中的那个是
+**平台内的一次判断**,不是"标定出的最优点" —— 本脚本**证明不了最优**,
+它只能证明"这一段里读数相同"。曾有一版 docstring 写了
 `--save`,而 argparse 里没有这个开关 —— 那种"文档说有、代码里没有"的开关
 比没有更坏,已删。
 
@@ -58,9 +61,31 @@ REFUSE_BUCKET = "D_absent"
 
 
 def emit(line: str = "") -> None:
+    """把一行以 **UTF-8 字节**写出(cp936 陷阱,同 run_tool_selection_eval)。
+
+    ⚠️ 兜底分支**不能**退化成裸 `print(line)`:本机 locale 是 cp936,而兜底存在的
+    意义就是"异常路径也要能出字" —— 一个会炸的兜底等于没有兜底,且它**恰好破坏了
+    它自己要防的那件事**(本仓「脚本打印非 ASCII 要钉输出边界」那条)。
+    正常 CLI 跑不到这里(`sys.stdout` 总有 `.buffer`),只有换掉 stdout 的调用方看得见。
+
+    ⚠️ **崩的不是"中文"**(实测见下),别把机制记错:
+    cp936/GBK **能**编码中文;崩的是 **GBK 之外的码点**。
+    而本脚本**真会打的那一行**里就有这么一个 —— 阈值口径那行的 `⇒`(U+21D2):
+        `UnicodeEncodeError: 'gbk' codec can't encode character '⇒'`
+    (同类还有 `✓` `✗` `⚠`,即 CLAUDE.md 点名的那几个)。
+    ⇒ 兜底里 `reconfigure(encoding="utf-8", errors="replace")` 之后才 `print`,
+    且**任何**抛出都吞掉:诊断输出不该把主流程带走。
+    """
     stream = getattr(sys.stdout, "buffer", None)
     if stream is None:
-        print(line)
+        reconfigure = getattr(sys.stdout, "reconfigure", None)
+        try:
+            if callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="replace")
+            print(line)
+        except Exception:
+            # 连 print 都出不去时不再抛:诊断输出不该把主流程带走。
+            pass
         return
     stream.write(line.encode("utf-8") + b"\n")
     stream.flush()

@@ -55,9 +55,12 @@ class Settings(BaseSettings):
     # 判据 = w_top1*top1 + w_count*min(条数/max_count,1) + w_gap*clamp(top1-top2,0,1)
     # 三个权重之和为 1 ⇒ 输出天然落在 0–1。
     #
-    # `evidence_confidence_threshold` = **0.2** —— 2026-09-23 由
-    #    `scripts/calibrate_evidence.py` 在 `evals/测试集.md`(300 条 / D_absent
-    #    应拒答桶 60 条)上跑**真实检索链路**标定得出。
+    # `evidence_confidence_threshold` = **0.2**,而它**不是**那次标定测出来的
+    #    **最优点** —— 标定测出来的是**一段平台**,`0.2` 是**平台内的一次判断**。
+    #    (来源与读数:`scripts/calibrate_evidence.py` 在 `evals/测试集.md`
+    #    —— 300 条 / D_absent 应拒答桶 60 条 —— 上跑**真实检索链路**。)
+    #    ⚠️ **只读这一段的人请把上面那句当结论**:别把 0.2 引成"最优"或"标定得
+    #    0.2";要引用就引**平台**与下面的两个实测数字。
     #
     #    ⚠️ **标定定出来的是"一个平台",不是"这一个点"。** 300 条里**没有一条**的
     #    置信度落在 `(0, 0.2894)` 这个开区间内 —— 正常类非零最小 **0.2894**、
