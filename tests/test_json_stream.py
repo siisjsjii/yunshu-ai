@@ -403,6 +403,45 @@ def test_extra_answer_value_that_is_an_object_is_now_a_violation():
     assert d.feed("x") == []
 
 
+def test_extra_useful_true_with_empty_answer_is_a_violation_at_object_close():
+    """`useful=true` 却一个字没答 ⇒ `violation == "empty_answer"`。
+
+    prompt 的语义是**双支的**(spec §5.2 第 3 条):证据不足 ⇒ `useful=false` **且**
+    `answer` 为空;反过来**足够 ⇒ `useful=true` 且正常作答**。
+    「说答得了、实际一个字没给」**自相矛盾**,而且正是本章入口②要抓的那件事。
+    按契约表第 3 行放行的话,用户看到的是**零字节** —— 没有回答、没有兜底、没有 trace。
+
+    **判据是「对象闭合」(`done` 由假变真),不是流的任意中途** —— 见下面那条对照组。
+    """
+    d, ev = _run(['{"useful": true, "answer": ""}'])
+    assert d.violation == "empty_answer"
+    assert d.done is True, "对象确实闭合了 —— 这条与中途违规(不改 done)不同"
+    assert d.useful is True, "已合法解出的 useful 不许被抹掉"
+    assert _deltas(ev) == ""
+    assert d.feed("x") == [], "违规后 feed 必须冻结"
+
+
+def test_extra_truncated_stream_with_empty_answer_is_not_a_violation():
+    """**对照组**:同一个对象**不闭合**(流被截断)⇒ **不违规**,走契约表第 3 行。
+
+    **区分就在 `done`:对象闭合(`}`)vs 流被截断(没有 `}`)。**
+    截断时用户看到已生成的那半截 —— 那是 **fail-open 的应有之义**,不是残余。
+    """
+    for parts, want_useful in (
+        (['{"useful": true, "answer": ""'], True),    # 值读完了,`}` 还没来
+        (['{"useful": true, "answer": "半截'], True),  # 断在答案中途
+        (['{"useful": true, "answer": "'], True),      # 刚开引号
+        # ⚠️ 这条 `useful` 是 `None`:标量以 `,` / `}` / 空白结尾,而这里三者都没来
+        # ⇒ 值还算「没收完」,**不许**替它下结论(这正是「判据是终态」的意思)。
+        (['{"useful": true'], None),                   # 连 answer 键都还没来
+    ):
+        d, ev = _run(parts)
+        assert d.violation is None, f"{parts}: 截断不是协议不合,不许判违规"
+        assert d.done is False, f"{parts}: 没闭合就不算收尾"
+        assert d.useful is want_useful, f"{parts}"
+        assert not any(e.kind == "violation" for e in ev), f"{parts}"
+
+
 def test_extra_answer_value_that_is_a_json_string_is_still_fine():
     """对照:值**看着像** JSON 但外面有引号 ⇒ 就是普通字符串,照常放行(防过度判违)。"""
     d, ev = _run(['{"useful": true, "answer": "{\\"text\\": \\"hi\\"}"}'])

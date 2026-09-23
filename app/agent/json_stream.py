@@ -262,7 +262,23 @@ class JsonAnswerDecoder:
             # 那种流由调用方按「流结束仍没 useful」处理(§5.6),解码器不替它下结论。
             # 「`done` 至多发一次」的守卫**不在这里**,在 `_IN_SCALAR` 那条
             # 「收过尾就别再让分隔符落下来」的早返回上 —— 守卫只该有一处。
-            self._done = True
+            #
+            # ⚠️ 「`useful=true` 却一个字没答」这颗雷**只在这一个时刻**判:
+            # **判据是 `done` 由假变真(对象闭合),不是流的任意中途。**
+            # 截断在答案中途(`{"useful": true, "answer": "半截`)是 **fail-open 的应有
+            # 之义** —— 用户看到已生成的那半截,**不许**算违规。
+            # **区分就在 `done`:对象闭合 vs 流被截断。**
+            if self._useful is True and not self._answer and self._violation is None:
+                # prompt 的语义是**双支的**(spec §5.2 第 3 条):证据不足 ⇒ `useful=false`
+                # **且** `answer` 为空;反过来足够 ⇒ `useful=true` **且正常作答**。
+                # 「说答得了、实际一个字没给」**自相矛盾**,而且正是本章入口②要抓的
+                # 那件事(模型嘴上说答得了、实际一个字没给)。
+                # 放行的话用户看到的是**零字节**:没有回答、没有兜底、没有 trace ——
+                # 与「`answer` 类型不对」那条是**同一个形态**,只是触发条件从
+                # 「值的类型不对」换成「值是空串」。
+                self._violation = "empty_answer"
+                self._out.append(Event("violation", self._violation))
+            self._done = True          # 对象确实闭合了 —— 这条与中途违规(不改 done)不同
             self._out.append(Event("done"))
             return
 
