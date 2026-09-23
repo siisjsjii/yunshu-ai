@@ -81,6 +81,12 @@ async def run_flywheel(*, session, model, batch_size: int) -> dict:
                     standard_question=norm["standard_question"],
                     example_answer=norm["example_answer"],
                     occurrences=1,
+                    # **显式写 `status="pending"`**(spec §8.2 的伪代码就是这么写的)。
+                    # 模型上的 `default="pending"` 与列上的 `server_default` 本来也会补,
+                    # 行为等价 —— 这里是**对齐 spec 的写法**,不是修行为:显式一行让
+                    # 「新建的行一定是待审」这件事在调用处可见,而不是要读者去查
+                    # `db/models.py` 的默认值(那两处默认值是给**别的**插入路径用的)。
+                    status="pending",
                     first_raw_question=row.question,
                     source_conversation_id=row.source_conversation_id,
                 )

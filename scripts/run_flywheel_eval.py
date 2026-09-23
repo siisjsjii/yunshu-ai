@@ -25,9 +25,11 @@
   原话本身就能满足该条全部判据 ⇒ 这条对「模型有没有做事」零判别力。
   与 `run_resolve_eval.py` 那版相比多算了 `expect_not_contains` 与 `max_chars`:
   只查「关键词在不在原话里」会把「原话里带着必须被剔除的噪声」的用例**标反**);
-- dedupe:`[硬负例]` —— 近域硬负例单独计数。**这是这份用例集里唯一有压力的那一类**:
-  本仓记过「干扰项里 3 条离阈值很远、不构成压力」的教训,只放明显不同的对子,
-  这个评估集没有信息量。
+- dedupe:`[硬负例]` / `[空清单:生产短路…]` / `[字面全等…]` / `[无压力(标注)]`
+  —— 后三类**与 normalize 那半的 `[透传即可满足]` 对等,而且前两类是自动判的**:
+  「9 对里 3 对不可能失败或不需要语义判断」会让分母虚高,所以结尾把
+  **带信息的对数**与全部对数**分列**。近域硬负例单独计数 —— 它是这份用例集里
+  唯一有压力的一类(本仓记过「干扰项里 3 条离阈值很远、不构成压力」的教训)。
 
 `--model extract`(默认)用 `create_extract_model`(温度 0);`--model chat` 用
 `create_chat_model`(温度 0.7)。两者温度不同,数字不可混用。
@@ -60,6 +62,21 @@ def emit(line: str = "") -> None:
     stream.flush()
 
 
+def _norm(text: str) -> str:
+    """比对用的规范化:**去掉所有空白**。
+
+    实测(2026-09-24,5 次连跑里的第 3 次):模型把「猫砂盆 Pro」写成了「猫砂盆Pro」
+    —— 中文没有词间空格,省略空格是**排版差异,不是能力差异**,而逐字比对把它判成了
+    MISS。这条规范化对 `expect_contains` 与 `expect_not_contains` **一视同仁**
+    (两边的文本都先过它),所以它既不放松也不收紧语义,只是把「空格写没写」这一维
+    从判据里拿掉。
+
+    ⇒ 这是**评估装置**层面的改动(统一作用于全部用例),不是给某条用例调参 ——
+    与「某条用例的判据写松一点」是两件事,后者正是本仓最忌讳的(看到输出再放宽)。
+    """
+    return "".join(text.split())
+
+
 def judge_normalize(row: dict, standard: str, answer: str) -> list[str]:
     """返回**没通过的原因**列表(空 = OK)。
 
@@ -67,11 +84,12 @@ def judge_normalize(row: dict, standard: str, answer: str) -> list[str]:
     还是「标注写错了」—— 后者在这个仓里出过(`\\d{4,32}` 匹配「99」那种同义反复判据)。
     """
     bad: list[str] = []
+    has = _norm(standard)
     for want in row.get("expect_contains") or []:
-        if want not in standard:
+        if _norm(want) not in has:
             bad.append(f"缺关键词 {want!r}")
     for unwanted in row.get("expect_not_contains") or []:
-        if unwanted in standard:
+        if _norm(unwanted) in has:
             bad.append(f"混进了 {unwanted!r}")
     if len(standard) > row["max_chars"]:
         bad.append(f"超长 {len(standard)}>{row['max_chars']}")
@@ -84,14 +102,56 @@ def judge_dedupe(actual: int, expect: int) -> list[str]:
     return [] if actual == expect else [f"期望编号 {expect},实际 {actual}"]
 
 
+def dedupe_labels(row: dict) -> list[str]:
+    """这一对**有没有判别力** —— 与 normalize 那半的 `[透传即可满足]` 对等。
+
+    ⚠️ 这是本轮补的(评审判为「两半的严谨度不对等」):normalize 那半的弱用例标注是
+    **自动算**的,而 dedupe 这半原先只有一个**人工**的 `hard` 字段。后果是**分母虚高**:
+    9 对里 3 对**不可能失败或不需要语义判断**,却被算进「9/9」——
+
+    - **空清单**:`find_duplicate` 在第一行就短路返回 `None`(`if not pending`),
+      **模型一次都没被叫** ⇒ 它对「查重准不准」零信息量(它测的是那条短路分支);
+    - **字面全等**:候选与清单里某条**逐字相同** ⇒ 字符串比对就能满分,不需要语义;
+    - **`no_pressure: true`**(显式标注):话题差得很远的对子,本仓已记账
+      「干扰项离阈值很远 = 不构成压力」。
+
+    前两类**自动判**(空清单看 `pending` 为空;字面全等看 `candidate in pending`),
+    第三类靠数据里显式写的 `no_pressure`。三类都不算「带信息的对数」。
+    """
+    labels: list[str] = []
+    if not row["pending"]:
+        labels.append("[空清单:生产短路,模型不会被叫]")
+    elif row["candidate"] in row["pending"]:
+        labels.append("[字面全等:字符串比对即可满分]")
+    if row.get("no_pressure"):
+        labels.append("[无压力(标注)]")
+    if row.get("hard"):
+        labels.append("[硬负例]")
+    return labels
+
+
+def dedupe_is_informative(row: dict) -> bool:
+    """这一对**值不值得算进分母**。"""
+    if not row["pending"]:
+        return False
+    if row["candidate"] in row["pending"]:
+        return False
+    return not row.get("no_pressure")
+
+
 def satisfiable_by_passthrough(row: dict) -> bool:
-    """「原话原样透传」能不能满足这条的全部判据。能 ⇒ 这条用例是弱用例。"""
-    raw = row["raw"]
-    if any(want not in raw for want in row.get("expect_contains") or []):
+    """「原话原样透传」能不能满足这条的全部判据。能 ⇒ 这条用例是弱用例。
+
+    走**同一个** `_norm`(而不是裸 `in`):两个判据函数对「有空格没空格」的口径
+    必须一致,否则会出现「弱用例标注说透传不行、判据却判它过了」这种自相矛盾,
+    而那种矛盾**只在带空格的用例上偶发**(本仓「同一件事两处实现」的老毛病)。
+    """
+    raw = _norm(row["raw"])
+    if any(_norm(want) not in raw for want in row.get("expect_contains") or []):
         return False
-    if any(unwanted in raw for unwanted in row.get("expect_not_contains") or []):
+    if any(_norm(unwanted) in raw for unwanted in row.get("expect_not_contains") or []):
         return False
-    return len(raw) <= row["max_chars"]
+    return len(row["raw"]) <= row["max_chars"]
 
 
 def _pending(texts: list[str]) -> list[ReviewQueue]:
@@ -130,8 +190,9 @@ async def run_normalize(rows: list[dict], model) -> tuple[int, int, int, int]:
     return hit, len(rows), passed_through, weak
 
 
-async def run_dedupe(rows: list[dict], model) -> tuple[int, int, int, int]:
-    hit = hard_total = hard_hit = 0
+async def run_dedupe(rows: list[dict], model) -> tuple[int, int, int, int, int, int]:
+    """返回 `(对, 总, 硬负例对, 硬负例总, 带信息对, 带信息总)`。"""
+    hit = hard_total = hard_hit = informative_total = informative_hit = 0
     for i, row in enumerate(rows, 1):
         pending = _pending(row["pending"])
         found = await find_duplicate(row["candidate"], pending, model=model)
@@ -143,16 +204,19 @@ async def run_dedupe(rows: list[dict], model) -> tuple[int, int, int, int]:
         is_hard = bool(row.get("hard"))
         hard_total += is_hard
         hard_hit += is_hard and ok
+        informative = dedupe_is_informative(row)
+        informative_total += informative
+        informative_hit += informative and ok
 
         emit(
             f"{'OK ' if ok else 'MISS'} [D{i}] 候选={row['candidate']!r} 期望={row['expect_index']}"
-            f"{'  [硬负例]' if is_hard else ''}\n"
+            f"{'  ' + ''.join(dedupe_labels(row)) if dedupe_labels(row) else ''}\n"
             f"        清单={row['pending']}\n"
             f"        → 实际={actual}"
             + (f"(命中 {row['pending'][actual - 1]!r})" if actual > 0 else "(没有匹配)")
             + (f"\n        ✗ {';'.join(bad)}" if bad else "")
         )
-    return hit, len(rows), hard_hit, hard_total
+    return hit, len(rows), hard_hit, hard_total, informative_hit, informative_total
 
 
 async def main() -> int:
@@ -196,10 +260,16 @@ async def main() -> int:
     )
 
     emit("\n---- 查重 ----")
-    d_hit, d_total, hard_hit, hard_total = await run_dedupe(dedupe_rows, model)
+    (
+        d_hit, d_total, hard_hit, hard_total, inf_hit, inf_total,
+    ) = await run_dedupe(dedupe_rows, model)
     emit(
         f"\n查重 {d_hit}/{d_total} = {d_hit / d_total:.1%};"
-        f"其中**近域硬负例** {hard_hit}/{hard_total}(这 {hard_total} 条是唯一有压力的一类)"
+        f"**带信息 {inf_hit}/{inf_total}**"
+        f"(另外 {d_total - inf_total} 对不可能失败或不需要语义判断:空清单那对在生产里"
+        f"短路、模型一次都不会被叫;字面全等那对字符串比对即可;还有一对显式标了无压力)"
+        f"\n其中**近域硬负例** {hard_hit}/{hard_total}"
+        f"(硬负例是唯一有压力的一类,见用例的 hard 标注)"
     )
     return 0
 
