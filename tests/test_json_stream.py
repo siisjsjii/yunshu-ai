@@ -220,6 +220,61 @@ def test_fuzz_random_three_to_eight_way_splits():
     assert escape_hits > 0, "一轮都没切在转义内部 ⇒ 这组用例对该分支零覆盖"
 
 
+BAD_USEFUL = [
+    '{"useful": 1, "answer": "这段不许出去"}',
+    '{"useful": 0, "answer": "这段不许出去"}',
+    '{"useful": nul, "answer": "这段不许出去"}',
+    '{"useful": TRUE, "answer": "这段不许出去"}',      # 大小写变体
+    '{"useful": True, "answer": "这段不许出去"}',
+    '{"useful": tru, "answer": "这段不许出去"}',       # 半截字面量
+    '{"useful": "true", "answer": "这段不许出去"}',    # 字符串不是布尔
+    '{"useful": , "answer": "这段不许出去"}',          # 值整个缺失
+]
+
+
+@pytest.mark.parametrize("stream", BAD_USEFUL)
+def test_extra_malformed_useful_is_violation_not_false(stream):
+    """`useful` 的值**不是字面 `true`/`false`** ⇒ violation,**不许当成 `useful=false`**。
+
+    spec §5.6 那一类走的是 **fail-open**(理由原文:按 `useful=false` 处理等于
+    **把一段可能完全正确的回答扔掉**并落一条 spec 点名过的**假池记录**)。
+    今天这个值畸形,是**协议不合**,不是**证据不足**。
+
+    三件事必须同时成立:①`violation` 非空且**说明是「值」不是「键」**;
+    ②`useful` **保持 `None`**(由调用方走它既有的降级路,解码器不造第三种结局);
+    ③**一个 `answer_delta` 都不出去**,且此后 `feed` 冻结。
+    """
+    d = JsonAnswerDecoder()
+    ev = []
+    # 再切一刀:跨 chunk 的畸形值必须同样被逮住(不能只在整段喂时才对)
+    for fragment in (stream[:12], stream[12:]):
+        ev.extend(d.feed(fragment))
+    assert d.violation, f"{stream}: 应当 violation"
+    assert "first_key" not in d.violation, f"{stream}: 这是**值**的违规,不是**键**的"
+    assert d.useful is None, f"{stream}: useful 必须保持 None(不许当 False)"
+    assert _deltas(ev) == "", f"{stream}: 违规时一个 answer_delta 都不许出去"
+    assert d.feed('" 更多"') == [], f"{stream}: 违规后 feed 必须冻结返回 []"
+    assert _deltas(ev) == "", f"{stream}: 冻结之后增量仍然为空"
+
+
+@pytest.mark.parametrize("stream", [
+    '{"useful": true , "answer": "x"}',      # 值**外侧**的空白是合法 JSON
+    '{"useful":\n true, "answer": "x"}',     # 值**前面**的空白同理
+    '{"useful":true, "answer": "x"}',        # 冒号后无空白
+])
+def test_extra_useful_surrounding_whitespace_is_accepted(stream):
+    """口径边界:`.`strip()` 只吃**值外侧**的空白 —— 那是 JSON 语法允许的,照常接受。
+
+    与上一条合起来才是「严格只认字面 `true`/`false`」的完整口径:
+    **周围空白不算异常,大小写变体算异常。**
+    """
+    d = JsonAnswerDecoder()
+    ev = d.feed(stream)
+    assert d.violation is None, f"{stream}: 不应当 violation"
+    assert d.useful is True, f"{stream}: 应当解出 True"
+    assert _deltas(ev) == "x"
+
+
 def test_extra_done_is_emitted_at_most_once():
     """`done` 事件**至多一次** —— 读代码时逮到的真缺陷,补上用例钉住。
 

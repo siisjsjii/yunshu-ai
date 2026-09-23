@@ -178,6 +178,10 @@ class JsonAnswerDecoder:
             if ch in ",}":
                 self._finish_scalar()
                 self._state = _EXPECT_KEY
+                # ⚠️ `_finish_scalar` 可能已经收过尾(`useful=false` 或**违规**)⇒
+                # 直接 return:`done` 至多发一次,违规之后也不许再收尾。
+                if self._done or self._violation:
+                    return
                 # 不 return:让 `,` / `}` 落到下面被同一轮处理
             else:
                 self._scalar_buf += ch
@@ -190,11 +194,10 @@ class JsonAnswerDecoder:
             elif ch == "}":
                 # 对象收尾。`useful` 没解出也照样收尾 —— 那种流由调用方
                 # 按「流结束仍没 useful」处理(§5.6),解码器不替它下结论。
-                # ⚠️ `done` **至多发一次**:`{"useful": false}` 这种标量直接在 `}`
-                # 上结束的流,`_finish_scalar` 已经收过尾了,别再收一次。
-                if not self._done:
-                    self._done = True
-                    self._out.append(Event("done"))
+                # 「`done` 至多发一次」的守卫**不在这里**,在 `_IN_SCALAR` 那条
+                # 「收过尾就别再让分隔符落下来」的早返回上 —— 守卫只该有一处。
+                self._done = True
+                self._out.append(Event("done"))
             # `{` / `,` / 空白 / 其他杂字符:忽略
             return
 
@@ -271,22 +274,52 @@ class JsonAnswerDecoder:
             self._state = _EXPECT_COLON
             return
         # 字符串值读完。`answer` 的每个字符已经在 _emit_text 里吐过了。
+        if self._cur_key == "useful":
+            # `"useful": "true"` —— 字符串**不是**布尔,与 `1` / `nul` 同一类
+            # 「协议不合」,走同一条 fail-open 的路(理由见 `_finish_useful`)。
+            text, self._string_buf = self._string_buf, ""
+            self._violation = f"useful_value={text!r}"
+            self._out.append(Event("violation", self._violation))
+            return
         self._state = _EXPECT_KEY
+
+    # ---- useful 的值 ------------------------------------------------------
+    def _finish_useful(self, raw: str) -> None:
+        """⚠️ **严格只认字面 `true` / `false`。** 别的值一律 `violation`,**不是** `False`。
+
+        spec §5.6 对「协议不合」的处置是 **fail-open**,与闸的 fail-closed 方向相反,
+        理由原文:闸拦下的是「**还没生成**的回答」,代价是再看一次兜底话术;这里面对的
+        是「**已经生成完、只是包装不合协议**」的回答,按 `useful=false` 处理等于
+        **把一段可能完全正确的回答扔掉**并落一条 spec 点名过的**假池记录**。
+
+        `1` / `"true"` / `nul` / `TRUE` 都属这一类 ⇒ 设 `violation`(**说明是「值」不是
+        「键」**)、`useful` 保持 `None`、冻结后续一切输出。**调用方**按它既有的
+        「`useful is None` ⇒ 降级成纯文本」那条路走 —— 解码器**不造第三种结局**。
+
+        「在解出 `useful` 之前一个 delta 都不许出去」这条不变量,不因为值畸形而破。
+        """
+        if raw == "true":
+            self._useful = True
+        elif raw == "false":
+            self._useful = False
+        else:
+            self._violation = f"useful_value={raw}"
+            self._out.append(Event("violation", self._violation))
+            return
+        self._out.append(Event("useful", self._useful))
+        if self._useful is False:
+            # **不变量 2**:解出 false 的那一刻停,**后续一个 delta 都不吐**。
+            # 边界 11 的违规流(useful=false 但 answer 非空)完全靠这一行守住。
+            self._done = True
+            self._out.append(Event("done"))
 
     # ---- 非字符串值 -------------------------------------------------------
     def _finish_scalar(self) -> None:
         raw, self._scalar_buf = self._scalar_buf.strip(), ""
-        if not raw:
-            return
         if self._cur_key == "useful":
-            # 非 `true` 一律当 False 处理:解析不出「证据够用」时,宁可当不够用。
-            self._useful = raw == "true"
-            self._out.append(Event("useful", self._useful))
-            if self._useful is False:
-                # **不变量 2**:解出 false 的那一刻停,**后续一个 delta 都不吐**。
-                # 边界 11 的违规流(useful=false 但 answer 非空)完全靠这一行守住。
-                self._done = True
-                self._out.append(Event("done"))
+            self._finish_useful(raw)
+            return
+        if not raw:
             return
         if self._cur_key == "confidence":
             try:
