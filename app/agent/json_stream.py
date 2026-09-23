@@ -91,6 +91,8 @@ class JsonAnswerDecoder:
         self._scalar_buf = ""        # 非字符串值的原文
         self._cur_key: str | None = None   # 当前这个值属于哪个键
         self._saw_key = False        # 协议对象里是否已出现第一个键
+        self._depth = 0              # 花括号深度:只有回落到 0 的那个 `}` 才收尾
+        self._pending_high: str | None = None   # 扣住的高代理,等可能跟着的低代理
         self._escape = False         # 上一个字符是字符串内的 `\`
         self._unicode_hex: str | None = None   # 非 None = 正在攒 \uXXXX
         self._out: list[Event] = []  # 本次 feed 的事件出口
@@ -183,35 +185,61 @@ class JsonAnswerDecoder:
                 if self._done or self._violation:
                     return
                 # 不 return:让 `,` / `}` 落到下面被同一轮处理
+                # (`}` 那一路会先过**深度闸**,见文末那一段)
+            elif ch == "{":
+                # 标量里冒出 `{`:畸形。丢掉半截标量,把它当结构字符处理。
+                self._scalar_buf = ""
+                self._state = _EXPECT_KEY
             else:
                 self._scalar_buf += ch
                 return
 
-        # ---------- 字符串外 ----------
+        # ---------- 字符串外:按位置分派 ----------
         if self._state == _EXPECT_KEY:
             if ch == '"':
                 self._begin_string(is_key=True)
-            elif ch == "}":
-                # 对象收尾。`useful` 没解出也照样收尾 —— 那种流由调用方
-                # 按「流结束仍没 useful」处理(§5.6),解码器不替它下结论。
-                # 「`done` 至多发一次」的守卫**不在这里**,在 `_IN_SCALAR` 那条
-                # 「收过尾就别再让分隔符落下来」的早返回上 —— 守卫只该有一处。
-                self._done = True
-                self._out.append(Event("done"))
-            # `{` / `,` / 空白 / 其他杂字符:忽略
-            return
-
-        if self._state == _EXPECT_COLON:
+                return
+            if ch == "," or ch.isspace():
+                return
+            # `{` / `}`(以及别的杂字符)落到下面统一处理
+        elif self._state == _EXPECT_COLON:
             if ch == ":":
                 self._state = _EXPECT_VALUE
             return
+        else:                                    # _EXPECT_VALUE
+            if ch == '"':
+                self._begin_string(is_key=False)
+                return
+            if ch.isspace():
+                return
+            if ch not in "{}":
+                self._scalar_buf = ch
+                self._state = _IN_SCALAR
+                return
+            # 值整个是个对象/数组:落到下面按结构字符处理
 
-        # _EXPECT_VALUE
-        if ch == '"':
-            self._begin_string(is_key=False)
-        elif not ch.isspace():
-            self._scalar_buf = ch
-            self._state = _IN_SCALAR
+        # ---------- 花括号:**结构字符,与位置无关;只有深度 0 的 `}` 才收尾** ----------
+        # ⚠️ 这里是本轮修掉的那个 Critical 的所在。原先标量后遇到的 `}` 会被
+        # `_EXPECT_KEY` 当成**根对象的收尾括号** ⇒ 嵌套对象的值(`"f0": {}`)
+        # **静默吞掉整段回答**:`useful` 已解出、`done=True`、`answer=""`,
+        # 于是调用方按 §7 的契约**什么都不发、也不走兜底** —— 一条**静默空回复**,
+        # 比任何一种兜底都糟,而且调用方测不出来。
+        if ch == "{":
+            self._depth += 1
+            self._state = _EXPECT_KEY            # 进了对象:开始等键名
+            return
+        if ch == "}":
+            self._depth -= 1
+            if self._depth > 0:
+                self._state = _EXPECT_KEY        # 嵌套对象收尾:回外层继续等键名
+                return
+            # 深度 0:这才是根对象的收尾。`useful` 没解出也照样收尾 ——
+            # 那种流由调用方按「流结束仍没 useful」处理(§5.6),解码器不替它下结论。
+            # 「`done` 至多发一次」的守卫**不在这里**,在 `_IN_SCALAR` 那条
+            # 「收过尾就别再让分隔符落下来」的早返回上 —— 守卫只该有一处。
+            self._done = True
+            self._out.append(Event("done"))
+            return
 
     # ---- 字符串 -----------------------------------------------------------
     def _begin_string(self, *, is_key: bool) -> None:
@@ -251,7 +279,38 @@ class JsonAnswerDecoder:
         self._emit_text(ch)
 
     def _emit_text(self, ch: str) -> None:
-        """字符串里解出的一个字符:键名与普通值只收着,``answer`` 的值边收边吐。"""
+        """字符串里解出的一个字符(可能是 ``\\uXXXX`` 解出来的)。
+
+        ⚠️ **非 BMP 字符(`😀` 这类)是按 UTF-16 代理对发的**(`\\ud83d\\ude00`),
+        而 `ensure_ascii=True` 的网关**正是这么发中文以外的一切非 ASCII**。
+        逐个 `chr(int(hex,16))` 解出来是**两个孤立代理**,于是::
+
+            decoder.answer.encode("utf-8")  →  UnicodeEncodeError: surrogates not allowed
+
+        T10 要把 `answer_delta.value` 放进 **UTF-8 的 SSE `token` 帧**、并进 `log_turn`
+        的 JSON ⇒ 那会变成**流中途一条 `error` 帧**,而不是一句回答。所以这里必须拼回去。
+        """
+        high = self._pending_high
+        if high is not None:
+            self._pending_high = None
+            if "\udc00" <= ch <= "\udfff":
+                # 拼成一个码点:非 BMP 平面 = 0x10000 + 20 位
+                ch = chr(0x10000 + (ord(high) - 0xD800) * 0x400 + (ord(ch) - 0xDC00))
+            else:
+                # **孤立高代理**(后面不是低代理)⇒ 用 U+FFFD 顶掉。
+                # 刻意与 `json.loads` 不同:后者原样给回一个孤立代理,而那正是上面
+                # 那条 UnicodeEncodeError 的形态。**可预测 + 一定编得出来** > 忠实。
+                self._flush_text("�")
+        if "\ud800" <= ch <= "\udbff":
+            self._pending_high = ch        # 先扣住,等可能跟着的后半个
+            return
+        if "\udc00" <= ch <= "\udfff":
+            self._flush_text("�")     # **孤立低代理**:同上
+            return
+        self._flush_text(ch)
+
+    def _flush_text(self, ch: str) -> None:
+        """把一个**已经合法可编码**的字符送去它该去的地方(键名 / 普通值 / answer)。"""
         if not self._is_key and self._cur_key == "answer":
             self._answer += ch
             self._out.append(Event("answer_delta", ch))
@@ -259,6 +318,11 @@ class JsonAnswerDecoder:
         self._string_buf += ch
 
     def _finish_string(self) -> None:
+        # 字符串在**高代理之后**就收了尾(如 `"...\ud83d"`)⇒ 那个代理永远等不到
+        # 后半个,收尾时按孤立代理顶掉。**不能留到下一个字符串**去配对。
+        if self._pending_high is not None:
+            self._pending_high = None
+            self._flush_text("�")
         if self._is_key:
             key, self._string_buf = self._string_buf, ""
             self._is_key = False

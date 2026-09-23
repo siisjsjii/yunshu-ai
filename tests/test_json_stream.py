@@ -179,12 +179,24 @@ def test_fuzz_escaped_unicode_split_at_every_point():
 # test_1 那条绝对断言 —— 洞是真的。这条用一个**外部参照系**(`json.loads`)把这个洞
 # 堵上:转义译错、少译一个字符、多吐一个字,都会在这里当场红。
 
+ESCAPED = '{"useful": true, "confidence": 0.5, "answer": "中\\u4e2d\\"x\\\\y"}'
+#: **非 BMP**(代理对)—— `ensure_ascii=True` 的网关正是这么发 `😀` 的
+SURROGATE = '{"useful": true, "confidence": 0.5, "answer": "\\ud83d\\ude00 ok \\u4e2d"}'
+
+ORACLE_PAYLOADS = (FULL, ESCAPED, SURROGATE)
+
+
 def test_oracle_answer_matches_json_loads_at_every_split():
-    """独立口径:`answer` 必须逐字等于 `json.loads` 的结果(不切 / 每一个切点)。"""
-    payload = '{"useful": true, "confidence": 0.5, "answer": "中\\u4e2d\\"x\\\\y"}'
-    for text in (FULL, payload):
+    """独立口径:`answer` 必须逐字等于 `json.loads` 的结果(不切 / 每一个切点)。
+
+    ⚠️ 这是 brief 那两条 fuzz 的**外部参照系**。它们两边都由同一个解码器产出,
+    「两边一起错」时全绿(实测:MUTATION-4 / MUTATION-5);只有 `json.loads` 能判对。
+    **代理对那条载荷是它的另一半边**:`\\ud83d\\ude00` 若不拼回去,`answer` 里就是
+    两个孤立代理,而两条 fuzz 依然全绿 —— 它们只比「切与不切一致」。
+    """
+    for text in ORACLE_PAYLOADS:
         expected = json.loads(text)["answer"]
-        assert _run([text])[0].answer == expected, "不切就对不上 json.loads"
+        assert _run([text])[0].answer == expected, f"不切就对不上 json.loads: {text}"
         for i in range(1, len(text)):
             d, _ = _run([text[:i], text[i:]])
             assert d.answer == expected, f"切点 {i}: {d.answer!r} != {expected!r}"
@@ -253,6 +265,12 @@ def test_extra_malformed_useful_is_violation_not_false(stream):
     assert "first_key" not in d.violation, f"{stream}: 这是**值**的违规,不是**键**的"
     assert d.useful is None, f"{stream}: useful 必须保持 None(不许当 False)"
     assert _deltas(ev) == "", f"{stream}: 违规时一个 answer_delta 都不许出去"
+    # ⚠️ 这两条是评审补的:原先这组用例**从没看 `done`**,于是把违规分支改成
+    # `_done = True` + append `Event("done")` 之后**8 条全绿** —— 那句
+    # 「畸形 useful 不吐 done」等于没有牙。
+    assert d.done is False, f"{stream}: 违规不是收尾,done 必须为 False"
+    assert [e.kind for e in ev] == ["violation"], \
+        f"{stream}: 事件序列必须**恰好**是 [violation](不许夹一个 done)"
     assert d.feed('" 更多"') == [], f"{stream}: 违规后 feed 必须冻结返回 []"
     assert _deltas(ev) == "", f"{stream}: 冻结之后增量仍然为空"
 
@@ -273,6 +291,131 @@ def test_extra_useful_surrounding_whitespace_is_accepted(stream):
     assert d.violation is None, f"{stream}: 不应当 violation"
     assert d.useful is True, f"{stream}: 应当解出 True"
     assert _deltas(ev) == "x"
+
+
+# ---- 嵌套值:只有深度 0 的 `}` 才收尾 -------------------------------------
+#
+# 评审逮到的 Critical。原先标量后遇到的 `}` 会被当成**根对象的收尾括号** ⇒
+# 嵌套对象的值(`"f0": {}`)**静默吞掉整段回答**,而调用方按 §7 的契约拿到的是
+# `useful=True + done=True + answer=""` ⇒ **什么都不发、也不走兜底**。
+# 一条**静默空回复**比任何一种兜底都糟,而且调用方测不出来。
+
+@pytest.mark.parametrize("stream", [
+    '{"useful": true, "f0": {}, "answer": "hi"}',            # 空对象
+    '{"useful": true, "f0": {"a": 1}, "answer": "hi"}',      # 非空对象
+    '{"useful": true, "f0": {"a": {"b": null}}, "answer": "hi"}',   # 两层嵌套
+    '{"useful": true, "tags": [1, 2], "answer": "hi"}',      # 数组(防回归)
+])
+def test_extra_nested_value_does_not_swallow_the_answer(stream):
+    """嵌套的 `{...}` / `[...]` 不得把根对象的收尾提前 ⇒ `answer` 必须完整拿到。"""
+    d, ev = _run([stream])
+    assert d.answer == "hi", f"{stream}: answer 被吞了"
+    assert _deltas(ev) == "hi"
+    assert d.violation is None, f"{stream}: 这是合法协议,不该违规"
+    assert d.done is True, f"{stream}: 流应当正常收尾"
+    assert d.useful is True
+    assert [e.kind for e in ev].count("done") == 1
+
+
+def test_extra_string_valued_confidence_emits_no_confidence_event():
+    """⚠️ **钉住实际行为**:`confidence` 的值是**字符串**时,压根不会有 confidence 事件。
+
+    走的不是「解析失败 ⇒ `None`」那条路 —— 字符串值由 `_finish_string` 收尾,
+    而那个分支**只把状态推回 `_EXPECT_KEY`、不解析值**(只有 `useful` 与 `answer`
+    两个键在那里有特判)。所以 **`confidence is None` 且事件表里没有 confidence**。
+
+    **行为不改**(§5.4:`confidence` 只记录,不做第二个阈值),但报告 §7-3 给 T10 的
+    说明原先写成「解析失败仍会吐 `Event("confidence", None)`」—— 那句只对标量成立。
+    这条用例把真实的形状钉住,免得 T10 照着一句错描述写。**标量路径**那条仍然成立:
+    `{"confidence": abc}` 会吐一个 `value=None` 的 confidence 事件。
+    """
+    stream = '{"useful": true, "confidence": "0.9", "answer": "x"}'
+    d, ev = _run([stream])
+    assert d.confidence is None
+    assert [e.kind for e in ev] == ["useful", "answer_delta", "done"]
+    assert not any(e.kind == "confidence" for e in ev)
+    # 对照组:**标量**解析失败时,那个事件是会吐的(值与形状都不同)
+    d2, ev2 = _run(['{"useful": true, "confidence": abc, "answer": "x"}'])
+    assert d2.confidence is None
+    assert [e.kind for e in ev2] == ["useful", "confidence", "answer_delta", "done"]
+    assert [e.value for e in ev2 if e.kind == "confidence"] == [None]
+
+
+def test_extra_nested_value_split_across_chunks():
+    """同上,但把那个嵌套对象的 `{` / `}` 切在两个 chunk 里。"""
+    stream = '{"useful": true, "f0": {"a": 1}, "answer": "hi"}'
+    at = stream.index("{", 1)          # 嵌套对象的开括号
+    d, ev = _run([stream[:at + 1], stream[at + 1:]])
+    assert d.answer == "hi"
+    assert d.done is True and d.violation is None
+    assert [e.kind for e in ev].count("done") == 1
+
+
+def test_extra_answer_value_that_is_an_object_yields_no_answer():
+    """⚠️ **记账**:`answer` 的值是**对象**时,`answer` 为空且**不违规**。
+
+    这是裁定里明确给的期望(`violation is None` / `done is True`)。但要说清楚:
+    它与上面那条 Critical 的**形态相同** —— `useful=True + answer=""` 到了调用方
+    就是一条静默空回复。区别在于这次是**模型真的没给字符串答案**(协议违规),
+    而不是我们把已经收到的答案弄丢了。
+
+    **本用例只钉「当前行为」,不是「已认可的行为」**;要不要按裁定 ④ 的同一条
+    fail-open 逻辑(非字符串 `answer` ⇒ `violation` ⇒ 调用方降级成纯文本)处理,
+    见报告 §10 的 concern,需要控制器拍板 —— 届时改的是这个断言,那是**有意**的改动。
+    """
+    d, ev = _run(['{"useful": true, "answer": {"text": "hi"}}'])
+    assert d.answer == ""
+    assert d.violation is None
+    assert d.done is True
+    assert _deltas(ev) == ""
+
+
+# ---- 代理对:非 BMP 字符必须拼回一个码点 ----------------------------------
+
+def test_extra_surrogate_pair_is_combined_and_is_utf8_encodable():
+    """`\\ud83d\\ude00`(`😀`,`ensure_ascii=True` 的网关**正是这么发**)必须拼回一个码点。
+
+    不拼的话 `answer` 里是两个**孤立代理**,而 `answer.encode("utf-8")` 直接抛
+    `UnicodeEncodeError: surrogates not allowed` —— T10 要把 `answer_delta.value`
+    放进 **UTF-8 的 SSE `token` 帧**、并进 `log_turn` 的 JSON
+    ⇒ 那会变成**流中途一条 `error` 帧**,而不是一句回答。
+    """
+    wire = '{"useful": true, "confidence": 0.5, "answer": "\\ud83d\\ude00 ok"}'
+    want = json.loads(wire)["answer"]
+    assert want == "\U0001f600 ok"
+    first = wire.index("\\ud83d")
+    cases = {
+        "整段喂": [wire],
+        "切开第一个 \\u 的十六进制位": [wire[:first + 2], wire[first + 2:]],
+        "切在两个 \\u 之间": [wire[:first + 6], wire[first + 6:]],
+        "逐字符": list(wire),
+    }
+    for label, parts in cases.items():
+        d, ev = _run(parts)
+        assert d.answer == want, f"{label}: {d.answer!r} != {want!r}"
+        assert _deltas(ev) == want, f"{label}: 增量流对不上"
+        d.answer.encode("utf-8")            # ← 关键:绝不抛 UnicodeEncodeError
+        assert d.done is True and d.violation is None
+
+
+@pytest.mark.parametrize("stream,label", [
+    ('{"useful": true, "answer": "\\ud83d"}', "孤立高代理在串尾"),
+    ('{"useful": true, "answer": "\\ud83dX"}', "高代理后面不是低代理"),
+    ('{"useful": true, "answer": "\\ude00"}', "孤立低代理"),
+    ('{"useful": true, "answer": "\\ud83d\\ud83d\\ude00"}', "两个高代理后跟一个低代理"),
+    ('{"useful": true, "answer": "\\ud83d", "confidence": 0.5}', "后面还有别的键"),
+])
+def test_extra_lone_surrogate_becomes_replacement_char(stream, label):
+    """**孤立代理**(不配对的)⇒ U+FFFD。口径写死在这里,别让它漂移。
+
+    **刻意与 `json.loads` 不同**:后者原样给回一个孤立代理,而那正是上面那条
+    `UnicodeEncodeError` 的形态。选 U+FFFD 的理由是**可预测 + 一定编得出来** ——
+    宁可让用户看见一个 `�`,也不能让 SSE 在流中途吐 `error` 帧。
+    """
+    d, _ = _run([stream])
+    d.answer.encode("utf-8")                       # ← 绝不抛
+    assert "�" in d.answer, f"{label}: 应当有替换字符"
+    assert not any("\ud800" <= c <= "\udfff" for c in d.answer), f"{label}: 不许留孤立代理"
 
 
 def test_extra_done_is_emitted_at_most_once():
