@@ -1111,3 +1111,56 @@ ReadIndex 就换了 leader。**机器空下来再 `docker start`,一次就起,�
 它的 generation + `classify_intent` + `RunnableSequence` + generation + `PydanticOutputParser`),
 7 + 18 = 25 条已 tag;`24 + 7 + 18 = 49` = 三个请求的观测总数,**逐条对得上**。
 ⇒ **边界仍然落在 `classify_intent` 上,根观测的引入没有把 tag 弄丢。**
+
+### 15.6 订正:退款子流程的 `refund_expand_retrieve` 补上 `retrieval` span;`retrieval` 与 `LangGraph` 平级**接受**
+
+（T3 修复轮 2,2026-09-23。两条裁定各记一条。）
+
+**① 补 span(需求 1 的一个洞,不是「不在本章范围」)**
+
+§14 那张表里手工 span 只列了「`execute_tool` 的调用点」与「`retrieve_knowledge` 节点」两处 ——
+**漏了 `refund_expand_retrieve`**(`app/agent/refund_nodes.py`),而它**也调 retriever**
+(`multi_search`)。后果是「每个节点的 prompt、工具调用、**检索结果**、token 消耗和耗时都能
+铺开看」这条需求对**退款请求**不成立:界面上那一步是空的,验收 1「点开任意一条请求,看到
+完整链路」对退款请求断不出来。这是**请求路径上最后一处**自动覆盖不到、又确实漏了的检索点。
+
+补法与知识那一路**同形**(键名与字段逐字一致,两条检索在界面上必须是同一种读法):
+
+| 位置 | span 名 | as_type | input | output |
+|---|---|---|---|---|
+| `refund_expand_retrieve`(`multi_search` 那一步) | `retrieval` | `retriever` | `{"query": queries}` —— **扩写之后的多路查询列表**,不是 `state["resolved_input"]` | `{"chunks": [{id, score, section_path}]}` |
+
+**真机复验**(退款请求 `订单 20240915 这个能退吗`,`intent=退款退货`,
+`refund_expand_retrieve:3 路 9 命中 top=0.97`):25 条观测、**1 个 `traceId`**,根 `SPAN 'chat'` →
+`LangGraph` → `refund_pick_order` / `refund_fetch_order`(内有 `TOOL 'query_order'`)/
+`refund_expand_retrieve` / `refund_judge` / `refund_offer` / `log_turn`,
+外加 `RETRIEVER 'retrieval'`(`parentObservationId` = `chat` 那个 SPAN)。
+⇒ **两条检索现在都落进请求那条 trace**,退款请求的完整链路成立。
+
+**② `retrieval` 挂在根 `chat` 下、与 `LangGraph` 平级 —— 接受,不再是缺陷**
+
+拿不到 `LangGraph` 那条 chain 观测的 observation id(它是 Langfuse 的 LangChain 回调建的),
+LangGraph 也不给节点级 span 钩子;要硬做就得自己把整个图重包一遍。
+
+**判据(裁定原话)**:**「同一条 trace」是需求的实质(能点开一条请求看完整链路),
+「挂在哪一层的缩进」不是。** 前者两条链路都已验到,后者不再动代码。
+
+**③ 顺带钉住的不变量**:手工 span 现在**只有一种形状**(`retrieval`)。`tool:*` 已按 §15.5 删除,
+**不许以任何理由加回来** —— `tests/test_agent_refund.py` 的新用例里有一条
+`spy.calls == [ {...} ]` 顺带钉住「整轮里只有这一条手工 span」。
+
+**④ 两条检索 span 的守卫(本轮新增,此前**一条都没有**)**
+
+变异实测(改错实现后能不能红):
+
+| 变异 | 结果 |
+|---|---|
+| 删掉 `refund_expand_retrieve` 的 span(**本轮之前**) | 全量 709 **全绿** ⇒ 它没被任何东西守着 |
+| 删掉 `refund_expand_retrieve` 的 span(加用例之后) | `tests/test_agent_refund.py` **1 failed** |
+| 删掉 `retrieve_knowledge` 的 span | `tests/test_agent_gate.py` **1 failed** |
+| 退款那条 `input` 记成原话(`text`)而不是扩写后的 `queries` | **1 failed** |
+| 知识那条 `input` 记成 `user_input` 原话而不是 `resolved_input` | **1 failed** |
+
+两条用例都建在 `observability.span` 这个**边界**上(捕获实参 + 一个记录 `update` 的假 handle):
+`name` / `as_type` / `input` 的形状与**取值**、`output` 的字段 —— 这些在节点返回的
+dict 里一个字都看不见。
