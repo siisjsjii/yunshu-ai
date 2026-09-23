@@ -392,16 +392,20 @@ async def test_truncated_protocol_degrades_to_the_raw_text():
 
 
 @pytest.mark.anyio
-async def test_plain_mode_neither_reflushes_nor_records_a_violation():
-    """⚠️ **契约表第 2 行的例外**(§11-⑪-D):`mode == PLAIN` **两个动作都不做**。
+async def test_plain_turn_without_tool_calls_is_a_protocol_violation():
+    """⚠️ **契约表第 2 行的例外**(§11-⑪-D)+ **控制器裁定①的一个限定**。
 
     `plain` 的终态**正好符合**第 2 行的字面描述(`useful is None`、`done is False`、
-    `answer == ""`),但它是**今天的行为**、是**被认可的正常路径**
-    ——「模型先说一句『让我查一下』再调工具」正是最常见的那一轮。照字面实现会在
-    **每一个非协议轮**上 (i) 把已经实时透出的整段回复用 `raw` 重发一遍、
-    (ii) 把这条正常路径记成违约。
+    `answer == ""`),所以**绝不能**照字面走第 2 行的**两个**动作:
 
-    ⇒ 帧序列必须是**逐片一次**(第二片若被当成 `raw` 补发,这里会多出第三帧)。
+    - **不重发** `raw` —— 它已经实时透出去了,再补一遍就是把用户刚看过的话重说
+      一次(帧序列必须是**逐片一次**;第二片若被当成 `raw` 补发,这里会多出第三帧);
+    - **记不记违约,看这一轮有没有 `tool_calls`**(裁定①):
+      没有 ⇒ **记**(这一轮本该作答、却吐了散文或围栏,是真违规)。
+
+    理由:`agent:protocol_violation` 的**唯一用途**是量「模型不守协议的比例」
+    (spec §12.3-1);按字面在**每个** PLAIN 轮打标,每一次调工具的正常轮都会被
+    记成违规,那个数就废了。反过来,漏记「本该作答却没 JSON」也会让那个数废掉。
     """
     frames = []
     model = _Model([["好的,我来查一下", "退货政策是 7 天"]])
@@ -412,7 +416,140 @@ async def test_plain_mode_neither_reflushes_nor_records_a_violation():
         {"frame": "token", "text": "退货政策是 7 天"},
     ]
     assert out["reply"] == "好的,我来查一下退货政策是 7 天"
+    assert "agent:protocol_violation" in out["trace"]
+
+
+@pytest.mark.anyio
+async def test_plain_tool_round_is_not_a_protocol_violation():
+    """裁定①的另一半:PLAIN 轮**有 `tool_calls`** ⇒ **不记**。
+
+    「模型先说一句『让我查一下』再调工具」—— spec §5.6 自己写着它
+    「**是正常行为不是违规**」,而是同一张表又要求「降级 ⇒ trace 里记
+    `agent:protocol_violation`」(**spec 内部自相矛盾**,裁定①就是为了切掉这一刀)。
+    """
+    tool = _Tool()
+    frames = []
+    model = _Model([
+        [_Chunk(text="好的,我来查一下", tool_calls=[
+            {"name": "query_faq", "args": {"q": "退货"}, "id": "c1"}])],
+        ['{"useful": true, "confidence": 0.9, "answer": "七天无理由。"}'],
+    ])
+    out = await _make(model, frames=frames, tools=[tool],
+                      registry={"query_faq": tool}).__call__(_state(intent="商品咨询"))
+
+    assert _tokens(frames) == ["好的,我来查一下"] + list("七天无理由。")
+    assert out["reply"] == "好的,我来查一下七天无理由。"
     assert "agent:protocol_violation" not in out["trace"]
+
+
+@pytest.mark.anyio
+async def test_persisted_assistant_message_is_the_answer_not_the_protocol():
+    """⚠️ **落库的那条 assistant 必须是答案,不是协议 JSON**(裁定②)。
+
+    不换的话,`messages` 表里存的是 `{"useful": true, …, "answer": "…"}` ——
+    而 `GET /api/conversations/{id}/messages`(会话回载)**原样把它显示给用户**
+    (真机实测,见 task-10-report §7-②),下一轮的上下文里也是它。
+
+    **两个通道都断**:它们是同一件事的两种形状,只换一个就等于造出两种。
+    """
+    frames = []
+    model = _Model(['{"useful": true, "confidence": 0.9, "answer": "七天无理由。"}'])
+    out = await _make(model, frames=frames).__call__(_state(intent="商品咨询"))
+
+    for channel in ("messages", "turn_messages"):
+        content = out[channel][-1].content
+        assert content == "七天无理由。", channel
+        assert "useful" not in content and "{" not in content, channel
+    # 用户看到的那段(`reply`)与落库的那段,必须是同一句
+    assert out["reply"] == out["turn_messages"][-1].content
+
+
+@pytest.mark.anyio
+async def test_persisted_assistant_message_is_still_the_tool_call_round():
+    """换的只是**收尾那条**;带 `tool_calls` 的 assistant 与工具结果**原样不动**。
+
+    它们不是「回答」,换掉它们等于把 ReAct 往返写坏(下一轮的层 2 要截的就是
+    工具结果那一条)。
+    """
+    tool = _Tool()
+    model = _Model([
+        [_Chunk(tool_calls=[{"name": "query_faq", "args": {"q": "退货"}, "id": "c1"}])],
+        ['{"useful": true, "confidence": 0.9, "answer": "七天无理由。"}'],
+    ])
+    out = await _make(model, tools=[tool],
+                      registry={"query_faq": tool}).__call__(_state(intent="商品咨询"))
+
+    kinds = [isinstance(m, ToolMessage) for m in out["turn_messages"]]
+    assert kinds == [False, True, False]
+    assert [tc["name"] for tc in out["turn_messages"][0].tool_calls] == ["query_faq"]
+    assert out["turn_messages"][1].content == '{"answer": "七天无理由"}'
+    assert out["turn_messages"][2].content == "七天无理由。"
+
+
+@pytest.mark.anyio
+async def test_persisted_assistant_message_is_the_fallback_on_useful_false():
+    """裁定②:`useful=false` 那一支落库的是**兜底话术** —— 既不是 JSON,也不是空串。
+
+    「用户看到的就是它」是同一条规矩;这里顺带把「不许把 JSON 原文落库」钉死
+    (那段 answer 一个字都不该进库)。
+    """
+    session = _Session()
+    model = _Model([INSUFFICIENT_WITH_ANSWER])
+    out = await _make(model, session=session).__call__(
+        _state(intent="商品咨询", evidence=[
+            {"chunk_id": 1, "section_path": "s", "score": 0.9, "answer": "a"}])
+    )
+
+    assert out["turn_messages"][-1].content == FALLBACK_REPLY
+    assert out["messages"][-1].content == FALLBACK_REPLY
+    assert "这段文本一个字都不该出现在用户面前" not in out["turn_messages"][-1].content
+
+
+@pytest.mark.anyio
+async def test_persisted_answer_of_a_degraded_round_is_what_was_sent():
+    """裁定②的降级那一支:落库的是**已经发出去的那段文本**,不是 `raw` 的重复。
+
+    ⚠️ **必须拿一条「先调工具、再违约降级」的轮次来断。** 单轮的直接降级里,
+    「收尾那一轮的模型原文」与「发出去的文本」**恰好逐字相同**(都是 `raw`),
+    断言在那条路上**恒真**(老实记账:降级这一支的改写是**构造上的恒等**,
+    有判别力的是 `useful=true` 与 `useful=false` 那两条 —— 它们断的是
+    「答案 ≠ JSON」)。
+    这条用例守的是**多轮**下的两件事:
+    ① 收尾那条消息**只装收尾那一轮**的交付文本(不把工具轮那句「让我查一下」
+       再抄一遍 —— 那句已经在**它自己那条** assistant 消息里了,抄一遍就是
+       回载时同一句话两个气泡);
+    ② `raw` **只出现一次**(第 2 行的动作是「发一遍」)。
+    """
+    tool = _Tool()
+    script = ['{"answer": ', '"您好", "useful": true}']
+    raw = "".join(script)
+    model = _Model([
+        [_Chunk(text="让我查一下", tool_calls=[
+            {"name": "query_faq", "args": {"q": "退货"}, "id": "c1"}])],
+        script,
+    ])
+    out = await _make(model, tools=[tool],
+                      registry={"query_faq": tool}).__call__(_state(intent="商品咨询"))
+
+    # 工具轮那句话已经在**它自己那条** assistant 消息里了
+    assert out["turn_messages"][0].content == "让我查一下"
+    # 收尾那条只装收尾那一轮的交付文本:不抄工具轮那句、也不把 raw 写两遍
+    assert out["turn_messages"][-1].content == raw
+    assert out["reply"] == raw
+
+
+@pytest.mark.anyio
+async def test_business_turn_persists_the_model_output_untouched():
+    """业务轮落库的是**模型原样输出** —— 换 content 那条路根本不经过它。
+
+    业务轮不过解码器(`dec is None`),所以「用户看到的」与「模型说的」本来就
+    是同一串字节;把这条钉住,免得将来有人把那条改写挪到所有轮次上。
+    """
+    model = _Model([["您的订单", "已发货"]])
+    out = await _make(model).__call__(_state(intent="物流"))
+
+    assert out["turn_messages"][-1].content == "您的订单已发货"
+    assert out["messages"][-1].content == "您的订单已发货"
 
 
 @pytest.mark.anyio
@@ -440,3 +577,10 @@ async def test_resumed_write_round_carries_the_protocol_too():
     assert "agent:protocol_violation" not in out["trace"]
     # 只问一次模型:续跑续的是同一轮,不该重跑 ReAct 循环
     assert model.calls == 1
+    # ⚠️ 续跑这条路上 `messages` 与 `turn_messages` 是**两个不同的列表**
+    # (前者 `[final_acc]`、后者 `existing_turn + [final_acc]`;其余两条路是
+    # **同一个列表对象**)。改写若只照顾一个,这里会红一条绿一条 —— 而
+    # 「同一件事两个形状」正是本仓记过的那类静默分叉。
+    assert out["messages"][-1].content == "已为您建单 T-1。"
+    assert out["turn_messages"][-1].content == "已为您建单 T-1。"
+    assert "useful" not in out["messages"][-1].content

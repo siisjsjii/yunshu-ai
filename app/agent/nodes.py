@@ -493,6 +493,48 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
         # 交给 add_messages 并入 state,再由 log_turn 落库。
         new_messages: list = []
 
+        def _note_plain_violation(dec, acc) -> None:
+            """裁定①:`mode == PLAIN` 什么时候算违约 —— **判据是这一轮有没有 `tool_calls`**。
+
+            `agent:protocol_violation` 的**唯一用途**是量「模型不守协议的比例」
+            (§12.3-1 要的就是那个数)。按字面在**每个** PLAIN 轮打标,那么
+            **每一次调工具的正常轮**(「让我查一下」+ `tool_calls`)都会被记成违规,
+            这个数就废了。真违规只有一种:**这一轮本该作答,却吐了散文或 ``` 围栏**。
+
+            帧**不重发**:`raw` 已经在 `lead` 阶段逐片透出去过(§11-⑪-D 钉的那半条
+            没有被裁定①推翻)—— 重发就是把用户刚看过的话再说一遍。
+            """
+            if dec is None or not dec.raw or dec.mode != PLAIN:
+                return
+            if getattr(acc, "tool_calls", None):
+                return          # 调工具的那一轮是**正常形态**(spec §5.6 自己说的)
+            trace.append("agent:protocol_violation")
+
+        def _persist_what_the_user_saw(new_messages, dec) -> None:
+            """把**要落库**的那条 assistant 的正文换成「用户真正看到的那段」。
+
+            ⚠️ 协议 JSON 是**包装**,不是回答。不换的话:`messages` 表里存的是
+            `{"useful": true, …, "answer": "…"}`,而
+            `GET /api/conversations/{id}/messages`(会话回载)**原样把它显示给用户**
+            (真机实测,见 task-10-report §7-②),下一轮的上下文里也是它。
+
+            **只换 `content`,不动这两个通道的覆写语义** —— 列表本身一个元素都不增删。
+            **就地改**而不是另建一条副本:续跑那条路上 `messages` 与
+            `turn_messages` 装的是**同一个对象、两个不同的列表**,换成一个副本会让
+            「同一件事两个形状」。
+
+            判据是「这一轮实际发出去了什么」,不是模式:
+              - 可用(第 3 行)⇒ `"".join(parts)` 就是 `dec.answer`(逐字符流出);
+              - `useful is False` ⇒ `parts` 已被换成兜底话术;
+              - 降级(第 2 行)⇒ `parts` 已被换成整段 `raw`;
+              - `PLAIN` ⇒ `parts` 本来就是逐片透出的那段文本。
+
+            `dec is None`(业务轮)或这一轮一个字节都没有 ⇒ **原样不动**(业务轮零回归)。
+            """
+            if dec is None or not dec.raw or not new_messages:
+                return
+            new_messages[-1].content = "".join(parts)
+
         async def _finish_verdict(dec) -> str:
             """按 T9 交付的**三行契约表**处理这一轮的终态,返回要追加的 trace 项。
 
@@ -548,6 +590,9 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                     )
                 return "agent:self_assess_insufficient"
             if dec.mode == PLAIN:
+                # `plain` 的**动作**在这里归零(不重发、这里也不记违约)——
+                # 「记不记」由 `_note_plain_violation` 在**每一轮**上判(裁定①),
+                # 判据是那一轮有没有 `tool_calls`,而 `_finish_verdict` 手上没有它。
                 return ""
             if dec.violation or dec.useful is None or (
                 dec.done is False and not dec.answer
@@ -573,6 +618,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             final_acc, used, dec = await _stream_round(
                 model, msgs, parts, decode=is_knowledge)
             usage_total += used
+            _note_plain_violation(dec, final_acc)
             final_acc = (
                 final_acc if final_acc is not None
                 else AIMessage(content="".join(parts))
@@ -581,6 +627,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             verdict = await _finish_verdict(dec)
             if verdict:
                 trace.append(verdict)
+            _persist_what_the_user_saw(new_messages, dec)
             return {
                 "reply": "".join(parts),
                 "messages": [final_acc],
@@ -604,6 +651,10 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             acc, used, dec = await _stream_round(
                 bound, msgs, parts, decode=is_knowledge)
             usage_total += used
+            # 裁定①:PLAIN 轮的违约**逐轮判**(判据是这一轮的 `tool_calls`)——
+            # 只在整个 ReAct 走完之后判会漏掉「调完工具那一轮的话」那一类;
+            # 每一轮都在这里过一遍时,「有工具调用的轮」才真的被排除在外。
+            _note_plain_violation(dec, acc)
             tool_calls = list(getattr(acc, "tool_calls", None) or [])
 
             if not tool_calls:
@@ -692,6 +743,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
             final_acc, used, dec = await _stream_round(
                 model, msgs, parts, decode=is_knowledge)
             usage_total += used
+            _note_plain_violation(dec, final_acc)
             new_messages.append(
                 final_acc if final_acc is not None else AIMessage(content="".join(parts))
             )
@@ -699,6 +751,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
         verdict = await _finish_verdict(dec)
         if verdict:
             trace.append(verdict)
+        _persist_what_the_user_saw(new_messages, dec)
         trace.append("agent:converged")
         # 两个键值**相同、语义不同**,别只写一个:
         #   `messages`      → add_messages 累积进完整历史(跨轮)
