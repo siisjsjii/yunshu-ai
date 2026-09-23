@@ -65,25 +65,56 @@ def make_handler(settings: Settings) -> Any | None:
         return None
 
 
+def _outer_cm(settings: Settings, conversation_id: str) -> Any:
+    """建外层 trace 上下文。**单独抽出来是为了能测** —— 测试把它换成假的,
+    于是 enabled 路径可以在不联网、不 import langfuse 的前提下被验到。
+    """
+    from langfuse import propagate_attributes
+
+    return propagate_attributes(trace_name="cs-chat", session_id=conversation_id)
+
+
 @contextmanager
 def trace_scope(*, conversation_id: str, settings: Settings) -> Iterator[None]:
     """包住整段流,把会话 id 挂到 trace 上。
 
     实测:`propagate_attributes(session_id=...)` 在**这一层**是有效的,
     而且它覆盖**全部**观测(包括进入之前创建的 —— 因为它是外层)。
+
+    ⚠️ **每条路径只允许 `yield` 一次** —— 这是 `@contextmanager` 的硬约束:
+    业务异常是被 `throw()` 进生成器的,若被 `except` 抓住后再 `yield` 一次,
+    contextlib 会抛 `RuntimeError: generator didn't stop after throw()`,
+    **把原始业务异常替换掉**(本仓记过的"报错指向别处"那一类)。
+    所以正常路径与降级路径**各自 yield 一次**,异常一律原样穿出 ——
+    形状与下面的 `span` 对齐。
     """
     if not enabled(settings):
         yield
         return
+
+    cm = None
     try:
         _setup_env(settings)
-        from langfuse import propagate_attributes
-
-        with propagate_attributes(trace_name="cs-chat", session_id=conversation_id):
-            yield
+        cm = _outer_cm(settings, conversation_id)
+        cm.__enter__()
     except Exception:  # noqa: BLE001
-        logger.warning("langfuse trace_scope 失败,降级为无观测", exc_info=True)
-        yield
+        logger.warning("langfuse trace_scope 进入失败,降级为无观测", exc_info=True)
+
+    if cm is None:
+        yield                      # ← 降级路径:**只 yield 这一次**
+        return
+
+    exc_info = (None, None, None)
+    try:
+        yield                      # ← 正常路径:**只 yield 这一次**
+    except BaseException:          # noqa: BLE001 —— CancelledError 是 BaseException
+        exc_info = __import__("sys").exc_info()
+        raise                      # 业务异常原样穿出去
+    finally:
+        try:
+            cm.__exit__(*exc_info)
+        except Exception:  # noqa: BLE001
+            logger.warning("langfuse trace_scope 退出失败", exc_info=True)
 
 
 class TagScope:
