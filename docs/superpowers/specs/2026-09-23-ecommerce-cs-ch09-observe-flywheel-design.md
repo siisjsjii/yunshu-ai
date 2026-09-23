@@ -48,8 +48,13 @@ LANGFUSE_BASE_URL=https://us.cloud.langfuse.com
 
 **这是 Langfuse Cloud 美国区,不是自部署。** 两条冲突的事实都摆给了用户,用户 2026-09-23 拍板:**就用云端**。
 
-- 服务端版本实测:`GET /api/public/ready` → `{"status":"OK","version":"4.41.0"}`。
+- 服务端版本实测:`GET /api/public/ready` → `4.41.0`;同一天晚些时候再测是 **`4.42.0`**
+  ⇒ **Cloud 会自己升级,服务端版本不是固定值**。引用版本号时要带日期。
 - SDK 取 PyPI `latest` = **`langfuse==4.15.4`**(`requires_python: >=3.10`)。
+- **装它零漂移**:`pip install --dry-run langfuse==4.15.4` 实测只新增 11 个包
+  (`backoff`、`googleapis-common-protos`、`opentelemetry-{api,sdk,proto,semantic-conventions,
+  exporter-otlp-proto-common,exporter-otlp-proto-http}`、`wrapt`),**不升级任何现有依赖** ——
+  `httpx==0.28.1` / `pydantic==2.13.5` 一字不动。§13-10 那条风险随之解除。
 - **代价如实记**:对话原文、召回片段、用户问题会出境到 Langfuse Cloud,与需求里写的「链路数据不出自家服务器」不符。换成自部署只需改 `LANGFUSE_BASE_URL` 一个值(§11)。
 - **`.env.example` 补上三个键**(现在没有),并把 `LANGFUSE_BASE_URL` 的默认值写成 Cloud 地址 + 一行注释说明可改自部署。
 
@@ -204,29 +209,92 @@ async for mode, chunk in graph.astream(
 
 **放行的是「渲染后的证据」而不是「裸 answer」** —— 与 `journal.model_ctx` 的口径一致(那里数的是 `render_evidence(evidence)`)。
 
-### 3.4 意图 → trace 元数据 + tag
+### 3.4 意图 → trace tag(实测后重写,见 §15.3)
+
+**三段实测事实**(探针 `.superpowers/probe_ch09_langfuse2.py`):
+
+1. **`LangfuseSpan.update(**kwargs)` 的 kwargs 被静默丢弃** —— 源码 docstring 逐字:
+   `**kwargs: Additional keyword arguments (ignored)`。⇒
+   `root.update(**{"langfuse.trace.tags": [...]})` **什么都不做、也不报错**。
+   (**本仓「静默无效」家族的新成员**,§15.3 记账。)
+2. **`propagate_attributes(tags=[...])` 有效,且「中途进入」也有效**:包住整段的观测拿到 tag;
+   **中途 `__enter__` 之后新建的观测拿到 tag,之前的没有**。实测:
+   - 整段包裹 → `tags: ['intent:AAA','ch09']`,3 条观测
+   - 中途进入 → `tags: ['intent:BBB']`,**2 条**(进入前那次调用不在内)
+3. **`_AgnosticContextManager` 没有 `__aenter__`** ⇒ 中途进入只能用**同步** `__enter__`。
+
+**做法(定稿)**:
 
 ```python
-metadata = {
-    "langfuse_session_id": conversation_id,     # 会话视图把多轮串起来
-    "langfuse_tags": ["ch09", f"intent:{intent}"],
-    "langfuse_trace_name": "cs-chat",
-}
+with propagate_attributes(trace_name="cs-chat", session_id=conversation_id):
+    cm = None
+    async for mode, chunk in graph.astream(...):      # 端点现有的循环
+        ...
+        if cm is None and <这一批 updates 里出现了 classify_intent>:
+            cm = propagate_attributes(tags=[f"ch09", f"intent:{state}"])
+            cm.__enter__()                            # 同步,不是 __aenter__
+        ...
+    finally:
+        if cm is not None:
+            cm.__exit__(None, None, None)
 ```
 
-意图在 `classify_intent` **之后**才知道,而 `config` 在 `astream` **之前**就固定了 —— 所以**不能**把意图塞进 `config["metadata"]`。
+- **session_id 走外层**:`session_id` 在 `astream` 之前就已知,外层包裹能覆盖**全部**观测
+  (实测 A/B 两条 trace 的 `sessionId` 都落对了)。
+- **intent 走中途**:意图要 `classify_intent` 跑完才知道,**不可能**在 `astream` 之前拿到。
+  中途进入意味着**意图分类那一次调用本身不带 tag**;这可以接受 —— 开销的大头在它**之后**
+  的 agent 轮次,而验收 5 问的正是「钱花在哪类**问题**上」。
+- ⚠️ **待冒烟**:上面这段在**真实图**里能不能让 tag 落到 graph 内部的 generation 上
+  **尚未验证** —— 探针里 `model.ainvoke` 是直接调的,真实链路上模型调用发生在
+  `graph.astream` **内部**(LangGraph 可能自带 OTel 上下文)。**这是 T1 冒烟项。**
+  不行的话退路是:把意图写进**我们自己开的观测**(`retriever` / `tool:*` 两个手动 span 的
+  `update(metadata=...)`),`intent_cost.py` 改从这些观测自己聚合 —— 代价是脚本变重。
 
-**做法**:用 Langfuse 的 `propagate_attributes(trace_name=…, session_id=…, tags=[…], metadata={...})` 上下文管理器**包住** `astream` 那段;意图是 `state` 里的值,而 `astream` 是流式的 ⇒ 在**收到 `trace` 帧**(端点已折进 `final`)或 `updates` 里出现 `classify_intent` 时,**先**把已知的 `session_id / tags` 定下来,意图用 `update_current_trace` 补写。
+> **不用 `config["metadata"]["langfuse_tags"]`** 那条路吗?它**实测也有效**
+> (C 组:`tags: ['intent:CCC']`)。但 `config` 在 `astream` **之前**就固定了,
+> 而意图在那之后才知道 —— 这条路解决不了「事后才知道」这件事。留着它给**已知**的标签用。
 
-> ⚠️ **这条是本章最不确定的接口细节,列为 T1 计划期的第一个阅读项**:`propagate_attributes` 与 `update_current_trace` 在 langfuse 4.15.4 里的**确切签名以装好的 wheel 源码为准,不以文档为准**(ch08 §2.1 的教训:Context7 整站迁 v2,连标着 v1 的 library id 返回的都是 v2 内容)。**探针脚本先跑通再加进实现。**
+### 3.5 按意图的 token 花销(实测后订正)
 
-### 3.5 按意图的 token 花销
+`scripts/intent_cost.py`:打 Langfuse **Metrics API v2**,按 `tags` 维度分组,打印
+「意图 / 观测数 / token 总量」表。**请求形状是实测出来的,不是照文档拼的**:
 
-`scripts/intent_cost.py`:打 Langfuse **Metrics API v2**(`GET /api/public/v2/metrics`,`observations` 视图,支持 `tags` 维度与 cost/token 指标),按 `intent:*` 分组,打印「意图 / 调用数 / 输入 token / 输出 token / 成本」表。
+```python
+query = {
+    "view": "observations",                        # v2 只支持 observations / scores-*
+    "metrics": [{"measure": "totalTokens", "aggregation": "sum"},
+                {"measure": "count", "aggregation": "count"}],
+    "dimensions": [{"field": "tags"}],             # ← 按 tag 分组,实测可用
+    "filters": [],
+    "fromTimestamp": …,  "toTimestamp": …,         # ← **两个都必填**
+    "config": {"row_limit": 50},
+}
+resp = await http.get(f"{base}/api/public/v2/metrics",
+                      params={"query": json.dumps(query)},   # ← 整个 query 是一个字符串参数
+                      auth=(pk, sk))
+```
 
+三条实测出来的坑,逐条记:
+
+1. **`query` 必须是 JSON 字符串参数**,把 `view`/`metrics` 平铺成独立 query 参数会 400
+   (`Invalid input: expected string, received undefined` 指向 `query`)。
+2. **`sum_totalCost` 恒为 0** —— 模型 `deepseek-flash` 没在 Langfuse 里配价格。
+   ⇒ **统计表报 token,不报钱**;脚本对 cost 字段**只在非零时才打印**,并且在文档里写清
+   「为什么是 0」。**不许把 0 当成本报出去。**
+3. **按 `tags` 过滤时 `type` 不能是 `"string"`** —— 网关原话:
+   `Filter type 'string' is not supported for dimension type 'string[]'. Expected 'arrayOptions'`。
+   (本章的分组统计不需要 filter,但脚本的 `--intent` 可选参数会用到,先记下。)
+
+其他实测事实:
+
+- **`GET /api/public/v2/observations`**(v1 的 `/traces` 已弃用)按 `traceId` +
+  `fromStartTime` / `toStartTime` 读回,**行里的 `tags` 字段是 `None`** ——
+  单体观测读不回 tag,**只有 Metrics 聚合看得见**。所以「验证 tag 落没落」只能靠 Metrics。
+- **ingestion 有延迟**:首次读回 0 条、隔一会儿再读就有了。⇒ 脚本与验收**一律轮询**,
+  不许读一次就断言。
 - 凭证从 `.env` 读,走 `httpx.AsyncClient`(**不引新依赖**);出站错误文本过 `redact_api_key`。
 - **不写进任何端点** —— 它是「拿出统计」的交付物,不是在线功能。
-- 验收 5 就断它:输出里必须**每个出现过的意图一行**,且能看出哪个最烧钱。
+- 验收 5 就断它:输出里必须**至少两个不同意图的行**,且能看出哪个 token 最多。
 
 ### 3.6 单测「全程不联网」怎么守
 
@@ -789,8 +857,13 @@ flywheel_batch_size: int = Field(default=10, ge=1)
 
 ### 12.3 真机冒烟(单测绿了也要跑)
 
+0. **⚠️ 头一条,也是唯一挡路的**:跑一次**真实的 `/api/chat/stream`**,然后打
+   `GET /api/public/v2/metrics`(按 `tags` 分组),确认**出现了 `intent:<那一轮的意图>` 这一行**。
+   探针里模型调用是直接 `ainvoke` 的,真实链路上它在 `graph.astream` **内部** ——
+   中途进入的 `propagate_attributes` 能不能穿透 LangGraph 的上下文,**这是唯一没验的一件事**。
+   不行就走 §3.4 末尾的退路。
 1. **真实网关上的回答轮真的会吐协议 JSON** —— 单测里的假流是我们喂的,**测不出模型守不守协议**。跑 N 次真实的商品咨询问题,统计 `agent:protocol_violation` 出现几次。**这个数要如实进 dev-notes**,它是 §5.7-1 那条「没有硬保证」的**唯一**证据。
-2. **Langfuse trace 真能落在 Cloud 上**:跑一次 `/api/chat/stream`,去 Langfuse 用 `session_id` 搜到它,确认**巢状结构**(模型 span 在节点 span 下)、`intent:*` tag 在、工具 span 与 retrieval span 都在。**探针跑通不算数,要在 UI 里看见。**
+2. **Langfuse trace 真能落在 Cloud 上**:去 Langfuse 用 `session_id` 搜到那条 trace,确认**巢状结构**(模型 span 在节点 span 下)、工具 span 与 retrieval span 都在,**人眼看见**。**探针跑通不算数。**(tag 那半条见 0。)
 3. **`scripts/intent_cost.py` 打真实 Metrics API** 拿到非空结果(验收 5 的前置)。
 
 ### 12.4 端到端验收:`scripts/acceptance_ch09.sh`
@@ -823,7 +896,8 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 
 | # | 风险 | 应对 |
 |---|---|---|
-| 1 | **Langfuse 4.15.4 的 API 未按 wheel 核对就写** —— `propagate_attributes` / `update_current_trace` / `CallbackHandler` 的确切签名 | 计划期**第一个阅读项**:读 `.venv/Lib/site-packages/langfuse/` 的 `__init__.py` 与 `langchain/` 子模块,**探针跑通再写实现**(ch08 §2.1 的教训:文档整站迁版) |
+| 1 | ⚠️ **中途 `propagate_attributes` 在真实图里能不能给 graph 内部的 generation 打上 tag —— 未验**(探针里模型调用是直接调的,真实链路上它在 `graph.astream` 内部) | 已按 wheel 源码核过签名、已用探针验过机制(§3.4);**剩下这一条是 T1 的冒烟项**。不行就走 §3.4 末尾写明的退路:`intent_cost.py` 改从我们自己的观测聚合 |
+| 1b | ~~Langfuse API 未按 wheel 核对~~ | **已解除**:4.15.4 已装并逐字读过 `langfuse/__init__.py`、`langchain/CallbackHandler.py:496-520`、`_client/span.py:637-675`;两条探针跑通(§3.4 / §3.5) |
 | 2 | `.env` 指向 **Cloud**,与需求写的自部署不符 | 已由用户 2026-09-23 拍板;§2.1 记账;换自部署只需改一个值 |
 | 3 | **协议没有硬保证**(`response_format` 与 `bind_tools` 互斥,§2.2)⇒ 模型不守协议时该轮拿不到 `useful` | §5.6 降级 = 今天的 ch08 行为,**不会更差**;`trace` 记 `agent:protocol_violation`,违约率可观测;§12.3-1 真机跑 N 次把违约率量出来 |
 | 4 | **改动落在 `agent` 节点上**(全仓最复杂的一段,ch08 的确认流在里面) | 改动面**只有两处**:`msgs` 多一条协议消息、文本出口多一次解码。**工具绑定、工具执行、`pending_write`、`turn_messages`、每轮清零全不碰**;§12.1 的「业务轮逐字节不变」用例是这条的硬证据 |
@@ -889,3 +963,33 @@ ch01–ch08 的既有测试**不改判据、不放宽**。特别地:
 - **代价(如实记)**:新形态把改动落到了 `agent` 节点上(全仓最复杂的一段)。
   缓解是改动面**只有两处**(`msgs` 多一条消息、文本出口多一次解码),
   且 §12.1 加了「业务轮 token 帧逐字节不变」这条硬证据。
+
+### 15.3 待订正:§3.4 / §3.5 —— Langfuse 的三条接口事实**全和文档不一样**
+
+**最初写的**(§3.4 原文):用 `propagate_attributes(trace_name=…, session_id=…, tags=…)`
+包住 `astream`,意图「用 `update_current_trace` 补写」。
+
+**实际是**(实测,探针 `.superpowers/probe_ch09_langfuse.py` / `…2.py`):
+
+| 我写的 / 文档说的 | 实测 |
+|---|---|
+| `langfuse.update_current_trace` 存在 | ❌ **不存在**。模块级没有,`Langfuse` 客户端上也没有(它有 `score_current_trace` / `set_current_trace_io`,没有 update) |
+| `span.update(**{"langfuse.trace.tags": …})` | ❌ **静默丢弃** —— 源码 docstring 逐字 `**kwargs: Additional keyword arguments (ignored)` |
+| `CallbackHandler(session_id=…, user_id=…, tags=…)`(文档 JS 页的写法) | ❌ Python 4.15.4 的签名只有 `(*, public_key=None, trace_context=None)` |
+| `client.api.trace.get(id)` 读回 | ❌ 已弃用,换 `GET /api/public/v2/observations`(按 `traceId` 过滤) |
+| Metrics v2 把参数平铺进 query string | ❌ 必须 `params={"query": json.dumps({...})}` |
+| Metrics 能报成本 | ❌ `sum_totalCost` **恒为 0**(模型没配价格)⇒ 统计只报 **token** |
+| 按 `tags` 过滤用 `type="string"` | ❌ 网关要求 `arrayOptions` |
+
+**为什么会写错**:§3.4 那一版是**照文档写的**,而文档里那页是 **JS/TS 示例与 Python 示例混排**,
+我按 JS 的构造参数写了 Python 的代码。**ch08 已经记过「Context7 整站迁 v2、以轮子为准」**,
+这次**没等读轮子就把结论写进了 spec** —— 同一个教训的第二次。
+
+**订正后的形态**:见 §3.4(外层 `propagate_attributes` 管 session/trace_name,
+**中途同步 `__enter__` 一个只带 `tags` 的 `propagate_attributes`** 管意图)与
+§3.5(请求形状、只报 token、过滤要 `arrayOptions`)。
+
+**顺带记一条「静默无效」的新成员**:`span.update(**kwargs)` 不报错、不生效。
+本仓已经收过「未声明的通道写入被静默丢弃」(ch06)、「`add_messages` 给无 id 消息赋 uuid4」
+(ch07)、「`response_format` 走 beta 路径」(ch09 §2.2)。**这一次是第四次同一个形状**:
+**一个看起来会生效的赋值,什么都没做,而且不报错。**
