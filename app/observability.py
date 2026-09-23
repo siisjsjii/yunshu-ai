@@ -1,14 +1,22 @@
 """Langfuse 观测 —— **全章唯一**的边界。
 
-三条纪律(每条都有测试):
+三条纪律,**每条都有测试守着**(`tests/test_observability.py`;括号里是守着它的用例):
 
 1. **`app/` 下除本模块外,零处 import langfuse。** 别的模块只认
    `trace_scope` / `intent_scope` / `span` / `make_handler` 四个名字。
+   (`test_no_module_outside_observability_imports_langfuse` —— 源码扫描)
 2. **关掉时全 no-op,且不 import langfuse。** 三个 `LANGFUSE_*` 任一为空
    ⇒ `enabled()` 为假 ⇒ 所有函数走空壳分支。**langfuse 的 import 一律放在
    函数体内**,顶层 import 会让"没配"的环境在导入期就炸。
+   (`test_disabled_*` / `test_disabled_means_no_handler_and_no_langfuse_import`)
 3. **本模块不抛异常**(`span` 的 `__exit__` 吞掉一切并 `logger.warning`)——
    与 `app/tools/audit.py:record_audit` 的"永不抛"同族。观测不许影响业务。
+   (`test_span_enabled_path_*` / `test_trace_scope_enabled_path_*` ——
+   开启态的降级与吞异常分支都有用例,不只是关掉态的空壳分支)
+
+> ⚠️ 上面第 1 条是**源码**扫描,不是运行时断言:`__pycache__` 之外只看 `*.py` 的正文。
+> 它抓的是"有没有人**写下**这行 import",而不是"这次跑到没跑到" ——
+> 这正是那条纪律的字面意思。
 
 ⚠️ **两条实测出来的坑,改动前先读 spec §3.4:**
 
@@ -93,14 +101,21 @@ def trace_scope(*, conversation_id: str, settings: Settings) -> Iterator[None]:
         return
 
     cm = None
+    entered = False
     try:
         _setup_env(settings)
         cm = _outer_cm(settings, conversation_id)
         cm.__enter__()
+        entered = True             # ← **只有 __enter__ 成功之后才算"进了"**
     except Exception:  # noqa: BLE001
         logger.warning("langfuse trace_scope 进入失败,降级为无观测", exc_info=True)
 
-    if cm is None:
+    if not entered:
+        # ⚠️ 判据是 `entered` 而不是 `cm is not None`:`__enter__` 抛了的话 `cm`
+        # 早已被赋值,拿它当"进了"会落到正常分支,**对一个从未进入过的 CM 调
+        # __exit__**(实测 `_AgnosticContextManager.__exit__` 在未进入时会抛
+        # `RuntimeError: generator didn't stop`)—— 虽被 finally 吞掉、无业务影响,
+        # 但"降级"是假的、日志在说谎。
         yield                      # ← 降级路径:**只 yield 这一次**
         return
 
@@ -165,6 +180,18 @@ def intent_scope(intent: str, *, settings: Settings) -> TagScope:
         return TagScope(None)
 
 
+def _observation_cm(settings: Settings, name: str, as_type: str, input: Any) -> Any:
+    """建一个手工观测上下文。**单独抽出来是为了能测** —— 理由与 `_outer_cm` 相同:
+    测试把它换成假的,enabled 路径就能在不联网、不 import langfuse 的前提下被验到。
+    `span` 将来要承担工具执行与知识检索的观测,它自己的吞异常/降级分支必须有测试。
+    """
+    from langfuse import get_client
+
+    return get_client().start_as_current_observation(
+        name=name, as_type=as_type, input=input
+    )
+
+
 @contextmanager
 def span(
     name: str, *, as_type: str = "span", input: Any = None, settings: Settings
@@ -186,12 +213,8 @@ def span(
     cm = None
     try:
         _setup_env(settings)
-        from langfuse import get_client
-
-        cm = get_client().start_as_current_observation(
-            name=name, as_type=as_type, input=input
-        )
-        handle = cm.__enter__()
+        cm = _observation_cm(settings, name, as_type, input)
+        handle = cm.__enter__()    # ← 抛了就直接落进下面的 except,不会再碰这个 cm
     except Exception:  # noqa: BLE001
         logger.warning("langfuse span 进入失败", exc_info=True)
         yield None
