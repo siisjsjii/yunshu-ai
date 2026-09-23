@@ -1055,3 +1055,59 @@ generation 带上 `intent:<x>` 标签」——探针里模型调用是直接 `ai
 实测症状是 `panic: etcdserver: leader changed` + SIGABRT(exit 134)。成因是嵌入 etcd 没等到
 ReadIndex 就换了 leader。**机器空下来再 `docker start`,一次就起,存储卷完好**(实测:集合
 `knowledge` 90 行,一字未丢)。**别急着删数据。**
+
+### 15.5 订正:手工 span 的**嵌套**已修 —— `trace_scope` 补开根观测;手工 `tool:*` span 删除
+
+（T3 的修复轮,2026-09-23。**§15.4 ③ 那条「未实施 / 待主控裁定」以本节为准。**
+§15.4 保留原文,记的是当时**只报不改**的那个状态。)
+
+**主控裁定(原话摘要)**:「`trace_scope` 现在**只调了 `propagate_attributes`**,没有开任何
+**当前 span**……**是我把这个关键动作漏在了 `trace_scope` 的实现里**」⇒ 两件事一起做。
+
+**① `app/observability.py:trace_scope` 补开根观测(`chat`)**
+
+- 新增接缝 `_root_cm(settings, conversation_id)`(照 `_outer_cm` / `_observation_cm` 的样子
+  单独抽出来,**唯一目的是让 enabled 路径能在不联网、不 import langfuse 的前提下被验到**)。
+- 形状:`propagate_attributes(...)` 在**外层**、根观测在**里层**;退出顺序相反。
+- 根观测:`name="chat"` / `as_type="span"` / `input={"conversation_id": …}`。
+  **用户原话刻意不在这里塞**(谁手里有谁放,归端点决定)——
+  在真正的 `chat` 根观测上补 `input`,是上下文那半章的事。
+- 进入失败:**进了一半要 unwind 外层**(否则 `propagate_attributes` 的 token
+  一直挂在当前任务上,后面的观测会被当成它的孩子 —— 跨请求串味,且**没有任何日志**)。
+- 退出走 `_safe_exit`,根与外层各吞各的异常。
+- **对外签名不变**(`trace_scope(*, conversation_id, settings)`),端点那一侧一字未动。
+
+**② 删掉手工的 `tool:*` span(`app/agent/nodes.py` 与 `app/agent/confirm_nodes.py`)**
+
+- 依据:§15.4 ② 的实测(内置工具**已经**有一条嵌套正确的 `TOOL` 观测)+ Langfuse 自己的
+  最佳实践原话 **`Don't emit duplicate dispatch + execution nodes. … it double-represents
+  one event.`** ⇒ 一次 `query_product` 产出两条观测是**同一个事件表示两遍**。
+- 那两处**包着的业务代码一行不动**,只是不再开手工 span;
+  `app/agent/confirm_nodes.py` 的 `observability` import 随之删除。
+- **`retrieval` 那条保留**:`KnowledgeRetriever` 是自写的普通类,**不是** LangChain run,
+  没有它知识检索在界面上是空的 —— 这一条不能被自动覆盖,手工 span 的存在理由成立。
+
+**③ 修复后的真机复验(三个请求,逐个查 `traceId` 与 `parentObservationId`)**
+
+| 请求 | 意图 | 观测数 | **distinct `traceId`** | 树里有没有 |
+|---|---|---|---|---|
+| A(知识路径 + 闸不过) | 商品咨询 | 15 | **1** | `chat` 根 / 3×generation / `retrieval` |
+| B(业务路径) | 订单 | 15 | **1** | `chat` 根 / 4×generation / **`TOOL 'query_order'`** |
+| C(知识路径 + 调工具) | 商品咨询 | 19 | **1** | `chat` 根 / 5×generation / **`TOOL 'query_product'`** / `retrieval` |
+
+修复前的对照值(§15.4 ③):同一次请求里 **2 个 `traceId`**,手工 span 的
+`parentObservationId` 是 **`null`**。现在三个请求**各自只有一个 `traceId`**,
+根是 `SPAN 'chat'`(`parentObservationId=null`),`LangGraph` chain 与 `retrieval` 都挂在它下面。
+
+**④ tag 没有回归**:同一窗口的 Metrics v2 按 `tags` 分组(修复后重跑)
+
+```
+{"tags": ["ch09", "intent:商品咨询"], "sum_totalTokens": "3365", "count_count": "18"}
+{"tags": [],                          "sum_totalTokens": "2444", "count_count": "24"}
+{"tags": ["ch09", "intent:订单"],     "sum_totalTokens": "2198", "count_count": "7"}
+```
+
+24 = 3 个请求各 8 条未 tag 的观测(`chat` 根 + `LangGraph` + `resolve_references` +
+它的 generation + `classify_intent` + `RunnableSequence` + generation + `PydanticOutputParser`),
+7 + 18 = 25 条已 tag;`24 + 7 + 18 = 49` = 三个请求的观测总数,**逐条对得上**。
+⇒ **边界仍然落在 `classify_intent` 上,根观测的引入没有把 tag 弄丢。**
