@@ -338,16 +338,24 @@ resp = await http.get(f"{base}/api/public/v2/metrics",
 
 ```python
 def evidence_confidence(chunks: Sequence[RetrievedChunk]) -> float:
-    """把「检索+精排的结果」压成一个 0–1 的置信度。空证据返回 0.0。"""
+    """把「检索+精排的结果」压成一个 0–1 的置信度。
+
+    空证据、或全部块都低于 `evidence_min_score`,返回 0.0(同一个出口)。
+    """
 ```
 
-三个信号(用户 2026-09-23 点名):
+三个信号(**三个一律只在那批「分数 ≥ `evidence_min_score`」的块上算**,见 §15.8;
+用户 2026-09-23 点名):
 
 | 信号 | 取法 | 为什么要它 |
 |---|---|---|
-| 精排 Top1 的相关性分 | `max(c.score)` | 主判据。`RetrievedChunk.score` **已经是重排 sigmoid 分**(不是 RRF、不是余弦) |
+| 精排 Top1 的相关性分 | 过滤后的 `max(c.score)` | 主判据。`RetrievedChunk.score` **已经是重排 sigmoid 分**(不是 RRF、不是余弦) |
 | 有效证据数 | 分数 ≥ `evidence_min_score` 的条数,封顶 `evidence_max_count` | 单条高分可能是巧合;**够多条中高分**才叫「知识库覆盖了」 |
-| Top1 与 Top2 的分差 | `top1 - top2`(只有一条时按 `top1 - 0`) | 分差大 ⇒ 那条明确对口;分差小 ⇒ 几条都差不多,**可能都不对口** |
+| Top1 与 Top2 的分差 | 过滤后的 `top1 - top2`(只剩一条时按 `top1 - 0`) | 分差大 ⇒ 那条明确对口;分差小 ⇒ 几条都差不多,**可能都不对口** |
+
+**全被过滤掉时返回全 0**(`top1` / `top2` / `count` / `gap` / `confidence` 五个键全 0),
+与「空证据」走**同一个出口**。理由见 §15.8:**不是证据的块,不该影响任何一个信号**;
+而且这是闸的 **fail-closed 一侧** —— 一堆纯噪声的块必须被拦。
 
 **合成式**(权重与形状在 §11 里是配置项,便于标定时调):
 
@@ -835,7 +843,7 @@ langfuse_base_url: str = "https://us.cloud.langfuse.com"
 # scripts/calibrate_evidence.py 在 evals/测试集.md 上扫出来的折中点,
 # 依据是「D_absent 应拒答桶的拦截率 vs 正常桶的误杀率」。改动属设计授权,记 §15。
 evidence_confidence_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
-evidence_min_score: float = Field(default=0.15, ge=0.0, le=1.0)   # 算「有效证据条数」的分线下界
+evidence_min_score: float = Field(default=0.15, ge=0.0, le=1.0)   # 「什么算一条证据」的下界,三个信号共用(§15.8)
 evidence_max_count: int = Field(default=3, ge=1)                  # 条数信号的封顶
 w_top1: float = Field(default=0.6, ge=0.0, le=1.0)
 w_count: float = Field(default=0.2, ge=0.0, le=1.0)
@@ -868,7 +876,8 @@ flywheel_batch_size: int = Field(default=10, ge=1)
 **按 TDD 走的**(确定性逻辑):
 
 - `app/agent/json_stream.py` —— §5.3 表里 **13 条边界,每条一个用例**,另加一组 **chunk 边界 fuzz**(把一段完整 JSON 按**每一个可能的切点**切成两段,以及随机切成 3–8 段,**结论必须与不切时逐字节相同**)。这是本章测试价值最高的一处。
-- `app/kb/evidence.py` —— 三个信号的取值、空证据、只有一条、分数并列(top1−top2=0)、条数封顶。
+- `app/kb/evidence.py` —— 三个信号的取值、空证据、只有一条、分数并列(top1−top2=0)、条数封顶、
+  **全部块低于 `evidence_min_score` ⇒ 五个键全 0 且与「空证据」返回同一个 dict**(§15.8)。
 - `confidence_gate` —— 判据换成 `evidence_confidence` 后:通过/不通过两支、`reject_reason` 含三个信号、落池的 `entry_point` 仍是 `置信度闸`。
 - **`agent` 节点的协议路径**(注入一个**可控的假流**,按需吐片段):
   - **知识轮**走 `protocol`:首键 `useful` 正常 ⇒ line-by-line 的 token 帧与 answer 逐字节一致;**中途的分片不影响结果**(拿 §5.3 的 fuzz 再来一遍,这次在**节点层**)。
@@ -1248,3 +1257,43 @@ dict 里一个字都看不见。
 与 §15.3 那条 `span.update(**kwargs)` 是同一个形状(「做了,但什么都没发生,而且不报错」),
 **这是本章第二次**,也是全仓第五次。它比 400 **危险得多** —— 400 会逼你去查,
 它只会让你得到「窗口内确实没数据」这个**错误结论**。
+
+### 15.8 订正:§4.1 —— `evidence_min_score` 必须也用在 top1/top2 上(骨架与它自己的测试不一致)
+
+- **最初写的**(本节 4.1 的表 + T6 的实现骨架):`evidence_min_score` **只**用在
+  「有效证据数」这一个信号上;`top1` 写作 `max(c.score)`、`top2` 写作"第二大的 score",
+  两者都隐含地取在**全部**分数上。
+- **实际是**:**同一批块上算三个信号**。T6 的实现骨架逐字落地后,它**自己 brief 里那条**
+  `test_low_scores_do_not_count_toward_the_count_signal` 就是**红的**:
+
+  ```
+  tests/test_kb_evidence.py:68: in test_low_scores_do_not_count_toward_the_count_signal
+  >   assert noisy == clean
+  E   assert 0.4647 == 0.4667
+  1 failed, 7 passed
+  ```
+
+  根因:那条 `0.01`(低于 `evidence_min_score=0.15`)的噪声**没被算进条数**,却
+  **占住了 top2 的位子**,把 gap 从 `0.50` 压到 `0.49` ⇒ 置信度差 `0.2 × 0.01 ≈ 0.002`。
+  即「不是证据的块**换了条路**影响了另一个信号」。更糟的一侧:全部块都低于下限时,
+  骨架仍会拿那条噪声分当 `top1` ⇒ 纯噪声拿到 `confidence = 0.084` 的**非零**值。
+- **为什么会写错**:**计划里的实现骨架与它自己的测试不一致 —— 骨架是错的,测试是对的。**
+  §4.1 那张表其实**已经承认了这条下限**(它把"有效证据数"定义成「分数 ≥
+  `evidence_min_score` 的条数」),我只是**没把同一个下限推广到另外两个信号上**;
+  而 T6 的用例作者(同一个我)在写用例时用的语义是"不是证据的块对**置信度完全不可见**",
+  两边**没有对过**。⇒ 与本仓已记过的形态同族:§15.1「把看起来合理当成已成立」、
+  §15.7「交给实现者的代码本身没跑过」;**这一条是第三次**,错因是**同一份计划里
+  两处文本各自成立、互相矛盾,而两处都没有被拿着对读**。
+  这一次是**实现者去跑了才照出来的** —— 若他照抄骨架交差,那句"8 passed"会被
+  用例**自己**揭穿,不会静默通过。
+- **订正后的形态**(§4.1 表已改):`valid = [分数 ≥ evidence_min_score 的块]`;
+  三个信号(`top1` / `count` / `gap`)**一律在 `valid` 上算**;`valid` 为空时
+  与"空证据"走**同一个出口**,五个键全 0。
+- **证据**:T6 的变异检查 —— 把过滤那一步去掉(退回骨架写法)后,
+  **两条**用例同时变红:`test_low_scores_do_not_count_toward_the_count_signal`
+  (`0.4647 == 0.4667`)**与**新补的
+  `test_all_below_min_score_is_exactly_the_empty_evidence_result`
+  (`{'top1': 0.14, 'top2': 0.14, 'confidence': 0.084, …}` ≠ 全 0)。
+- **记账一条范围限定**:`confidence = 0.084` 在**当前占位阈值 `0.42`** 下**仍然会被拦**,
+  所以这不是"今天就漏放了"的活故障;订正的是**语义** —— 「判据的取值不该依赖
+  "噪声分恰好算出来不大"」,而这个性质在 T8 把阈值标定成**更小**的值时就会失效。

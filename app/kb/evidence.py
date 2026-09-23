@@ -10,11 +10,13 @@
 为什么要有 count 与 gap:单条高分可能是巧合;**够多条中高分**才叫"知识库覆盖了";
 分差大说明那条明确对口,分差小说明几条都不对口。
 
-⚠️ **与 spec §4.1 的一处偏离(记账)**:spec 那张表把 top1 写作 `max(c.score)`、
-未提过滤。实现改成**先按 `evidence_min_score` 过滤再取 top1/top2**,理由见
-`evidence_detail` 里的注释与 `tests/test_kb_evidence.py` 那条低分用例的实测
-(0.4647 vs 0.4667)。影响面:全部块都低于 min_score 时返回全 0(不过滤则会返回
-一个由噪声分算出的非零置信度)。一句话回退:把 `valid` 换回 `sorted(所有 score)`。
+⚠️ **`evidence_min_score` 是"什么算一条证据"的唯一定义,三个信号都在它过滤后的
+集合上算。** spec §4.1 最初只把这条下限用在"有效证据数"上、把 top1 写作
+`max(c.score)` —— 那是错的:一条低于下限的噪声会占住 top2 的位子把 gap 压小
+(实测 0.4647 vs 0.4667),即「不是证据的块换了条路影响另一个信号」。已按
+spec §15.8 订正为一致口径。**推论**:全部块都低于 min_score ⇒ 返回全 0
+(与空证据同一个出口)—— 这是闸的 fail-closed 一侧,
+`test_all_below_min_score_is_exactly_the_empty_evidence_result` 钉着它。
 
 ⚠️ **阈值不是拍出来的**:`evidence_confidence_threshold` 由
 `scripts/calibrate_evidence.py` 在 `evals/测试集.md` 上标定(spec §4.2)。

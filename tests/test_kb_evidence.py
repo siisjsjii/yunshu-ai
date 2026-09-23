@@ -68,6 +68,23 @@ def test_low_scores_do_not_count_toward_the_count_signal():
     assert noisy == clean
 
 
+def test_all_below_min_score_is_exactly_the_empty_evidence_result():
+    """全部块都低于 evidence_min_score ⇒ **全 0**,且与空证据返回**同一个 dict**。
+
+    这是闸的 **fail-closed 一侧**:一个知识问题检索回来一堆全是噪声的块,
+    闸**必须拦**,而不是因为「最高分还比第二高一点点」就放行。
+    也是「不是证据的块不该影响**任何一个**信号」这条语义的护栏 ——
+    若把过滤那一步去掉(top1/top2 退回取在**全部**分数上),这里会返回一个
+    由噪声分算出的非零置信度,本条立刻变红。
+    """
+    s = _settings()
+    noise = [_c(0.14, i) for i in range(1, 5)]  # 0.14 < evidence_min_score=0.15
+    assert evidence_detail(noise, settings=s) == evidence_detail([], settings=s)
+    assert evidence_detail(noise, settings=s) == {
+        "top1": 0.0, "top2": 0.0, "count": 0, "gap": 0.0, "confidence": 0.0,
+    }
+
+
 def test_confidence_is_always_in_unit_interval():
     s = _settings()
     assert 0.0 <= evidence_confidence([_c(1.0, i) for i in range(10)], settings=s) <= 1.0
