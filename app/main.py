@@ -13,6 +13,7 @@ from app.api.extract import router as extract_router
 from app.api.feedback import router as feedback_router
 from app.api.kb import router as kb_router
 from app.api.refund import router as refund_router
+from app.api.review import router as review_router
 from app.config import get_settings
 from app.logging_setup import setup_logging
 from app.memory import budget
@@ -122,6 +123,10 @@ app.include_router(conversations_router)
 # ch09 用户反馈落池(飞轮入口 ③)。同样**必须在 `mount("/")` 之前** ——
 # 不注册时它不会 404 而是 **405**:静态目录的 catch-all 只放行 GET/HEAD。
 app.include_router(feedback_router)
+# ch09 待审队列的人工审核端点(`app/api/review.py`)。同样**必须在 `mount("/")`
+# 之前** —— 与上面两处同理(不注册时 POST 会得到 405、GET 得到 404,
+# 而静态目录的 catch-all 只放行 GET/HEAD)。
+app.include_router(review_router)
 
 # 静态页必须**最后**挂:mount("/") 会接管根路径,先挂会抢走 /api/*。
 _static_dir = Path(__file__).parent / "static"
