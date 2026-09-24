@@ -1,0 +1,156 @@
+基准输出(未变异)sha256 前 12 位:e3f0a3bcbd49
+===== 评估趋势 =====
+（↑/↓ = 相对上一轮的增减;第 1 轮没有可比对象、不打箭头。**条数或 top_k 与上一轮不同的两轮标「不可比」并整行不打箭头** —— 分母不同的两个分数之间的差不是「变化」。）
+轮次  时间                 条数    纯dense                    纯BM25                     混合(RRF)                  混合+Rerank              
+  1   2026-09-24 21:03:00  300     recall@10=0.747 mrr=0.652  recall@10=0.710 mrr=0.587  recall@10=0.747 mrr=0.634  recall@10=0.747 mrr=0.671
+  2   2026-09-24 21:15:00  300     recall@10=0.740 mrr=0.650  recall@10=0.710 mrr=0.587  recall@10=0.700 mrr=0.655  recall@10=0.747 mrr=0.671
+                                   ↓ -0.007        ↓ -0.002   = 0.000         = 0.000    ↓ -0.047        ↑ +0.021   = 0.000         = 0.000  
+  3   2026-09-24 21:22:00  300     recall@10=0.730 mrr=0.640  recall@10=0.700 mrr=0.580  recall@10=0.690 mrr=0.640  recall@10=0.740 mrr=0.660
+                                   ≠ 与上一轮不可比（top_k 10→5）:本条不打印增减
+  4   2026-09-24 21:31:00  5       recall@10=1.000 mrr=0.900  recall@10=1.000 mrr=0.850  recall@10=1.000 mrr=0.767  -                        
+                                   ≠ 与上一轮不可比（条数 300→5）:本条不打印增减
+  5   2026-09-24 21:40:00  5       recall@10=0.800 mrr=0.700  recall@10=1.000 mrr=0.850  recall@10=1.000 mrr=0.700  -                        
+                                   ↓ -0.200        ↓ -0.200   = 0.000         = 0.000    = 0.000         ↓ -0.067   -                        
+
+==============================================================================
+### M1 顶层 case_count 取全量而不是实际跑的那批
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________ test_eval_run_row_carries_case_count_separately _______________
+
+    @pytest.mark.anyio
+    async def test_eval_run_row_carries_case_count_separately():
+        """`--limit 5` 那一轮:两处 `case_count` 都是**实际**条数,不是全量条数。"""
+        full = run_eval.load_cases()
+        # 自检:全量条数必须 ≠ LIMIT。相等的话「记实际条数」与「记全量」读数相同,
+        # 这条断言就变成恒真 —— 它守护的性质当场消失(本仓形态 ⑤)。
+        assert len(full) > LIMIT, (
+            f"评估集只有 {len(full)} 条,与 LIMIT={LIMIT} 区分不开 —— "
+            "请把 LIMIT 调小,否则这条用例没有判别力"
+        )
+        cases = run_eval.select_cases(full, LIMIT)
+        assert len(cases) == LIMIT
+    
+        await run_eval.run_round(cases, TOP_K, _ctx(), trigger_by=PROBE_TRIGGER)
+    
+        rows = await _probe_rows()
+        assert len(rows) == 1, "一轮评估应该正好落一行"
+        row = rows[0]
+        # 顶层那一列(H3:记 5 而不是 300)
+>       assert row.case_count == LIMIT
+E       assert 300 == 5
+E        +  where 300 = <app.db.models.EvalRun object at 0x0000020445AEC190>.case_count
+
+tests\test_eval_runs_write.py:140: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+纯dense 完成(耗时 0.0s)
+纯BM25 完成(耗时 0.0s)
+混合(RRF) 完成(耗时 0.0s)
+⚠ 混合+Rerank:权重未就绪,跳过
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+1 failed in 4.22s
+
+
+### 判定: RED(用例红了)
+==============================================================================
+### M2 metrics 里的 case_count 取全量
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________ test_eval_run_row_carries_case_count_separately _______________
+
+    @pytest.mark.anyio
+    async def test_eval_run_row_carries_case_count_separately():
+        """`--limit 5` 那一轮:两处 `case_count` 都是**实际**条数,不是全量条数。"""
+        full = run_eval.load_cases()
+        # 自检:全量条数必须 ≠ LIMIT。相等的话「记实际条数」与「记全量」读数相同,
+        # 这条断言就变成恒真 —— 它守护的性质当场消失(本仓形态 ⑤)。
+        assert len(full) > LIMIT, (
+            f"评估集只有 {len(full)} 条,与 LIMIT={LIMIT} 区分不开 —— "
+            "请把 LIMIT 调小,否则这条用例没有判别力"
+        )
+        cases = run_eval.select_cases(full, LIMIT)
+        assert len(cases) == LIMIT
+    
+        await run_eval.run_round(cases, TOP_K, _ctx(), trigger_by=PROBE_TRIGGER)
+    
+        rows = await _probe_rows()
+        assert len(rows) == 1, "一轮评估应该正好落一行"
+        row = rows[0]
+        # 顶层那一列(H3:记 5 而不是 300)
+        assert row.case_count == LIMIT
+        assert row.case_count != len(full)
+        # R4:`metrics` 是「现有 latest.json 的内容原样进、外面包一层」——
+        # 所以 `case_count` 在这里**也有**一份,而且与顶层同值。
+>       assert row.metrics["case_count"] == LIMIT
+E       assert 300 == 5
+
+tests\test_eval_runs_write.py:144: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+纯dense 完成(耗时 0.0s)
+纯BM25 完成(耗时 0.0s)
+混合(RRF) 完成(耗时 0.0s)
+⚠ 混合+Rerank:权重未就绪,跳过
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+1 failed in 4.37s
+
+
+### 判定: RED(用例红了)
+==============================================================================
+### M3 先落库、再评估(半途而废的一轮被记成完整的一轮)
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________________ test_failed_round_writes_no_row _______________________
+
+    @pytest.mark.anyio
+    async def test_failed_round_writes_no_row():
+        """评估半途炸掉 ⇒ **一行都不写**:写库在评估**之后**,顺序是承重的。"""
+        cases = run_eval.select_cases(run_eval.load_cases(), LIMIT)
+    
+        with pytest.raises(ToolInfrastructureError):
+            await run_eval.run_round(cases, TOP_K, _ctx(store=_DeadStore()),
+                                     trigger_by=PROBE_TRIGGER)
+    
+>       assert await _probe_rows() == [], (
+            "评估在第一个策略就抛了,却仍然落下了一行 —— "
+            "趋势表会把这一轮当成一次**完整**的评估"
+        )
+E       AssertionError: 评估在第一个策略就抛了,却仍然落下了一行 —— 趋势表会把这一轮当成一次**完整**的评估
+E       assert [<app.db.mode...01D807DCC050>] == []
+E         
+E         Left contains one more item: <app.db.models.EvalRun object at 0x000001D807DCC050>
+E         Use -v to get more diff
+
+tests\test_eval_runs_write.py:159: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_failed_round_writes_no_row - Asser...
+1 failed in 4.78s
+
+
+### 判定: RED(用例红了)
+==============================================================================
+### M4 差值符号取反(表上两个数字手算与箭头对不上)
+锚点命中数 = 1(必须恰好 1)
+===== 评估趋势 =====
+（↑/↓ = 相对上一轮的增减;第 1 轮没有可比对象、不打箭头。**条数或 top_k 与上一轮不同的两轮标「不可比」并整行不打箭头** —— 分母不同的两个分数之间的差不是「变化」。）
+轮次  时间                 条数    纯dense                    纯BM25                     混合(RRF)                  混合+Rerank              
+  1   2026-09-24 21:03:00  300     recall@10=0.747 mrr=0.652  recall@10=0.710 mrr=0.587  recall@10=0.747 mrr=0.634  recall@10=0.747 mrr=0.671
+  2   2026-09-24 21:15:00  300     recall@10=0.740 mrr=0.650  recall@10=0.710 mrr=0.587  recall@10=0.700 mrr=0.655  recall@10=0.747 mrr=0.671
+                                   ↓ +0.007        ↓ +0.002   = 0.000         = 0.000    ↓ +0.047        ↑ -0.021   = 0.000         = 0.000  
+  3   2026-09-24 21:22:00  300     recall@10=0.730 mrr=0.640  recall@10=0.700 mrr=0.580  recall@10=0.690 mrr=0.640  recall@10=0.740 mrr=0.660
+                                   ≠ 与上一轮不可比（top_k 10→5）:本条不打印增减
+  4   2026-09-24 21:31:00  5       recall@10=1.000 mrr=0.900  recall@10=1.000 mrr=0.850  recall@10=1.000 mrr=0.767  -                        
+                                   ≠ 与上一轮不可比（条数 300→5）:本条不打印增减
+  5   2026-09-24 21:40:00  5       recall@10=0.800 mrr=0.700  recall@10=1.000 mrr=0.850  recall@10=1.000 mrr=0.700  -                        
+                                   ↓ +0.200        ↓ +0.200   = 0.000         = 0.000    = 0.000         ↓ +0.067   -                        
+
+
+### 判定: 输出变了

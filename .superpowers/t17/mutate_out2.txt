@@ -1,0 +1,257 @@
+=== 变异前的基线(两条用例文件各自先跑一遍,确认全绿)===
+tests/test_eval_runs_write.py: ['2 passed in 2.66s']  returncode=0
+tests/test_eval_trend.py: ['7 passed in 2.79s']  returncode=0
+==============================================================================
+### M1 顶层 case_count 取全量而不是实际跑的那批
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________ test_eval_run_row_carries_case_count_separately _______________
+
+    @pytest.mark.anyio
+    async def test_eval_run_row_carries_case_count_separately():
+        """`--limit 5` 那一轮:两处 `case_count` 都是**实际**条数,不是全量条数。"""
+        full = run_eval.load_cases()
+        # 自检:全量条数必须 ≠ LIMIT。相等的话「记实际条数」与「记全量」读数相同,
+        # 这条断言就变成恒真 —— 它守护的性质当场消失(本仓形态 ⑤)。
+        assert len(full) > LIMIT, (
+            f"评估集只有 {len(full)} 条,与 LIMIT={LIMIT} 区分不开 —— "
+            "请把 LIMIT 调小,否则这条用例没有判别力"
+        )
+        cases = run_eval.select_cases(full, LIMIT)
+        assert len(cases) == LIMIT
+    
+        await run_eval.run_round(cases, TOP_K, _ctx(), trigger_by=PROBE_TRIGGER)
+    
+        rows = await _probe_rows()
+        assert len(rows) == 1, "一轮评估应该正好落一行"
+        row = rows[0]
+        # 顶层那一列(H3:记 5 而不是 300)
+>       assert row.case_count == LIMIT
+E       assert 300 == 5
+E        +  where 300 = <app.db.models.EvalRun object at 0x000001CB8DFE0190>.case_count
+
+tests\test_eval_runs_write.py:140: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+纯dense 完成(耗时 0.0s)
+纯BM25 完成(耗时 0.0s)
+混合(RRF) 完成(耗时 0.0s)
+⚠ 混合+Rerank:权重未就绪,跳过
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+1 failed in 4.54s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+==============================================================================
+### M2 metrics 里的 case_count 取全量
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________ test_eval_run_row_carries_case_count_separately _______________
+
+    @pytest.mark.anyio
+    async def test_eval_run_row_carries_case_count_separately():
+        """`--limit 5` 那一轮:两处 `case_count` 都是**实际**条数,不是全量条数。"""
+        full = run_eval.load_cases()
+        # 自检:全量条数必须 ≠ LIMIT。相等的话「记实际条数」与「记全量」读数相同,
+        # 这条断言就变成恒真 —— 它守护的性质当场消失(本仓形态 ⑤)。
+        assert len(full) > LIMIT, (
+            f"评估集只有 {len(full)} 条,与 LIMIT={LIMIT} 区分不开 —— "
+            "请把 LIMIT 调小,否则这条用例没有判别力"
+        )
+        cases = run_eval.select_cases(full, LIMIT)
+        assert len(cases) == LIMIT
+    
+        await run_eval.run_round(cases, TOP_K, _ctx(), trigger_by=PROBE_TRIGGER)
+    
+        rows = await _probe_rows()
+        assert len(rows) == 1, "一轮评估应该正好落一行"
+        row = rows[0]
+        # 顶层那一列(H3:记 5 而不是 300)
+        assert row.case_count == LIMIT
+        assert row.case_count != len(full)
+        # R4:`metrics` 是「现有 latest.json 的内容原样进、外面包一层」——
+        # 所以 `case_count` 在这里**也有**一份,而且与顶层同值。
+>       assert row.metrics["case_count"] == LIMIT
+E       assert 300 == 5
+
+tests\test_eval_runs_write.py:144: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+纯dense 完成(耗时 0.0s)
+纯BM25 完成(耗时 0.0s)
+混合(RRF) 完成(耗时 0.0s)
+⚠ 混合+Rerank:权重未就绪,跳过
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+1 failed in 4.52s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_runs_write.py::test_eval_run_row_carries_case_count_separately
+==============================================================================
+### M3 先落库、再评估(半途而废的一轮被记成完整的一轮)
+锚点命中数 = 1(必须恰好 1)
+F                                                                        [100%]
+================================== FAILURES ===================================
+_______________________ test_failed_round_writes_no_row _______________________
+
+    @pytest.mark.anyio
+    async def test_failed_round_writes_no_row():
+        """评估半途炸掉 ⇒ **一行都不写**:写库在评估**之后**,顺序是承重的。"""
+        cases = run_eval.select_cases(run_eval.load_cases(), LIMIT)
+    
+        with pytest.raises(ToolInfrastructureError):
+            await run_eval.run_round(cases, TOP_K, _ctx(store=_DeadStore()),
+                                     trigger_by=PROBE_TRIGGER)
+    
+>       assert await _probe_rows() == [], (
+            "评估在第一个策略就抛了,却仍然落下了一行 —— "
+            "趋势表会把这一轮当成一次**完整**的评估"
+        )
+E       AssertionError: 评估在第一个策略就抛了,却仍然落下了一行 —— 趋势表会把这一轮当成一次**完整**的评估
+E       assert [<app.db.mode...01DDA6C28050>] == []
+E         
+E         Left contains one more item: <app.db.models.EvalRun object at 0x000001DDA6C28050>
+E         Use -v to get more diff
+
+tests\test_eval_runs_write.py:159: AssertionError
+---------------------------- Captured stdout call -----------------------------
+嵌入 5 条 query…
+=========================== short test summary info ===========================
+FAILED tests/test_eval_runs_write.py::test_failed_round_writes_no_row - Asser...
+1 failed in 4.26s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_runs_write.py::test_failed_round_writes_no_row - Asser...
+==============================================================================
+### M4 差值符号取反(表上两个数字手算与箭头对不上)
+锚点命中数 = 1(必须恰好 1)
+..F....                                                                  [100%]
+================================== FAILURES ===================================
+_________________ test_comparable_rounds_print_signed_deltas __________________
+
+    def test_comparable_rounds_print_signed_deltas():
+        """同规模、同 `top_k` ⇒ 该出正确的符号与**具体的数值**(手算可复核)。"""
+        lines = render([
+            _view(1, _strategies(**BASE), minute=3),
+            _view(2, _strategies(**NEXT), minute=15),
+        ])
+        body = _body(lines)
+    
+        # 头条的差值行:紧跟在第 2 轮那一行的后面
+        row2 = next(i for i, ln in enumerate(body) if ln.strip().startswith("2   2026"))
+        delta = body[row2 + 1]
+>       assert "↓ -0.020" in delta, f"纯dense 的头条 recall@10 应掉 0.020:{delta!r}"
+E       AssertionError: 纯dense 的头条 recall@10 应掉 0.020:'                                   ↓ +0.020        ↓ +0.020   ↑ -0.010        = 0.000  '
+E       assert '↓ -0.020' in '                                   ↓ +0.020        ↓ +0.020   ↑ -0.010        = 0.000  '
+
+tests\test_eval_trend.py:127: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_eval_trend.py::test_comparable_rounds_print_signed_deltas
+1 failed, 6 passed in 4.41s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_trend.py::test_comparable_rounds_print_signed_deltas
+==============================================================================
+### M5 删掉「不可比」分支(不同规模的轮次之间照样打箭头)
+锚点命中数 = 1(必须恰好 1)
+...FF..                                                                  [100%]
+================================== FAILURES ===================================
+__________ test_incomparable_case_count_prints_marker_and_no_arrows ___________
+
+    def test_incomparable_case_count_prints_marker_and_no_arrows():
+        """条数不同 ⇒ 打 `≠` 且**整个 body 里一个箭头都没有**。"""
+        lines = render([
+            _view(1, _strategies(**BASE), case_count=300, minute=3),
+            _view(2, _strategies(**NEXT), case_count=60, minute=15),
+        ])
+        body = _body(lines)
+>       assert any("≠ 与上一轮不可比" in ln and "条数 300→60" in ln for ln in body)
+E       assert False
+E        +  where False = any(<generator object test_incomparable_case_count_prints_marker_and_no_arrows.<locals>.<genexpr> at 0x0000029ED7D96B50>)
+
+tests\test_eval_trend.py:144: AssertionError
+_____________ test_incomparable_top_k_prints_marker_and_no_arrows _____________
+
+    def test_incomparable_top_k_prints_marker_and_no_arrows():
+        """条数一样但 `top_k` 变了 ⇒ 一样判不可比(recall@10 的定义变了)。"""
+        lines = render([
+            _view(1, _strategies(**BASE), top_k=10, minute=3),
+            _view(2, _strategies(**NEXT), top_k=5, minute=15),
+        ])
+        body = _body(lines)
+>       assert any("≠ 与上一轮不可比" in ln and "top_k 10→5" in ln for ln in body)
+E       assert False
+E        +  where False = any(<generator object test_incomparable_top_k_prints_marker_and_no_arrows.<locals>.<genexpr> at 0x0000029ED7D97D30>)
+
+tests\test_eval_trend.py:156: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_eval_trend.py::test_incomparable_case_count_prints_marker_and_no_arrows
+FAILED tests/test_eval_trend.py::test_incomparable_top_k_prints_marker_and_no_arrows
+2 failed, 5 passed in 4.66s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_trend.py::test_incomparable_case_count_prints_marker_and_no_arrows
+     FAILED tests/test_eval_trend.py::test_incomparable_top_k_prints_marker_and_no_arrows
+==============================================================================
+### M6 分桶表不再默认渲染(只剩一个可选开关背后的东西)
+锚点命中数 = 1(必须恰好 1)
+..F...F                                                                  [100%]
+================================== FAILURES ===================================
+_________________ test_comparable_rounds_print_signed_deltas __________________
+
+    def test_comparable_rounds_print_signed_deltas():
+        """同规模、同 `top_k` ⇒ 该出正确的符号与**具体的数值**(手算可复核)。"""
+        lines = render([
+            _view(1, _strategies(**BASE), minute=3),
+            _view(2, _strategies(**NEXT), minute=15),
+        ])
+        body = _body(lines)
+    
+        # 头条的差值行:紧跟在第 2 轮那一行的后面
+        row2 = next(i for i, ln in enumerate(body) if ln.strip().startswith("2   2026"))
+        delta = body[row2 + 1]
+        assert "↓ -0.020" in delta, f"纯dense 的头条 recall@10 应掉 0.020:{delta!r}"
+        assert "↑ +0.010" in delta, f"纯BM25 的头条 recall@10 应涨 0.010:{delta!r}"
+    
+        # 分桶表:差值内联在同一格里(0.700 相对 0.800 ⇒ ↓ -0.100)
+>       assert any(re.search(r"0\.700 ↓ -0\.100", ln) for ln in body), \
+            "分桶表里 A_policy 的 dense recall@10 该内联 ↓ -0.100"
+E       AssertionError: 分桶表里 A_policy 的 dense recall@10 该内联 ↓ -0.100
+E       assert False
+E        +  where False = any(<generator object test_comparable_rounds_print_signed_deltas.<locals>.<genexpr> at 0x000001ECA604A880>)
+
+tests\test_eval_trend.py:131: AssertionError
+__________ test_bucket_view_is_on_by_default_and_shows_the_dilution ___________
+
+    def test_bucket_view_is_on_by_default_and_shows_the_dilution():
+        """**分桶表默认就打**(不是藏在开关后面)—— 且它把头条值被稀释那件事摆出来。
+    
+        纯dense 的头条 recall@10 = 0.740,而 A_policy 那一格是 0.800;
+        `D_absent`(n=60,占 1/5)的分桶值是 0.000 ⇒ 它把头条值往下拉。
+        """
+        lines = render([_view(1, _strategies(纯dense=BASE["纯dense"]))])
+        body = _body(lines)
+>       assert any(ln.startswith("---- 按桶 · recall@10 ----") for ln in lines)
+E       assert False
+E        +  where False = any(<generator object test_bucket_view_is_on_by_default_and_shows_the_dilution.<locals>.<genexpr> at 0x000001ECA602B780>)
+
+tests\test_eval_trend.py:189: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_eval_trend.py::test_comparable_rounds_print_signed_deltas
+FAILED tests/test_eval_trend.py::test_bucket_view_is_on_by_default_and_shows_the_dilution
+2 failed, 5 passed in 4.01s
+
+
+### 判定: RED(用例红了)
+     FAILED tests/test_eval_trend.py::test_comparable_rounds_print_signed_deltas
+     FAILED tests/test_eval_trend.py::test_bucket_view_is_on_by_default_and_shows_the_dilution
+==============================================================================
+sha256(scripts/eval_trend.py) = a9275f3086ea

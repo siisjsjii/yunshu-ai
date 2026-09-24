@@ -1,5 +1,13 @@
 """四策略检索评估:纯 dense / 纯 BM25 / 混合(RRF) / 混合+Rerank。
 
+前置(与 ch07/ch08 的脚本同款):**MySQL 里必须有 `eval_runs` 表** ——
+`scripts/init_db.py` 跑过(全新库),或者 `db/ch09.sql` 应用过(老库升级)。
+⚠️ **漏了它,失败点在最后一步、而且看起来像「跑成功了」**:全量 300 条跑一两分钟、
+`latest.json` 写完、对照表打完,然后在插 `eval_runs` 时抛 `ProgrammingError(1146)` ——
+一次**实际成功**的评估拿到非零退出码。这里**刻意不改成「只警告不报错」**:
+半途而废的一轮不许被记成一条完整的评估(spec §10.2),
+所以宁可在最后响亮地炸。检查:`SHOW TABLES LIKE 'eval_runs';`
+
 用法:
     .venv/Scripts/python.exe scripts/run_eval.py
     .venv/Scripts/python.exe scripts/run_eval.py --top-k 10

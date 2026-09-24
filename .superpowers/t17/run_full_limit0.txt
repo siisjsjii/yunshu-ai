@@ -1,0 +1,43 @@
+åµŒå…¥ 300 æ¡ queryâ€¦
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 391/391 [00:00<00:00, 14010.64it/s]
+pre tokenize:   0%|          | 0/19 [00:00<?, ?it/s]pre tokenize: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 19/19 [00:00<00:00, 854.81it/s]
+Inference Embeddings:   0%|          | 0/19 [00:00<?, ?it/s]Inference Embeddings:   5%|¨„         | 1/19 [00:00<00:02,  8.74it/s]Inference Embeddings:  11%|¨€         | 2/19 [00:00<00:01,  9.05it/s]Inference Embeddings:  16%|¨€¨„        | 3/19 [00:00<00:01,  8.96it/s]Inference Embeddings:  21%|¨€¨€        | 4/19 [00:00<00:01,  8.90it/s]Inference Embeddings:  26%|¨€¨€¨ƒ       | 5/19 [00:00<00:01,  9.17it/s]Inference Embeddings:  37%|¨€¨€¨€¨ƒ      | 7/19 [00:00<00:01,  9.60it/s]Inference Embeddings:  47%|¨€¨€¨€¨€¨ƒ     | 9/19 [00:00<00:01,  9.82it/s]Inference Embeddings:  58%|¨€¨€¨€¨€¨€¨‚    | 11/19 [00:01<00:00, 10.20it/s]Inference Embeddings:  68%|¨€¨€¨€¨€¨€¨€¨‚   | 13/19 [00:01<00:00, 10.33it/s]Inference Embeddings:  79%|¨€¨€¨€¨€¨€¨€¨€¨  | 15/19 [00:01<00:00, 11.90it/s]Inference Embeddings:  89%|¨€¨€¨€¨€¨€¨€¨€¨€¨ | 17/19 [00:01<00:00, 12.89it/s]Inference Embeddings: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 19/19 [00:01<00:00, 13.97it/s]Inference Embeddings: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 19/19 [00:01<00:00, 11.29it/s]
+çº¯dense å®Œæˆ(è€—æ—¶ 1.1s)
+çº¯BM25 å®Œæˆ(è€—æ—¶ 1.0s)
+æ··åˆ(RRF) å®Œæˆ(è€—æ—¶ 1.0s)
+Loading weights:   0%|          | 0/393 [00:00<?, ?it/s]Loading weights:   9%|¨         | 35/393 [00:00<00:01, 286.44it/s]Loading weights:  16%|¨€¨ƒ        | 64/393 [00:00<00:01, 249.99it/s]Loading weights:  23%|¨€¨€¨†       | 90/393 [00:00<00:01, 252.35it/s]Loading weights:  30%|¨€¨€¨       | 116/393 [00:00<00:01, 220.37it/s]Loading weights:  43%|¨€¨€¨€¨€¨†     | 169/393 [00:00<00:00, 290.26it/s]Loading weights:  51%|¨€¨€¨€¨€¨€     | 199/393 [00:00<00:00, 259.30it/s]Loading weights:  58%|¨€¨€¨€¨€¨€¨‚    | 228/393 [00:00<00:00, 263.87it/s]Loading weights:  66%|¨€¨€¨€¨€¨€¨€¨„   | 259/393 [00:00<00:00, 272.69it/s]Loading weights:  73%|¨€¨€¨€¨€¨€¨€¨€¨†  | 287/393 [00:01<00:00, 256.40it/s]Loading weights:  80%|¨€¨€¨€¨€¨€¨€¨€¨€  | 315/393 [00:01<00:00, 252.56it/s]Loading weights:  87%|¨€¨€¨€¨€¨€¨€¨€¨€¨ƒ | 341/393 [00:01<00:00, 204.74it/s]Loading weights: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 393/393 [00:01<00:00, 273.39it/s]
+æ··åˆ+Rerank å®Œæˆ(è€—æ—¶ 74.4s)
+
+ç»“æœå†™å…¥ D:\agent\MewHelp-develop\evals\results\latest.json
+
+===== Recall@10 / MRR / ç½®ä¿¡åº¦ å¯¹ç…§(æŒ‰æ¡¶)=====
+
+ã€A_policyã€‘
+  çº¯dense       recall@10=0.817 mrr=0.747 conf=0.720 åº”ç­”æ­£ç¡®=0.817
+  çº¯BM25        recall@10=0.817 mrr=0.701 conf=0.016 åº”ç­”æ­£ç¡®=0.817
+  æ··åˆ(RRF)      recall@10=0.817 mrr=0.724 conf=0.033 åº”ç­”æ­£ç¡®=0.817
+  æ··åˆ+Rerank    recall@10=0.817 mrr=0.728 conf=0.711 åº”ç­”æ­£ç¡®=0.817
+
+ã€B_modelã€‘
+  çº¯dense       recall@10=1.000 mrr=0.924 conf=0.678 åº”ç­”æ­£ç¡®=1.000
+  çº¯BM25        recall@10=1.000 mrr=0.992 conf=0.016 åº”ç­”æ­£ç¡®=1.000
+  æ··åˆ(RRF)      recall@10=1.000 mrr=0.967 conf=0.033 åº”ç­”æ­£ç¡®=1.000
+  æ··åˆ+Rerank    recall@10=1.000 mrr=0.992 conf=0.922 åº”ç­”æ­£ç¡®=1.000
+
+ã€C_colloquialã€‘
+  çº¯dense       recall@10=0.933 mrr=0.759 conf=0.667 åº”ç­”æ­£ç¡®=0.933
+  çº¯BM25        recall@10=0.750 mrr=0.463 conf=0.016 åº”ç­”æ­£ç¡®=0.750
+  æ··åˆ(RRF)      recall@10=0.917 mrr=0.655 conf=0.031 åº”ç­”æ­£ç¡®=0.917
+  æ··åˆ+Rerank    recall@10=0.917 mrr=0.823 conf=0.456 åº”ç­”æ­£ç¡®=0.917
+
+ã€D_absentã€‘
+  çº¯dense       recall@10=0.000 mrr=0.000 conf=0.561 åº”ç­”æ­£ç¡®=1.000
+  çº¯BM25        recall@10=0.000 mrr=0.000 conf=0.016 åº”ç­”æ­£ç¡®=1.000
+  æ··åˆ(RRF)      recall@10=0.000 mrr=0.000 conf=0.030 åº”ç­”æ­£ç¡®=1.000
+  æ··åˆ+Rerank    recall@10=0.000 mrr=0.000 conf=0.070 åº”ç­”æ­£ç¡®=1.000
+
+ã€E_multiã€‘
+  çº¯dense       recall@10=0.983 mrr=0.830 conf=0.710 åº”ç­”æ­£ç¡®=0.983
+  çº¯BM25        recall@10=0.983 mrr=0.779 conf=0.016 åº”ç­”æ­£ç¡®=0.983
+  æ··åˆ(RRF)      recall@10=1.000 mrr=0.822 conf=0.033 åº”ç­”æ­£ç¡®=1.000
+  æ··åˆ+Rerank    recall@10=1.000 mrr=0.814 conf=0.687 åº”ç­”æ­£ç¡®=1.000
