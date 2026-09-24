@@ -22,24 +22,47 @@ MUTANTS = [
         "args": ["tests/test_llm.py", "-m", "not db", "-k", "timeout or silent"],
     },
     {
+        # ⚠️ 这条锚点**改过一次**:fix round 1 之前它锚的是一整块
+        # `try/except TimeoutError` 旧代码,那次改动之后命中数掉成 0 ——
+        # 脚本当场报 `!!! 锚点没打上/打重了` 并**拒绝计数**(本仓记过的
+        # 「变异后没红有两个互斥解释」那条规矩,靠的就是这个断言)。
+        # 换成单行锚点:`asyncio.timeout(None)` 就是「不设上界」。
         "name": "M2 拿掉飞轮的寿命上界 ⇒ 卡住的任务不再有出口",
         "file": ROOT / "app" / "flywheel" / "tasks.py",
+        "old": "                timeout_cm = asyncio.timeout(settings.flywheel_job_timeout_seconds)\n",
+        "new": "                timeout_cm = asyncio.timeout(None)  # MUTANT: 寿命上界被拿掉\n",
+        "args": ["tests/test_flywheel_task.py", "-m", "not db",
+                 "-k", "is_killed_by_the_deadline"],
+    },
+    {
+        "name": "M3(fix round 1 / F1)拿掉「把死线原因抢回来」那层守卫",
+        "file": ROOT / "app" / "flywheel" / "tasks.py",
         "old": (
-            "            try:\n"
-            "                async with asyncio.timeout(settings.flywheel_job_timeout_seconds):\n"
-            "                    result = await run_flywheel(\n"
-            "                        session=session, model=model,\n"
-            "                        batch_size=settings.flywheel_batch_size)\n"
-            "            except TimeoutError as exc:\n"
+            "            if deadline_hit and not isinstance(exc, FlywheelDeadlineExceeded):\n"
             "                raise FlywheelDeadlineExceeded(\n"
             "                    limit=settings.flywheel_job_timeout_seconds) from exc\n"
+            "            raise\n"
         ),
-        "new": (
-            "            result = await run_flywheel(  # MUTANT: 拿掉寿命上界\n"
-            "                session=session, model=model,\n"
-            "                batch_size=settings.flywheel_batch_size)\n"
+        "new": "            raise  # MUTANT: 死线那句话不再被抢回来\n",
+        "args": ["tests/test_flywheel_task.py", "-m", "not db", "-k", "survives"],
+    },
+    {
+        "name": "M4(fix round 1)拿掉 `expired()` 收窄",
+        "file": ROOT / "app" / "flywheel" / "tasks.py",
+        "old": (
+            "                    if not timeout_cm.expired():\n"
+            "                        raise\n"
+            "                    deadline_hit = True\n"
         ),
-        "args": ["tests/test_flywheel_task.py", "-m", "not db", "-k", "deadline"],
+        "new": "                    deadline_hit = True  # MUTANT: 归因不再收窄\n",
+        "args": ["tests/test_flywheel_task.py", "-m", "not db", "-k", "inner_timeout"],
+    },
+    {
+        "name": "M5(fix round 1)文案回到 `:.0f`",
+        "file": ROOT / "app" / "flywheel" / "tasks.py",
+        "old": 'f"任务超时(上限 {limit:g}s):本轮已放弃。整批一次提交 ⇒ "',
+        "new": 'f"任务超时(上限 {limit:.0f}s):本轮已放弃。整批一次提交 ⇒ "',
+        "args": ["tests/test_flywheel_task.py", "-m", "not db", "-k", "sub_second"],
     },
 ]
 

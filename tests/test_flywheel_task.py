@@ -600,6 +600,13 @@ async def test_a_pipeline_that_never_returns_is_killed_by_the_deadline(
         job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
         assert job_id is not None
         job = await _wait(job_store, job_id, timeout=10.0)
+        # ⚠️ **必须等线程走完再看 message**:终态有**两次写**(协程 `finally` 先落
+        # 「未进终态」这句通用文案 → `_spawn` 的兜底随后才把**真正的原因**补上),
+        # 两次之间隔着一次 `await engine.dispose()`。只等状态就在这个窗口里读,
+        # 于是「原因写在 message 里」这条断言**偶发红** ——
+        # 全量跑那一轮实测到过(`1 failed, 864 passed`,message 是通用那句);
+        # 本文件 `_wait` 的 docstring 早就写过这个陷阱。
+        await _await_thread_gone(job_id)
 
         assert job.status == "failed", (
             f"卡住的流水线必须被寿命上界杀掉,实际停在 {job.status}"
@@ -616,6 +623,143 @@ async def test_a_pipeline_that_never_returns_is_killed_by_the_deadline(
         await _wait(job_store, second, timeout=10.0)
     finally:
         stop.set()      # 修好之前那条线程要能自己退出来,不留活过 monkeypatch 拆卸
+
+
+class _RaisingOnExitSession:
+    """session 替身:**退出时抛**(T16b 复审 F1 的确定性形态)。
+
+    `__exit__` 抛的文案是**逐字**抄本仓 ch08 记过的那段 —— 真库里 session 停在
+    「待回滚」态时,`str()` 就是它(`PendingRollbackError` / `InterfaceError` 同族)。
+    """
+
+    TEXT = (
+        "This Session's transaction has been rolled back due to a previous exception "
+        "during flush. To begin a new transaction with this Session, first issue "
+        "Session.rollback()."
+    )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        raise RuntimeError(self.TEXT)
+
+
+class _RaisingOnExitMaker:
+    def __call__(self):
+        return _RaisingOnExitSession()
+
+
+@pytest.mark.anyio
+async def test_the_deadline_message_survives_a_session_that_raises_on_exit(
+    monkeypatch, job_store, caplog
+):
+    """**死线那句话不许被 session 的退出故障冲掉**(T16b 复审 F1)。
+
+    成因:`async with factory() as session` 退出时自己也会抛(失步连接上的
+    rollback / 连接归还),那时到达 `_spawn` 兜底的就不是 `FlywheelDeadlineExceeded`
+    ——出站到 `JobStore.message` 的会变成**裸的 SQLAlchemy 内部文本**,
+    而死线这句话(操作员唯一的信号)就**没了**。
+
+    ⚠️ **这条守的是一条传播性质,不是「真库上必然发生」**:真 MySQL 上
+    「死线取消一个慢查询」实测**没有**抛(`SELECT SLEEP(8)` + 0.4s 死线,
+    见 `.superpowers/probe_t16b_f1_clobber.py` 的形态 A)。形态 B(session 退出抛)
+    是确定性复现 —— 它证明的是**收尾一旦抛,原因就会被换掉**这件事。
+
+    判据两条**方向相反**,缺一不可:
+    ① 出站 message 里**有**死线那句话;
+    ② 那段 SQLAlchemy 内部文本**不在** message 里 —— 但它**没丢**:它进了
+    `__cause__`(服务日志的 traceback 里看得到)。
+    """
+    stop = threading.Event()
+
+    async def never_returns(*, session, model, batch_size):
+        while not stop.is_set():
+            await asyncio.sleep(0.05)
+        return dict(PIPELINE_RESULT)
+
+    class _NoopEngine:
+        async def dispose(self):
+            return None
+
+    monkeypatch.setattr(
+        tasks, "_fresh_factory", lambda s: (_NoopEngine(), _RaisingOnExitMaker()))
+    monkeypatch.setattr(tasks, "run_flywheel", never_returns)
+    settings = _settings(flywheel_job_timeout_seconds=0.3)
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="app.flywheel.tasks"):
+            job_id = tasks.start_flywheel_job(
+                settings=settings, model_factory=lambda: MODEL)
+            assert job_id is not None
+            job = await _wait(job_store, job_id, timeout=10.0)
+            await _await_thread_gone(job_id)
+    finally:
+        stop.set()
+
+    assert job.status == "failed", f"实际 {job.status}:{job.message}"
+    assert "超时" in (job.message or ""), (
+        f"死线那句话被 session 的退出故障冲掉了 —— 操作员唯一的信号变成"
+        f"别的文本,实际 {job.message!r}"
+    )
+    assert _RaisingOnExitSession.TEXT not in (job.message or ""), (
+        f"裸 SQLAlchemy 内部文本出站了(本仓 ch08 记过的那一类),实际 {job.message!r}"
+    )
+    # 原文没丢:它应该在日志的 `__cause__` 链上(排查靠它)
+    chain = []
+    for rec in caplog.records:
+        if rec.name == "app.flywheel.tasks" and rec.exc_info:
+            cur = rec.exc_info[1]
+            while cur is not None:
+                chain.append(str(cur))
+                cur = cur.__cause__
+    assert any(_RaisingOnExitSession.TEXT in text for text in chain), (
+        f"收尾故障被整个吃掉了 —— 它必须留在服务日志的 cause 链上,实际 {chain}"
+    )
+
+
+@pytest.mark.anyio
+async def test_an_inner_timeout_error_is_not_blamed_on_the_deadline(
+    monkeypatch, job_store
+):
+    """流水线**自己**抛的 `TimeoutError` 不许被贴成「任务超时(上限 300s)」。
+
+    `except TimeoutError` 比那个取消作用域**本身**宽:任何别人的 `TimeoutError`
+    (`wait_for`、某个库自己的超时)都会被归因到这条死线上,而**归因按构造就是错的**
+    —— 操作员读到的是「任务超时」,真因却消失了。收窄靠 `timeout_cm.expired()`
+    (`asyncio.Timeout.expired()`:只有**它自己**放过枪才是 `EXPIRING/EXPIRED`)。
+
+    死线设得**远大于**用例时长(30s),保证它**不会**开火 —— 这样这条用例测的
+    纯粹是归因,不掺时序。
+    """
+    async def inner_boom(*, session, model, batch_size):
+        raise TimeoutError("inner timeout(替身注入:不是死线干的)")
+
+    _patch_fresh_factory(monkeypatch)
+    monkeypatch.setattr(tasks, "run_flywheel", inner_boom)
+    settings = _settings(flywheel_job_timeout_seconds=30.0)
+
+    job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
+    job = await _wait(job_store, job_id, timeout=10.0)
+    await _await_thread_gone(job_id)      # 两次写:理由同上一条
+
+    assert job.status == "failed", f"实际 {job.status}:{job.message}"
+    assert "inner timeout" in (job.message or ""), (
+        f"真正的失败原因必须到达 message,实际 {job.message!r}"
+    )
+    assert "任务超时" not in (job.message or ""), (
+        f"流水线内部的 TimeoutError 被误归因到死线上,实际 {job.message!r}"
+    )
+
+
+def test_the_deadline_message_keeps_sub_second_precision():
+    """亚秒上界不许渲染成「上限 0s」(一条**看起来像配置坏了**的文案)。
+
+    实测来源:探针里 `flywheel_job_timeout_seconds=0.4` 打出的就是
+    `任务超时(上限 0s)…`(见 `.superpowers/probe_f1_clobber_pre.txt`)。
+    """
+    assert "上限 0.5s" in str(tasks.FlywheelDeadlineExceeded(limit=0.5))
+    assert "上限 300s" in str(tasks.FlywheelDeadlineExceeded(limit=300.0))
 
 
 # --------------------------------------------------------------------------

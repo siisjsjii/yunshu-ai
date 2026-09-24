@@ -71,6 +71,21 @@
 而半批落地的中间态会让「哪些算处理过」变得没有判据。所以那条 message 里
 必须把这件事写出来 —— 「消失了」与「被上界杀掉的」在 `GET /api/kb/jobs` 上
 要分得开。
+
+### 死线那句话必须活到最后一手(T16b 复审 F1)
+
+`JobStore.message` 是操作员**唯一**的信号(卡住时它只有一个空串),而
+`async with factory() as session` **退出时自己也会抛** —— 失步连接上的 rollback /
+连接归还会抛 `PendingRollbackError` / `InterfaceError`,它的 `str()` 正是本仓
+ch08 记过的那段**裸 SQLAlchemy 内部文本**。那时到达 `_spawn` 兜底的就不是
+`FlywheelDeadlineExceeded` 了,**出站文案跟着换成那段内部文本,而死线这句话没了**。
+⇒ `_run_flywheel` 里那层 `except BaseException` 会在死线确实放过枪时**把原因抢回来**
+(真正的收尾故障进 `__cause__`,服务日志里照样看得到)。
+
+⚠️ **实测边界(别把这条读成「确认会在真库上发生」)**:真 MySQL 上「死线取消一个慢查询」
+那条路**没有**抛(`SELECT SLEEP(8)` + 0.4s 死线);这条守卫挡的是**收尾抛**那一类。
+确定性复现是「`__aexit__` 会抛的 session」,见
+`.superpowers/probe_t16b_f1_clobber.py`(两种形态都在那份输出里)。
 """
 
 import asyncio
@@ -106,8 +121,10 @@ class FlywheelDeadlineExceeded(RuntimeError):
     """
 
     def __init__(self, *, limit: float) -> None:
+        # `:g` 而不是 `:.0f` —— 亚秒配置(测试里就是 0.3/0.5)在 `:.0f` 下会渲染成
+        # 「上限 0s」,一条**看起来像配置坏了**的文案(实测见过)。
         super().__init__(
-            f"任务超时(上限 {limit:.0f}s):本轮已放弃。整批一次提交 ⇒ "
+            f"任务超时(上限 {limit:g}s):本轮已放弃。整批一次提交 ⇒ "
             f"这一批一行都没落地,池子里的行仍在(下一轮会重新吃到)"
         )
 
@@ -195,32 +212,63 @@ def _fresh_factory(settings):
 
 async def _run_flywheel(job_store: JobStore, job_id: str, settings, model_factory) -> None:
     engine, factory = _fresh_factory(settings)
+    #: 死线是不是**本函数自己**放的那一枪。见下面那层 `except BaseException`。
+    deadline_hit = False
     try:
         # 模型在**后台线程里**才建(`start_flywheel_job` 那三处是 fire-and-forget
         # 调它,调用方是用户请求的那条线程 —— 那边一毫秒都不该花在建模型上)。
         model = model_factory()
-        async with factory() as session:
-            # 寿命上界(模块 docstring 第四条出口)。**只包住流水线**:
-            # 终态的写入与 `engine.dispose()` 必须在它**外面** —— 被上界杀掉时
-            # 那两步更要做完(否则槽照样占死,那就等于没修)。
+        try:
+            async with factory() as session:
+                # 寿命上界(模块 docstring 第四条出口)。**只包住流水线**:
+                # 终态的写入与 `engine.dispose()` 必须在它**外面** —— 被上界杀掉时
+                # 那两步更要做完(否则槽照样占死,那就等于没修)。
+                #
+                # ⚠️ `except` 写在 `async with timeout_cm` 的**外面**(用 try 包住
+                # 整个 with 块):`TimeoutError` 是那个 CM 在 `__aexit__` 里抛的,
+                # 写在里面会连它自己的取消转换一起吞掉(`uncancel` 也对不上)。
+                timeout_cm = asyncio.timeout(settings.flywheel_job_timeout_seconds)
+                try:
+                    async with timeout_cm:
+                        result = await run_flywheel(
+                            session=session, model=model,
+                            batch_size=settings.flywheel_batch_size)
+                except TimeoutError as exc:
+                    # ⚠️ **必须用 `expired()` 收窄**:`except TimeoutError` 比这个
+                    # 取消作用域**本身**宽 —— 流水线内部任何一个 `TimeoutError`
+                    # (别人的 `wait_for`、某个库自己的超时)原本会被贴成
+                    # 「任务超时(上限 300s)」,归因按构造就是错的。今天它潜伏
+                    # (openai 会把读超时包成 `APITimeoutError`,不是内置 `TimeoutError`),
+                    # 但错的那一天没人看得出来。
+                    if not timeout_cm.expired():
+                        raise
+                    deadline_hit = True
+                    raise FlywheelDeadlineExceeded(
+                        limit=settings.flywheel_job_timeout_seconds) from exc
+            job_store.update(
+                job_id, status="done",
+                message=(f"处理 {result['processed']} 行:"
+                         f"归并 {result['merged']}、新建 {result['created']}、"
+                         f"失败 {result['failed']}"),
+                result=result)
+        except BaseException as exc:  # noqa: BLE001 —— CancelledError 是 BaseException
+            # ⚠️ **死线那句话不许被冲掉**(T16b 复审 F1)。`JobStore.message` 是
+            # 操作员唯一的信号(§T16 报告:卡住时它只有一个空串),而
+            # `async with factory() as session` **退出时自己也会抛** ——
+            # rollback / 连接归还在失步的连接上会抛 `PendingRollbackError` /
+            # `InterfaceError`,它的 `str()` 是本仓 ch08 记过的那段**裸 SQLAlchemy
+            # 内部文本**。那时到达 `_spawn` 兜底的就**不是**死线异常,出站文案跟着
+            # 变成那段内部文本,而死线这句话**没了**。
+            # ⇒ 只要死线确实放过枪,就以它为准重新抛(原文进 `__cause__`,
+            # 服务日志里照样看得到真正的收尾故障)。
             #
-            # ⚠️ `except` 写在 `async with asyncio.timeout(...)` 的**外面**(用 try
-            # 包住整个 with 块):`TimeoutError` 是那个 CM 在 `__aexit__` 里抛的,
-            # 写在里面会连它自己的取消转换一起吞掉(`uncancel` 也对不上)。
-            try:
-                async with asyncio.timeout(settings.flywheel_job_timeout_seconds):
-                    result = await run_flywheel(
-                        session=session, model=model,
-                        batch_size=settings.flywheel_batch_size)
-            except TimeoutError as exc:
+            # **两处构造同一个异常是刻意的**:这里这一处是「收尾把原因换掉」的
+            # 补救口,上面那一处是「正常路径」的出口 —— 文案本身在异常类里,
+            # 只有一份。
+            if deadline_hit and not isinstance(exc, FlywheelDeadlineExceeded):
                 raise FlywheelDeadlineExceeded(
                     limit=settings.flywheel_job_timeout_seconds) from exc
-        job_store.update(
-            job_id, status="done",
-            message=(f"处理 {result['processed']} 行:"
-                     f"归并 {result['merged']}、新建 {result['created']}、"
-                     f"失败 {result['failed']}"),
-            result=result)
+            raise
     finally:
         # 终态与 dispose **同一个 finally**,理由见模块 docstring 第 3 条。
         #

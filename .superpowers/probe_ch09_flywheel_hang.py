@@ -20,6 +20,26 @@
     .venv/Scripts/python.exe .superpowers/probe_ch09_flywheel_hang.py
     .venv/Scripts/python.exe .superpowers/probe_ch09_flywheel_hang.py --outside-loop
     .venv/Scripts/python.exe .superpowers/probe_ch09_flywheel_hang.py --real-gateway --seconds 30
+
+## ⚠️ 前置条件:池子里**必须有未匹配的行**(否则什么都没在跑,自然也不卡)
+
+流水线吃的是 `WHERE matched_review_id IS NULL ORDER BY id LIMIT batch_size`。
+**池子空了就一次模型调用都不会发生**,`_run_flywheel` 立刻 `done`(处理 0 行)
+—— 那时的输出**看起来**像「修好了」,其实是什么都没跑。
+
+这条不是理论:T16 报告 §1.2 那三份读数(15s/12s 仍 `running`)是在
+`lq#791` **还没被消费**的时候取的;此后池子变成 **0 条未匹配**(T16 走查末
++ 本任务那次经授权的真网关对照组各消费了一行),**同一支探针在今天的库上
+不再复现修前那个挂死**。要复现就得加 `--synthetic-row`:
+
+    --synthetic-row   插一条**探针自己的**池子行(commit,`entry_point='用户反馈'`,
+                      `reject_reason` 里带 `T16b` 标记),收工时**按
+                      `id AND reject_reason` 自清**,并打印删除前后的
+                      `(总数, 未匹配数)` 供核对。
+
+    测试期用的两个**设施**旋钮(不改库):
+    --llm-timeout S     覆盖 `settings.llm_timeout_seconds`(把演示压到秒级)
+    --job-timeout S     覆盖 `settings.flywheel_job_timeout_seconds`(寿命上界)
 """
 
 import argparse

@@ -20,8 +20,14 @@ def _build(settings: Settings, *, temperature: float) -> ChatOpenAI:
         # 而 SDK 对「显式给的 None」的处理是**不设超时** —— 不是它自己的
         # `DEFAULT_TIMEOUT = Timeout(connect=5.0, read=600, write=600, pool=600)`。
         # 实测:`model.root_async_client._client.timeout` 是 `Timeout(timeout=None)`,
-        # 四相全 None;httpcore 那一层同样传 `timeout=None` 给
-        # `connect_tcp`/`start_tls`(⇒ 连 DNS 与握手都没有上界)。
+        # 四相全 None;下一层(httpcore2 2.13.0 —— 这条路径**不是**遗留的
+        # `httpcore` 1.0.9,那是 httpx 0.28.1 的依赖)同样把 `timeout=None` 交给
+        # `connect_tcp`/`start_tls` ⇒ 连 DNS 与握手都没有上界。
+        # ⚠️ 一个**标量**会把 SDK 原本的 `connect=5` 一并换成 60 ⇒ 连接阶段是
+        # **放松**了 12 倍(修前它是 ∞,所以不是回归)。要保留 SDK 的 connect 值,
+        # 就把它改成四元组 `(5, 60, 60, 60)`(实测可用:
+        # `_client.timeout` 变成 `Timeout(connect=5.0, read=60.0, write=60.0, pool=60.0)`;
+        # 注意**二**元组会让 write/pool 落回 None = 又不设上界了)。
         # 后果不是「慢」而是**永不返回**:对端静默一个字节都不回时,那次 await
         # 谁也等不回来 —— 飞轮任务因此卡在 running 占着单槽(见 config 里那两个
         # 上界的注释),而每次请求各建一个模型 ⇒ **每个**入口都被同一条命门覆盖。
