@@ -692,8 +692,21 @@
     try {
       renderQueue(await api("/api/review/queue"));
     } catch (e) {
-      $("q-list").replaceChildren(el("div", "muted", `⚠ 待审列表加载失败(${e.message})`));
-      $("q-count").textContent = "";
+      // ⚠️ **拉列表失败时不许把已有的行擦掉**(fix round 2 走查读出来的):
+      // 服务停掉时那条「通过」会失败,而这里原本会把整列清空换成一句「加载失败」
+      // —— 于是结果卡片上那句「请在待审列表里核对:它还在列表里就说明仍是待审」
+      // **指着一个空列表**,操作员没法照做。改成:有旧行就**留着**并标注它们
+      // **可能已过期**,一条旧行都没有时才只显示这句。
+      const hasRows = $("q-list").querySelector(".rv-item") !== null;
+      if (hasRows) {
+        $("q-list").prepend(el("div", "muted",
+          `⚠ 列表刷新失败(${e.message})—— 下面这些是**上一次成功拉到**的内容,可能已过期;` +
+          "点「刷新」可以再试。"));
+        $("q-count").textContent = "⚠ 未能更新";
+      } else {
+        $("q-list").replaceChildren(el("div", "muted", `⚠ 待审列表加载失败(${e.message})`));
+        $("q-count").textContent = "";
+      }
     }
   }
 
@@ -754,11 +767,22 @@
       //   404 —— 这一行在服务端**本来就不在**(已处理 / 不存在),不是连不上;
       //   422 —— 请求本身不合约定(空答案),服务端拒了,行**仍在**;
       //   502 —— 基础设施故障,**行仍在**、可重试。
-      card.appendChild(el("div", "rv-note", `服务端返回(${info.status}) ${info.error}`));
+      // 没有状态码 = **请求根本没送达**(网络层失败)。这时**不能**打印
+      // `服务端返回(null)`:那个括号里没有东西,看着像「服务端说了一句空话」,
+      // 而事实是这一次请求可能压根没到服务端(fix round 2 F1)。
+      card.appendChild(el("div", "rv-note", info.status == null
+        ? `请求没能送达服务端(网络层失败,没有 HTTP 状态码):${info.error}`
+        : `服务端返回(${info.status}) ${info.error}`));
       if (info.status === 404) {
         card.appendChild(el("div", "rv-note",
           "这一行在服务端**已经不存在或已处理过**(404)—— 不是连接问题。" +
           "它刷新后不会再出现在待审列表里。"));
+      } else if (info.status == null) {
+        // 请求没送达 ⇒ 「这一行有没有被处理」**从这里判断不出来**:可能压根没送到,
+        // 也可能送到了、只是响应没回来。所以给一条**可执行**的核对办法,不下结论。
+        card.appendChild(el("div", "rv-note",
+          "这一行**是否已被处理,从这里判断不出来**(请求可能根本没送到,也可能送到了" +
+          "而响应没回来)—— 请在待审列表里核对:它**还在列表里**就说明仍是待审,可以重试。"));
       } else if (fresh && fresh.status === "pending") {
         card.appendChild(el("div", "rv-note",
           "这一行**仍在待审队列里**(服务端状态 pending)⇒ 可以重试。"));
@@ -779,11 +803,16 @@
       d.appendChild(renderRow(fresh));
       box.appendChild(d);
     } else if (!(ok && info.readError)) {
-      // 「成功 + 回读失败」时上面那张卡片已经把这件事说过了,这里不再重复一遍
-      // (两句说同一件事只会让操作员以为出了两个问题)。
-      box.appendChild(el("div", "rv-note",
-        "⚠ 没能取到该行的服务端状态(GET /api/review/{id} 也失败了)—— " +
-        "这只是**回读**失败,不代表上面那一步没发生。"));
+      // 走到这里 = **POST 失败 且 回读也失败**(`fresh === null` 只可能来自回读失败,
+      // 而「成功 + 回读失败」已经被上面那张卡片说过了)。所以这句话必须**按 `ok` 分叉**:
+      // 对一次**失败**的操作说「这只是回读失败,不代表上面那一步没发生」,
+      // 扫一眼的操作员会以为通过**已经生效**了 —— 那正是 R3 要防的谎报(fix round 2 F1)。
+      box.appendChild(el("div", "rv-note", ok
+        ? "⚠ 没能取到该行的服务端状态(GET /api/review/{id} 也失败了)—— " +
+          "这只是**回读**失败,不代表上面那一步没发生。"
+        : "⚠ 这一行的服务端状态**也读不到**(GET /api/review/{id} 失败了)—— " +
+          "上面那次操作**确实没成功**,但这一行现在是什么状态,这个页面答不上来;" +
+          "请稍后在待审列表里核对(它还在 = 仍是待审)。"));
     }
   }
 
