@@ -280,7 +280,7 @@ def test_snapshot_is_none_when_nothing_recalled():
 
 @pytest.mark.db
 @pytest.mark.anyio
-async def test_up_writes_nothing_to_the_pool(client_factory):
+async def test_up_writes_nothing_to_the_pool(client_factory, flywheel_hooks):
     """`up` 不落池,且**不是错误**。
 
     「不落池」这一半**必须配一个 200 断言** —— 只断「池子里 0 行」的话,
@@ -309,16 +309,25 @@ async def test_up_writes_nothing_to_the_pool(client_factory):
         # 的实现会白烧一次 Milvus 往返 + 一次重排(用户点了 👍 却去查知识库),
         # 而上面那些断言**全都照样绿**(它确实没落池)。替身的 `calls` 就为这个闲着。
         assert retriever.calls == [], f"up 不该调检索器,实际搜了 {retriever.calls}"
+        # ch09 T14:👎 那三处钩子**不 await**,不拦的话这一轮会真起一条线程。
+        # `up` **没落池** ⇒ 一次都不该起飞轮(起了就是白跑一批:一次真模型往返
+        # 加一次库扫描,而池子里没有任何新行)。
+        assert flywheel_hooks.calls == [], (
+            "up 不落池,不该起飞轮(钩子必须挂在那条 `down` 的落池之后)"
+        )
     finally:
         await _teardown(PROBE_UP)
 
 
 @pytest.mark.db
 @pytest.mark.anyio
-async def test_down_writes_one_row_with_user_feedback_entry_point(client_factory):
+async def test_down_writes_one_row_with_user_feedback_entry_point(
+    client_factory, flywheel_hooks
+):
     """`down` 落**一行**,`entry_point="用户反馈"`,并带上尽力回捞到的召回片段。
 
-    三样都断,因为每一样都能单独静默失效:
+    四样都断(第四个是 ch09 T14 加的「落池之后起了飞轮」),因为每一样都能
+    单独静默失效:
     - `entry_point` 写错(比如沿用 `置信度闸`)⇒ 飞轮的三个入口在池子里**分不开**,
       验收 4 与审核页都会读到一堆分不清来源的行;
     - 快照没落 ⇒ 审核人只有一句问题,「知识库真缺这块」与「有、但没检到」
@@ -348,6 +357,19 @@ async def test_down_writes_one_row_with_user_feedback_entry_point(client_factory
         )
         assert retriever.calls == [Q_DOWN], (
             f"回捞重跑的是**这一轮的问题**,实际搜了 {retriever.calls}"
+        )
+        # ---- ch09 T14:落池之后 fire-and-forget 起一轮飞轮(入口 ③)----
+        # 断言按 `database_url` 比,不用 `is`:**端点拿的是 `Depends(get_settings)`
+        # 每次现造的那一份**(`client_factory` 里那个 lambda),测试手上没有同一个
+        # 对象。而这条比较恰恰有判别力 —— 传 `get_settings()`(读真 `.env` 那个
+        # 开发库)而不是这一份配置的实现会**跑到另一个库上**,那条路不报任何错。
+        # `_REQUIRED_SETTINGS` 的 URL 与真 `.env` 逐字不同(T14 实测过)。
+        assert len(flywheel_hooks.calls) == 1, (
+            f"👎 落池之后必须起一轮飞轮(用户点的 👎 不该等人去点管理台按钮),"
+            f"实际起了 {len(flywheel_hooks.calls)} 次"
+        )
+        assert flywheel_hooks.calls[0].database_url == _REQUIRED_SETTINGS["database_url"], (
+            "起飞的必须是**这一份**配置,不是 `get_settings()` 读到的真 `.env`"
         )
     finally:
         await _teardown(PROBE_DOWN)

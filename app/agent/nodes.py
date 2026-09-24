@@ -20,6 +20,7 @@ from app import observability
 from app.agent.json_stream import PLAIN, JsonAnswerDecoder
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
+from app.flywheel.tasks import start_flywheel_job_safely
 from app.kb.assess import record_low_confidence
 from app.kb.evidence import evidence_detail
 from app.memory import journal, layers
@@ -301,6 +302,11 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
                 entry_point="置信度闸",
                 reject_reason=reason,
             )
+            # 落池之后 fire-and-forget 起一轮飞轮(§8.3)。**不 await、也不许抛**
+            # (`start_flywheel_job_safely` 自己吞掉装配故障):它是这一轮请求的
+            # **旁观者**,绝不能把「闸拦下一句答不上的问题」变成一次 500。
+            # **只在没通过的那一支**:过了闸就没有新行落池,起了就是白跑一批。
+            start_flywheel_job_safely(settings)
 
         return {
             "gate_passed": passed,
@@ -600,6 +606,10 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                         reject_reason="生成自评:模型判定召回的证据不足,无法作答",
                         evidence_snapshot=_snapshot(evidence, settings=settings),
                     )
+                    # 落池之后 fire-and-forget 起一轮飞轮(§8.3),与闸那一处
+                    # **同一个形状**(不 await、不抛)。入口 ② 少了这一行的话,
+                    # 「模型自评答不上」这条路上的行**只能靠人点按钮**才进飞轮。
+                    start_flywheel_job_safely(settings)
                 # ⚠️ 落库的是**兜底话术**(用户看到的就是它)—— 覆盖掉
                 # `_persist_round_text` 刚按轮写的那份(它写的是模型交的答案)。
                 return "agent:self_assess_insufficient", FALLBACK_REPLY

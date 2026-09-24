@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from app.config import Settings, get_settings
 from app.db.models import KnowledgeChunk
 from app.db.session import get_session
+from app.flywheel.tasks import start_flywheel_job
 from app.kb.ingest import parse_corpus_file
 from app.kb.jobs import Job, get_job_store
 from app.kb.orchestrate import start_job
@@ -208,6 +209,24 @@ async def start_mine(settings: Settings = Depends(get_settings)):
     if job is None:
         raise HTTPException(status_code=409, detail="已有任务在跑")
     return {"job_id": job.id}
+
+
+@router.post("/api/kb/jobs/flywheel", status_code=201)
+async def start_flywheel(settings: Settings = Depends(get_settings)):
+    """**手动**强制跑一轮飞轮(ch09 §8.3)。
+
+    形状与上面两条逐字一致(同一个 `JobStore`、同一条 409):验收脚本与前端靠它,
+    不必等「落池之后」那个 fire-and-forget 任务。落池那三处**不走这个端点** ——
+    它们直接调 `start_flywheel_job`,少一次 HTTP 往返。
+
+    ⚠️ 与它们共用**同一个运行槽**:手动跑的时候落池触发的那个会拿到 `None`
+    (被这里占着),反过来也一样 —— 这是刻意的,同一张池子两条流水线并发跑
+    只会互相抢行。
+    """
+    job_id = start_flywheel_job(settings=settings)
+    if job_id is None:
+        raise HTTPException(status_code=409, detail="已有任务在跑")
+    return {"job_id": job_id}
 
 
 def _job_dict(job: Job) -> dict:

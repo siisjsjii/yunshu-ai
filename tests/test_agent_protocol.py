@@ -288,12 +288,19 @@ async def test_knowledge_tool_round_keeps_working_and_protocol_is_appended_once(
 
 
 @pytest.mark.anyio
-async def test_useful_false_falls_back_and_records_one_pool_row():
+async def test_useful_false_falls_back_and_records_one_pool_row(flywheel_hooks):
     """契约表第 1 行:兜底话术 + 知识类落池(带召回片段快照)。
 
     用的是**违规流**(`useful=false` 却带非空 answer)—— 只有这样
     「一个 answer_delta 都没出去」才是可判别的:合法的空串流上,
     「不发」与「没东西可发」长得一模一样。
+
+    `flywheel_hooks`(ch09 T14)是全局装置(见 `tests/conftest.py`):这三处钩子
+    **不 await**,不打桩的话这一轮会真起一条线程(它拿本用例这份 settings 去连库 ——
+    本文件用的是假 URL,所以连不上;但那仍然是一次**真的线程 + 真的 TCP 尝试**,
+    照「非 DB 测试绝不碰网络」这条硬约束就是不许的)。这里顺带断「落池 ⇒ 真起了
+    飞轮」—— 入口 ② 少了那一行,「模型自评答不上」这条路上的行只能靠**人**点按钮
+    才进飞轮。
     """
     session = _Session()
     settings = _settings()
@@ -316,6 +323,13 @@ async def test_useful_false_falls_back_and_records_one_pool_row():
     assert "这段文本一个字都不该出现在用户面前" not in "".join(_tokens(frames))
 
     assert len(session.added) == 1
+    # 落池之后 fire-and-forget 起一轮飞轮(ch09 §8.3,入口 ②)。
+    # **同一性**(`is`)断言:传 `get_settings()` 而不是这一份配置的实现同样能让
+    # 「调过一次」通过,而它会跑到**另一个库**上去 —— 那条路不报任何错。
+    assert len(flywheel_hooks.calls) == 1, (
+        f"落池之后必须起一轮飞轮,实际起了 {len(flywheel_hooks.calls)} 次"
+    )
+    assert flywheel_hooks.calls[0] is settings, "起飞轮必须用这一份 settings"
     row = session.added[0]
     assert row.entry_point == "生成自评"
     assert row.question == "退货政策是什么"

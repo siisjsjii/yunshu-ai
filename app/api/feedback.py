@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.db.models import LowConfidenceQuestion
 from app.db.session import get_session
+from app.flywheel.tasks import start_flywheel_job_safely
 from app.kb.assess import record_low_confidence
 from app.retrieval.search import KnowledgeRetriever
 from app.tools.registry import build_retriever
@@ -141,4 +142,17 @@ async def post_feedback(
         reject_reason="用户点了 👎(未解决)",
         evidence_snapshot=snapshot,
     )
+    # **落池之后** fire-and-forget 起一轮飞轮(ch09 §8.3;
+    # `docs/superpowers/specs/2026-09-23-ecommerce-cs-ch09-observe-flywheel-design.md:805`
+    # 写的是「**落池后** fire-and-forget 起一个后台任务」,**没有**限定入口)——
+    # 与 `app/agent/nodes.py` 那两处(置信度闸 / 生成自评)同一个形状:不 await、
+    # 也不许抛。这是飞轮的**第三个入口**(requirement ③ 把 👎 算作三个入口之一),
+    # 少了这一行,用户点的那个 👎 只能等**人**去点管理台按钮才进飞轮。
+    #
+    # ⚠️ 放在 `record_low_confidence` **之后**:它是「刚落的那行顺手喂过去」,
+    # 排在前面的话,飞轮会在这一行**还没提交**时就去 `WHERE matched_review_id
+    # IS NULL` 里捞它 —— 捞不到(另一个 session、另一个提交),于是这一轮白跑,
+    # 而返回体里的 `pooled: true` 让人以为喂过了。
+    start_flywheel_job_safely(settings)
+
     return {"ok": True, "pooled": True, "snapshot_chunks": len(snapshot or [])}
