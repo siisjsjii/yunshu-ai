@@ -51,6 +51,23 @@ bash scripts/acceptance_ch08.sh                                   # ch08 验收 
 #   否则会 curl 到旧代码,得到本仓记过的那类**假红**。端口可用 `PORT` / `MCP_*_PORT` 覆盖。
 #   ⚠️ 验收 3 重启的是 **MCP Server**,不是客服服务 —— 它的断言正是「客服服务的进程号没变」。
 
+# ch09(前置:MySQL + **Milvus** + 真实 key + **Langfuse 可达**)
+.venv/Scripts/python.exe scripts/intent_cost.py --minutes 30      # 按意图的 token 花销(打 Langfuse Metrics API)
+.venv/Scripts/python.exe scripts/run_eval.py --limit 5 --trigger manual   # 只跑前 5 条(给验收用)
+.venv/Scripts/python.exe scripts/eval_trend.py                    # 评估趋势(每轮相对上一轮的增减)
+bash scripts/acceptance_ch09.sh                                   # ch09 验收 1–6
+# ↑ **验收脚本自己起客服服务(8000)+ 两个 MCP Server(尽力而为:起不来只 WARN)**,
+#   跑完自己收干净 ⇒ 跑之前先清掉 8000/8101/8102 的残留进程(否则会 curl 到旧代码 —— 本仓记过的那类假红)。
+#   ⚠️ 它**会往共享的表与知识库里真的写东西**:② 落一条低置信度问题,③ 把它核准进知识库
+#   (写 1 块 + 向量化 1),④ 再落一条 👎,⑥ 往 `eval_runs` 加 3 行(两轮 5 条 + 收尾一轮 300 条全量)。
+#   ⚠️ ③ 跑完**那条问题就答得对了** ⇒ ② 的选题是**运行时现挑**的:脚本从 `CAND_Q1..Q8` 里挑
+#   第一条「此刻 `GET /api/kb/search` 召不到」的候选用,**八条用尽就响亮地报**「请加一条」
+#   (每跑一轮消耗一条)。这比写死题面、第二轮起悄悄变红要诚实。
+#   ⚠️ ①⑤ 依赖 Langfuse,而**读**侧(REST 查询)通了**不代表写**侧(服务端 OTel exporter)通 ——
+#   实测本机导出会成片读超时几分钟而读侧一切正常;那种情况下 ① 会**重试两轮**,仍失败就把
+#   服务端日志里那行 `opentelemetry.exporter ... Read timed out` 打出来指认错因。
+#   ⚠️ ① 的「界面能点开、点开之后是什么样」**靠人看**:脚本断的只有「数据在不在」(观测齐、同一条 trace)。
+
 # 建库 / 升级(Milvus 另需 docker start milvus-standalone;BGE-M3 等权重由 main.py 预热)
 .venv/Scripts/python.exe scripts/init_db.py                     # 建表:create_all,只建**不存在的表**
 # ⚠️ **`init_db.py` 永不加列。** `create_all` 对已存在的表是**空操作** —— 它不会
@@ -58,7 +75,15 @@ bash scripts/acceptance_ch08.sh                                   # ch08 验收 
 #    再执行那份 DDL**,升级一个老库时尤其:`db/ch03.sql`(knowledge_chunks)、
 #    `db/ch04.sql`(low_confidence_questions)、`db/ch06.sql`(refund_requests)、
 #    `db/ch07.sql`(新表 conversation_summaries + conversations 的两个锚点列)、
-#    **`db/ch08.sql`(新表 tool_audit_logs)**。
+#    **`db/ch08.sql`(新表 tool_audit_logs)**、
+#    **`db/ch09.sql`(新表 `review_queue` + `eval_runs`,外加
+#    `low_confidence_questions` 的两列 `evidence_snapshot` / `matched_review_id`)**。
+#    漏掉 ch09 那份的后果**不是「少个功能」**:飞轮每条 `WHERE matched_review_id IS NULL`
+#    的选择谓词、审核页的每一行、趋势表的每一轮都读那两列/两张表 ⇒ 一进 `/api/review/*`
+#    或 `eval_trend.py` 就是 `Unknown column`。⚠️ 走法与其余几份**相反**(DDL 头部写着,
+#    实测于 2026-09-23):它**第一句就是 ALTER `low_confidence_questions`** ⇒
+#    **老库升级:先 `db/ch09.sql`、再 `init_db.py`**;**全新库:只跑 `init_db.py`,
+#    不要跑那份 DDL**(先跑它在 ALTER 上 1146,先跑 init_db 再跑它 1060 + 1050 三条全红)。
 #    漏掉 ch07 那份的后果不是「少个功能」:`conversations` 缺两列、`conversation_summaries`
 #    整张表不存在 ⇒ **每一个请求**都在 `ensure_conversation` 或分层读锚点那一步炸,
 #    而报错指向 SQL 列名,读起来像「ORM 写错了」。五份文件都不幂等(重复执行**响亮地失败**,
