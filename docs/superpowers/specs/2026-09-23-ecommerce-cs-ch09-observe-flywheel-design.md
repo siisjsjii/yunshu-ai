@@ -315,8 +315,15 @@ resp = await http.get(f"{base}/api/public/v2/metrics",
   不许读一次就断言。
 - 凭证从 `.env` 读,走 `httpx.AsyncClient`(**不引新依赖**);出站错误文本过 `redact_api_key`。
   ⚠️ **传的是这个脚本自己的凭据 `LANGFUSE_SECRET_KEY`,不是 `openai_api_key`** ——
-  本仓那 17 处调用传的都是 `openai_api_key`,那是因为它们处理的是**上游 openai SDK** 的异常文本;
+  本仓**其余**那些调用传的都是 `openai_api_key`,那是因为它们处理的是**上游 openai SDK** 的异常文本;
   这条规矩的**目的**是「出站文本不许回显凭据」,所以按**碰的是哪把密钥**来传。
+  > ⚠️ **订正(2026-09-25,T19)**:这句话原写「本仓那 **17** 处调用」,**17 这个数没有数过** ——
+  > 评审在 T4 时用 AST 数出来是 **11**(chat.py 6 / extract.py 2 / refund.py 1 /
+  > `kb/orchestrate.py` 1 / `memory/tasks.py` 1)。**11 也是当时那一刻的读数**:那之后
+  > T15 加了 `api/review.py` 1 处、T14 加了 `flywheel/tasks.py` 1 处 ⇒ 本章结束时 `app/` 下
+  > 共 **12** 处传 openai 那把(plus `scripts/intent_cost.py` 的 **2** 处传 **Langfuse** 那把,
+  > 那正是本条规矩的应用)。原话里「17」保留在此处不删,便于对账;
+  > **要引用计数就现数一遍**(判据:`redact_api_key(...)` 的第二次实参提到 openai)。
   覆盖面:**每一个**会把响应体或异常字符串打出去的地方(`连不上 Langfuse` 那条、
   以及 400 分支里回显 `resp.text` 的那一段)。**不要**因此引入 `OPENAI_API_KEY` 的依赖。
 - 命令行的两条流**都要钉编码**:`emit()` 走 stdout,而 `SystemExit` / traceback 走 **stderr**
@@ -814,7 +821,7 @@ await session.commit()
 
 ## §9 审核页与端点
 
-### 9.1 三个端点(`app/api/review.py`,与 `kb_router` 并列 include)
+### 9.1 **四个**端点(`app/api/review.py`,与 `kb_router` 并列 include)
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
@@ -1518,3 +1525,161 @@ dict 里一个字都看不见。
 - **一处被这一裁定顺带订正的**:§12.1 原先那条「首键违规 ⇒ 恰好重试 **1** 次
   (模型替身记录调用次数)」**已删** —— 它描述的是一个**从未实现**的行为,
   留着的唯一后果是**让后来人以为它测过**。
+
+### 15.12 订正:T16b —— 飞轮的**两个墙钟上界**,而「单槽」只关了一半
+
+（T16 走查照出来的运行时故障 + T16b 的修复,2026-09-24。**§8.3 提到的「照 ch04 那套」原文不改。**）
+
+- **最初的样子(实现期第 11 阶段之前)**:`app/llm.py` 的 `ChatOpenAI(...)` **没有传 `timeout`**,
+  `_run_flywheel` 也没有任何**整条任务**的寿命上界 —— 唯一终结一个任务的东西是「它自己跑完」。
+- **实际发生了什么**(T16 走查现场,原文见 `task-16-report.md` §6-C1):**9 个任务里卡了 3 个**
+  (`7e24193e0520` / `21f7dad5859d` / `f40f9075cb2e`),分别盯到 **666 / 245 / 382 秒**
+  仍是 `running`、窗口内**零日志**;MySQL 那侧是一条**开着却空转的事务**
+  (`trx_rows_locked=0`、连接状态 `Sleep`)⇒ 不是锁等待、不是慢查询,是**在等一个永远不回来的
+  模型响应**(同一时刻服务对 443 有 `CLOSE_WAIT`)。**后果**:运行槽被永久占着,
+  此后**每一次**手动触发都是 409 —— 连「手动那根杠杆」也拿不到槽,**唯一出路是重启客服服务**。
+- **根因(两条,缺一不成)**:
+  1. **不传 `timeout` ≠ 用 SDK 的默认值。** langchain-openai 1.6.2 把 `request_timeout=None`
+     **原样**交给 openai SDK,而 SDK 对「**显式给的 None**」的处理是**不设超时** ——
+     不是它自己的 `DEFAULT_TIMEOUT = Timeout(connect=5.0, read=600, ...)`。
+     实测 `model.root_async_client._client.timeout` 是 `Timeout(timeout=None)`,**四相全 None**,
+     连 DNS 与握手都没有上界(再下一层 httpcore2 同样把 `None` 直接交给 `connect_tcp`/`start_tls`)。
+  2. **`finally` 只在异常时执行。** 挂起**不是异常** ⇒ 取消/收尾代码永不运行 ⇒ 槽永不释放。
+- **为什么会写错**:**「用了库的默认值」这个假设从来没被验证过**,而它恰好是反的
+  (库把「没给」翻译成了「不要超时」)。这是本仓那条「**语言/库 X 在情况 Z 下表现 Y,要么带证据
+  要么标注未验证**」的第 N 次复现 —— 只是这一次,错误的代价是**服务不可用**,而不是一个读数。
+- **订正后的形态**(两处,各一个设置项):
+  - `app/llm.py` 显式传 `timeout=settings.llm_timeout_seconds`(默认 **60**,**每一次往返**的上界);
+  - `app/flywheel/tasks.py` 的 `_run_flywheel` 用 `asyncio.timeout(settings.flywheel_job_timeout_seconds)`
+    (默认 **300**,**整条任务**的上界;被它杀掉的那一批**一行都不落地** —— 池子靠
+    `matched_review_id IS NULL` 幂等,下一轮会重新吃到)。
+  - ⚠️ 一个**标量**会把 SDK 原本的 `connect=5` 一并换成 60 ⇒ 连接阶段**放松 12 倍**
+    (修前是 ∞,所以不是回归);要保住它得写成**四元组**(**二元组会让 write/pool 落回 `None`**)。
+- **真机复验**(黑洞监听端口 + 真 `ChatOpenAI`,证据见 `task-16b-debug-report.md`):
+  | 配置 | 结果 |
+  |---|---|
+  | `timeout=1.0` | **4.25s** 抛 `OpenAITimeoutError`(3 次尝试 + 两次退避) |
+  | `timeout=1.0, max_retries=0` | **1.01s** 抛同款 |
+  | 黑洞 + `llm_timeout=1.0` | job 寿命 **5.94s** → `done`,行留池、下一轮重试(**基础设施故障没有伪装成成功**) |
+  | 黑洞 + `llm_timeout=5.0` + `job_timeout=2.0` | job 寿命 **3.45s** → `failed`,**槽即刻可用** |
+
+- **⚠️ 范围限定(必须与上面一起读):那个「单槽」只关了一半。**
+  `JobStore`(ch04)只有**一个** `running` 槽,**三个任务共用**:`vectorize` / `mine`(ch04)与
+  `flywheel`(本章)。本章只给**其中一个**加了整条任务的墙钟上界;**`vectorize` 与 `mine`
+  至今没有任何死线**,ch04 管理台的 `pollJob` 也**没有轮询上界** ⇒
+  「任务卡住 ⇒ 槽位永久占死 ⇒ 只能重启服务」在那两个任务上**依然敞着**。
+  **不许把本节读成「单槽问题已修复」** —— 准确的说法是
+  **「飞轮这一个任务有了寿命上界」**。
+- **一处顺带被证否的旧说法**:T16 报告 §6-C1 里那句「`app/llm.py` 没有配任何 `timeout`/`max_retries`」
+  在修复后**不再成立**(它记的是修复前的状态,保留原文)。
+
+### 15.13 订正:T18b —— 置信度闸**漏传了落池快照**,以及一条被推翻的「iff」
+
+（T18b,2026-09-24。**§4.3 与 §7.1 的正文不改。**）
+
+- **最初的样子**:§7.1 要求「落池那一行带上当轮召回片段快照」,三处入口里
+  `生成自评`(`app/agent/nodes.py:_finish_verdict`)与 👎(`app/api/feedback.py`)都做了,
+  **置信度闸那一处没做** —— 它的 `record_low_confidence(...)` **只传到 `reject_reason` 为止**,
+  `evidence_snapshot` 走 `None` 默认值。**不是做不到**(形参与 `_snapshot()` 早就都在),
+  **是漏写的**一处调用。
+- **一处必须订正的旧说法**(它是 T18 复审的产物):有一份报告断言
+  「闸 **iff** 召回为空才拦(证据非空 ⇒ confidence ≥ 0.2667 > 0.2)」。**这个断言过强,是错的。**
+  反例(生产默认值):单条 `score = 0.16` ⇒ 过得了 `evidence_min_score`(0.15)、
+  过不了 `evidence_confidence_threshold`
+  (`0.6×0.16 + 0.2×min(1/3,1) + 0.2×0 = 0.163 < 0.2`)⇒ **「手里有一个块、却被拦」真实可达**。
+  那一刻今天做的是**把这个块的原文与得分扔掉**,池子里只剩一句问题 ——
+  而审核页上「知识库真缺这一块」与「有、但没检到」长得**一模一样**,分开它俩正是快照的用途。
+- **为什么会写错**:把**两个独立旋钮**当成一个 —— `evidence_min_score` 管「哪些块算证据」,
+  合成分管「分够不够」,**两者可以一个过一个不过**。订正后那段算术**写进了生产代码的注释**。
+- **订正后的形态**:闸的落池调用与另两处**逐字同形** ——
+  `evidence_snapshot=(_snapshot(evidence, settings=settings) if evidence else None)`;
+  空证据传 **`None`(不是 `[]`)** —— 本仓约定 `None` = 当轮确实零召回。
+- **证据**:`tests/test_agent_gate_ch09.py` 新增判别性用例(把过滤/kwarg 去掉即红);
+  真机读数见验收 ②(零召回那一支)与 T18b 报告。
+- **⚠️ 端到端验收对**这一列**没有覆盖**(如实记):验收 ② 问的是**零召回**的问题 ⇒
+  没有片段可快照;而零召回那一支里「闸写了这一列」与「闸漏了 `evidence_snapshot=`」落出来的
+  **都是 JSON `null`** ⇒ ② 那条断言对它本该抓的那个 bug **不变**。
+  守它的是上面那条单测,**不在端到端覆盖内**(验收脚本自己在结尾的「局限」里打这条)。
+  探针读数(供对账,别当覆盖证据):修之前闸行 **40 条、非空 0**;接上之后 **43 条、非空 14**。
+
+### 15.14 订正:T19 章级文档同步 —— 四条错账与九处过时
+
+（T19,2026-09-25。**本节是本章最后一次订正,记的全是「文档里写了一个与实测不符的事实」。**）
+
+**① `app/db/models.py` 的 `created_at` 差异,被一次复审判过一次「不是差异」—— 那个判定不可复现。**
+
+- **最初写的**:T5 修复轮在差异清单里加了「③ `created_at` 的默认值措辞:create_all 建出来是
+  `DEFAULT (now())`,DDL 是 `DEFAULT CURRENT_TIMESTAMP`」。
+- **那次复审说**:实测 `CreateTable` 发的是 `DEFAULT now()`,在 MySQL 8.0.46 上执行得到
+  `DEFAULT CURRENT_TIMESTAMP`,**与 DDL 相同** ⇒ 「把不是差异记成了差异」。
+- **实际是(2026-09-25 重测,方法:临时库 + 一条路走 `create_all`、另一条路走 `db/ch09.sql`
+  原文的 `CREATE TABLE`,核对 `SHOW CREATE TABLE`)**:
+
+  | 路径 | `created_at` 那一行 |
+  |---|---|
+  | `create_all` | `` `created_at` datetime NOT NULL DEFAULT (now()) `` |
+  | `db/ch09.sql` | `` `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP `` |
+
+  **两条路逐字不同 ⇒ 原判(是差异)是对的,那次「订正」才是不可复现的那个。**
+- **两边各对一半、所以容易读错**:`CreateTable` **发**出去的确是 `DEFAULT now()`,
+  是 **MySQL 把它规范化成 `(now())`**。**「发出去的文本」不等于「`SHOW CREATE TABLE` 读回来的文本」** ——
+  那次复审正是从前者往上推后者。判据:**凡「外部系统会怎么规范化我这条声明」,必须跑一遍
+  `SHOW CREATE TABLE`。**
+- **仍是纯文本差异**(语义都是「插入时取当前时间」),所以**不影响行为**——
+  这一条要**两件事分开说**:语义对齐、措辞不同。原先 `EvalRun` 的 docstring 把两者写在同一段里,
+  读起来**自相矛盾**(已拆开)。
+
+**② §3.5 的「本仓那 17 处调用」—— 17 这个数**没有数过**。**
+评审在 T4 时用 AST 数出来是 **11**(chat.py 6 / extract.py 2 / refund.py 1 / `kb/orchestrate.py` 1 /
+`memory/tasks.py` 1)。**11 也是当时的读数**:那之后 T15 加了 `api/review.py` 1 处、
+T14 加了 `flywheel/tasks.py` 1 处 ⇒ 本章结束时 `app/` 下共 **12** 处传 openai 那把,
+另有 `scripts/intent_cost.py` 的 **2** 处传 **Langfuse** 那把(那正是本条规矩的应用)。
+**为什么写错**:引用了一个没数过的数 —— 本仓已有禁令。已在 §3.5 就地订正并留原文备查,
+**引用计数时现数一遍**。
+
+**③ 两处**方向相反的**过时 docstring(`app/observability.py`)。**
+- `_root_cm` 的 docstring 与 `span()` 的 docstring 都还写着「**工具执行**与知识检索一个 span
+  都不会自动出现」—— 而 §15.4 ② 的实测**推翻了前半句**(`spec.tool.ainvoke` **是** LangChain run,
+  内置工具**早就**有一条嵌套正确的 `TOOL` 观测),§15.5 又据此**删掉了**手工 `tool:*`。
+  ⇒ 「过时」的方向与常见的相反:**不是漏记了新东西,是留着一条已被推翻的旧理由。**
+  已改成:**手工 span 今天只剩 `retrieval` 一种形状**(且它的存在理由只剩「检索器不是 LangChain run」)。
+
+**④ `app/db/models.py:147` 的「它今天还不存在」已过时。**
+`evidence_snapshot` 的 docstring 里写着另一处写入方是「T12 起的 `POST /api/feedback`
+(**它今天还不存在**,形状按这一条对齐)」。**T12 早已交付**(`app/api/feedback.py`,
+`POST /api/feedback` 在 `main.py` 里 include),而且 T18b 又**加了第三处**写入方(置信度闸)。
+已按「**三处写入方都已在线**」重写。
+
+**⑤ `tests/test_config_ch09.py` 的四条被取代的弱断言。**
+`test_langfuse_defaults_are_empty_so_tests_never_go_online` / `test_evidence_weights_are_bounded` /
+`test_snapshot_and_flywheel_bounds` / `test_out_of_range_is_rejected` 是 T1 初版写的;
+同一文件下半段的 `test_ch09_fields_have_defaults`(逐条 `==`)、两个 parametrize 的越界用例
+(且**断出错信息里出现字段名**)**严格更强**,`>= 1` / `0.0 <= x <= 1.0` / `pytest.raises(Exception)`
+对一个**没有声明任何边界**的实现同样成立。**处置:保留 + 逐条标注「已被取代,不得引用」**
+(不删 —— 本仓的记法是留痕);四条都还在跑,但**不许拿它们当证据**。
+
+**⑥ §9.1 的小标题写「三个端点」,而它**自己的表**里有四行。**
+`app/api/review.py` 实测 **4** 条路由(`GET /api/review/queue`、`GET /api/review/{id}`、
+`POST .../approve`、`POST .../reject`),模块 docstring 也写「四个」——
+**表是对的,标题少了一个**。已就地改标题(原标题的读数保留在此处备查)。
+同一形状的还有 §14 里「`app/api/review.py`」的措辞与 `include` 处,核过无误。
+
+**⑦ 两处报告/留痕的出处错账**(不在 spec 里,记在此处备查):
+`dev-notes/ch09.md` 里两个标记曾写作「**证据独有的一行**」,而同一段 11 行之下的订正
+**自己就否掉了那个理由**(那个命令块**逐字引用了**这两个标记 ⇒ 「引用里不会出现」当场是假的);
+`task-17-report.md` §7 的证据索引**只列了 19 个文件**,而 `.superpowers/t17/` 下被 git 跟踪的是
+**23** 个(`git ls-files .superpowers/t17/ | wc -l`)。**两处都已订正。**
+
+**⑧ 验收脚本的「候选预算」与「特征串不许含数字」。**
+② 每跑一轮会消耗一条 `CAND_Q*`,旧 8 条在 T18 的八次运行里耗尽,2026-09-25 T19 那次跑
+用的是**最后一条(`#8`)**。T19 补了 `CAND_Q9..Q16`(现 16 条),并把两条选材规矩写进脚本头:
+① marker 必须真的出现在它自己的答案里,**且要用脚本自己的解码器核**
+(那是 `chr(int(h,16))` **码点**,不是 UTF-8 字节 —— 极易写混);
+② **marker 里不许出现数字** —— 实测:`#8` 的核准答案写「一点八米」,模型转述成「**1.8 米**」,
+③ 那句「回复含核准答案的特征串」因此判红,而**产品那一侧每一步都是对的**
+(写块 / 向量化 / 召回 / 过闸 / 带引用 / 不再是兜底话术)。**数字是这一族**回声断言**
+唯一不稳定的一类 token**,原注释只防了反方向(`12 毫米` → `12毫米`)。
+**断言本身一个字没动** —— 改的是**夹具**;`CAND_Q8 / M8` **原样留着当证据**。
+补候选时还要**先用生产同款探针核 `hits == 0`**:实测起草的 **22** 条里**有 10 条召得到**
+(其中 3 条只比阈值 0.25 高一点点:0.2507 / 0.2615 / 0.2757)⇒
+**「看起来库里没写」靠眼睛判不出来。**

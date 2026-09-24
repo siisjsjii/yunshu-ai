@@ -18,7 +18,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **ch08(工具系统:注册中心 + MCP + 写操作确认流)** 交付(分支 `ch08-tool-registry`):把写死的五个 `@tool` 换成**即插即用的工具系统** —— `ToolSpec`(名 / 用途描述 / **原始 JSON Schema** / `read`|`write` / 来源)进注册中心,内置工具**包内自动发现**(在 `app/tools/builtin/` 里新增一个文件就是一个新工具),**全章唯一**的 JSON Schema 校验器,三态权限闸,唯一执行点 `execute_tool`,新表 `tool_audit_logs`;两个**自建业务 MCP Server**(`mcp_servers/logistics.py` → 8101 / `aftersales.py` → 8102,Streamable HTTP)+ 一个**每请求现问现拿、单 Server 连不上就降级**的客户端(`app/mcp/client.py`,**刻意不缓存**);并把建工单改成**确认流** —— `agent` 撞到未确认的写调用就**停循环** → `interrupt()` 弹卡片 → `Command(resume=…)` 同 thread 续跑 → 执行或拒绝,**挂起的那一轮完全不落库**。设计源见 ch08 spec(§15 订正最多的一章)。
 
-**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**全程不做**:多轮 Agent Loop、认证。
+- **ch09(数据观测 + 低置信度数据飞轮)** 交付(分支 `ch09-observe-flywheel`)。两件事:
+  **① 观测** —— Langfuse(Cloud,配在 `.env`)经 `app/observability.py` 接入,那是**全章唯一**的
+  langfuse 边界(其余模块只认 `trace_scope` / `intent_scope` / `span` / `make_handler` 四个名字,
+  有源码扫描测试守着);每请求一个**根观测**(`chat`)+ 一个手动 `retrieval` span + 意图 tag
+  (`intent:<x>`,在 `classify_intent` 跑完后**中途进入**);三个 `LANGFUSE_*` 任一为空 ⇒ 整套观测
+  no-op 且**不 import langfuse**(单测「全程不联网」靠它守)。`app/agent/json_stream.py` 是**三态
+  增量解码器**(`lead` / `protocol` / `plain`,纯状态机、零 IO),让**知识轮**边收 token 边解出
+  `useful` / `answer`,而违约时**逐字节退回 ch08 的纯文本行为**。
+  **② 数据飞轮** —— 低置信度池有**三个入口**(`置信度闸` / `生成自评` / 用户点 👎 走
+  `POST /api/feedback`),每行带 `evidence_snapshot`(落池当轮的召回片段);`app/flywheel/`
+  (normalize → dedupe → pipeline)把池子变成 `review_queue`;`app/api/review.py` 让人工**通过**
+  (通过 ⇒ 立刻写知识库并**同步向量化**,否则「重问就答对」要等下次 `build_kb`)或驳回;
+  审核页在 `admin.html` 的「待审」标签页;`scripts/run_eval.py`(加 `--trigger`)+ `scripts/eval_trend.py`
+  把每轮评估记进 `eval_runs` 并打趋势表。设计源见 ch09 spec(**§15 订正最多的一章**,15.1–15.14)。
+
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -52,9 +67,12 @@ bash scripts/acceptance_ch08.sh                                   # ch08 验收 
 #   ⚠️ 验收 3 重启的是 **MCP Server**,不是客服服务 —— 它的断言正是「客服服务的进程号没变」。
 
 # ch09(前置:MySQL + **Milvus** + 真实 key + **Langfuse 可达**)
+.venv/Scripts/python.exe scripts/calibrate_evidence.py            # 置信度阈值标定(读 evals/测试集.md 300 条,走真实链路)
+# ↑ 改 `evidence_confidence_threshold` 之前**先跑它**;`--dump` 出逐条置信度(定「平台段」靠它)
 .venv/Scripts/python.exe scripts/intent_cost.py --minutes 30      # 按意图的 token 花销(打 Langfuse Metrics API)
 .venv/Scripts/python.exe scripts/run_eval.py --limit 5 --trigger manual   # 只跑前 5 条(给验收用)
 .venv/Scripts/python.exe scripts/eval_trend.py                    # 评估趋势(每轮相对上一轮的增减)
+.venv/Scripts/python.exe scripts/run_flywheel_eval.py             # 飞轮评估集(标准化 + 查重两半,打网络)
 bash scripts/acceptance_ch09.sh                                   # ch09 验收 1–6
 # ↑ **验收脚本自己起客服服务(8000)+ 两个 MCP Server(尽力而为:起不来只 WARN)**,
 #   跑完自己收干净 ⇒ 跑之前先清掉 8000/8101/8102 的残留进程(否则会 curl 到旧代码 —— 本仓记过的那类假红)。
@@ -68,6 +86,19 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 #   ⚠️ ③ 跑完**那条问题就答得对了** ⇒ ② 的选题是**运行时现挑**的:脚本从 `CAND_Q1..Q8` 里挑
 #   第一条「此刻 `GET /api/kb/search` 召不到」的候选用,**八条用尽就响亮地报**「请加一条」
 #   (每跑一轮消耗一条)。这比写死题面、第二轮起悄悄变红要诚实。
+#   ⚠️ **所以这个脚本不是「可以无限重跑」的**:它有一个**候选预算**(旧 8 条在 T18 的八次
+#   运行里耗尽,T19 那次跑用的正是最后一条 `#8`,随后就地补了 `CAND_Q9..`)。预算用尽时的
+#   唯一正解是**往 `CAND_Q*` 里加候选**,不是把题面写死 —— 写死之后第二轮起会**悄悄变红**
+#   (那条问题已经被上一轮写进知识库了)。
+#   ⚠️ **加候选有三条选材规矩**(都在 T19 用真跑换来的,写在脚本头的「特征串三条选材规矩」里):
+#   ① marker 必须真的出现在它自己的答案里,**且要用脚本自己的解码器核**(那是
+#   `chr(int(h,16))` **码点**,不是 UTF-8 字节);② **marker 里不许出现数字**(中文与阿拉伯
+#   都不行 —— 实测「一点八米」被模型写成「1.8 米」,③ 那条回声断言因此红,而**产品每一环都对**);
+#   ③ **核准答案必须真的回答那个题面**(实测:一条没回答「转速是多少」的答案让模型
+#   **正确地**自评不足走了兜底 ⇒ ③ 那条**承重**断言也红)。
+#   ⇒ **③ 不是一条不变的断言**:它断的是「模型**逐字**复述了核准答案里的某个词组」,
+#   而模型会改写(尤其数字)。红的判据是「先看产品那几步(写块 / 向量化 / 召回 / 过闸 /
+#   带引用)是不是都绿,再判是不是代码坏了」。
 #   ⚠️ ①⑤ 依赖 Langfuse,而**读**侧(REST 查询)通了**不代表写**侧(服务端 OTel exporter)通 ——
 #   实测本机导出会成片读超时几分钟而读侧一切正常;那种情况下 ① 会**重试两轮**,仍失败就把
 #   服务端日志里那行 `opentelemetry.exporter ... Read timed out` 打出来指认错因。
@@ -156,12 +187,25 @@ app/memory/       ch01-06:store.py(锁注册表)、trim.py(token 计数与按整
                   summarize.py(摘要 prompt + 触发判定 + 原子落库)、tasks.py(后台摘要执行体)、
                   journal.py(两个上下文日志)—— **全部不依赖 LangChain**
 app/services/     chat.py(纯校验的 prepare_turn)、extract.py(抽取)、history.py(会话历史读写)
-app/api/          chat.py、extract.py、conversations.py(ch07 两个只读端点)
-app/static/       聊天页(单页,无构建工具链)
+app/api/          chat.py、extract.py、conversations.py(ch07 两个只读端点)、
+                  feedback.py(ch09 飞轮入口 ③:`POST /api/feedback`)、
+                  review.py(ch09 待审队列的四个端点)
+app/static/       聊天页 + 管理台 admin.html(单页,无构建工具链)
 app/retrieval/    ch03 在线检索:embedder.py(BGE-M3 懒加载)、milvus.py、search.py(KnowledgeRetriever)
-app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining
+app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining;
+                  ch04 的 jobs.py(JobStore)与 orchestrate.py(后台任务);
+                  ch09 增 **evidence.py**(三信号置信度 `evidence_confidence`,纯函数);
+                  ch09 改 **assess.py**(落池写口 `record_low_confidence` 多收一个
+                  `evidence_snapshot=`;`None` 与 `[]` 是**两个不同的值**)
+app/observability.py  ch09:**全章唯一**的 Langfuse 边界(四个名字:`trace_scope` / `intent_scope` /
+                  `span` / `make_handler`)。关掉时全 no-op 且不 import langfuse
+app/agent/json_stream.py  ch09:三态增量 JSON 解码器(纯状态机,零 IO/零 await/零依赖)
+app/flywheel/     ch09 数据飞轮(**池子的下游**):normalize.py(口语 → 标准问法 + 示例答案)、
+                  dedupe.py(对 `review_queue` 做**语义**查重)、pipeline.py(编排:归并或新建)、
+                  tasks.py(后台任务,带**整条任务的墙钟上界**)
 knowledge/        知识语料(3 份 Markdown,首行带 <!--type: ...--> 类型标记)
-scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)
+scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)、calibrate_evidence.py、
+                  intent_cost.py、eval_trend.py、run_flywheel_eval.py
 ```
 
 ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm, retrieval}`,仍是单向。
@@ -170,6 +214,22 @@ ch08 又加了两条边,方向分别是:`tools → {db}`(审计落库,本来就�
 (`client.py` 把 MCP 的工具**转成 `ToolSpec`** 再交给注册表),以及一个**不在 `app/` 下的**
 `mcp_servers/ → {tools.mock_data}`(两个 Server 与内置工具**共用同一份种子数据**,
 否则同一个订单号会在两边说两套话)。
+
+**ch09 加的四条边**(都不是新方向,但有一条值得单独记):
+
+- **`app/agent/nodes.py` → `app.flywheel.tasks`** —— 知识轮自评不足时,**落池之后**
+  fire-and-forget 起一轮飞轮(`start_flywheel_job_safely`,自己吞装配故障)。
+  这是**请求路径第一次直接依赖离线管线那一侧**;`app/flywheel/` **不反向引用 `app.agent`**
+  ⇒ 图仍无环。
+- `app/api/feedback.py` → `{app.kb.assess, app.flywheel.tasks, app.retrieval.search,
+  app.tools.registry}`(**重跑一次检索**回捞片段,见 §6.2 的语义偏差)与
+  `app/api/review.py` → `{app.kb.writer, app.kb.chunker, app.retrieval.*}`(通过 ⇒ 写库 + 立刻向量化).
+- 两个手工观测点(`retrieval`)落在 `app/agent/nodes.py` 与 `app/agent/refund_nodes.py`。
+
+> **`app/observability.py` 是全章唯一的 langfuse 边界**:**`app/` 下零处**别的模块 import
+> langfuse(一条**源码扫描**测试守着,见模块 docstring —— 它抓的是「有没有人写下这行 import」)。
+> 别的模块只认 `trace_scope` / `intent_scope` / `span` / `make_handler` 四个名字 ⇒
+> 「换观测后端」改的是这一个文件。
 
 > **`app/tools/` 不依赖 `app/mcp/`,两者靠 `ToolSpec` 交接。** 这是本章最关键的一条接缝:
 > 内置工具与 MCP 工具在注册表里**长得一模一样**(同一种 `ToolSpec`),执行器、权限闸、
@@ -363,6 +423,92 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 
 **本机对一个已关闭的回环端口调裸 `socket.connect()` 要 ~2.05s 才拿到拒绝**(2026-09-23 复测:端口 1 / 9 / 65500 / 54321 / 8101 / 8102 分别是 2.036 / 2.055 / 2.050 / 2.055 / 2.039 / 2.055 秒),而**在监听**的端口是毫秒级(19530 0.4ms、3307 22ms)。⇒ 「两个 MCP Server 都没起时每请求白等 ≈4.8s」**是**本机**的性质,不是这条链路的性质**(两个 Server ≈ 2×2.05 + adapters 的 0.35×2 ≈ 4.83s,与实测吻合)。**引用任何具体秒数都必须带「本机实测」四个字**;可移植的上界只有一个:`mcp_discovery_timeout_seconds × 2 = 10s` —— 而**那个上界本身未实测**(它对应「只吞 SYN 不回」那条路径,实测走的是「立刻拒绝」那条,且一轮发现里未必只有一次请求,所以它未必紧)。
 
+**ch09 · 观测(Langfuse)与飞轮的命门**(细节见 ch09 spec §15 与 `dev-notes/ch09.md`):
+
+**`LangfuseSpan.update(**kwargs)` 的 kwargs 被静默丢弃** —— 源码 docstring **逐字**写着
+`**kwargs: Additional keyword arguments (ignored)`。想在中途改 trace 属性只有一个口子:
+`propagate_attributes`,而它返回的 `_AgnosticContextManager` **没有 `__aenter__`** ⇒
+中途进入只能用**同步** `__enter__`(那是 `observability.TagScope` 存在的理由)。
+**这是本仓「静默无效」家族的第四个成员**(前三个:ch06 未声明通道写入被丢弃、ch07
+`add_messages` 给无 id 消息赋 uuid4、ch09 §2.2 的 `response_format` 走 beta 路径)——
+共同的形状是「一个看起来会生效的赋值,什么都没做,而且不报错」。
+
+**只调 `propagate_attributes` 而不开「当前 span」⇒ 每个观测各自成一条 trace**。
+`start_as_current_observation` 的父级取自 **OTel 当前 span**,而 Langfuse 的 LangChain
+回调**不把观测挂成 current**(它靠 LangChain 的 run tree 定父子)。⇒ `trace_scope` 里的
+**根观测(`chat`)是必需品,不是装饰**(T3 真机实测:修复前同一次请求 **2 个 `traceId`**、
+手工 span 的 `parentObservationId` 全是 `null`;修复后每个请求**只有 1 个**)。
+
+**`response_format` 与 `bind_tools` 在本网关上互斥**(langchain-openai 1.6.2 走 beta 路径,
+而那条路只接受 strict 工具)⇒ 知识轮的作答协议是**纯提示词驱动**、**没有硬保证**,
+解码器**fail-open**:模型不守协议 ⇒ 逐字节退回 ch08 的纯文本行为(`json_stream` 的 `plain` 态)。
+违约率**未被量成一个率** —— 真机 6 个样本里 **0 次**违约(T10),那是「这 6 轮守了协议」,
+不是「违约率是 0」。**别把 0/6 引成 0%。**
+
+**Metrics v2 的三条实测**:① `query` 是**一个 JSON 字符串参数**
+(`params={"query": json.dumps({...})}`),**不是把字段平铺进 query string**;
+② 按 `tags` 过滤要 `arrayOptions`(该组合法算子是 `any of` / `none of` / `all of`,
+**`contains` 是 string 那一组的、用了直接 400**);③ **`sum_totalCost` 恒为 0**
+(本项目模型没在 Langfuse 里配价格)⇒ `scripts/intent_cost.py` **只报 token,不报钱**
+(且 `totalCost` 必须**显式请求**,不请求时那个键**根本不在响应里** ⇒ 那句「恒为 0」
+会退化成空值兜底,成了断言而不是读数)。⚠️ 同族的静默坑:`dimensions` 清空时行里
+**没有 `tags` 键** ⇒ `r.get("tags")` 恒判 False ⇒ 脚本**安静地打印「没有找到任何 intent
+观测」**并退出码 0 —— 它比 400 危险得多(400 逼你查,它只给你一个自信的错答案)。
+
+**`app/llm.py` 必须显式传 `timeout`(本章最贵的一条)**。不传的话 langchain-openai(1.6.2)
+把 `request_timeout=None` **原样**交给 openai SDK,而 SDK 对「显式给的 `None`」的处理是
+**不设超时** —— 不是它自己的 `Timeout(connect=5, read=600)`;实测
+`model.root_async_client._client.timeout` 是 `Timeout(timeout=None)`,**四相全 None**,
+连 DNS 与握手都没上界。**后果不是「慢」,是永不返回**:对端一个字节都不回时那次 `await`
+谁也等不回来,而**挂起不是异常** ⇒ `finally` 永不执行、**飞轮的单槽被永久占死**,
+唯一解法是重启客服服务(T16 走查实测:三个任务分别盯到 **666 / 245 / 382 秒**仍是
+`running`,此后每次手动触发都是 409)。两道防线都是设置项:`llm_timeout_seconds`
+(每次往返,默认 60)与 `flywheel_job_timeout_seconds`(整条任务,默认 300)。
+⚠️ **标量会连带把 SDK 的 `connect=5` 换成 60**(连接阶段反而放松 12 倍;修前是 ∞,
+所以不是回归);要保住它就用**四元组**(**二元组会让 write/pool 落回 `None` = 又没上界了**)。
+
+**那个单槽只关了一半 —— 不许写成「已修复」**。`JobStore`(**ch04** 的)只有**一个**
+`running` 槽,`vectorize` / `mine`(ch04 的 `app/kb/orchestrate.py`)**至今没有任何死线**,
+ch04 管理台的 `pollJob` 也没有轮询上界 ⇒ 「任务卡住 ⇒ 槽位永久占死」这条路**在那两个任务上
+依然敞着**。本章只给**三个任务里的一个**(`flywheel`)加了整条任务的墙钟上界。
+
+**`evidence_confidence_threshold` 是标定值,但标定只定出了「平台段」。** 读
+`scripts/calibrate_evidence.py` 的表:`(0, 0.2894]` 内**任何**阈值在那 300 条上读数**逐位相同**
+(300 条里没有一条置信度落在这个开区间内)⇒ 现取值 `0.2` 是**平台内的一次判断,不是最优解**;
+**改它之前先重跑那个脚本**。两条更值钱的读数:(a) 误杀率 **0.175 与阈值无关** —— 被误杀的
+42 条正常问题**检索返回空**,闸的 `bool(evidence)` 在**任何**阈值下都拦它们(连 0 也拦),
+集中在口语桶(`C_colloquial` **21/60 = 35%**,`B_model` 只有 3/60);(b) 拦截率 0.967
+**几乎全部由「检索为空」挣来**,公式的判别带**零覆盖** ⇒ **本章验证的是检索器,不是那个三信号公式。**
+
+**`evidence_min_score` 必须同时用在 `top1` / `count` / `gap` 三个信号上**(spec §15.8)。
+只用在「有效证据数」上是一条**看起来更严、实际更松**的写法:一条低于下限的块**不进条数、
+却占住 `top2` 的位子**,把分差压小 ⇒ 换个路影响置信度。全部块低于下限时,
+与「空证据」走**同一个出口**、五个键全 0。
+
+**闸不是「召回为空才拦」(`iff` 是错的)。** 两个旋钮各管一段:单条 `score = 0.16` 的块
+**过得了** `evidence_min_score`(0.15)、**过不了**合成分(`0.6×0.16 + 0.2×(1/3) ≈ 0.163 < 0.2`)⇒
+**「手里有块、却被拦」真实可达**。那一刻丢掉的是这块的原文与得分,审核页上
+「知识库真缺这块」与「有、但没检到」长得**一模一样** —— 分开它俩正是快照的用途。
+
+**`evidence_snapshot` 的 `None` 与 `[]` 是两个不同的值**:本仓约定 **`None` = 当轮确实零召回**,
+空列表是另一个、会读错的值(三处写着这件事:`app/kb/assess.py`、`app/agent/nodes.py`、
+`tests/test_agent_gate_ch09.py`)。⚠️ 而且:**`NULL` 不等于「知识库没有这条」** ——
+一个编程错误(漏传 kwarg)会产生**逐字节相同**的行。要分开只能靠当轮检索的独立读数。
+
+**`matched_review_id` 一列担两个语义**(spec §7.1):既记「这条池子行归并到了 `review_queue`
+的哪一行」,**又**是流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
+⇒ 它是**可空且有含义**的(NULL = 尚未处理);谁把它写成 `NOT NULL`,谁就抹掉了「待处理」
+这个状态,**而且不会有任何东西报错**。流水线的幂等**只靠它**,不需要第二个状态列。
+池子行是**共享且只追加**的:飞轮按 `ORDER BY id LIMIT batch_size` 吃**最旧的**未处理行 ⇒
+「我这次跑只处理了自己那几行」**不成立**(T16 走查实测:那 30 条 ch09 之前的老行
+**全部**被消费掉、`matched_review_id` 全填上了)。
+
+**`db/ch09.sql` 是给「已有 `low_confidence_questions`、但缺那两列」的库升级用的**:
+**升级老库:先跑它、再跑 `init_db.py`**;**全新库:只跑 `init_db.py`、不要跑它**
+(空库上先跑它在 ALTER 上报 **1146**;先 `init_db.py` 再跑它 **1060 + 1050** 三条全红)。
+它**刻意不幂等** —— 与 db/ch03/04/06/07/08 同规矩。核对:
+`SHOW CREATE TABLE low_confidence_questions\G` 里要出现 `evidence_snapshot`。
+
 **`mount("/")` 必须在 `include_router` 之后**(`app/main.py`),否则静态目录会抢走 `/api/*`。
 
 ## 写测试的规矩(本项目血的教训)
@@ -413,6 +559,20 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - `evals/summary_cases.jsonl`(ch07)—— 11 条**摘要**标注样例,四类:正例 3 / 负例 2 / **幻觉探针** 2 / 四样提炼物(product、identifier、request、unresolved)各 1。口径**闭式**(关键词、字数上限、`\d{4,32}` 正则)。**实测 9/11**:两条负例(纯寒暄)判 MISS —— 模型**不返回空串**,而是吐约 40 字的**元叙述**(「本次对话未涉及任何商品…」)。**它没有编事实,但那句正是 prompt 点名的「对话状态一律不留」** ⇒ 这条既是「prompt 遵从度不满」的读数,也说明 T8 的「空输出退路」在真实模型上**很难触发**。**引用时必须带上这句**,别把 9/11 读成「实现坏了」。
   - **幻觉探针的判别力靠一个前提**:该用例的对话里**本来就没有** `\d{4,32}` 形态的数字。脚本对每条探针**自动核对这个前提**(用例自检),不成立就单独报 `!!!` 而不混进 MISS。另有**探针自检**:`\d{4,32}` 必须能匹配 `20240915`/`13800138000`(真会出现的形态)、**不能**匹配 `99` —— 后者正是 ch06 T1 那条**同义反复断言**(用 `\d{4,32}` 匹配「99」,长度对不上 ⇒ 恒真)的反面教材。
 - `evals/results/` 被 gitignore,是历史运行产物。
+- `evals/flywheel_cases.jsonl`(ch09)—— **两半合一个文件**,靠 `kind` 字段区分:
+  `normalize` 那半 **10 条**、`dedupe` 那半 **9 对**(`kind` 缺省按 `normalize` 处理,
+  所以旧 10 条一字未动)。**读数(normalize)**:最终判据(C 口径)**13 轮里 3 轮各挂 1 条**
+  (约每 4 轮 1 次、挂的不是同一条),逐条 **127/130**;D 口径 5 轮全对。
+  **读数(dedupe)**:**9/9**,给两个分母 —— 原始 **9** 与**带信息 6**(近域硬负例 2/2)。
+  ⚠️ **这个分数不是稳定量,而且是四次判据订正之后的读数**;单次「10/10」**不许当门禁**、
+  也不代表跑一遍永远 10/10(细节见「已知问题与未达成项」里 ch09 那一段与 T13 报告 §2.0/§2.3)。
+  跑它:`.venv/Scripts/python.exe scripts/run_flywheel_eval.py`(打网络)。
+- `eval_runs`(ch09 新表)+ `scripts/eval_trend.py`:一行一轮、按 `(created_at, id)` 连成趋势;
+  **条数或 `top_k` 与上一轮不同的两轮标「不可比」并整行不打箭头**(分母不同,差值不是「变化」)。
+  ⚠️ **真实两轮读数逐位相同 ⇒ 真实数据上不会有 `↓`/`↑`**,那是**确定性链路的性质**,
+  **不是「模型稳定」**(箭头只有合成数据验过;详见 ch09 已知问题那一段)。
+- 置信度阈值的**读数**放在上面的硬约束里(平台段 `(0, 0.2894]` + 拦截率 0.967 / 误杀率 0.175),
+  改它之前先跑 `scripts/calibrate_evidence.py`。
 
 ## 已知问题与未达成项(如实记账,不许读成「全绿」)
 
@@ -430,6 +590,76 @@ ch01 抓到 4 类;ch02 又抓到 **7 条「在它本该禁止的实现下依然�
 - **两条候选修法(择一或都做,未实施)**:
   1. **给 API 层兜底**:那个 `except Exception` 里不再直接 `str(exc)`,改成固定文案 + 把原文 `logger.error` 出去(与 502 那条路径同款)。改一处,覆盖面最大。
   2. **给写工具的取消路径补 `rollback()`**:照 ch03 `retrieval/search.py` 在 `except BaseException` 里先 `rollback()` 再抛的样子,给 `create_ticket`(以及任何将来直接用调用方 session 的写工具)补上。**治因**,但只治这一条路径。
+
+**ch09 · 那个单槽只关了一半 —— 不许写成「单槽问题已修复」。** `JobStore`(ch04 的,内存注册表)
+只有**一个** `running` 槽,**三个任务共用**:`vectorize` / `mine`(ch04)/ `flywheel`(ch09)。
+本章只给**其中一个**(`flywheel`)加了整条任务的墙钟上界(`flywheel_job_timeout_seconds=300`);
+**`vectorize` 与 `mine` 至今没有任何死线**,ch04 管理台的 `pollJob` 也**没有轮询上界**
+⇒ 「任务卡住 ⇒ 槽位永久占死 ⇒ 只能重启服务」这条路在那两个任务上**依然敞着**。
+(T16 走查的原始现象:三个卡住的任务分别盯到 **666 / 245 / 382 秒**仍是 `running`,
+此后每次手动触发都是 409 —— 连「手动那根杠杆」也拿不到槽。)
+
+**ch09 · 验收对「置信度闸那一列的 `evidence_snapshot`」零覆盖 —— ② 那条断言对它本该抓的
+bug 是不变的。** ② 问的是**零召回**的问题 ⇒ 没有片段可快照;而零召回那一支里,
+「闸**写了**这一列」与「闸**漏了** `evidence_snapshot=` 这个 kwarg」落出来的**都是 JSON `null`**
+⇒ 断言在两种实现下都成立。守它的是 `tests/test_agent_gate_ch09.py`,**不在端到端覆盖内**;
+脚本自己在结尾的「局限」里打这条。⚠️ **别拿池子里的读数反推覆盖**:探针曾读到「闸行 40 条、
+非空 **0**」(那时闸**根本没传这个 kwarg**);T18b 接上之后,T19 实测闸行 **43 条、非空 14 条** ——
+**「池子里有非空的行」不等于「② 那条断言有判别力」**,两件事别混。**没有为了凑覆盖去构造弱召回场景**
+(那要改服务端旋钮,验的是场景不是产品)。
+
+**ch09 · 验收脚本有一个「候选预算」,不是可以无限重跑的。** ② 每次运行会往知识库**真的写进一条**
+并核准 ⇒ 那条问题下一轮就召得到了 ⇒ 脚本每次从 `CAND_Q*` 里挑**第一条此刻召不到**的,
+**每跑一轮消耗一条**,用尽就**响亮地报**「请加一条」。旧 8 条在 T18 的八次运行里耗尽,
+2026-09-25 T19 那次跑用的**正是最后一条(`#8`)**;T19 补了 `CAND_Q9..Q16`(现 16 条)。
+**加候选有两条规矩**(都吃过教训):① marker 必须真的出现在它自己的答案里,
+**并且要用脚本自己的解码器核**(那是 `chr(int(h,16))` **码点**,不是 UTF-8 字节 —— 极易写混);
+② **marker 里不许出现数字(阿拉伯与中文都不行)** —— 见下面那条。
+用尽后的唯一正解是**加候选**,不是把题面写死(写死之后第二轮起会**悄悄变红**)。
+
+**ch09 · ③ 的「回复含核准答案的特征串」不是一条不变的断言(2026-09-25 实测红在数字上)。**
+核准答案写的是「电源线长约**一点八米**」,模型转述成「**1.8 米**」⇒ 判红;而**产品那一侧
+每一步都是对的**(写了块、向量化了、召得回来、过闸、回复带引用 `[1]`、不再是兜底话术 ——
+③ 下面那条否定断言就是绿的)。**数字是这一族「回声断言」唯一不稳定的一类 token**
+(模型会把中文数字写成阿拉伯数字,还带一个空格);原注释只防了反方向(`12 毫米` → `12毫米`)。
+⇒ **判据**:特征串取**实词词组**,不取任何形态的数字。修复只是**补了选材规矩**(断言一个字没动),
+`CAND_Q8 / M8` **原样留在文件里当证据**。
+
+**ch09 · 评估流水线是确定性的 ⇒ 趋势表上的 `= 0.000` 不是「模型稳定」。** 两轮真实评估
+(各 5 条)在四个策略、八个指标上**逐位相同**,所以真实数据上**一个 `↓` / `↑` 都不会出现**
+(箭头只有喂 `trend_synthetic.py` 的造数才验过)。要读成「**同一批用例走了同一条确定性检索链路**」。
+
+**ch09 · 飞轮自己的评估集是不稳定的 ⇒ 不许拿「10/10」当门禁。** `evals/flywheel_cases.jsonl`
+在最终判据(C 口径)下:**13 轮里 3 轮各挂 1 条**(约每 4 轮 1 次),**挂的不是同一条**
+(第 4 / 6 / 8 条各一次),逐条 **127/130**;D 口径 5 轮全对。⇒ **单次「10/10」不代表稳定**,
+引用时必须带上「四次判据订正之后的读数 + 23 轮采样」这个限定。**查重那一半要报两个分母**:
+原始 **9/9** 与**带信息 6/6**(9 对里 3 对是「明显同义/完全同一」之外的弱用例,其中近域硬负例 2/2)。
+另有 T13 的一条**判据缺陷**记账:`evals/flywheel_cases.jsonl` 的用例集**偏弱**,
+四次订正**全部是判据缺陷、不是模型缺陷**。
+
+**ch09 · `NULL` 快照 ≠ 「知识库没有这条」。** 一个**编程错误**(漏传 kwarg)会产生**逐字节相同**的
+行 ⇒ 要分开「知识库真缺这块」与「有、但没检到」,只能靠**当轮的独立检索读数**。同族地,
+本仓约定 **`None` = 当轮确实零召回**,空列表 `[]` 是**另一个**值(三处代码写着这件事)。
+
+**ch09 · 三条如实记账的既有/前端缺陷(都不阻塞本章验收)**:
+- **`admin.html` 的 `showResult` 读 `r.body || {}` 里的 `info.op.chunks_added`** ⇒ 一个 **2xx 但
+  body 不是 JSON** 的响应会渲染成「新增知识块 **undefined**」(同一处还有 `undefined 块`)。
+- **`app/static/index.html` 的 `makeCitesClickable` 读 `textContent`、写回 `innerHTML`**
+  —— **先于本章**(ch04 T9 起就在),不是 ch09 引入的。
+- **验收脚本「输出干净」自检有一条残留**:那条**绿判词的文案自己就含**它要扫的三个串
+  ⇒ 同一份转录上**再跑第二次会自咬**(进程内只调用一次,外观级;候选也只剩很少,没为它再烧一轮全量)。
+
+**ch09 · 池子那 30 行 ch09 之前的行已被飞轮消费掉 —— 任何「池子未动」的旧基线都不再成立。**
+飞轮每批吃 `WHERE matched_review_id IS NULL ORDER BY id LIMIT batch_size`(最旧的先),
+而池子是共享、只追加的 ⇒ 「我这次只处理了自己那几行」**不成立**。T19 实测读数:
+池子 **58** 行、`matched_review_id IS NOT NULL` **58**、未处理 **0**(这之前的 56/56/0 同款)。
+**这些数一律是当时的读数**,随运行次数只增不减 —— **断言不要拿它们当基线**。
+
+**ch09 · Langfuse 的写侧会成片失败几分钟,而读侧一切正常。** 服务端 OTel exporter 打
+`Read timed out`(`read timeout=4.99999`)而 REST 查询端点(①⑤ 用的那条)**照常返回**。
+⇒ ① 因此**重试两轮**,仍失败就把服务端日志里那行 `opentelemetry.exporter ... Read timed out`
+打出来指认错因 —— 别把它读成「代码坏了」。连带:`sum_totalCost` **恒为 0**(没配模型价格),
+`scripts/intent_cost.py` **只报 token、不报钱**。
 
 ## 平台陷阱(Windows + Git Bash)
 

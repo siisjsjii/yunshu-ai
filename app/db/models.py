@@ -143,8 +143,10 @@ class LowConfidenceQuestion(Base):
     # `app/agent/nodes.py:_snapshot` 返回**列表**,每项是
     # `{"chunk_id", "score", "section_path", "answer"}`。注解原先写的是
     # `dict | None` —— 运行时无害(JSON 列照收),但**注解与事实不符会误导后来人**
-    # (审核页 T15/T16 是照这个形状读的)。**另一处写入方是 T12 起的
-    # `POST /api/feedback`(它今天还不存在,形状按这一条对齐)。**
+    # (审核页 T15/T16 是照这个形状读的)。**另两处写入方**:`POST /api/feedback`
+    # (T12 起,**已在线**,`app/api/feedback.py` 的 `_snapshot` 吃的是检索器刚返回的
+    # `RetrievedChunk` 对象)与置信度闸(T18b 起,`_snapshot(evidence) if evidence else None`,
+    # **已在线** —— 它改之前闸那一处**根本没传这个 kwarg**,池子里那一列恒为 NULL)。
     #
     # ⚠️ **别拿这两条反推形状**(都核过、都写准):
     # - `tests/test_ch09_orm.py` 的往返用例塞的是 **dict**(`{"chunks": [...]}`)——
@@ -342,6 +344,23 @@ class ReviewQueue(Base):
     ③ **`created_at` 的默认值措辞**:DDL 建出来是 `DEFAULT CURRENT_TIMESTAMP`,
        create_all 建出来是 `DEFAULT (now())`(SQLAlchemy 把 `func.now()` 渲染成表达式)。
        两者都是「插入时取当前时间」,行为一致。
+       ⚠️ **本条被一次复审判过一次「不是差异」—— 那个判定不可复现,2026-09-25 重测,
+       结论是原判。** 方法(可复跑、不碰生产库):建临时库 → 一条路走 ORM 的
+       `create_all`、另一条路走 `db/ch09.sql` 原文那句 `CREATE TABLE` →
+       核对 `SHOW CREATE TABLE`。读数(MySQL **8.0.46**,即本机那个容器):
+
+       | 路径 | `created_at` 那一行 |
+       |---|---|
+       | `create_all` | `` `created_at` datetime NOT NULL DEFAULT (now()) `` |
+       | `db/ch09.sql` | `` `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP `` |
+
+       **两条路逐字不同。** 注:`CreateTable` **发**出去的是 `DEFAULT now()`,是 **MySQL
+       把它规范化成 `(now())`** —— 所以「发的是 `now()`」与「库里存的是 `(now())`」
+       两句话**都对**,差别只在下一步。那次复审的依据正是「发的是 `now()` ⇒ 落库就是
+       `CURRENT_TIMESTAMP`」的推论:**前半句对,后半句实测不成立**(「发出去的文本」
+       不等于「`SHOW CREATE TABLE` 读回来的文本」)。判据:凡「外部系统会怎么规范化我这条
+       声明」,必须**跑一遍 `SHOW CREATE TABLE`**,不能从发出去的文本往上推。
+       仍是**纯文本差异**(语义都是「插入时取当前时间」)—— 别读成行为分歧。
     ④ **列序**:db/ch09.sql 走的是 ALTER,新列被**追加到末尾**(池子那两列就落在
        `created_at` 之后),而 create_all 按 ORM 的声明顺序建表 ⇒ 两条路径**列序不同**。
        这是 ALTER 路径的必然结果,而 SQLAlchemy 一律**按名取列**(不按位置)⇒ 不影响行为。
@@ -388,11 +407,16 @@ class EvalRun(Base):
     与 db/ch09.sql 的形状差异 —— 同 `ReviewQueue` docstring 里那份**五条清单**:
     ① `id` 的 `unsigned` 有无(DDL 带 `UNSIGNED`,ORM 有符号);
     ② DDL 的表/列 COMMENT 在 ORM 侧没有对应物;
-    ③ `created_at` 的 `DEFAULT CURRENT_TIMESTAMP`(DDL)vs `DEFAULT (now())`(create_all);
+    ③ `created_at` 的 `DEFAULT CURRENT_TIMESTAMP`(DDL)vs `DEFAULT (now())`(create_all)
+       —— 本表与 `review_queue` 是**同一个读数、同一次实测**(2026-09-25 重测,方法见
+       `ReviewQueue` 的 ③);
     ④ 列序不涉及(本表没走 ALTER);
     ⑤ 索引名 `ix_eval_runs_created_at` 对 DDL 的 `idx_created`。
-    **已对齐的**:列名、可空性、类型、`created_at` 的默认值、**索引覆盖**
-    (`created_at` 在两条路径上都建索引)。
+    **已对齐的**:列名、可空性、类型、**索引覆盖**(`created_at` 在两条路径上都建索引),
+    以及 `created_at` 默认值的**语义**(两条路都是「插入时取当前时间」)。
+    ⚠️ 那句「语义对齐」与上面 ③ 的「**措辞**不同」**不矛盾,但必须分开说**:
+    对齐的是行为,不同的是 `SHOW CREATE TABLE` 读回来的文本(一度把这两件事写成
+    同一句话,读起来自相矛盾)。
     """
 
     __tablename__ = "eval_runs"

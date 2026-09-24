@@ -93,11 +93,17 @@ def _root_cm(settings: Settings, conversation_id: str) -> Any:
 
     ⚠️ **它不是一个装饰**:T3 的第一次真机冒烟实测到,只调
     `propagate_attributes` 而**不开当前 span** 时,**所有观测都各自成一条 trace**
-    —— 请求那条 trace 上只有 LangChain 回调建的那些,而 `retrieval` / `tool:*`
-    这两个手工 span(以及 LangChain 回调建的观测)各自开新 trace,`traceId` 互不相同、
-    `parentObservationId` 全是 `null`。成因:`start_as_current_observation` 的父级
-    取自 **OTel 当前 span**,而 Langfuse 的 LangChain 回调**不把观测挂成 current**
-    (它靠 LangChain 的 run tree 定父子)⇒ 没有"当前 span"就没有东西可挂。
+    —— 请求那条 trace 上只有 LangChain 回调建的那些,手工 span 各自开新 trace,
+    `traceId` 互不相同、`parentObservationId` 全是 `null`。成因:
+    `start_as_current_observation` 的父级取自 **OTel 当前 span**,而 Langfuse 的
+    LangChain 回调**不把观测挂成 current**(它靠 LangChain 的 run tree 定父子)⇒
+    没有"当前 span"就没有东西可挂。
+
+    ⚠️ **这句话一度写成「`retrieval` / `tool:*` 这两个手工 span」—— `tool:*` 已按
+    spec §15.5 删除**(内置工具本来就有 LangChain 回调建的 `TOOL` 观测,手工那条是
+    **同一事件表示两遍**)。**今天全仓手工 span 只剩 `retrieval` 一种形状**
+    (`app/agent/nodes.py` 与 `app/agent/refund_nodes.py` 各一处),
+    `tests/test_agent_refund.py` 有一条用例钉住「整轮里只有这一条手工 span」。
 
     ⇒ 有了它,回调建的观测与手工 span 才会落进**同一条** trace、`chat` 之下。
 
@@ -242,7 +248,8 @@ def intent_scope(intent: str, *, settings: Settings) -> TagScope:
 def _observation_cm(settings: Settings, name: str, as_type: str, input: Any) -> Any:
     """建一个手工观测上下文。**单独抽出来是为了能测** —— 理由与 `_outer_cm` 相同:
     测试把它换成假的,enabled 路径就能在不联网、不 import langfuse 的前提下被验到。
-    `span` 将来要承担工具执行与知识检索的观测,它自己的吞异常/降级分支必须有测试。
+    `span` 今天的唯一使用方是**知识检索**(见 `span` 的 docstring),它自己的
+    吞异常/降级分支因此必须有测试。
     """
     from langfuse import get_client
 
@@ -257,11 +264,16 @@ def span(
 ) -> Iterator[Any | None]:
     """手工开一个观测。关掉时 yield None。
 
-    **它存在的理由**:Langfuse 的 LangChain 回调只覆盖 LangChain 的 run。
-    本项目的**工具执行**(`app/tools/executor.py:execute_tool`)与**知识检索**
-    (`app/retrieval/search.py:KnowledgeRetriever`)都不是 LangChain run,
-    一个 span 都不会自动出现 —— 而"每个节点的工具调用、检索结果都能铺开看"
-    这条需求,只有这里能落地。
+    **它存在的理由**:Langfuse 的 LangChain 回调只覆盖 **LangChain 的 run**。
+    本项目的**知识检索**(`app/retrieval/search.py:KnowledgeRetriever`)是一个自写的
+    普通类、**不是** LangChain run ⇒ 没有这个手工 span,知识检索在界面上**是空的**
+    (`retrieval` 因此是今天唯一的使用方)。
+
+    ⚠️ **不要按「工具执行也要靠它」来理解** —— 这句话一度是这么写的,**与实测相反**:
+    `app/tools/executor.py:execute_tool` 里的 `spec.tool.ainvoke(...)` **是**一个
+    LangChain run ⇒ 回调**已经**给了它一条嵌套正确的 `TOOL 'query_order'`
+    (在 `agent` 之下)。手工再开一条是**同一个事件表示两遍**,已按 spec §15.5 删除
+    (Langfuse 自己的最佳实践原话:`Don't emit duplicate dispatch + execution nodes`)。
 
     实测可用的 `as_type`:`span` / `generation` / `agent` / `tool` / `chain` /
     `retriever` / `evaluator` / `guardrail` / `embedding`。

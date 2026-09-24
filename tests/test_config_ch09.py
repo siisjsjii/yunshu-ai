@@ -15,6 +15,11 @@ def _settings(**over):
 
 
 def test_langfuse_defaults_are_empty_so_tests_never_go_online():
+    """⚠️ **已被更严的用例取代(2026-09-25 标注)—— 不要拿它当证据引用。**
+
+    取代者:`test_ch09_fields_have_defaults`(**逐字 `==` 钉住同样这三个值**,
+    一分不差)。本条与它同真同假,留着只为保留「当时是这么写的」这个痕迹。
+    """
     s = _settings()
     assert s.langfuse_public_key == ""
     assert s.langfuse_secret_key == ""
@@ -22,6 +27,13 @@ def test_langfuse_defaults_are_empty_so_tests_never_go_online():
 
 
 def test_evidence_weights_are_bounded():
+    """⚠️ **已被取代(2026-09-25 标注)—— 判别力极弱,别引用。**
+
+    它只钉住了「和」:`0.5/0.3/0.2` 也满足它,而 spec §4 的分数会跟着变
+    (同一份文件里 `test_ch09_fields_have_defaults` 的 docstring 已经写明这件事)。
+    取代者:**权重逐条 `==`**(`test_ch09_fields_have_defaults`)+
+    **两个方向都拒的 `test_out_of_range_proportions_are_rejected`**。
+    """
     s = _settings()
     assert s.w_evidence_top1 + s.w_evidence_count + s.w_evidence_gap == pytest.approx(1.0)
     assert 0.0 <= s.evidence_confidence_threshold <= 1.0
@@ -29,6 +41,13 @@ def test_evidence_weights_are_bounded():
 
 
 def test_snapshot_and_flywheel_bounds():
+    """⚠️ **已被取代(2026-09-25 标注)—— 判别力极弱,别引用。**
+
+    `>= 1` 对一个**完全没有声明下界**的实现同样成立(见本文件下方那段
+    「为什么必须补」)。取代者:`test_ch09_fields_have_defaults`(逐条 `==`)+
+    `test_non_positive_counts_are_rejected`(0 与负数两个方向,且**断出错信息里
+    出现该字段名**)。
+    """
     s = _settings()
     assert s.snapshot_top_n >= 1
     assert s.snapshot_answer_chars >= 1
@@ -36,6 +55,13 @@ def test_snapshot_and_flywheel_bounds():
 
 
 def test_out_of_range_is_rejected():
+    """⚠️ **已被取代(2026-09-25 标注)—— 断言太松散,别引用。**
+
+    `pytest.raises(Exception)` 只问「有没有抛」,不问**哪个字段**被拒 ——
+    一个把所有 ch09 字段的边界都写错的实现照样通过。取代者:两个 parametrize
+    用例(`test_out_of_range_proportions_are_rejected` /
+    `test_non_positive_counts_are_rejected`,各自 `assert field in str(exc.value)`)。
+    """
     with pytest.raises(Exception):
         _settings(evidence_confidence_threshold=2.0)
     with pytest.raises(Exception):
