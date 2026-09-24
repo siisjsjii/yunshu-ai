@@ -554,6 +554,71 @@ async def test_a_thread_that_cannot_start_still_lands_in_a_terminal_status(
 
 
 # --------------------------------------------------------------------------
+# 一之二、任务的**寿命上界**(不读库)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_a_pipeline_that_never_returns_is_killed_by_the_deadline(
+    monkeypatch, job_store
+):
+    """**卡住的任务必须自己走到终态** —— 不抛异常的那条路也要有出口。
+
+    这是本章最贵的一次真实故障(T16 走查,2026-09-24):三条任务卡在 `running`
+    不放(`7e24193e0520` 盯到 666s、`21f7dad5859d` 245s、`f40f9075cb2e` 382s),
+    **零日志、message 空串**,库里一条开着却空转的事务;而槽是**单槽**的 ⇒
+    此后端点永远 409、**连手动那个「跑一轮飞轮」也拿不到槽**(它的存在理由正是
+    「从一次坏跑的现场恢复」),唯一的出路是**重启服务**。
+
+    ⚠️ **它钉的是一个「不抛异常」的失败形态** —— 本文件其余全部用例(线程起不来、
+    流水线抛、dispose 抛、脱敏抛)走的都是 `except BaseException` 那条路,而
+    **挂起不是异常**:`finally` 根本不会被执行。所以「每条出口都进终态」那句话
+    在**没有寿命上界**时是假的。
+
+    判据(三条缺一不可,顺序也就是读的人要看的顺序):
+    ① 终态是 `failed`(不是一直 running);② `message` 里说得出**为什么**
+    (「消失了」与「被超时杀掉的」在 `GET /api/kb/jobs` 上必须分得开);
+    ③ **槽真的被摘了** —— 用一个新任务起得来证明,而不是看 `is_busy()` 那个布尔。
+
+    ⚠️ 流水线替身用**轮询 `threading.Event`** 而不是 `await asyncio.Event().wait()`:
+    后者的 `set()` 要在同一条事件循环里才有意义,而这条协程跑在**后台线程自己**的
+    循环上 —— 用例这个线程去 set 它是跨循环操作。`threading.Event` 让
+    **没有被超时杀掉时**(修好之前)那条线程也能被收干净,不留活过拆卸的线程。
+    """
+    _patch_fresh_factory(monkeypatch)
+    stop = threading.Event()
+
+    async def never_returns(*, session, model, batch_size):
+        while not stop.is_set():
+            await asyncio.sleep(0.05)
+        return dict(PIPELINE_RESULT)
+
+    monkeypatch.setattr(tasks, "run_flywheel", never_returns)
+    settings = _settings(flywheel_job_timeout_seconds=0.3)
+
+    try:
+        job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
+        assert job_id is not None
+        job = await _wait(job_store, job_id, timeout=10.0)
+
+        assert job.status == "failed", (
+            f"卡住的流水线必须被寿命上界杀掉,实际停在 {job.status}"
+            f":{job.message}(这就是「单槽被永久占死」的现场)"
+        )
+        assert "超时" in (job.message or ""), (
+            f"message 必须说得出**为什么**结束(消失与超时在接口上要分得开),"
+            f"实际 {job.message!r}"
+        )
+        assert job_store.is_busy() is False, "槽没摘 ⇒ 端点此后永远 409"
+        second = tasks.start_flywheel_job(
+            settings=settings, model_factory=lambda: MODEL)
+        assert second is not None, "被超时杀掉之后必须能再起一个(槽真的被摘了)"
+        await _wait(job_store, second, timeout=10.0)
+    finally:
+        stop.set()      # 修好之前那条线程要能自己退出来,不留活过 monkeypatch 拆卸
+
+
+# --------------------------------------------------------------------------
 # 二、fire-and-forget 的那一层守卫(不读库)
 # --------------------------------------------------------------------------
 

@@ -40,6 +40,37 @@
 - `start_flywheel_job_safely`:**落池之后**那三处 fire-and-forget 用的形状
   (`置信度闸` / `商品咨询`自评轮 / `POST /api/feedback`)。区别只有一条:
   它**绝不抛**。
+
+## 「挂起不是异常」⇒ 终态还有**第四条**出口:寿命上界
+
+上面那三条出口**全部**以「有异常」为前提(协程抛 / 线程起不来 / 兜底自己炸)。
+2026-09-24 的 T16 走查实测到第四条:**任务只是卡住**,谁都没抛 ——
+三条任务停在 `running` 666s / 245s / 382s,**零日志**、`message` 空串、库里一条
+开着却空转的事务,而槽是**单槽**的 ⇒ 端点此后永远 409、**连手动那个
+「跑一轮飞轮」也拿不到槽**,唯一的出路是**重启客服服务**。
+⇒ `finally` 根本没被执行,而「每条出口都进终态」那句保证在有界等待之外是假的。
+
+**两半各治一半,缺一不可:**
+
+1. **让等待有界**(`app/llm.py:_build` 的 `timeout=`)—— 治因:对端静默时
+   每次往返在 `settings.llm_timeout_seconds` 内抛 `APITimeoutError`,
+   于是「卡住」重新变回一种**异常**,上面那三条出口立刻全部生效
+   (它同时救了对话/抽取/摘要 —— 那几个入口此前同样会被一次静默拖死)。
+2. **让任务有寿命上界**(下面 `_run_flywheel` 里的 `asyncio.timeout`)—— 兜住
+   **其它**任何一种无界等待(将来某个新依赖、某个锁、某个没配 timeout 的客户端)。
+   它不替代第 1 条:没有第 1 条时它每次都要等到 300s 才收场,而且那 300s 里
+   用户看到的是「任务在跑」。
+
+**为什么不用「JobStore 里的存活检查 / 强制清槽」**:JobStore **停不下**那条线程
+—— 把槽提前放掉只等于允许**第二批**与那个僵尸并发跑,而单槽的全部意义正是
+「同一张池子两条流水线并发只会互相抢行」(`occurrences` 会跟着涨错);
+僵尸稍后写自己的终态时状态也会打架。上界必须长在**干活的那一侧**。
+
+**被上界杀掉的那一批一行都不会落地**(`run_flywheel` 整批只提交一次)。
+这是**刻意**的:池子行靠 `matched_review_id IS NULL` 幂等,下一轮会重新吃到它,
+而半批落地的中间态会让「哪些算处理过」变得没有判据。所以那条 message 里
+必须把这件事写出来 —— 「消失了」与「被上界杀掉的」在 `GET /api/kb/jobs` 上
+要分得开。
 """
 
 import asyncio
@@ -63,6 +94,22 @@ JOB_KIND = "flywheel"
 #: 脱敏自己失败时用的固定文案。**绝不回显未脱敏原文** —— 宁可丢原因,
 #: 也不许把可能带密钥的文本写进 `JobStore.message`(它经 `GET /api/kb/jobs` 出站)。
 UNREDACTED_REASON_MESSAGE = "任务异常结束(原因未能脱敏,详见服务日志)"
+
+
+class FlywheelDeadlineExceeded(RuntimeError):
+    """寿命上界到了(见模块 docstring「挂起不是异常」那一节)。
+
+    它是**普通异常**是刻意的:终态的写入走的是那三条**已经验过**的出口
+    (协程的 `finally` → `_spawn` 的兜底,后者把原因写进 `JobStore.message`),
+    不新增第四个写口。⇒ `str(它)` 就是那条**出站**文案,所以里面
+    **不许出现任何可能带密钥的东西**(它要过 `redact_api_key`,那只是第二道)。
+    """
+
+    def __init__(self, *, limit: float) -> None:
+        super().__init__(
+            f"任务超时(上限 {limit:.0f}s):本轮已放弃。整批一次提交 ⇒ "
+            f"这一批一行都没落地,池子里的行仍在(下一轮会重新吃到)"
+        )
 
 
 def _write_failed(job_store: JobStore, job: Job, settings, exc: BaseException) -> None:
@@ -153,9 +200,21 @@ async def _run_flywheel(job_store: JobStore, job_id: str, settings, model_factor
         # 调它,调用方是用户请求的那条线程 —— 那边一毫秒都不该花在建模型上)。
         model = model_factory()
         async with factory() as session:
-            result = await run_flywheel(
-                session=session, model=model,
-                batch_size=settings.flywheel_batch_size)
+            # 寿命上界(模块 docstring 第四条出口)。**只包住流水线**:
+            # 终态的写入与 `engine.dispose()` 必须在它**外面** —— 被上界杀掉时
+            # 那两步更要做完(否则槽照样占死,那就等于没修)。
+            #
+            # ⚠️ `except` 写在 `async with asyncio.timeout(...)` 的**外面**(用 try
+            # 包住整个 with 块):`TimeoutError` 是那个 CM 在 `__aexit__` 里抛的,
+            # 写在里面会连它自己的取消转换一起吞掉(`uncancel` 也对不上)。
+            try:
+                async with asyncio.timeout(settings.flywheel_job_timeout_seconds):
+                    result = await run_flywheel(
+                        session=session, model=model,
+                        batch_size=settings.flywheel_batch_size)
+            except TimeoutError as exc:
+                raise FlywheelDeadlineExceeded(
+                    limit=settings.flywheel_job_timeout_seconds) from exc
         job_store.update(
             job_id, status="done",
             message=(f"处理 {result['processed']} 行:"

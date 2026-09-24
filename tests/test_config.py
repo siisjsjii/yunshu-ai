@@ -136,6 +136,31 @@ def test_negative_retry_delay_is_rejected():
     assert "tool_retry_delay_seconds" in str(exc.value)
 
 
+@pytest.mark.parametrize("field", ["llm_timeout_seconds", "flywheel_job_timeout_seconds"])
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_non_positive_wall_clock_bounds_are_rejected(field, bad):
+    """这两个上界 <= 0 都会**静默失效**,所以必须启动即拒(T16b,2026-09-24)。
+
+    - `llm_timeout_seconds=0` ⇒ 每一次模型往返**立刻**超时(工具那条
+      `tool_timeout_seconds` 是同款理由);
+    - `flywheel_job_timeout_seconds=0` ⇒ 寿命上界形同虚设:任务一起来就被杀,
+      而**看起来**又是一条正常的 failed(真正的效果是飞轮永远跑不完一批)。
+    """
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **REQUIRED, **{field: bad})
+    assert field in str(exc.value)
+
+
+def test_wall_clock_bounds_defaults():
+    """两个默认值本身也是「被看见的决定」,不是随手拍的数:
+    `llm_timeout_seconds` 对的是**实测最慢一次调用约 4.5s**(T16 走查的日志里
+    相邻两次 200 之间最大的间隔),60s ≈ 13 倍余量;`flywheel_job_timeout_seconds`
+    对的是**一批 10 行 ≈ 30s**(同一份日志:20 次调用 29s),300s ≈ 10 倍余量。"""
+    s = Settings(_env_file=None, **REQUIRED)
+    assert s.llm_timeout_seconds == 60.0
+    assert s.flywheel_job_timeout_seconds == 300.0
+
+
 def test_zero_bounds_are_allowed():
     """下界只在负数上收:0 次重试(等价于只试一次)与零延迟都是合法配置。"""
     settings = Settings(
