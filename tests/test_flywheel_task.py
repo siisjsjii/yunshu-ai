@@ -146,6 +146,20 @@ def _patch_pipeline(monkeypatch, *, result=None, exc=None, on_call=None):
     return calls
 
 
+async def _await_thread_gone(job_id: str, *, timeout=5.0) -> None:
+    """等那条后台线程收尾。
+
+    兜底那两次写(协程的 finally → `_spawn` 的 except)是**同一线程里的先后两步**,
+    只等状态会在第二步还没落上时就返回 —— 于是「原因写进 message」那类断言**偶发红**。
+    线程消失 ⇒ 那两步都做完了。
+    """
+    name = f"flywheel-job-{job_id}"
+    for _ in range(int(timeout / 0.01)):
+        if not any(t.name == name for t in threading.enumerate()):
+            return
+        await asyncio.sleep(0.01)
+
+
 async def _wait(job_store, job_id, *, until=None, timeout=10.0):
     """轮询到终态(`until` 是额外条件)。
 
@@ -233,7 +247,14 @@ async def test_second_job_while_running_gets_409(monkeypatch, job_store):
     """
     _patch_fresh_factory(monkeypatch)
     release = threading.Event()
-    _patch_pipeline(monkeypatch, on_call=release.wait)
+    started = threading.Event()
+
+    def on_call():
+        # 进流水线 ⇒ **线程真的起来了**(下面那条断言要的就是它)
+        started.set()
+        release.wait()
+
+    _patch_pipeline(monkeypatch, on_call=on_call)
 
     app.dependency_overrides[get_settings] = lambda: _settings(
         flywheel_batch_size=3)
@@ -245,6 +266,26 @@ async def test_second_job_while_running_gets_409(monkeypatch, job_store):
             first = await client.post("/api/kb/jobs/flywheel")
             assert first.status_code == 201, f"实际 {first.status_code}:{first.text}"
             job_id = first.json()["job_id"]
+
+            # ★ 「专用线程」这条性质的**唯一**带牙断言(brief 说它一个字都不能省)。
+            # 线程名由 `_spawn` 起(名字里带的就是这个 job id,端点的 `job_id`
+            # 就是 `Job.id`)。⚠️ 不能只断「任务在跑」——`JobStore` 是纯内存字典,
+            # 一个**压根不起线程**的实现(比如把 `_spawn` 整行删掉)照样能让 job
+            # 停在 running、照样 409,而用户的任务永远不会被处理。
+            # `started` 必须等:流水线是在**那条线程里**被调用的。
+            for _ in range(int(5 / 0.01)):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set(), (
+                "流水线一直没被调用 —— 后台线程没起来(或 `_spawn` 里起线程那行被删了)"
+            )
+            alive = [t.name for t in threading.enumerate()
+                     if t.name == f"flywheel-job-{job_id}"]
+            assert alive, (
+                f"必须有一条名为 `flywheel-job-{job_id}` 的线程在跑(专用线程那条性质),"
+                f"当前线程:{[t.name for t in threading.enumerate()]}"
+            )
 
             second = await client.post("/api/kb/jobs/flywheel")
             assert second.status_code == 409, (
@@ -290,8 +331,13 @@ async def test_a_raising_pipeline_lands_in_failed_and_releases_the_slot(
     )
     assert engine.disposes == 1, "异常路径同样要把自建 engine 收掉"
     assert job_store.is_busy() is False, "槽没摘 ⇒ 下一个任务永远 409"
-    assert tasks.start_flywheel_job(
-        settings=settings, model_factory=lambda: MODEL) is not None
+    second = tasks.start_flywheel_job(
+        settings=settings, model_factory=lambda: MODEL)
+    assert second is not None
+    # ⚠️ **收尾必须等它跑完**:不等的话那条线程会活过本用例的 monkeypatch 拆卸 ——
+    # 打桩一撤,它手里就变成**真的** `_fresh_factory` / **真的** `run_flywheel`
+    # (实测:日志里冒出一条连不上 `h` 的 traceback;那还是假 URL 的情况)。
+    await _wait(job_store, second)
 
 
 @pytest.mark.anyio
@@ -342,8 +388,10 @@ async def test_a_failing_engine_factory_does_not_leak_the_slot(monkeypatch, job_
 
     assert job.status == "failed", f"实际 {job.status}:{job.message}"
     assert job_store.is_busy() is False
-    assert tasks.start_flywheel_job(
-        settings=settings, model_factory=lambda: MODEL) is not None
+    second = tasks.start_flywheel_job(
+        settings=settings, model_factory=lambda: MODEL)
+    assert second is not None
+    await _wait(job_store, second)      # 收尾:别让那条线程活过 monkeypatch 拆卸(见上一条)
 
 
 @pytest.mark.anyio
@@ -367,16 +415,12 @@ async def test_spawn_fallback_never_downgrades_a_done_job(job_store):
 
     job = job_store.start(tasks.JOB_KIND)
     assert job is not None
-    tasks._spawn(job_store, job, coro)
+    tasks._spawn(job_store, job, _settings(), coro)
 
     # 先等 `result` 落地(它证明协程真的跑过),再等那条线程收尾 —— 兜底若要
     # 覆写,就在这两步之间发生(同一线程、纯 CPU、微秒级)。
     await _wait(job_store, job.id, until=lambda j: j.result is not None)
-    name = f"flywheel-job-{job.id}"
-    for _ in range(500):
-        if not any(t.name == name for t in threading.enumerate()):
-            break
-        await asyncio.sleep(0.01)
+    await _await_thread_gone(job.id)
 
     settled = job_store.get(job.id)
     assert settled.status == "done", (
@@ -384,6 +428,129 @@ async def test_spawn_fallback_never_downgrades_a_done_job(job_store):
         f"(result 还在:{settled.result})"
     )
     assert settled.result == PIPELINE_RESULT
+
+
+#: 一份**只活在这条用例里**的 key。它与真 `.env` 那份必然不同 —— 用例会就地
+#: 断这个前提,不然「拿全局 key 脱敏」那个缺陷在两边相同时**照不亮**。
+CALLER_KEY = "sk-caller-only-1f2e3d4c5b6a"
+
+
+@pytest.mark.anyio
+async def test_the_fallback_redacts_with_the_callers_key(monkeypatch, job_store):
+    """兜底脱敏必须用**调用方那份** settings 的 key,不是进程全局那份。
+
+    反例的后果:`_spawn` 要兜的是调用方传进来的 settings(端点那条路来自
+    `Depends(get_settings)`,三处钩子来自节点手上的 settings),而
+    `str(exc)` 里带的是**那一份** key 的时候,拿全局那份去 `replace` 等于**什么都没抹**
+    —— 于是密钥**原样写进 `JobStore.message`**,而它经 `GET /api/kb/jobs` 出站。
+    本仓那条「所有出站错误文本必须过 `redact_api_key`」在**参数配错**时是静默失效的。
+    """
+    settings = _settings(openai_api_key=CALLER_KEY)
+    # 前提:两份 key 真的不同 —— 相同的话这条用例对那个缺陷恒真。
+    assert settings.openai_api_key != get_settings().openai_api_key
+
+    _patch_fresh_factory(monkeypatch)
+    _patch_pipeline(
+        monkeypatch, exc=RuntimeError(f"上游 401:Incorrect API key provided: {CALLER_KEY}"))
+
+    job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
+    assert job_id is not None
+    await _wait(job_store, job_id)
+    await _await_thread_gone(job_id)
+
+    settled = job_store.get(job_id)
+    assert settled.status == "failed", f"实际 {settled.status}"
+    assert CALLER_KEY not in (settled.message or ""), (
+        f"密钥没被抹掉 —— 它经 `GET /api/kb/jobs` 出站。实际 {settled.message!r}"
+    )
+    assert "Incorrect API key" in settled.message, (
+        "脱敏不许把**整条原因**也一起丢掉(剩下的那句才是排查用的),"
+        f"实际 {settled.message!r}"
+    )
+    assert "***" in settled.message, f"抹掉的痕迹该留着,实际 {settled.message!r}"
+
+
+@pytest.mark.anyio
+async def test_the_fallback_still_writes_a_terminal_status_when_redaction_fails(
+    monkeypatch, job_store
+):
+    """**兜底自己不许抛**:脱敏炸了,也照样把终态写下去。
+
+    这一条守的是「宁可丢文案,不许丢终态」。反例的后果非常安静:`target` 里那条
+    `except BaseException` 的**函数体自己抛出去**,线程带着 traceback 结束,
+    **没有任何终态写入** ⇒ job 永远停在 running、进程级单槽**永不释放**
+    (端点此后永远 409、三处钩子静默拿到 `None`),而用户侧一切正常。
+
+    ⚠️ **注入点必须选在「兜底是唯一写口」的那条路上**(这里:`_fresh_factory` 抛 ⇒
+    `_run_flywheel` 连 `try` 都没进 ⇒ 它那条 finally 根本不会执行)。
+    第一版把注入点放在流水线里 —— 那条路上 `_run_flywheel` 的 finally **已经**写过
+    `failed` 了,于是「兜底炸掉 ⇒ 没有终态」这个后果**照不出来**,用例在旧代码上
+    照样绿(实测)。这正是本仓那条「注入的必须是**处理之前**的形态」:
+    兜底要验的是「它是唯一那一手」,就不能让另一手先替它把事情办了。
+    """
+    def boom(text, key):
+        raise RuntimeError("脱敏炸了(替身注入)")
+
+    def fresh_boom(settings):
+        raise RuntimeError("database_url 写错了(替身注入)")
+
+    monkeypatch.setattr(tasks, "redact_api_key", boom)
+    monkeypatch.setattr(tasks, "_fresh_factory", fresh_boom)
+    settings = _settings()
+
+    job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
+    assert job_id is not None
+    await _wait(job_store, job_id)
+    await _await_thread_gone(job_id)
+
+    settled = job_store.get(job_id)
+    assert settled.status == "failed", (
+        f"脱敏失败必须退成固定文案、照样落终态,实际 {settled.status}"
+    )
+    assert settled.message, "退成固定文案,不是空"
+    assert job_store.is_busy() is False, "槽没摘 ⇒ 端点此后永远 409"
+    second = tasks.start_flywheel_job(
+        settings=settings, model_factory=lambda: MODEL)
+    assert second is not None
+    await _wait(job_store, second)      # 收尾:别让那条线程活过 monkeypatch 拆卸
+
+
+@pytest.mark.anyio
+async def test_a_thread_that_cannot_start_still_lands_in_a_terminal_status(
+    monkeypatch, job_store
+):
+    """`Thread.start()` 抛(`RuntimeError: can't start new thread`)⇒ 照样进终态。
+
+    ⚠️ 这条**与上面三条都不同**:`job_store.start()` **已经把 job 置成 running**
+    (槽已经占上了),而线程起不来的话**没有任何协程会跑** —— 于是「终态由协程的
+    finally 兜」这个前提**根本不成立**。唯一能救它的就是 `_spawn` 自己在
+    `start()` 上兜一手。漏了的后果不是「少跑一轮」,是**单槽被永久占死**:
+    端点此后永远 409、三处钩子静默拿到 `None`,而唯一的痕迹是
+    `GET /api/kb/jobs` 里一条卡在 running 的 job。
+
+    线程起不来时**没有任何用户代码在跑**,所以这里不需要打桩流水线/engine ——
+    需要验的恰恰是「除了写终态,别的什么都不该发生」。
+    """
+    def boom(self):
+        raise RuntimeError("can't start new thread(替身注入)")
+
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    settings = _settings()
+
+    job_id = tasks.start_flywheel_job(settings=settings, model_factory=lambda: MODEL)
+    assert job_id is not None, "job 已经进了 JobStore,id 必须照常返回"
+
+    settled = job_store.get(job_id)
+    assert settled.status != "running", (
+        f"线程起不来时必须**当场**落终态,实际 {settled.status}"
+        f"(这就是那个「槽被永久占死」的形态)"
+    )
+    assert settled.status == "failed", f"实际 {settled.status}:{settled.message}"
+    assert job_store.is_busy() is False, "槽没摘 ⇒ 端点此后永远 409"
+    second = tasks.start_flywheel_job(
+        settings=settings, model_factory=lambda: MODEL)
+    assert second is not None, "第二个任务必须起得来 —— 这才是「槽真的被摘了」"
+    await _wait(job_store, second)      # 收尾:同一进程里不留活过拆卸的线程
 
 
 # --------------------------------------------------------------------------

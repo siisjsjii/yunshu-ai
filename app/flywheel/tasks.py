@@ -13,6 +13,26 @@
    (ch07 记过同款)。这里还多一层:`except BaseException`(见 `_spawn`)——
    `CancelledError` 是 `BaseException`,只抓 `Exception` 会让它漏过去。
 
+## 「终态」有**三条**出口,不是一个 finally
+
+`job_store.start()` 一返回就**已经占住了槽**,而后面还有两步可能失败,每一步
+都得自己把终态写下去,否则槽**永久**占着(端点此后永远 409、三处钩子静默拿到
+`None`,唯一的痕迹是 `GET /api/kb/jobs` 里一条卡在 running 的 job):
+
+  1. 协程内部抛 ⇒ `_run_flywheel` 的 `finally`(它自己也可能只是被 `_spawn` 兜住);
+  2. **线程起不来**(`Thread.start()` 抛)⇒ **没有任何协程会跑**,只能由 `_spawn`
+     的 `except` 兜 —— 这一条是 T14 复审逮到的,它的前提「终态由协程的 finally 兜」
+     **根本不成立**;
+  3. 兜底那句写终态的语句自己炸(脱敏失败等)⇒ `_write_failed` **保证不抛**。
+
+## 脱敏用的是**调用方**那份 settings
+
+`_write_failed` 脱的是调用方传进来的 `settings` 的 key,**不是** `get_settings()`
+那份进程全局配置 —— 后者在参数配错时是**静默失效**:`str(exc)` 里带的若是调用方
+那份 key,拿全局那份去 `replace` 等于什么都没抹,而 `JobStore.message` 是
+**出站**文本(`GET /api/kb/jobs` 原样回给前端)。本模块因此**不 import
+`get_settings`**(T14 复审 F1;删掉 import 顺带让那行代码没法被悄悄加回来)。
+
 ## 两种入口
 
 - `start_flywheel_job`:**手动**触发(端点 / 脚本),忙时返回 `None`,由调用方决定
@@ -28,7 +48,6 @@ import threading
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.config import get_settings
 from app.flywheel.pipeline import run_flywheel
 from app.kb.jobs import Job, JobStore, get_job_store
 from app.llm import create_extract_model
@@ -41,8 +60,50 @@ logger = logging.getLogger(__name__)
 JOB_KIND = "flywheel"
 
 
-def _spawn(job_store: JobStore, job: Job, coro_fn) -> None:
-    """专用线程 + 线程内 `asyncio.run`(ch04 模板)。
+#: 脱敏自己失败时用的固定文案。**绝不回显未脱敏原文** —— 宁可丢原因,
+#: 也不许把可能带密钥的文本写进 `JobStore.message`(它经 `GET /api/kb/jobs` 出站)。
+UNREDACTED_REASON_MESSAGE = "任务异常结束(原因未能脱敏,详见服务日志)"
+
+
+def _write_failed(job_store: JobStore, job: Job, settings, exc: BaseException) -> None:
+    """把「线程级意外」写成终态。**本函数保证不抛**(它已经是最后一道防线)。
+
+    两半各自可能失败,所以各自兜住:
+
+    ① **脱敏用调用方那份 settings 的 key**,不是进程全局那份。`_spawn` 兜的是
+       **调用方传进来的** settings(端点那条路来自 `Depends(get_settings)`,三处钩子
+       来自节点手上的那份),而 `str(exc)` 里带的正是**那一份** key —— 拿全局那份去
+       `replace` 等于什么都没抹。`JobStore.message` 是**出站**文本
+       (`GET /api/kb/jobs` 原样回给前端),所以那等于把密钥送出去。
+       脱敏自己炸了(设置对象缺字段等)就退成**固定文案**:宁可丢原因,
+       既不丢终态、也绝不回显原文。
+
+    ② **写终态**:先看它是不是已经 `done`(跑成了、只有 `dispose()` 炸了 ——
+       不许改口),再写 `failed`。`JobStore.update` 不是「对终态 job 只覆盖 message」,
+       它连 `status` 一起改。
+    """
+    try:
+        message = redact_api_key(str(exc), settings.openai_api_key)
+    except BaseException:  # noqa: BLE001
+        logger.error("飞轮失败原因脱敏失败 job=%s", job.id, exc_info=True)
+        message = UNREDACTED_REASON_MESSAGE
+    try:
+        # ⚠️ 变量名**不能叫 `job`** —— 那是形参,在这里再绑一次就把它变成局部名,
+        # 于是**上面那行 `logger.error(..., job.id)` 会 `UnboundLocalError`**
+        # (赋值在后面),而它看起来像「日志模块坏了」。踩过一次(见 T14 报告)。
+        latest = job_store.get(job.id)
+        if latest is not None and latest.status == "done":
+            return
+        job_store.update(job.id, status="failed", message=message)
+    except BaseException:  # noqa: BLE001
+        logger.error("飞轮写终态失败 job=%s(运行槽可能被占住)", job.id, exc_info=True)
+
+
+def _spawn(job_store: JobStore, job: Job, settings, coro_fn) -> None:
+    """专用线程 + 线程内 `asyncio.run`(ch04 模板)。**两条出口都要落终态。**
+
+    `settings` 是**调用方那一份**(不是 `get_settings()`):兜底要用**它的** key
+    脱敏(见 `_write_failed`),拿进程全局那份去脱敏在参数配错时是静默失效的。
 
     ⚠️ **`except BaseException`,不是 `except Exception`** —— 与 ch04 刻意不同。
     `CancelledError` 与 `KeyboardInterrupt` 都是 `BaseException`:只抓 `Exception`
@@ -59,24 +120,19 @@ def _spawn(job_store: JobStore, job: Job, coro_fn) -> None:
             # 终态在这里再写一次**是刻意的**:它把 `_run_flywheel` 那条通用文案
             # (「任务异常结束(未进终态)」)换成**真正的原因** —— 池子里那批行
             # 只会「一直不消失」,没有原因的 failed 等于没写。
-            #
-            # ⚠️ 但**不许把 `done` 覆写成 `failed`**:`JobStore.update` 不是
-            # 「只覆盖 message」,它会连 `status` 一起改(本条注释的前一版就是这么
-            # 写错的)。会走到这里而 job 已经是 `done` 的只有一种情形 ——
-            # **一批跑成了、`dispose()` 却炸了**;那时 `result` 已经落地,再把状态
-            # 覆成 `failed` 只会让前端读到一对自相矛盾的值(与 `_run_flywheel`
-            # 的 finally 里那条守卫同一个理由)。dispose 的失败留在**日志**里。
-            # ⚠️ 变量名**不能叫 `job`** —— 那是 `_spawn` 的形参,`target` 里再绑一次
-            # 就把它变成局部名,于是**上面那行 `logger.error(..., job.id)` 会
-            # `UnboundLocalError`**(赋值在后面),而它看起来像「日志模块坏了」。
-            latest = job_store.get(job.id)
-            if latest is not None and latest.status == "done":
-                return
-            job_store.update(
-                job.id, status="failed",
-                message=redact_api_key(str(exc), get_settings().openai_api_key))
+            _write_failed(job_store, job, settings, exc)
 
-    threading.Thread(target=target, name=f"flywheel-job-{job.id}", daemon=True).start()
+    try:
+        threading.Thread(
+            target=target, name=f"flywheel-job-{job.id}", daemon=True).start()
+    except BaseException as exc:  # noqa: BLE001
+        # ⚠️ **这一层不能省**:`job_store.start()` 已经把 job 置成 running(**槽已经
+        # 占上了**),而线程起不来时**没有任何协程会跑** —— 「终态由协程的 finally 兜」
+        # 这个前提在此**根本不成立**。漏掉的代价不是「少跑一轮」,是**单槽被永久占死**:
+        # 端点此后永远 409、三处钩子静默拿到 `None`,唯一的痕迹是
+        # `GET /api/kb/jobs` 里一条卡在 running 的 job。
+        logger.error("飞轮后台线程起不来 job=%s", job.id, exc_info=True)
+        _write_failed(job_store, job, settings, exc)
 
 
 def _fresh_factory(settings):
@@ -137,7 +193,7 @@ def start_flywheel_job(*, settings, model_factory=None) -> str | None:
         return None
     if model_factory is None:
         model_factory = lambda: create_extract_model(settings)  # noqa: E731
-    _spawn(job_store, job,
+    _spawn(job_store, job, settings,
            lambda: _run_flywheel(job_store, job.id, settings, model_factory))
     return job.id
 
