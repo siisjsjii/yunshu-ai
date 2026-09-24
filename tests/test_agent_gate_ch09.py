@@ -81,6 +81,36 @@ async def test_weak_evidence_is_blocked_and_reason_names_all_three_signals():
 
 
 @pytest.mark.anyio
+async def test_weak_evidence_is_recorded_with_the_round_s_recall_snapshot():
+    """拦下**手里有块**那一支时,池子里那一行必须带上当轮的召回片段。
+
+    ⚠️ **这一支真的可达** —— 别把闸读成「只有零召回才拦」:`evidence_min_score`
+    与合成分是**两个旋钮**,单条 0.16 的块过得了前者(0.16 ≥ 0.15)、过不了后者
+    (`0.6*0.16 + 0.2*(1/3) ≈ 0.163 < 0.2`,生产默认值)。那一刻闸是**手里有一个
+    块**却答不了:而「知识库真缺这块」与「有、但没检到」在审核页上长得一模一样,
+    只有这块的原文与得分能分开它们(spec §7.1)。快照丢了,那一行就只剩一句问题。
+
+    期望值写成**字面投影**、不拿 `nodes._snapshot` 当判据:用被测函数自己算出来的
+    期望值去比它自己的输出,「键少一个」「截断没做」都测不出来。
+    """
+    s = _settings()
+    sess = _FakeSession()
+    out = await _gate(sess, s)({"user_input": "猫砂盆多少钱", "evidence": [_ev(0.2)]})
+
+    assert out["gate_passed"] is False
+    assert len(sess.added) == 1
+    assert sess.added[0].evidence_snapshot == [{
+        "chunk_id": 1,
+        "score": 0.2,
+        "section_path": "退换货 > 退货政策",
+        "answer": "七天无理由退货",
+    }], (
+        "闸拦下一条**非空**证据时必须把当轮召回存进池子 —— "
+        f"实际 {sess.added[0].evidence_snapshot!r}(`None` = 快照整段缺失)"
+    )
+
+
+@pytest.mark.anyio
 async def test_strong_evidence_passes_and_writes_nothing():
     """三条 0.9:`0.6*0.9 + 0.2*1.0 + 0.2*0 = 0.74 ≥ 0.5` ⇒ 过,且不落池。
 
@@ -106,6 +136,10 @@ async def test_empty_evidence_is_blocked_with_readable_reason():
 
     assert out["gate_passed"] is False
     assert sess.added[0].reject_reason == "检索为空"
+    # 零召回 ⇒ `None`,**不是 `[]`**(本仓约定:`None` = 「当轮确实零召回」,
+    # 空列表是另一个值,见 `app/kb/assess.py`)—— 它正是「知识库缺这一块」与
+    # 「没人记这件事」的分界,写成 `[]` 的话审核页读不出这个差别。
+    assert sess.added[0].evidence_snapshot is None
 
 
 @pytest.mark.anyio

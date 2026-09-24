@@ -301,6 +301,18 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
                 source_conversation_id=conversation_id,
                 entry_point="置信度闸",
                 reject_reason=reason,
+                # 快照与入口 ②(`生成自评`)**同一个形状**;空证据那一支传
+                # `None`、**不是 `[]`** —— 本仓约定 `None` = 「当轮确实零召回」,
+                # 空列表是另一个值(见 `app/kb/assess.py` 的 docstring)。
+                #
+                # ⚠️ **别把闸读成「只有零召回才拦」**。`evidence_min_score` 与
+                # 合成分是两个旋钮:单条 0.16 的块过得了前者(0.16 ≥ 0.15)、
+                # 过不了后者(`0.6*0.16 + 0.2*(1/3) ≈ 0.163 < 0.2`,生产默认值),
+                # 所以「手里有一个块、却被拦」这一支真的可达。那一刻丢掉这块的
+                # 原文与得分,审核页就再也分不开「知识库缺这块」与「有、没检到」。
+                evidence_snapshot=(
+                    _snapshot(evidence, settings=settings) if evidence else None
+                ),
             )
             # 落池之后 fire-and-forget 起一轮飞轮(§8.3)。**不 await、也不许抛**
             # (`start_flywheel_job_safely` 自己吞掉装配故障):它是这一轮请求的
