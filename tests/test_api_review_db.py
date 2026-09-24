@@ -49,6 +49,7 @@ Q_APPROVE = "t15 探针:通过之后要能检索到"
 Q_RETRY = "t15 探针:第一次入库失败、重试要补上"
 Q_REJECT = "t15 探针:驳回一个字都不许写"
 Q_DONE = "t15 探针:已经在库里的那条不该重做"
+Q_ORPHAN = "t15 探针:崩溃遗留在 pending 上的那一条"
 
 ANSWER = "探针答案:换货运费由我们承担。"
 
@@ -340,19 +341,23 @@ async def test_approve_writes_exactly_one_chunk_and_vectorizes_it(client):
 async def test_retry_after_a_failed_vectorize_vectorizes_on_the_second_call(
     client, fake_vector_deps,
 ):
-    """**H1(真库)**:第一次向量化炸了 ⇒ 502、队列行留 pending;重试 ⇒ **必须真的
-    走到向量化**(那时 `write_chunks` 返回的是 **0**)。
+    """**H1 + F4(真库)**:第一次向量化炸了 ⇒ 502、队列行留 pending、
+    **本次写的草稿被清掉**;重试 ⇒ 重新写入并**真的走到向量化**。
 
-    这条是 brief 里 `if added:` 那段代码的**照妖镜**,而且这里走的是**真的**
-    `write_chunks`:第二次调用命中三元组查重、返回 0 —— 这正是 bug 的触发条件
-    (替身里那个 0 是替身编的,证明力弱一档,非 db 的那条也留着当第二道)。
-
-    四个观测缺一不可:
+    五个观测:
       ① 第一次 502(不降级成「写进 MySQL 了但检索不到」);
       ② 队列行**仍是 pending** —— 它必须**先别动**,审核人才有得重试;
-      ③ 库里那条块**停在 pending**(MySQL 有、Milvus 没有 = 那个问题暂时答不上,
-         但**看得见**);
-      ④ 重试之后它变 done、且那次 upsert 真的发出去了(带的是这条块的 id)。
+      ③ **库里没有残留的待向量化草稿**(F4):留在那儿的话,下一次全表
+         `vectorize_pending`(不筛 category)会把它送进 Milvus ⇒ 一条**没人核准过**
+         的草稿静默进了可检索知识库。这条也正是「改答案重试」那个场景的关法 ——
+         孤儿是**第一次**的失败产生的,第一次的失败处理器就把它删掉了;
+      ④ 重试重新写入(`chunks_added == 1`)并真的 upsert(带那条块的 id);
+      ⑤ 重试之后恰好一条、且是 done。
+
+    ⚠️ 判据是 **upserts 边界**(真 `vectorize_rows` + 「第一次抛、之后放行」的
+    Milvus 替身),不是「`vectorize_rows` 被调了几次」—— 后者在 `if added:` 那种
+    实现下**照样绿**。「重试时 `write_chunks` 返回 0」那条真路(崩溃遗留的孤儿)
+    由下一条用例守,因为**本用例的流程在 F4 之后不再经过它**。
     """
     queue_id = await _make_queue_row(question=Q_RETRY)
     fake_vector_deps.store = _FakeStore(fail_first_upserts=1)
@@ -367,9 +372,9 @@ async def test_retry_after_a_failed_vectorize_vectorizes_on_the_second_call(
         assert (await _queue_row(queue_id))["status"] == "pending", (
             "502 之后队列行必须仍是 pending(否则审核人没有重试的入口)"
         )
-        stuck = await _chunk_rows(Q_RETRY)
-        assert [c["vectorize_status"] for c in stuck] == ["pending"], (
-            f"前置:块已经写进 MySQL 了、只是没向量化,实际 {stuck}"
+        assert await _chunk_rows(Q_RETRY) == [], (
+            "F4:失败之后**不许留下**这条三元组的待向量化草稿 —— 它会被下一次"
+            "全表扫描送进 Milvus(一条没人核准过的答案),而全程不报错"
         )
         assert store.upserts == [], "前置:第一次的 upsert 不该落地"
 
@@ -377,24 +382,61 @@ async def test_retry_after_a_failed_vectorize_vectorizes_on_the_second_call(
         assert second.status_code == 200, (
             f"重试必须成功,实际 {second.status_code}:{second.text}"
         )
-        assert second.json()["chunks_added"] == 0, (
-            f"前置:重试时 `write_chunks` 返回的**就是 0**(三元组已存在),"
-            f"实际 {second.json()}"
+        assert second.json()["chunks_added"] == 1, (
+            f"草稿已被清掉 ⇒ 重试是**重新写一条**,实际 {second.json()}"
         )
         assert second.json()["vectorized"] == 1, (
             f"重试**必须真的向量化那一条** —— 这就是 H1,实际 {second.json()}"
-        )
-        assert store.upserts == [[str(stuck[0]["id"])]], (
-            f"重试那次 upsert 必须带这条块的 id,实际 {store.upserts}"
         )
         after = await _chunk_rows(Q_RETRY)
         assert [c["vectorize_status"] for c in after] == ["done"], (
             f"重试之后必须补上向量化,实际 {after}"
         )
         assert len(after) == 1, f"重试不许写出第二条,实际 {len(after)}"
+        assert store.upserts == [[str(after[0]["id"])]], (
+            f"那次 upsert 必须带这条块的 id,实际 {store.upserts}"
+        )
         assert (await _queue_row(queue_id))["status"] == "approved"
     finally:
         await _cleanup(queue_ids=[queue_id], questions=[Q_RETRY])
+
+
+@pytest.mark.anyio
+async def test_a_pending_orphan_from_a_crash_is_still_vectorized(
+    client, fake_vector_deps,
+):
+    """H1 的真路:**崩溃遗留的 pending 行**(不是这次写的)⇒ 通过时必须被向量化,
+    哪怕 `write_chunks` 返回 **0**。
+
+    为什么这条不能少:F4 的清理只覆盖「本次调用自己写进去的行」—— 进程被杀 /
+    请求被取消 / 清理自己失败,都会把一条 pending 行留在库里,而**它分不出是不是
+    别人的**。那条路正是 `if added:` 会失效的地方:重试命中三元组查重 ⇒ `added == 0`
+    ⇒ 向量化永不发生 ⇒ 端点回 200、队列行 approved,而那块知识**永远答不上**。
+
+    造法:直接插一条 **pending** 的知识块(不经 `write_chunks`),再通过一条
+    standard_question/answer 与它逐字相同的待审行 —— 这正是崩溃之后库里的样子。
+    """
+    orphan_id = await _make_chunk_row(question=Q_ORPHAN, status="pending")
+    queue_id = await _make_queue_row(question=Q_ORPHAN)
+    try:
+        r = await client.post(f"/api/review/{queue_id}/approve", json={})
+        assert r.status_code == 200, f"实际 {r.status_code}:{r.text}"
+        assert r.json()["chunks_added"] == 0, (
+            f"前置:三元组已经在库里(崩溃遗留)⇒ 查重命中、本次没新增,实际 {r.json()}"
+        )
+        assert r.json()["vectorized"] == 1, (
+            f"遗留的 pending 行必须被向量化 —— 挂在 `if added:` 上的话这里是 0,"
+            f"而端点照样回 200(那块知识永远答不上),实际 {r.json()}"
+        )
+        assert fake_vector_deps.store.upserts == [[str(orphan_id)]], (
+            f"upsert 必须带那条遗留行的 id,实际 {fake_vector_deps.store.upserts}"
+        )
+        rows = await _chunk_rows(Q_ORPHAN)
+        assert [c["vectorize_status"] for c in rows] == ["done"]
+        assert len(rows) == 1, "不许再写一条出来(查重已经命中了)"
+        assert (await _queue_row(queue_id))["status"] == "approved"
+    finally:
+        await _cleanup(queue_ids=[queue_id], questions=[Q_ORPHAN])
 
 
 @pytest.mark.anyio

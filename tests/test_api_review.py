@@ -82,6 +82,12 @@ class FakeSession:
     看着原始 SQL 自己判(见文件头 ②)。唯一的「语义」是身份映射:`get` 每次返回
     **同一个对象**,所以端点写上去的 `status` 第二次读得到 —— 真 session 就是这样,
     换成「每次现造一行 status=pending」会让 R2 那条幂等用例**恒绿**。
+
+    ⚠️ 它**也不执行 `DELETE`**(`execute` 只记录语句):于是 502 清理(F4)在本文件里
+    是 no-op,`kb_rows` 里那条 pending 行会**留下来** —— 这是**刻意**的,好让
+    「`write_chunks` 返回 0 时也必须向量化」那条契约(H1 的陷阱,也就是**崩溃遗留
+    孤儿**那条真路)在本文件里继续被行使。真库上的清理行为由
+    `tests/test_api_review_db.py::test_a_failed_vectorize_discards_its_draft` 守。
     """
 
     def __init__(self, *, queue_row=None, linked=(), kb_rows=()):
@@ -270,15 +276,17 @@ def _chunk_row(vectorize_status="pending"):
     )
 
 
-def _where_of(session: FakeSession, *, table: str) -> dict:
+def _where_of(session: FakeSession, *, table: str, require: str | None = None) -> dict:
     """取**唯一**一条打到 `table` 的语句的 `WHERE` 之后那一段 + 绑定参数。
 
     命中数不为 1 直接红 —— 本仓变异脚本的头号事故是「锚点打到了别处」,
-    这里同样不许「多条里随便挑一条」。
+    这里同样不许「多条里随便挑一条」。`require` 是**收窄用的子串**:同一个
+    `session` 上打到同一张表的语句可能不止一条(F4 起:写入前后各查一次三元组的
+    那两条 `SELECT`,与 `_rows_to_vectorize` 那条),收窄之后仍然必须是**恰好一条**。
     """
     hits = [
         (sql, params) for sql, params in session.statements
-        if f"FROM {table}" in sql
+        if f"FROM {table}" in sql and (require is None or require in sql)
     ]
     assert len(hits) == 1, f"打到 {table} 的语句应恰好 1 条,实际 {len(hits)}:{hits}"
     sql, params = hits[0]
@@ -665,6 +673,54 @@ async def test_a_failed_vectorize_is_a_502_and_leaves_the_row_pending(
     assert session.queue_row.approved_answer is None
 
 
+#: F1 用的密钥:它同时被注入**模块常量**与**这一份 settings**,两者都不含它时
+#: 这条用例照不亮任何东西(所以下面断言了两份 key 必然不同)。
+CALLER_KEY = "sk-t15-caller-0a1b2c3d4e5f"
+_KEYED_DETAIL = f"知识入库失败(向量化未完成),原始错误里的 key={CALLER_KEY}"
+
+
+@pytest.mark.anyio
+async def test_the_502_detail_goes_through_redact_api_key(
+    client_factory, vector_deps, deduping_write_chunks, monkeypatch,
+):
+    """F1:502 的文案**也要过 `redact_api_key`** —— 哪怕它今天是个常量。
+
+    `app/api/refund.py:_infra_failure` 与 `app/api/chat.py` 的那条 502 都是这么
+    做的,理由写在那两处:**把「所有出站文本都过同一个出口」这条规则留成无例外的**,
+    比每次判断「这个字符串要不要脱敏」可靠。本端点是全章**唯一**绕开它的出口。
+
+    ⚠️ 注入的是**处理之前**的形态:直接把模块常量改成**真的带上密钥**的那一句。
+    把已经脱敏的值喂进去的话,这条用例对「端点压根没调 redact」**恒真**
+    (本仓那条「在**处理之后**注入」的假绿形态,`tests/test_api_ticket.py:151-212`
+    是它的对照写法)。
+
+    判据不是「等于常量」(那是同义反复),而是**出站体里没有那份 key、且有抹掉的
+    痕迹** —— 顺带把「用的是**调用方这一份** settings 的 key」也钉住:实现若去读
+    `get_settings()` 那份(真 `.env`),注入的这份 key 根本不在它的替换表里,
+    下面第一条断言当场红。
+    """
+    assert CALLER_KEY != get_settings().openai_api_key, (
+        "前提:两份 key 必须不同 —— 相同的话「拿进程全局那份脱敏」这个缺陷照不亮"
+    )
+    monkeypatch.setattr(review_api, "VECTORIZE_FAILED_DETAIL", _KEYED_DETAIL)
+    vector_deps.store = FakeStore(fail_first_upserts=1)
+    session = FakeSession(queue_row=_queue_row())
+    deduping_write_chunks(session)
+
+    async with client_factory(session, openai_api_key=CALLER_KEY) as client:
+        r = await client.post(f"/api/review/{RQ_ID}/approve", json={})
+
+    assert r.status_code == 502, f"实际 {r.status_code}:{r.text}"
+    detail = r.json()["detail"]
+    assert CALLER_KEY not in detail, (
+        f"密钥随 502 的文案出站了 —— 这是全章唯一一个没走 redact_api_key 的出口:"
+        f"{detail!r}"
+    )
+    assert "***" in detail, (
+        f"抹掉的痕迹该留着(剩下的那句才是排查用的):{detail!r}"
+    )
+
+
 @pytest.mark.anyio
 async def test_retry_after_a_failed_vectorize_really_vectorizes(
     client_factory, vector_deps, deduping_write_chunks,
@@ -715,6 +771,85 @@ async def test_retry_after_a_failed_vectorize_really_vectorizes(
     assert session.queue_row.status == "approved"
 
 
+def _delete_statements(session) -> list[tuple[str, dict]]:
+    return [
+        (sql, params) for sql, params in session.statements
+        if sql.startswith("DELETE")
+    ]
+
+
+def _param_values(params: dict) -> list:
+    """绑定参数摊平(那条 `DELETE ... WHERE id IN (...)` 的 id 是个**列表**)。"""
+    values: list = []
+    for v in params.values():
+        values.extend(v if isinstance(v, list) else [v])
+    return values
+
+
+@pytest.mark.anyio
+async def test_a_failed_vectorize_discards_the_draft_it_just_wrote(
+    client_factory, vector_deps, deduping_write_chunks,
+):
+    """F4:502 这条路上,**把本次刚写进去的待向量化草稿删掉**。
+
+    为什么非清不可(复审员复现的场景):第一次通过(答案 A)把行写进了 MySQL、
+    然后 Milvus 炸 ⇒ 502;审核人把答案改成 B 重试 ⇒ (Q,B) 被向量化、队列行
+    approved,而 **(Q,A,pending) 成了永久残留**。下一次 `build_kb.py` 或管理台的
+    向量化任务(`app/kb/writer.py` 的 `WHERE vectorize_status == 'pending'`,
+    **不筛 category**)会把它送进 Milvus ⇒ **一条没人核准过的草稿静默进了
+    可检索知识库**,全程不报错。
+
+    ⚠️ 判据是「**本次新增的 id**」,不是「这个三元组的所有 pending 行」——
+    后者会删掉**别人**写进去的行(同一三元组的 pending 行可能是另一个并发请求
+    刚写的、或上一次崩溃留下的)。「不许删别人的行」由下一条用例正面钉住。
+    """
+    vector_deps.store = FakeStore(fail_first_upserts=1)
+    session = FakeSession(queue_row=_queue_row())     # kb_rows 从空开始 ⇒ 本次真的写了一条
+    deduping_write_chunks(session)
+    async with client_factory(session) as client:
+        r = await client.post(f"/api/review/{RQ_ID}/approve", json={})
+    assert r.status_code == 502, f"前置:这一次必须失败,实际 {r.status_code}"
+
+    deletes = _delete_statements(session)
+    assert len(deletes) == 1, (
+        f"失败路径必须清掉本次写入的草稿(否则它会静默进知识库),实际 {deletes}"
+    )
+    _sql, params = deletes[0]
+    values = _param_values(params)
+    assert CHUNK_ID in values, (
+        f"删的必须是**本次**写进去的那一条,实际绑定 {params}"
+    )
+    assert "pending" in values, (
+        f"只许删还没向量化的 —— 已经 done 的行是别人写进 Milvus 的,删了就是丢知识,"
+        f"实际绑定 {params}"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_failed_vectorize_does_not_delete_a_row_it_did_not_write(
+    client_factory, vector_deps, deduping_write_chunks,
+):
+    """hazard ①:库里那条 pending 行**不是本次写的** ⇒ 一条都不许删。
+
+    场景很常见:`write_chunks` 命中三元组查重、返回 0(上一次请求崩在「写库」与
+    「向量化」之间留下的行,或另一个并发请求刚写的),此时失败路径**必须什么都不删**。
+    删了就是把别人的行清掉 —— 那一行下一次重试/全表扫描还会用到,而**两边都不报错**。
+    """
+    vector_deps.store = FakeStore(fail_first_upserts=1)
+    existing = _chunk_row()                     # 调用前就在库里的 pending 行
+    session = FakeSession(queue_row=_queue_row(), kb_rows=[existing])
+    deduping_write_chunks(session)
+    async with client_factory(session) as client:
+        r = await client.post(f"/api/review/{RQ_ID}/approve", json={})
+    assert r.status_code == 502, f"前置:这一次必须失败,实际 {r.status_code}"
+
+    assert _delete_statements(session) == [], (
+        "本次一条都没写进去(`write_chunks` 返回 0)⇒ 不许删任何行"
+    )
+    assert session.kb_rows == [existing], "别人留下的行必须原样在库里"
+    assert existing.vectorize_status == "pending", "它还得留在 pending 上等下一次"
+
+
 @pytest.mark.anyio
 async def test_already_vectorized_chunks_are_left_alone(
     client_factory, deduping_write_chunks,
@@ -738,7 +873,7 @@ async def test_already_vectorized_chunks_are_left_alone(
     assert r.status_code == 200, r.text
     assert r.json()["chunks_added"] == 0, "前置:三元组已在库里,没新增"
 
-    seen = _where_of(session, table="knowledge_chunks")
+    seen = _where_of(session, table="knowledge_chunks", require="vectorize_status !=")
     assert "knowledge_chunks.vectorize_status" in seen["where"], (
         f"「已 done 的不重做」必须在 SQL 里(WHERE = {seen['where']!r})"
     )

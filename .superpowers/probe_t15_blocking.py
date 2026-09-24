@@ -23,13 +23,20 @@
 """
 
 import asyncio
-import io
 import sys
 import time
+from pathlib import Path
 
-import httpx
+# ⚠️ **本脚本要「照 docstring 复制粘贴就能跑」**(F2)。它住在 `.superpowers/`,
+# 而 `app` 包在**仓库根**:直接 `python .superpowers/probe_t15_blocking.py` 会把
+# **脚本所在目录**放进 `sys.path[0]`(那里既没有 bootstrap 也没有 conftest),
+# `import app` 当场 ModuleNotFoundError —— 复审员实测过。
+# 所以这里自己把仓库根插到最前,不许调用方记得加 `PYTHONPATH=.`。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api import review as review_api
+import httpx  # noqa: E402
+
+from app.api import review as review_api  # noqa: E402
 from app.config import get_settings
 from app.db.models import KnowledgeChunk, ReviewQueue
 from app.db.session import get_session
