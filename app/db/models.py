@@ -146,7 +146,7 @@ class LowConfidenceQuestion(Base):
     # (审核页 T15/T16 是照这个形状读的)。**另两处写入方**:`POST /api/feedback`
     # (T12 起,**已在线**,`app/api/feedback.py` 的 `_snapshot` 吃的是检索器刚返回的
     # `RetrievedChunk` 对象)与置信度闸(T18b 起,`_snapshot(evidence) if evidence else None`,
-    # **已在线** —— 它改之前闸那一处**根本没传这个 kwarg**,池子里那一列恒为 NULL)。
+    # **已在线** —— 它改之前闸那一处**根本没传这个 kwarg**,那一列恒是「没快照」)。
     #
     # ⚠️ **别拿这两条反推形状**(都核过、都写准):
     # - `tests/test_ch09_orm.py` 的往返用例塞的是 **dict**(`{"chunks": [...]}`)——
@@ -154,6 +154,14 @@ class LowConfidenceQuestion(Base):
     #   「dict 才是历来唯一的形状」;
     # - 同为 JSON 列的 `EvalRun.metrics` 是 **`Mapped[dict]`**(确实是对象);
     #   而 `MessageRecord.tool_calls` 是 **`Mapped[list]`** ⇒ **不能按表推**,一列一核。
+    #
+    # ⚠️⚠️ **查这一列「有没有快照」不许用 `IS NOT NULL`**(2026-09-25 T19 复审实测)。
+    # `JSON` 类型的默认是 `none_as_null=False` ⇒ Python 的 `None` **落库是字面 JSON `null`**,
+    # 它 **SQL 上不是 NULL** ⇒ `evidence_snapshot IS NOT NULL` 对「没记快照」的行**同样为真**。
+    # 实测(闸的 46 行):SQL NULL **29** / 字面 JSON `null` **17** /
+    # **`JSON_TYPE(...)='ARRAY'`(真的带快照)0** ⇒ 「闸那一列被行使过」是**假的**。
+    # **判据:一律用 `JSON_TYPE(evidence_snapshot)`**;`NULL`(SQL)与 `null`(JSON)
+    # 在这一列上是**两个不同的东西**(前者 = 加列之前的老行,后者 = 写了但没快照)。
     evidence_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # ⚠️ **一个列担两个语义**(ch09 §7.1):既记「这条问题归并到了 review_queue 的
     # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
