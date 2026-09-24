@@ -82,7 +82,9 @@
   button.secondary { background: #fff; color: var(--brand); }
 
   .job-status { margin-top: 10px; padding: 10px 12px; border: 1.5px dashed var(--badge);
-    border-radius: 3px; font-size: 13.5px; }
+    border-radius: 3px; font-size: 13.5px;
+    /* 轮询到上限那条提示是两行(复审 Minor 5),要让它真的换行 */
+    white-space: pre-wrap; word-break: break-word; }
   .job-status.done { border-color: var(--ok); color: var(--ok); }
   .job-status.failed { border-color: var(--warn); color: var(--warn); }
   .qa-item { padding: 8px 0; border-bottom: 1px dashed #cdd9e4; }
@@ -644,8 +646,27 @@
 
     const ui = { okBtn, noBtn, state, item };
     okBtn.addEventListener("click", () => {
-      const typed = editor ? editor.value.trim() : "";
-      const override = typed && typed !== (r.example_answer || "").trim() ? typed : null;
+      // **展开过就以框里的内容为准,一次也不替它兜底**;框被清空 ⇒ 送一个
+      // **一个空格**的答案,让**服务端**那条 422(`核准答案不能为空`)来裁 ——
+      // 前端不许把「我要留空」悄悄换成示例答案。
+      //
+      // ⚠️ 为什么是 `" "` 而**不是** `""`(复审 Minor 3 的裁定写的是空串,
+      // 实现时实测它**到不了** 422 —— 理由在此,不许悄悄改回去):
+      // 服务端那两行是
+      //     answer = ((body.approved_answer if body is not None else None)
+      //               or rq.example_answer).strip()
+      //     if not answer: raise HTTPException(422, "核准答案不能为空")
+      // 即 `""` 是**假值**,会被 `or` 吞掉、回落到 `example_answer` ⇒ 回 **200**,
+      // 而且写进知识库的是示例答案(实测:清空框点通过 → 200、`核准答案` 显示的是
+      // 示例答案)。**空串在这条链上表达不了「空答案」。**
+      // 要走到服务端那条判据,送出去的值必须**同时**满足:① 是**真值**(不然被
+      // `or` 吞掉)② `strip()` 之后为空(不然会写进库)。一个空格正好卡在这个缝里。
+      // 另一个形态(清空时禁用「通过」+ 就地提示)被否:那等于把服务端那条规则
+      // 在**前端再实现一遍**,两处迟早漂移;这里宁可用一个看得出来是刻意的载荷,
+      // 也不自己在客户端判一次「空答案不合法」。
+      // 「根本没展开」= 没有框可清 ⇒ 不带 body,服务端回落到示例答案
+      // (那是「点通过而不改答案」这条最常见路径的正确语义)。
+      const override = editor ? { approved_answer: editor.value.trim() || " " } : null;
       return decide(r.id, "approve", override, ui);
     });
     noBtn.addEventListener("click", () => decide(r.id, "reject", null, ui));
@@ -687,6 +708,14 @@
   // R3 的落点:处理结果与**该行的服务端状态**一起摆出来。
   // 刻意不放进那一行里 —— 处理过的行马上就不是 pending、会从列表消失,
   // 跟着它一起消失的还有「到底成没成」。
+  //
+  // `info` 的三个字段各说各的事,**不许相互顶替**:
+  //   `error`     —— POST 那一步的失败(这一行**没被处理**);
+  //   `status`    —— POST 的 HTTP 状态码(404 / 422 / 502 对操作员是三件事);
+  //   `readError` —— **操作成功了、只是回读那一行失败**。它**绝不能**把
+  //                  「✗ 未成功」显示出来:那会让一次已经提交成功的 approve
+  //                  看起来失败了,而那一行又不在了(队列只回 pending)——
+  //                  屏幕说失败、真相是成功,正是 R3 要防的那件事的镜像。
   function showResult(fresh, info) {
     const box = $("rv-result");
     box.replaceChildren();
@@ -714,12 +743,32 @@
       } else {
         card.appendChild(el("div", "rv-note", "驳回不改知识库(没有写入、也没有向量化)。"));
       }
+      if (info.readError) {
+        // 成功 + 回读失败:两件事都写成它们本来的样子。
+        card.appendChild(el("div", "rv-note",
+          `⚠ 上面这一步**已经在服务端提交成功了**,只是回读该行失败(${info.readError})。` +
+          "这一行可能已经从「待审」列表里消失 —— 那是正常的,不要据此重试。"));
+      }
     } else {
-      card.appendChild(el("div", "rv-note", `服务端返回:${info.error}`));
-      card.appendChild(el("div", "rv-note",
-        fresh && fresh.status === "pending"
-          ? "这一行**仍在待审队列里**(服务端状态 pending)⇒ 可以重试。"
-          : "未能从服务端确认这一行的当前状态,请在待审列表里核对。"));
+      // **按状态码分支**,不许把它们压成同一句(复审 Minor 4):
+      //   404 —— 这一行在服务端**本来就不在**(已处理 / 不存在),不是连不上;
+      //   422 —— 请求本身不合约定(空答案),服务端拒了,行**仍在**;
+      //   502 —— 基础设施故障,**行仍在**、可重试。
+      card.appendChild(el("div", "rv-note", `服务端返回(${info.status}) ${info.error}`));
+      if (info.status === 404) {
+        card.appendChild(el("div", "rv-note",
+          "这一行在服务端**已经不存在或已处理过**(404)—— 不是连接问题。" +
+          "它刷新后不会再出现在待审列表里。"));
+      } else if (fresh && fresh.status === "pending") {
+        card.appendChild(el("div", "rv-note",
+          "这一行**仍在待审队列里**(服务端状态 pending)⇒ 可以重试。"));
+      } else if (fresh) {
+        card.appendChild(el("div", "rv-note",
+          `这一行的服务端当前状态是「${fresh.status}」—— 见下面的明细。`));
+      } else {
+        card.appendChild(el("div", "rv-note",
+          "没能读到它的当前状态(GET /api/review/{id} 也失败了)—— 请在待审列表里核对。"));
+      }
     }
 
     box.appendChild(card);
@@ -729,12 +778,19 @@
       d.appendChild(el("div", "rv-section", "该行当前的服务端状态(处理之后重新拉取)"));
       d.appendChild(renderRow(fresh));
       box.appendChild(d);
-    } else {
+    } else if (!(ok && info.readError)) {
+      // 「成功 + 回读失败」时上面那张卡片已经把这件事说过了,这里不再重复一遍
+      // (两句说同一件事只会让操作员以为出了两个问题)。
       box.appendChild(el("div", "rv-note",
-        "⚠ 没能取到该行的服务端状态(GET /api/review/{id} 也失败了)。"));
+        "⚠ 没能取到该行的服务端状态(GET /api/review/{id} 也失败了)—— " +
+        "这只是**回读**失败,不代表上面那一步没发生。"));
     }
   }
 
+  // `override` = `null`(不带 body,服务端回落示例答案)**或**
+  // `{approved_answer: <值>}` —— 后者为 `" "` 时是「审核人把框清空了」,
+  // 故意让服务端 422 拒掉它(理由与那个空格的来历见 `queueItem` 里那段注释:
+  // 空串会被服务端的 `or` 吞掉,**只有**「真值 but strip 后为空」才到得了那条判据)。
   async function decide(id, kind, override, ui) {
     if (rvBusy) return;
     setReviewBusy(true);
@@ -743,31 +799,61 @@
     ui.state.textContent = kind === "approve"
       ? "提交中…(通过会立刻写知识库并向量化,可能要几秒)"
       : "提交中…";
+
+    // 这一次操作的结果。**失败与「成功但回读失败」是两条路**,所以分开攒。
+    let failure = null;   // {status, detail}
+    let op = null;
+    let readError = null;
+
     try {
       const opts = { method: "POST" };
       if (kind === "approve") {
         opts.headers = { "Content-Type": "application/json" };
-        // 没改答案就送一个空 body(端点声明的是可空 body,`{}` 与不带 body
-        // 等价)。**不送 `approved_answer`** 时服务端回退到 `example_answer` ——
-        // 那是「点通过而不改答案」这条最常见路径的正确语义。
-        opts.body = JSON.stringify(override ? { approved_answer: override } : {});
+        // 没展开(没有编辑框)⇒ 不带 body:`{}` 与不带 body 等价,服务端回落到
+        // `example_answer` —— 那是「点通过而不改答案」这条最常见路径的正确语义。
+        opts.body = JSON.stringify(override ? override : {});
       }
       const r = await req(`/api/review/${id}/${kind}`, opts);
-      if (!r.ok) throw new Error((r.body && r.body.detail) || `HTTP ${r.status}`);
-      const op = r.body || {};
-      const fresh = await api(`/api/review/${id}`);   // 状态的权威是服务端
-      ui.state.className = "rv-state ok";
-      ui.state.textContent = kind === "approve"
-        ? `已通过 · 新增 ${op.chunks_added} 块 · 向量化 ${op.vectorized}`
-        : "已驳回";
-      showResult(fresh, { id, kind, op, error: null });
+      if (!r.ok) {
+        // 状态码留着 —— 404 / 422 / 502 要在屏幕上分开说(复审 Minor 4)。
+        failure = {
+          status: r.status,
+          detail: (r.body && r.body.detail) || `HTTP ${r.status}`,
+        };
+      } else {
+        op = r.body || {};
+      }
     } catch (e) {
-      ui.state.className = "rv-state err";
-      ui.state.textContent = `⚠ ${e.message}`;
-      let fresh = null;
-      try { fresh = await api(`/api/review/${id}`); } catch (e2) { fresh = null; }
-      showResult(fresh, { id, kind, op: null, error: e.message });
+      // 网络层失败(连不上 / 请求发不出去):没有状态码。
+      failure = { status: null, detail: e.message };
+    }
+
+    // **回读那一步单独兜**:它失败只影响「屏幕上看不看得到服务端状态」,
+    // 不许把上面那次操作说成失败。
+    let fresh = null;
+    try {
+      fresh = await api(`/api/review/${id}`);   // 状态的权威是服务端
+    } catch (e) {
+      readError = e.message;
+    }
+
+    try {
+      if (!failure) {
+        ui.state.className = "rv-state ok";
+        ui.state.textContent = kind === "approve"
+          ? `已通过 · 新增 ${op.chunks_added} 块 · 向量化 ${op.vectorized}`
+          : "已驳回";
+      } else {
+        ui.state.className = "rv-state err";
+        ui.state.textContent = `⚠ ${failure.detail}`;
+      }
+      showResult(fresh, {
+        id, kind, op, status: failure ? failure.status : null,
+        error: failure ? failure.detail : null, readError,
+      });
     } finally {
+      // **每一条退出路径都要把按钮放开**(连 `showResult` 自己炸了也算)——
+      // 漏掉的话这一列按钮从此再也点不动,而屏幕上还写着「提交中…」。
       ui.item.classList.remove("busy");
       setReviewBusy(false);
       await refreshQueue();   // 处理过的行已不是 pending ⇒ 从列表消失
@@ -784,7 +870,7 @@
   // 状态必须**看得见**:`[running]` = 还没跑完;`[done] 处理 N 行:归并 x、
   // 新建 y、失败 z` = 跑完了 —— 新建 0 就是「跑完了但没进来」,一眼分得开。
   async function startFlywheel() {
-    clearInterval(flywheelTimer);
+    clearTimeout(flywheelTimer);       // 起新的一轮之前先掐掉上一个轮询链
     const st = $("q-fly-status");
     st.style.display = "block";
     st.className = "job-status";
@@ -828,41 +914,66 @@
     return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
   }
 
+  //: 轮询上限与退避。**不许无界轮询**(复审 Minor 5):这个按钮存在的理由之一就是
+  //: 「任务会卡住」,而无界轮询会让页面一直打下去,直到关标签页。
+  //: 300 秒与服务端那条任务级死线对齐(`e5afbdd` 起飞轮有 300s 死线),
+  //: 到点没进终态就停下并**说清楚**「它可能还在跑,可以手动看」。
+  const FLYWHEEL_POLL_MAX_MS = 300 * 1000;
+  const FLYWHEEL_POLL_BASE_MS = 1000;
+  const FLYWHEEL_POLL_MAX_GAP_MS = 5000;
+
   function pollFlywheel(jobId) {
     const st = $("q-fly-status");
-    const tick = async () => {
+    const startedAt = Date.now();
+    let gap = FLYWHEEL_POLL_BASE_MS;
+
+    const schedule = (ms) => { flywheelTimer = setTimeout(tick, ms); };
+
+    async function tick() {
       try {
         const r = await req(`/api/kb/jobs/${jobId}`);
         if (!r.ok || !r.body) {
-          clearInterval(flywheelTimer);
           st.className = "job-status failed";
           st.textContent = `⚠ 任务状态读取失败(HTTP ${r.status})`;
-          return;
+          return;                       // 不排下一次 = 停
         }
         const j = r.body;
         let line = `[${j.status}] ${j.type} ${j.id} ${j.message || ""}`;
         if (j.status === "running" && j.created_at) {
           line += ` · 已跑 ${fmtDur(Date.now() / 1000 - j.created_at)}`;
         }
-        if (j.result) {
+        // **`message` 与 `result` 说的是同一件事,只打印一次**(复审 Minor 1):
+        // 飞轮任务跑完时 `message` 里已经写着「处理 N 行:归并 x、新建 y、失败 z」,
+        // 再拿 `result` 拼一遍就是同一句出现两次(原始走查记录里逐字可见)。
+        // `result` 只在 `message` 为空时兜底(别的任务类型可能只填 result)。
+        if (!j.message && j.result) {
           line += ` · 处理 ${j.result.processed} 行:归并 ${j.result.merged}、` +
                   `新建 ${j.result.created}、失败 ${j.result.failed}`;
         }
         st.className = "job-status " + j.status;
         st.textContent = line;
         if (j.status !== "running") {
-          clearInterval(flywheelTimer);
           // 跑完才刷队列:新归并 / 新建出来的待审行是这一刻才有的。
           await refreshQueue();
+          return;                       // 终态 = 停
         }
+        if (Date.now() - startedAt >= FLYWHEEL_POLL_MAX_MS) {
+          st.className = "job-status failed";
+          st.textContent = line +
+            `\n⚠ 轮询已停:盯了 ${fmtDur((Date.now() - startedAt) / 1000)}还是 running。` +
+            `任务**可能仍在跑**(也可能卡住了)—— 点「刷新」看队列有没有新行,` +
+            `或过一会儿重开本页看它是否已经结束。`;
+          return;                       // 到点 = 停
+        }
+        gap = Math.min(gap * 2, FLYWHEEL_POLL_MAX_GAP_MS);
+        schedule(gap);
       } catch (e) {
-        clearInterval(flywheelTimer);
         st.className = "job-status failed";
         st.textContent = `⚠ 任务状态轮询中断(${e.message})`;
       }
-    };
+    }
+
     tick();
-    flywheelTimer = setInterval(tick, 1000);
   }
 
   $("q-refresh").addEventListener("click", refreshQueue);
