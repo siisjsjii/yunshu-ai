@@ -76,6 +76,24 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 [ -f app/main.py ] || { echo "请在项目根目录运行本脚本(找不到 app/main.py)" >&2; exit 2; }
 
+# ── 自我转录(收尾那条「输出干净性自检」的输入,见文件后半 `output_cleanliness_check`)──
+# **为什么要转录**:本脚本的绿/红只由显式的 `ok/bad/boom/warn` 喂,**没有任何东西校验
+# 脚本自己的输出**。实测踩过(fix round 1):收尾那段「局限」原用反引号写在双引号里 —
+# bash 把它当**命令替换**执行,喷出一屏 `import: command not found` / `syntax error`,
+# **而脚本照样打「6/6 通过」**。⇒ 本轮输出必须能被脚本自己再看一遍。
+#
+# 形状:**父进程**`tee` 一份转录并等子进程(自己的另一份)跑完,用 `PIPESTATUS[0]` 原样
+# 传回它的退出码。`tee` 是**流式**的 ⇒ 人照样实时看到输出,而转录逐行落盘。
+# ⚠️ 转录放在 `log/` 里(已被 .gitignore 忽略),**不放 `$WORK`** —— `$WORK` 开头会被
+# `rm -rf` 重建,放进去等于让 tee 写一个已经被删掉的文件。
+SELF_LOG="${CH09_SELF_LOG:-$PWD/log/acceptance_ch09_self.log}"
+if [ -z "${CH09_SELF_LOG:-}" ]; then
+  mkdir -p log
+  export CH09_SELF_LOG="$SELF_LOG"
+  bash "$0" "$@" 2>&1 | tee "$SELF_LOG"
+  exit "${PIPESTATUS[0]}"
+fi
+
 PYTHON="${PYTHON:-.venv/Scripts/python.exe}"
 PORT="${PORT:-8000}"
 BASE="http://localhost:$PORT"
@@ -176,6 +194,11 @@ cleanup() {
   if [ "$FAIL" -eq 0 ] && [ "$KEEP" -eq 0 ]; then
     rm -rf "$WORK"
   else
+    # 本轮转录也留一份进证据目录:它是「输出干净性自检」的输入,失败时最该看的东西
+    # 之一(那一屏 shell 错误行就在里面)。`cp` 而不是 `mv` —— 转录文件此刻还被
+    # 文件头那个 `tee`(父进程)开着写,搬走它在 Windows 上可能失败。
+    [ -n "${CH09_SELF_LOG:-}" ] && [ -f "$CH09_SELF_LOG" ] && \
+      cp "$CH09_SELF_LOG" "$WORK/transcript.txt" 2>/dev/null
     echo "  (证据留在 $(pwd)/$WORK/)"
   fi
 }
@@ -602,6 +625,11 @@ for i, l in enumerate(lines):
 sys.stdout.buffer.write((intent or "?").encode("utf-8"))' "$1"
 }
 # 回复(拼回后)里有没有这个 needle。**needle 用十六进制码点传**(规矩 3)。
+# ⚠️ **退出码有三个,别把 1 与 2 混成一个非零**(fix round 2,复审 F2):
+#   0 = 针在;1 = 文件读得动、**针确实不在**;2 = **文件读不了/解不开**(装置故障)。
+# 混成一个非零的后果很具体:`has_needle ... || ok "......不再是兜底话术"` 这种**否定**断言
+# 会把一次 `OSError`/解码失败**静默判绿** —— 而它本该是「装置坏了,这条判不了」。
+# **凡否定断言一律走下面的 `assert_needle_absent`**,不要自己写 `else` 分支。
 has_needle() {   # $1=文件 $2="空格分隔的码点"
   "$PYTHON" -c '
 import sys
@@ -611,6 +639,19 @@ except (OSError, UnicodeDecodeError):
     raise SystemExit(2)
 needle = "".join(chr(int(h, 16)) for h in sys.argv[2].split())
 raise SystemExit(0 if needle in text else 1)' "$1" "$2"
+}
+# 「针**不在**」这种**否定**断言。$1=文件 $2=hex $3=绿话 $4=红话(针在时)
+assert_needle_absent() {
+  has_needle "$1" "$2"; local rc=$?
+  case "$rc" in
+    0) bad "$4" ;;                    # 针在
+    1) ok "$3" ;;                     # 文件读得动、针确实不在
+    # ⚠️ **除 1 以外的非零一律当装置故障**,不做「反正不是 0,就当针不在」的兜底 ——
+    # 那个兜底与「把 OSError 判成绿」同源:127(has_needle 根本没定义)、2(读不了)
+    # 都会以「否定断言成立」的样子绿过去。
+    2) boom "装置故障:读不了 $1 —— 这条否定断言判不了(不是「针不在」)" ;;
+    *) boom "装置故障:has_needle 返回 $rc(只该是 0/1/2)⇒ 这条否定断言判不了" ;;
+  esac
 }
 # 这一句的意图是不是某个值(②/⑤ 的选题判据;hex needle 走 argv)。
 intent_is() {    # $1=SSE 文件 $2=意图的 hex
@@ -934,12 +975,20 @@ for i in 0 1 2 3 4 5 6 7; do
   # 少了第 ② 条的话,一次「其他 → 兜底」也会让「回复含兜底话术」为真 ——
   # 那条路**根本不落池**,于是断言会在下一段以「池子里没落行」的样子红掉,
   # 而错因在**分流**不在飞轮(C1 记的就是这个形状)。
-  if has_needle "$WORK/acc2_reply.txt" "$H_FALLBACK" && intent_is "$WORK/acc2.sse" "$H_PRODUCT"; then
+  # ⚠️ 先分开 `has_needle` 的两种非零(复审 F2):**读不了文件是装置故障**,
+  # 不是「这一轮没走兜底」—— 后者会让我们**换下一条候选**并一路把候选耗光,
+  # 最后报的是「八条候选都没造出」,而真正的原因在第一条候选那次读盘就坏了。
+  has_needle "$WORK/acc2_reply.txt" "$H_FALLBACK"; fb_rc=$?
+  if [ "$fb_rc" = "2" ]; then
+    boom "装置故障:读不了 $WORK/acc2_reply.txt —— ② 的选题判据跑不动"
+    break
+  fi
+  if [ "$fb_rc" = "0" ] && intent_is "$WORK/acc2.sse" "$H_PRODUCT"; then
     Q2="$q"; A2="${CAND_A[$i]}"; M2="${CAND_M[$i]}"
     ok "② 兜底话术 + 意图=商品咨询(这一轮真的走了知识路径)"
     break
   fi
-  echo "    这一轮不满足(兜底=$(has_needle "$WORK/acc2_reply.txt" "$H_FALLBACK" && echo y || echo n)、意图=$got_intent),换下一条候选"
+  echo "    这一轮不满足(兜底=$( [ "$fb_rc" = "0" ] && echo y || echo n)、意图=$got_intent),换下一条候选"
   SID2=""
 done
 if [ -z "$SID2" ]; then
@@ -996,17 +1045,26 @@ EOF
       # ⚠️ **这条断言判据很窄,而且如实说:它对「闸漏写 `evidence_snapshot=`」是不变的**
       # —— 零召回那一支两种写法都落 JSON `null`(闸今天传的是
       # `_snapshot(evidence) if evidence else None`)。能断的只有「这一行是自洽的:
-      # 快照为空 **且** 理由就是「检索为空」**且** 独立探针也召不到」。见脚本尾部「局限」。
+      # 快照为 `null` **且** 理由就是「检索为空」**且** 独立探针也召不到」。见脚本尾部「局限」。
+      #
+      # ⚠️ **`null` 与空数组不是同一个值**(fix round 2 订正):本仓约定**`None` = 「当轮确实
+      # 零召回」**(`app/kb/assess.py:88-92`、`app/agent/nodes.py:304-306`、
+      # `tests/test_agent_gate_ch09.py:135-139` 三处同款),空数组 `[]` 是**另一个值**。
+      # 所以这一支只放行 `SNAP=none`;真看到 `SNAP=0` 要**红** —— 那说明「零召回」与
+      # 「记了、零召回」在这条链路上被混成了一个值,而这条断言存在的全部理由就是它们分不开。
       SNAP_SHAPE=$(grep '^SNAP=' "$WORK/acc2_check.txt" | head -1)
       if grep -q '^SNAP=[1-9]' "$WORK/acc2_check.txt"; then
         warn "② 快照居然有内容($SNAP_SHAPE)—— 与独立探针(0 块)不同,记一笔"
-      elif has_needle "$WORK/acc2_check.txt" "$H_EMPTY_RETRIEVAL"; then
-        # 「空」的两种形态都算自洽:JSON `null`(闸今天空证据那一支传 `None`)与
-        # 空数组(本仓约定里「记了、零召回」的那个值)。**关键是被另一个读数解释过** ——
-        # 独立探针 0 块 + 理由「检索为空」,不是「看见一个 null 就猜」(C7)。
-        ok "② 快照为空且落池理由就是「检索为空」—— 与独立探针(0 块)一致,不是漏记($SNAP_SHAPE)"
+      elif grep -q '^SNAP=0$' "$WORK/acc2_check.txt"; then
+        bad "② 快照是空数组($SNAP_SHAPE):「记了、零召回」与「漏记」在这一列上分不开 —— 本仓约定 None 才是零召回的值"
+      elif grep -q '^SNAP=none$' "$WORK/acc2_check.txt"; then
+        if has_needle "$WORK/acc2_check.txt" "$H_EMPTY_RETRIEVAL"; then
+          ok "② 快照为 null 且落池理由就是「检索为空」—— 与独立探针(0 块)一致,不是漏记"
+        else
+          bad "② 快照为 null,但落池理由不是「检索为空」—— 与独立探针矛盾,查落池那一步"
+        fi
       else
-        bad "② 快照为空,但落池理由不是「检索为空」—— 与独立探针矛盾,查落池那一步($SNAP_SHAPE)"
+        bad "② 快照那一列的形状认不出来($SNAP_SHAPE)—— 先看 reviewcheck.py 的判据"
       fi
       echo "    $(grep '^ENTRY=' "$WORK/acc2_check.txt" | head -1)  $(grep '^REASON=' "$WORK/acc2_check.txt" | head -1)"
     else
@@ -1095,11 +1153,11 @@ print("%s|%s" % (d.get("chunks_added"), d.get("vectorized")))' "$WORK/acc3_appro
         echo "        证据:$WORK/acc3.sse"
       fi
     fi
-    if has_needle "$WORK/acc3_reply.txt" "$H_FALLBACK"; then
-      bad "③ 重问**仍然**是兜底话术 —— 知识入库了却没被用上"
-    else
-      ok "③ 重问不再是兜底话术"
-    fi
+    # **否定断言**:「兜底话术**不在**回复里」。必须走 `assert_needle_absent` ——
+    # 自己写 `else → ok` 会把「文件读不了」(退出 2)也判成绿(复审 F2)。
+    assert_needle_absent "$WORK/acc3_reply.txt" "$H_FALLBACK" \
+      "③ 重问不再是兜底话术" \
+      "③ 重问**仍然**是兜底话术 —— 知识入库了却没被用上"
   fi
 fi
 
@@ -1215,15 +1273,22 @@ if [ "$INTENT_OK" = "1" ]; then
   ok "⑤ 输出里有 $BODY 个意图行(去重后 $N_INTENTS 个不同意图)≥ 2"
   # ⚠️ **口径提醒**:这条断的是「窗口内至少两个 `intent:*` 行」——**窗口里的外来流量
   # 也能满足它**(本脚本跑之前 30 分钟内若有别人打过聊天接口,一样算数)。
-  # 所以这里**标出本轮的贡献**:表里有没有本轮造的那个业务意图(物流/订单)。
-  if has_needle "$WORK/acc5_intent.txt" "$H_LOGISTICS" || \
-     has_needle "$WORK/acc5_intent.txt" "$H_ORDER"; then
-    ok "⑤ 表里有**本轮造的那个业务意图**行(物流/订单)—— 本轮的贡献就是它"
+  # 所以这里**标出**:表里有没有本轮造的那个业务意图(物流/订单)那一行。
+  # ⚠️ 措辞收着说(复审已判「不用返工、改措辞即可」):这是在**全窗口的输出上** grep,
+  # 命中只能说明「窗口里出现过这个意图」,**不等于**「这一行就是本轮那次请求挣来的」——
+  # 归因做不了(观测端点的 `tags` 是 `None`,单体观测读不回 tag)。
+  has_needle "$WORK/acc5_intent.txt" "$H_LOGISTICS" || has_needle "$WORK/acc5_intent.txt" "$H_ORDER"
+  ours_rc=$?
+  if [ "$ours_rc" = "0" ]; then
+    ok "⑤ 窗口内有**本轮那个业务意图**(物流/订单)的意图行 —— 注意这是全窗口 grep,不是归因"
   else
-    warn "⑤ 表里的意图行**没有一个是本轮造的**(本轮那句业务问题还没进 ingestion?)⇒ 这条断言的判别力这一轮打折,别读成「脚本造的两条都在」"
+    warn "⑤ 窗口内没看到物流/订单意图行(本轮那句业务问题还没进 ingestion?)⇒ 这条断言的判别力这一轮打折"
   fi
-  if has_needle "$WORK/acc5_intent.txt" "$H_HOTTEST"; then
+  has_needle "$WORK/acc5_intent.txt" "$H_HOTTEST"; hot_rc=$?
+  if [ "$hot_rc" = "0" ]; then
     ok "⑤ 输出里能看出 token 最多的那个意图"
+  elif [ "$hot_rc" = "2" ]; then
+    boom "装置故障:读不了 $WORK/acc5_intent.txt"
   else
     bad "⑤ 没打出「最烧 token 的意图」那一行"
   fi
@@ -1339,6 +1404,45 @@ echo '    本轮自己只贡献了一个业务意图轮次(输出里会标出那
 echo '  * ② 的候选每跑一轮消耗一条(CAND_Q1..CAND_Q8,8 条),用尽会**响亮地报**「请加一条」。'
 echo "  * 本脚本**会真的往共享表里写东西**(池子 / 待审队列 / 知识库 / eval_runs,以及"
 echo "    conversations / messages / tool_audit_logs),且一次跑要好几分钟(收尾那一轮是 300 条全量评估)。"
+
+# ══════════════════════════════════════════════════════════════════════════
+# 输出干净性自检(F3,fix round 2)—— **判词之前**跑,让「装置自己喷错误行」
+# 不再可能与「6/6 通过」共存。
+#
+# 判据只有三条 ASCII 串:`command not found` / `syntax error` / `unexpected EOF`
+# (都用 grep -E,不会与中文判词撞车)。它自己**可能红**:把任意一段这样的行进
+# 转录(或让脚本自己在输出里喷一行),这条就 `boom`。
+# ══════════════════════════════════════════════════════════════════════════
+output_cleanliness_check() {
+  echo ""
+  echo "== 输出干净性自检(装置自己喷错误行,就不许与「6/6 通过」共存)=="
+  if [ -z "${CH09_SELF_LOG:-}" ] || [ ! -f "$CH09_SELF_LOG" ]; then
+    # 只有绕过文件头那个 tee 包装才会走到这里(手工设了 CH09_SELF_LOG 之类)。
+    # **不静默**:说清「这一条本轮跑不了」,而不是让它悄悄绿着。
+    warn "没有转录文件(${CH09_SELF_LOG:-未设置})⇒ 这条自检本轮跑不了"
+    return
+  fi
+  # **屏障**:先打一个哨兵行,再**轮询转录直到哨兵出现** —— 那说明 tee 已经追平,
+  # 之后扫到的就是**本轮全部**输出。不靠 sleep 猜(猜短了会漏、猜长了白等)。
+  local sentinel="ch09-selfcheck-sentinel-$$-$RANDOM" i hits
+  echo "$sentinel"
+  for i in $(seq 1 50); do
+    grep -qF "$sentinel" "$CH09_SELF_LOG" && break
+    sleep 0.1
+  done
+  if ! grep -qF "$sentinel" "$CH09_SELF_LOG"; then
+    boom "转录里没有刚才那行哨兵 ⇒ tee 没追上(文件被别的东西截断?),这条自检可信度不足"
+  fi
+  hits=$(grep -nE 'command not found|syntax error|unexpected EOF' "$CH09_SELF_LOG" | head -5)
+  if [ -n "$hits" ]; then
+    boom "输出里出现了 shell 级错误行(装置自己喷的)—— 不许与「6/6 通过」共存:"
+    printf '%s\n' "$hits" | sed 's/^/      /'
+  else
+    ok "输出干净(转录里没有 command not found / syntax error / unexpected EOF)"
+  fi
+}
+output_cleanliness_check
+
 if [ "$FAIL" -eq 0 ]; then
   echo ""
   echo "6/6 通过"

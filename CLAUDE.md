@@ -72,6 +72,10 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 #   实测本机导出会成片读超时几分钟而读侧一切正常;那种情况下 ① 会**重试两轮**,仍失败就把
 #   服务端日志里那行 `opentelemetry.exporter ... Read timed out` 打出来指认错因。
 #   ⚠️ ① 的「界面能点开、点开之后是什么样」**靠人看**:脚本断的只有「数据在不在」(观测齐、同一条 trace)。
+#   ⚠️ 它会把**本轮自己的输出**转录一份到 `log/acceptance_ch09_self.log`(已 gitignore),
+#   并在判词**之前**扫它一遍:**命中 `command not found` / `syntax error` / `unexpected EOF`
+#   就判红** —— 让「装置自己喷错误行」不再可能与「6/6 通过」共存(踩过:收尾文案里的反引号
+#   被 bash 当命令替换执行,喷了一屏错误而脚本照样报 6/6)。失败时那份转录会被复制进证据目录。
 
 # 建库 / 升级(Milvus 另需 docker start milvus-standalone;BGE-M3 等权重由 main.py 预热)
 .venv/Scripts/python.exe scripts/init_db.py                     # 建表:create_all,只建**不存在的表**
