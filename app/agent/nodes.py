@@ -21,7 +21,7 @@ from app.agent.json_stream import PLAIN, JsonAnswerDecoder
 from app.agent.routing import INTENT_TO_ROUTE, OTHER
 from app.agent.state import IntentResult
 from app.flywheel.tasks import start_flywheel_job_safely
-from app.kb.assess import record_low_confidence
+from app.kb.assess import ENTRY_GATE, ENTRY_SELF_ASSESS, record_low_confidence
 from app.kb.evidence import evidence_detail
 from app.memory import journal, layers
 from app.memory.budget import ContextBudget
@@ -299,7 +299,7 @@ def make_confidence_gate_node(*, settings, session, conversation_id):
                 session,
                 question=state["user_input"],
                 source_conversation_id=conversation_id,
-                entry_point="置信度闸",
+                entry_point=ENTRY_GATE,
                 reject_reason=reason,
                 # 快照与入口 ②(`生成自评`)**同一个形状**;空证据那一支传
                 # `None`、**不是 `[]`** —— 本仓约定 `None` = 「当轮确实零召回」,
@@ -380,11 +380,23 @@ def _snapshot(evidence: list[dict], *, settings) -> list[dict]:
     只投影审核页真正要看的四个字段:哪一块、多像、哪一节、原文。
     `answer` 按 `snapshot_answer_chars` 截 —— 池子是给审核人看的窄表,
     整块原文塞进去只会让那一行读不动。
+
+    ⚠️ `score` **保留四位**(`round(..., 4)`,最终修复轮):与
+    `app/api/feedback.py:_snapshot` 的写法逐字对齐。两处写的是**同一列**、
+    **同一个审核页**(`admin.html:rawBlock` 把两侧的快照混着渲染),
+    一边四位一边原样的话,同一页上会出现 `0.1958` 与 `0.19581234` 并排 ——
+    读的人只会以为是两个不同的量。四位不是随便取的:重排分是 sigmoid,
+    `retrieval_score_threshold` 那一档的实测区分度就在第三、四位上,
+    再多记的是浮点噪声(池子那张窄表不值当为它变长)。
+    `None` 进 `None` 出(取不到分数时不硬造一个 0 分 —— 本文件的
+    `_evidence_chunks` 在缺 `score` 时是**响亮地炸**,这里是给审核页留白)。
     """
     return [
         {
             "chunk_id": c.get("chunk_id"),
-            "score": c.get("score"),
+            "score": (
+                None if c.get("score") is None else round(c["score"], 4)
+            ),
             "section_path": c.get("section_path"),
             "answer": (c.get("answer") or "")[: settings.snapshot_answer_chars],
         }
@@ -615,7 +627,7 @@ def make_agent_node(*, model, tools, registry, settings, emit, session,
                         session,
                         question=state["user_input"],
                         source_conversation_id=state["conversation_id"],
-                        entry_point="生成自评",
+                        entry_point=ENTRY_SELF_ASSESS,
                         # ⚠️ 这里**不写** `dec.confidence`:协议顺序是
                         # `useful → confidence → answer`,而解码器解出
                         # `useful=false` 的**那一刻就停**(§5.4 的不变量 2 ——

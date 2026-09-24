@@ -18,6 +18,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **ch08(工具系统:注册中心 + MCP + 写操作确认流)** 交付(分支 `ch08-tool-registry`):把写死的五个 `@tool` 换成**即插即用的工具系统** —— `ToolSpec`(名 / 用途描述 / **原始 JSON Schema** / `read`|`write` / 来源)进注册中心,内置工具**包内自动发现**(在 `app/tools/builtin/` 里新增一个文件就是一个新工具),**全章唯一**的 JSON Schema 校验器,三态权限闸,唯一执行点 `execute_tool`,新表 `tool_audit_logs`;两个**自建业务 MCP Server**(`mcp_servers/logistics.py` → 8101 / `aftersales.py` → 8102,Streamable HTTP)+ 一个**每请求现问现拿、单 Server 连不上就降级**的客户端(`app/mcp/client.py`,**刻意不缓存**);并把建工单改成**确认流** —— `agent` 撞到未确认的写调用就**停循环** → `interrupt()` 弹卡片 → `Command(resume=…)` 同 thread 续跑 → 执行或拒绝,**挂起的那一轮完全不落库**。设计源见 ch08 spec(§15 订正最多的一章)。
 
+- **ch09 · `.superpowers/` 的入库规则**(最终修复轮补,此前它是**随机的**):
+  `.superpowers/` **不是 gitignore 的**,只有 `.superpowers/sdd/` 自带一个内容为 `*` 的
+  `.gitignore`。判据是「**有没有被 git 跟踪的文档引用为某个数/某条修复的凭据**」——
+  是 ⇒ **入库**(探针脚本、变异日志、验收转录、pytest 全量转录都算);否 ⇒ 留在本机
+  (一次性运行产物,与 `evals/results/` 被 gitignore 同类;`.superpowers/t17/latest.json.bak`
+  就是这么退出版本控制的)。`.superpowers/sdd/**`(SDD 账本与逐任务报告)**一律本机 workspace、
+  不入版本控制** —— 文档引用它时按这个读法读,别指望 clone 里有。引用必须**逐条解析得开**
+  (或落在一张写明理由的例外表里),判据由 `.superpowers/probe_final_citations.py` 复查
+  (实测 20 条引用:16 条解析得开 + 4 条已记账例外 + **落空 0**)。**入库前先扫密钥**
+  (实测已入库的那些只有 `LANGFUSE_*` 的**变量名**,没有值)。
+  将来有人再往文档里写一条 `.superpowers/` 路径时,**先把它 `git add` 进去**再引用。
+
 - **ch09(数据观测 + 低置信度数据飞轮)** 交付(分支 `ch09-observe-flywheel`)。两件事:
   **① 观测** —— Langfuse(Cloud,配在 `.env`)经 `app/observability.py` 接入,那是**全章唯一**的
   langfuse 边界(其余模块只认 `trace_scope` / `intent_scope` / `span` / `make_handler` 四个名字,
@@ -31,7 +43,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   (normalize → dedupe → pipeline)把池子变成 `review_queue`;`app/api/review.py` 让人工**通过**
   (通过 ⇒ 立刻写知识库并**同步向量化**,否则「重问就答对」要等下次 `build_kb`)或驳回;
   审核页在 `admin.html` 的「待审」标签页;`scripts/run_eval.py`(加 `--trigger`)+ `scripts/eval_trend.py`
-  把每轮评估记进 `eval_runs` 并打趋势表。设计源见 ch09 spec(**§15 订正最多的一章**,15.1–15.14)。
+  把每轮评估记进 `eval_runs` 并打趋势表。设计源见 ch09 spec(**§15 订正最多的一章**,15.1–15.15)。
 
 **ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop、认证。
 
@@ -475,6 +487,15 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 ⚠️ **标量会连带把 SDK 的 `connect=5` 换成 60**(连接阶段反而放松 12 倍;修前是 ∞,
 所以不是回归);要保住它就用**四元组**(**二元组会让 write/pool 落回 `None` = 又没上界了**)。
 
+**请求路径上还有两处「不走 `execute_tool`」的检索/向量化,它们的上界是
+`retrieval_timeout_seconds`(默认 10,最终修复轮加的)** —— `POST /api/feedback` 的
+尽力回捞与 `POST /api/review/{id}/approve` 的同步向量化。`tool_timeout_seconds`
+**够不着它们**(它们不是工具调用),不加界时 Milvus 接了 TCP 不回话会让这两条请求
+**永远不返回**,而它们占的是**整个事件循环**(不是只占那一个用户)。⚠️ **这道界只圈得住
+`await` 的那一半**:两处内部大头是同步调用(torch 前向、pymilvus 往返),循环在它们
+里面跑不到定时器(ch07 实测)⇒「Milvus 接了 TCP 不回话」**今天仍会拖住循环**,
+被圈住的是收尾那次 `commit` / MySQL 回查;**别把它读成「这两条路已经不会卡了」**。
+
 **那个单槽只关了一半 —— 不许写成「已修复」**。`JobStore`(**ch04** 的)只有**一个**
 `running` 槽,`vectorize` / `mine`(ch04 的 `app/kb/orchestrate.py`)**至今没有任何死线**,
 ch04 管理台的 `pollJob` 也没有轮询上界 ⇒ 「任务卡住 ⇒ 槽位永久占死」这条路**在那两个任务上
@@ -498,9 +519,18 @@ ch04 管理台的 `pollJob` 也没有轮询上界 ⇒ 「任务卡住 ⇒ 槽位
 **「手里有块、却被拦」真实可达**。那一刻丢掉的是这块的原文与得分,审核页上
 「知识库真缺这块」与「有、但没检到」长得**一模一样** —— 分开它俩正是快照的用途。
 
-**`evidence_snapshot` 的 `None` 与 `[]` 是两个不同的值**:本仓约定 **`None` = 当轮确实零召回**,
-空列表是另一个、会读错的值(三处写着这件事:`app/kb/assess.py`、`app/agent/nodes.py`、
-`tests/test_agent_gate_ch09.py`)。⚠️ 而且:**`NULL` 不等于「知识库没有这条」** ——
+**`evidence_snapshot` 有三个取值,不是两个**(最终修复轮收紧了本条的措辞):
+**`None` = 当轮确实零召回**;空列表是另一个、会读错的值(三处写着这件事:
+`app/kb/assess.py`、`app/agent/nodes.py`、`tests/test_agent_gate_ch09.py`);
+而 👎 那条路上**回捞失败**落的是**哨兵** `{"error": "recall_failed"}`
+(`app/api/feedback.py:RECALL_FAILED_SNAPSHOT`,顶层类型与真快照不同:对象 vs 数组)。
+⚠️ **哨兵是这一列唯一一处「故障」标记,别把它读成第三个业务值**:它存在的全部理由是
+「回捞失败」与「零召回」原先**逐字节相同** ⇒ 审核页会把**服务不可用**读成
+**「知识库缺这块」这个诊断**(事故现场:Milvus 挂着,`POST /api/feedback` 照回
+`200 {"pooled": true}`)。审核页对它单画一句「召回失败(检索服务不可用)」;
+`scripts/acceptance_ch09.sh` 的 `reviewcheck.py` 把它印成 `SNAP=failed`(不能印成 `1` ——
+对象也有长度,而那会被验收 ② 读成「快照居然有内容」)。
+⚠️ 而且:**`NULL` 不等于「知识库没有这条」** ——
 一个编程错误(漏传 kwarg)会产生**逐字节相同**的行。要分开只能靠当轮检索的独立读数。
 
 **`matched_review_id` 一列担两个语义**(spec §7.1):既记「这条池子行归并到了 `review_queue`
@@ -675,7 +705,10 @@ T19 补了 `#9–#16`(8 条);三次跑又消耗 `#9` / `#10`
 
 **ch09 · `NULL` 快照 ≠ 「知识库没有这条」。** 一个**编程错误**(漏传 kwarg)会产生**逐字节相同**的
 行 ⇒ 要分开「知识库真缺这块」与「有、但没检到」,只能靠**当轮的独立检索读数**。同族地,
-本仓约定 **`None` = 当轮确实零召回**,空列表 `[]` 是**另一个**值(三处代码写着这件事)。
+本仓约定 **`None` = 当轮确实零召回**,空列表 `[]` 是**另一个**值(三处代码写着这件事),
+而 **👎 的回捞失败**落的是**哨兵** `{"error": "recall_failed"}`(最终修复轮加的**第三个**
+取值 —— 它是**故障**标记,不是业务值:别把它读成「零召回」的另一种写法,也别拿
+`len()` 去数它,对象**有长度**)。
 
 **ch09 · 三条如实记账的既有/前端缺陷(都不阻塞本章验收)**:
 - **`admin.html` 的 `showResult` 读 `r.body || {}` 里的 `info.op.chunks_added`** ⇒ 一个 **2xx 但

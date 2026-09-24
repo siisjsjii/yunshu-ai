@@ -27,6 +27,7 @@
   而「非 DB 测试绝不碰网络」是硬约束。
 """
 
+import asyncio
 import dataclasses
 from datetime import datetime
 
@@ -633,6 +634,56 @@ async def test_rejecting_twice_is_404(client_factory, write_recorders):
     assert first.status_code == 200, first.text
     assert second.status_code == 404, (
         f"已处理过的待审项再驳回必须 404,实际 {second.status_code}:{second.text}"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_hanging_vectorize_is_bounded_and_becomes_the_same_502(
+    client_factory, vector_deps, write_recorders, monkeypatch,
+):
+    """`vectorize_rows` **永不返回** ⇒ 有墙钟上界,且**照样是那个 502**(最终修复轮,D5)。
+
+    没有上界时这条请求**永远不返回** —— 审核台看起来就是「点了通过,一直转圈」,
+    而它挡住的是**整个事件循环**(不止这一个审核人:别的对话/审核请求也一起停),
+    并且**没有任何日志**:挂起不是异常,`finally` 永不执行(这条在本仓 ch09 的
+    飞轮那一段已经吃过一次,见 `flywheel_job_timeout_seconds` 的由来)。
+
+    落点必须与「Milvus 抛错」**完全同一条**路:502 + **固定文案** +
+    `_rollback_quietly` + `_discard_drafts`,而且队列行**留在 pending**
+    (审核人能重试)。换成别的收尾(比如 200、「稍后重试」)就等于把
+    「这次通过到底成没成」变成一个说不清的状态 —— 那正是本仓禁止的
+    「基础设施故障伪装成结果」。
+
+    ⚠️ 断言前面套一层 5s 的 `wait_for`:**修好的实现**跑完只要毫秒级,而上界一旦
+    回归,这条用例会**挂死**而不是变红 —— 挂死在一个没有 timeout 插件的测试套件里
+    是「没人看得见的红」。超时那一下自己就是判据。
+    """
+    reached = False
+
+    async def hanging_vectorize(session, store, embedder, rows):
+        nonlocal reached
+        reached = True
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(review_api, "vectorize_rows", hanging_vectorize)
+    session = FakeSession(queue_row=_queue_row(), kb_rows=[_chunk_row()])
+    async with client_factory(session, retrieval_timeout_seconds=0.01) as client:
+        r = await asyncio.wait_for(
+            client.post(f"/api/review/{RQ_ID}/approve", json={}), timeout=5.0)
+
+    assert reached, "前置:这一次必须真的走到向量化(否则验的不是挂死那条路)"
+    assert r.status_code == 502, (
+        f"向量化卡死必须是 502(与 Milvus 抛错同一个出口),实际 {r.status_code}:{r.text}"
+    )
+    assert r.json()["detail"] == review_api.VECTORIZE_FAILED_DETAIL, (
+        "超时的 502 也必须用**固定文案** —— 回显 `TimeoutError` 的 str() 会把"
+        "内部实现细节送出站"
+    )
+    assert session.queue_row.status == "pending", (
+        f"502 之后队列行必须仍是 pending(审核人才能重试),实际 {session.queue_row.status}"
+    )
+    assert session.rollbacks >= 1, (
+        "502 的收尾必须真的回滚过 —— 计时器是在一个**还没收尾的会话**上炸的"
     )
 
 

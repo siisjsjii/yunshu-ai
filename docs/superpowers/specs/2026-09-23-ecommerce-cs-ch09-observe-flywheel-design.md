@@ -34,7 +34,7 @@
 
 ## §2 设计依据(实测事实,不是推断)
 
-本章有三个决策完全由实测决定,先摆事实。**所有探针脚本留在 `.superpowers/`(未跟踪),结论抄在这里。**
+本章有三个决策完全由实测决定,先摆事实。**探针脚本与转录留在 `.superpowers/`,结论抄在这里。**（⚠️ 订正,见 §15.15：它们**不是全都未跟踪** —— 被**已跟踪文档**引用为某个数之凭据的那些**已入库**，规则写在 `CLAUDE.md` 的 ch09 一节；这一行原先写的「未跟踪」在 2026-09-25 的最终修复轮被改掉。）
 
 ### 2.1 Langfuse:用 Cloud,不是自部署(用户 2026-09-23 拍板)
 
@@ -688,6 +688,8 @@ ch08 的纯文本流,**不会让任何一条既有路径变差**。`trace` 里�
 **选后者的第二条理由(不只是省事)**:重跑对**审核人**更好用。审核页要回答的是「知识库是真缺这块,还是有但没检到」—— 重跑**召得到** ⇒ 有但当时没检到;重跑**召不到** ⇒ 真缺。而「那一轮当时的快照」在这件事上给的信息**更少**(它只证明当时没检到)。
 
 **如实记两条偏差**:① 停用阈值过滤后重跑,闲聊类问题**理论上**也可能召回低分块(实践中被 `retrieval_score_threshold` 挡掉,但这是**性质**不是保证);② 重跑用的是**当前**的知识库,而那一轮用的是**当时**的 —— 审核通过后重跑的同一问题,快照会变。
+
+⚠️ **第三条偏差(2026-09-25 最终修复轮订正,详见 §15.15 ②)**:上表与 §6.2 的整段推理都默认「重跑只有两个结局」—— 召得到 / 召不到。**实际有三个**:「**重跑本身失败**」(Milvus 挂了、嵌入挂了、超时)。原先它落的是 `None`,与「召不到」**逐字节相同** ⇒ 审核页把「服务不可用」读成「知识库缺这块」—— 那**正是本列存在的理由被反过来用**。现在回捞失败落哨兵 `{"error": "recall_failed"}`(`app/api/feedback.py:RECALL_FAILED_SNAPSHOT`),审核页单画一句「召回失败(检索服务不可用)」。
 
 ### 6.3 前端
 
@@ -1702,3 +1704,53 @@ T14 加了 `flywheel/tasks.py` 1 处 ⇒ 本章结束时 `app/` 下共 **13** �
 补候选时还要**先用生产同款探针核 `hits == 0`**:实测起草的 **22** 条里**有 10 条召得到**
 (其中 3 条只比阈值 0.25 高一点点:0.2507 / 0.2615 / 0.2757)⇒
 **「看起来库里没写」靠眼睛判不出来。**
+
+---
+
+### 15.15 订正:最终修复轮 —— 五条(1 Important×3 + 2 Minor + 1 记账)
+
+**复审结论是「ship it,零 Critical」**,这一轮只做复审列出的条目。逐条记**订正了什么**:
+
+**① 👎 的回捞失败与「零召回」在数据上是同一个值(Important)。**
+`app/api/feedback.py` 的 `except Exception` 原先把 `snapshot` 留成 `None`,而本仓约定
+**`None` = 「当轮确实零召回」** ⇒ Milvus 挂着时端点照回 `200 {"pooled": true}`,
+审核人在 `admin.html` 上读到「召回片段快照:无」,于是得出一个**诊断**——「知识库缺这块」——
+而真相是**服务不可用**。本仓那条「基础设施故障绝不伪装成结果」在这里伪装成了**结论**。
+**处置**:回捞失败落哨兵 `RECALL_FAILED_SNAPSHOT = {"error": "recall_failed"}`
+(顶层类型与真快照不同:对象 vs 数组),`admin.html` 单画一句
+「**召回失败(检索服务不可用)**」,`snapshot_chunks` 不再用 `len(snapshot or [])`
+(哨兵是对象,`len()` 会自报「有一条」)。三处写 `None` 约定的地方(CLAUDE.md ×2、AGENTS.md)
+一并改成「三个取值」。`scripts/acceptance_ch09.sh` 的 `reviewcheck.py` 同步加了
+`SNAP=failed`(否则哨兵会被数成 1 条片段,验收 ② 那句「快照居然有内容」当场点着)。
+
+**② 请求路径上两处直接调用检索/向量化组件**没有上界(Important)。
+`app/api/feedback.py` 的回捞与 `app/api/review.py` 通过后的同步向量化**都不经 `execute_tool`**
+⇒ `tool_timeout_seconds` 够不着。**处置**:新增 `retrieval_timeout_seconds`(默认 10.0,
+与 `tool_timeout_seconds` 同值 —— 两处干的是同一件事),两处都套 `asyncio.wait_for`,
+超时翻成 `ToolInfrastructureError`(review 侧由此走**原来那条 502**:固定文案 + 回滚 + 清草稿)。
+⚠️ **只圈得住 `await` 的那一半**:两处内部大头是同步调用(torch 前向、pymilvus 往返),
+事件循环在它们里面跑不到定时器(ch07 实测)⇒「Milvus 接了 TCP 不回话」**今天仍会拖住循环**,
+只有收尾那次 `commit` / MySQL 回查被圈住。要连同步那半一起圈住得把它挪进线程,
+而 `_load_rows` 用的是调用方的 `AsyncSession`(不可跨线程)⇒ 不在一次修复轮的射程里,**如实记账**。
+
+**③ `.superpowers/` 的入库规则原先不存在(Important)。**
+本章多处把「某条承重数字」的凭据指向 `.superpowers/` 下的一个探针或一份转录,而
+`.superpowers/` **只有 `sdd/` 子目录带一个内容为 `*` 的 `.gitignore`** ⇒ 哪些该入库是**随机的**。
+**处置**:写进 `CLAUDE.md` 的 ch09 一节(判据 + 例外),并把被**已跟踪文档**引用的 16 条
+路径全部入库;`.superpowers/sdd/**` 一律**本机 workspace,不入版本控制**(账本与逐任务报告
+在引用处按这个读法读)。解析结果由 `.superpowers/probe_final_citations.py` 复查
+(20 条引用:16 条解析得开 + 4 条已记账例外,**落空 0**)。
+
+**④ `scripts/intent_cost.py:73` 的「17 处」是错的(Minor)。** 重数 = **13**
+(`chat.py` 6 / `extract.py` 2 / `refund.py` 1 / `review.py` 1 / `flywheel/tasks.py` 1 /
+`kb/orchestrate.py` 1 / `memory/tasks.py` 1),注释已按**口径 + 读数 + 重数方法**改写
+(spec 早已在 §15.14 ② 撤回那个数,代码注释没跟上)。
+
+**⑤ 两个写口的 `score` 刻度不一致(Minor)。** `app/agent/nodes.py:_snapshot` 原样落浮点,
+`app/api/feedback.py:_snapshot` 落 `round(..., 4)`,而审核页**把两侧混着渲染** ⇒
+同一页上会出现 `0.1958` 与 `0.19581234` 并排。已对齐成四位(实测:没有任何测试钉住旧形状)。
+同轮:`.superpowers/t17/latest.json.bak` **退出版本控制**(它是**运行产物**,与
+`evals/results/` 被 gitignore 同类,且无跟踪文档引用它);`evals/flywheel_cases.jsonl`
+删掉 3 个空行(5/8/22)—— 脚本自己带 `if line.strip()` 所以**读数一个字没变**,
+但严格 JSONL 读法原先会炸;`entry_point` 的三个内联字面量收进 `app/kb/assess.py`
+(`ENTRY_GATE` / `ENTRY_SELF_ASSESS` / `ENTRY_USER_FEEDBACK`,那是落池的**唯一写口**)。

@@ -32,6 +32,24 @@ _ASSESS_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
+#: 低置信度池 `entry_point` 的**三个生产取值**(ch09 spec §7.2)。
+#:
+#: 三个名字住在**落池那个写口**这一个地方(最终修复轮):先前它们是三个散落的
+#: 内联字面量(`app/agent/nodes.py` 两处、`app/api/feedback.py` 一处),
+#: 而这一列是**审核人读「这条为什么进池子」的唯一依据**,也是飞轮三入口在池子里的
+#: **唯一分隔**(`app/flywheel/` 按它区分也要按它归并)。改一个字面量而漏改另一处
+#: ⇒ 池子里多出一种没人认识的口径,**而没有任何东西报错**;
+#: 反馈端点那侧的查重(会话 + 问题 + 入口)会**永远查不到**,于是每次重复点击
+#: 都再落一行。
+#:
+#: ⚠️ **它是开集,不是闭集**:列上是 `String(32)`,没有 CHECK、也没有像
+#: `app/api/review.py:STATUSES` 那样的校验 —— 这里只统一**生产取值的字面量**,
+#: 不对落库值做把关(把关会改变已有数据的可写入性,那是另一件事)。
+ENTRY_GATE = "置信度闸"
+ENTRY_SELF_ASSESS = "生成自评"
+ENTRY_USER_FEEDBACK = "用户反馈"
+
+
 class AssessError(Exception):
     """自评解析失败(与上游故障区分;退化为「够」,不因自评失败而误拒)。"""
 
@@ -62,7 +80,7 @@ async def assess_sufficiency(question: str, chunks: list, model) -> dict:
 
 async def record_low_confidence(session, *, question: str, source_conversation_id: str | None,
                                 entry_point: str, reject_reason: str,
-                                evidence_snapshot: list | None = None) -> int:
+                                evidence_snapshot: list | dict | None = None) -> int:
     """问题落低置信度池。**返回新行的 id。**
 
     ⚠️ **边界:真 session 上返回新行 id,替身 session 上返回 `None`。**
@@ -85,6 +103,13 @@ async def record_low_confidence(session, *, question: str, source_conversation_i
     没有它,池子里只有一句问题,那两件事看起来一模一样(ch09 spec §7.1)。
     不传 ⇒ 落 **JSON null**(不是空列表):「当轮零召回」与「没人记这件事」
     在审核页上是两件事。
+
+    ⚠️ **本函数不替调用方决定「失败长什么样」**:它只是把形参原样落库。三个生产
+    调用方里,**只有** `POST /api/feedback` 会先失败再落池,它落的是
+    `app/api/feedback.py:RECALL_FAILED_SNAPSHOT` 那个**哨兵对象**
+    (最终修复轮:此前那一支传 `None`,与「零召回」逐字节相同)。另两处
+    (置信度闸 / 生成自评)手里**已经有**证据,没有「失败」这一支。
+    `None` 的含义因此没有被放松:**`None` 仍然等于「当轮确实零召回」**。
 
     ⚠️ **它落的是 JSON 的 `null`,不是 SQL 的 NULL**(实测 2026-09-23:
     `evidence_snapshot IS NULL` = **0**、`JSON_TYPE(evidence_snapshot)` = `'NULL'`)。

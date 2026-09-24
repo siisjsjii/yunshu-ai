@@ -70,10 +70,20 @@ def _dotenv(name: str) -> str:
 
 async def _fetch(query: dict) -> dict:
     base = _dotenv("LANGFUSE_BASE_URL").rstrip("/")
-    # 脱敏要用**这个脚本自己那把密钥**。本仓其余 17 处调用传的都是 `openai_api_key`,
-    # 那是因为它们处理的是**上游 openai SDK** 的异常文本;这条规矩的**目的**是
+    # 脱敏要用**这个脚本自己那把密钥**。本仓**其余 13 处**调用传的都是
+    # `openai_api_key`(2026-09-25 最终修复轮重数,口径与做法见下),那是因为
+    # 它们处理的是**上游 openai SDK** 的异常文本;这条规矩的**目的**是
     # 「出站文本不许回显凭据」,所以按**碰的是哪把**来传 —— 这里碰的是 Langfuse 那把。
     # 顺带:本脚本**不需要** `OPENAI_API_KEY`,不引入那个无关依赖。
+    #
+    # ⚠️ 这个数**曾经写作 17,是错的**(spec §15.14 ② 早已撤回那个说法,代码注释
+    # 没跟上)。重数的方法与读数:`grep -rn "redact_api_key(" --include=*.py app/`,
+    # 去掉 `def`,**按行数调用点** —— `chat.py` 6 / `extract.py` 2 / `refund.py` 1 /
+    # `review.py` 1 / `flywheel/tasks.py` 1 / `kb/orchestrate.py` 1 /
+    # `memory/tasks.py` 1 = **13**(`app/sanitize.py` 那一处是定义,不算;
+    # `memory/tasks.py:248` 那句是注释,也不算)。本文件自己那 2 处
+    # (下面两条 `SystemExit`)不在这 13 里 —— 它们传的正是这把 `secret`。
+    # 后来人若再看到「N 处」这类计数,先按这个口径重数一遍再引用。
     secret = _dotenv("LANGFUSE_SECRET_KEY")
     auth = (_dotenv("LANGFUSE_PUBLIC_KEY"), secret)
     last = None

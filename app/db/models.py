@@ -148,6 +148,13 @@ class LowConfidenceQuestion(Base):
     # `RetrievedChunk` 对象)与置信度闸(T18b 起,`_snapshot(evidence) if evidence else None`,
     # **已在线** —— 它改之前闸那一处**根本没传这个 kwarg**,那一列恒是「没快照」)。
     #
+    # ⚠️ **第三个取值是「回捞失败」的哨兵**(2026-09-25 最终修复轮):`POST /api/feedback`
+    # 在 `retriever.search` 抛异常时落的是 `{"error": "recall_failed"}`
+    # (`app/api/feedback.py:RECALL_FAILED_SNAPSHOT`)—— 一个**JSON 对象**,不是列表。
+    # 注解因此从 `list | None` 放宽成 `list | dict | None`:**注解与事实不符会误导
+    # 后来人**(本条自己上一段就写着这句话)。读侧靠**顶层类型**分辨
+    # (`Array.isArray(...)` / `isinstance(snap, list)`):真快照一律是**数组**。
+    #
     # ⚠️ **别拿这两条反推形状**(都核过、都写准):
     # - `tests/test_ch09_orm.py` 的往返用例塞的是 **dict**(`{"chunks": [...]}`)——
     #   JSON 列两种都存得下,那条用例**说不出来**生产写的是哪种;别读成
@@ -162,7 +169,7 @@ class LowConfidenceQuestion(Base):
     # **`JSON_TYPE(...)='ARRAY'`(真的带快照)0** ⇒ 「闸那一列被行使过」是**假的**。
     # **判据:一律用 `JSON_TYPE(evidence_snapshot)`**;`NULL`(SQL)与 `null`(JSON)
     # 在这一列上是**两个不同的东西**(前者 = 加列之前的老行,后者 = 写了但没快照)。
-    evidence_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    evidence_snapshot: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
     # ⚠️ **一个列担两个语义**(ch09 §7.1):既记「这条问题归并到了 review_queue 的
     # 哪一行」,**又**是飞轮流水线的**待处理标记**(`WHERE matched_review_id IS NULL`)。
     # ⇒ 流水线天然幂等,重跑不会重复归并;别只把它当外键用 —— 谁把它写成 NOT NULL,

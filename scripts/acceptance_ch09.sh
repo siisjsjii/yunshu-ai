@@ -61,6 +61,11 @@
 #      去构造弱召回场景**(副本仓规矩:一条会自带前提的断言比没有更坏)。
 #      **「快照里有内容」那一半由验收 ④ 覆盖**:👎 那条路的 `evidence_snapshot` 是
 #      **回捞重跑**的产物,选一条召得到的问题就有内容,而且能按内容回溯到本轮的问题。
+#      ⚠️ 而 👎 那条路上这一列有**三个**取值(不是两个):`null` / 真快照 /
+#      **「回捞失败」哨兵**(`app/api/feedback.py:RECALL_FAILED_SNAPSHOT`,最终修复轮)。
+#      `reviewcheck.py` 把它们分成 `SNAP=none` / `SNAP=<n>` / `SNAP=failed`,
+#      ② 与 ④ 都对 `failed` **显式**报红 —— 故障不许被读成结论(它是**服务不可用**,
+#      不是「没捞到片段」,更不是「知识库缺这块」)。
 #   C. **选题从候选表里现挑**:每跑一轮,② 会往知识库**真的写进一条**并核准,
 #      于是那条问题**下一轮就变得召得到了**。脚本因此**每次运行时挑第一条「当前
 #      召不到」的候选**(独立探针判的),并在候选用尽时**响亮地报**「请往
@@ -501,8 +506,13 @@ cat > "$WORK/reviewcheck.py" <<'PYEOF'
     MATCH=yes|no                     ← 有一条的 question 与 question.txt **逐字相等**
     ENTRY=<那一行的 entry_point>
     REASON=<那一行的 reject_reason>
-    SNAP=none|<n>                    ← evidence_snapshot 是 JSON null / 有 n 条
+    SNAP=none|<n>|failed             ← JSON null / 有 n 条 / **回捞失败哨兵**
     SNAP_NEEDLE=yes|no|n/a           ← 有内容时,内容里有没有那个特征串
+
+⚠️ `SNAP=failed` 是**最终修复轮**加的(`app/api/feedback.py:RECALL_FAILED_SNAPSHOT`,
+`{"error": "recall_failed"}`)。不单列这一支的话,那个哨兵是**对象**,`len()` 给 1
+⇒ 这里会打出 `SNAP=1`,**bash 侧读作「快照里有一条片段」**(验收 ② 那句
+「快照居然有内容」就是这么被点着的),而真相是**检索服务当时不可用**。
 """
 
 import json
@@ -534,6 +544,12 @@ def main() -> None:
     snap = hit.get("evidence_snapshot")
     if snap is None:
         emit("SNAP=none")
+        emit("SNAP_NEEDLE=n/a")
+        raise SystemExit(0)
+    if not isinstance(snap, list):
+        # 哨兵(对象)。**必须在 `len(snap)` 之前分出来** —— 对象也有长度,
+        # 数出来的是键数(1),而那是「回捞失败」被读成「有一条片段」的入口。
+        emit("SNAP=failed")
         emit("SNAP_NEEDLE=n/a")
         raise SystemExit(0)
     emit("SNAP=%d" % len(snap))
@@ -1132,7 +1148,12 @@ EOF
       # 所以这一支只放行 `SNAP=none`;真看到 `SNAP=0` 要**红** —— 那说明「零召回」与
       # 「记了、零召回」在这条链路上被混成了一个值,而这条断言存在的全部理由就是它们分不开。
       SNAP_SHAPE=$(grep '^SNAP=' "$WORK/acc2_check.txt" | head -1)
-      if grep -q '^SNAP=[1-9]' "$WORK/acc2_check.txt"; then
+      if grep -q '^SNAP=failed$' "$WORK/acc2_check.txt"; then
+        # 回捞**失败**的哨兵(最终修复轮)。这一支是「服务不可用」而**不是**
+        # 「零召回」—— 它在这里出现意味着检索那条腿当轮是挂的,
+        # 于是「本轮确实零召回」这个结论**没被验证过**,不能算过。
+        bad "② 快照是「回捞失败」哨兵($SNAP_SHAPE)—— 检索服务当轮不可用,「零召回」的结论不成立"
+      elif grep -q '^SNAP=[1-9]' "$WORK/acc2_check.txt"; then
         warn "② 快照居然有内容($SNAP_SHAPE)—— 与独立探针(0 块)不同,记一笔"
       elif grep -q '^SNAP=0$' "$WORK/acc2_check.txt"; then
         bad "② 快照是空数组($SNAP_SHAPE):「记了、零召回」与「漏记」在这一列上分不开 —— 本仓约定 None 才是零召回的值"
@@ -1295,7 +1316,11 @@ EOF
         else
           bad "④ 入口不是「用户反馈」($(grep '^ENTRY=' "$WORK/acc4_check.txt" | head -1))—— 三入口串味了"
         fi
-        if grep -q '^SNAP=[1-9]' "$WORK/acc4_check.txt"; then
+        if grep -q '^SNAP=failed$' "$WORK/acc4_check.txt"; then
+          # 与上面同一支:哨兵是「回捞失败」,不是「没捞到」。混成一句的话,
+          # 一次检索故障会被记成「👎 的回捞没拿到片段」(看起来像知识库的问题)。
+          bad "④ 快照是「回捞失败」哨兵($(grep '^SNAP=' "$WORK/acc4_check.txt"))—— 检索服务当轮不可用,先查 Milvus"
+        elif grep -q '^SNAP=[1-9]' "$WORK/acc4_check.txt"; then
           ok "④ 召回片段快照有内容($(grep '^SNAP=' "$WORK/acc4_check.txt"))"
         else
           bad "④ 快照没有内容($(grep '^SNAP=' "$WORK/acc4_check.txt" || echo 'SNAP=?')）—— 👎 的回捞没拿到片段"

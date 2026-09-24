@@ -1,0 +1,401 @@
+BEFORE  pipeline.py sha256 = f56de31d3a8be7db76ea66570e0745e5ba5064ecf587aa2c27ca5056db650e12
+BEFORE  dedupe.py sha256 = 4c2de039f4b0c05bf6a6022d0b989499965c6c49ae065486466b9911a3df4f1b
+
+======================================================================
+### M1 drop the 'not yet processed' predicate (=> reprocess processed rows)
+file = pipeline.py
+anchor hits = 1 (must be exactly 1)
+mutated sha256 = 5244844c7cadeb3a4d8ef19f0bec327a14ac745ff225ae5fd623160beb874958 (changed: True)
+--- run [test_second_run_does_not_reprocess_already_processed_rows] ---
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________ test_second_run_does_not_reprocess_already_processed_rows __________
+
+    @pytest.mark.anyio
+    async def test_second_run_does_not_reprocess_already_processed_rows():
+        """�ڶ���**���س��Ѿ�����������** ���� �ݵ���ȫ�� `matched_review_id IS NULL` ������֤��
+    
+        \u26a0\ufe0f **\u4e3a\u4ec0\u4e48\u8fd9\u91cc\u4e0d\u662f\u300c\u7b2c\u4e8c\u904d `processed == 0`\u300d**(brief \u7ed9\u7684\u7528\u4f8b\u540d\u662f
+        `test_second_run_is_a_noop`):�����ǹ�����,�� `ORDER BY id LIMIT n` **�ȳԾɵ�**
+        ���� ��һ����걾������̽����֮��,�ڶ�������ᱻ�� 30 �о�������������Ҫһ��
+        ��������,ֻ�ܰ� `batch_size` �� 0(`LIMIT 0`),�����Ǹ�**����**����:��Ϊ��ʱ
+        �κ�ʵ�ֶ����� 0 ��,������ν������ɾ������ʵ��Ҳһ�����������ﻻһ��**ͬ��**
+        �Ĺ۲�,������**����**��:
+    
+          ����̽��(ids 1�C6,ȫ����С)����
+            \u7b2c\u4e00\u904d `batch_size=3` \u21d2 \u5403 **1\u30012\u30013**;
+            \u7b2c\u4e8c\u904d `batch_size=3` \u21d2 **\u6b63\u786e\u7684\u5b9e\u73b0**\u5403 **4\u30015\u30016**(\u4e0b\u4e00\u6279\u6700\u5c0f\u7684\u672a\u5904\u7406\u884c,
+                                     ���Ǳ������Լ���);
+                                     **©�� `IS NULL` ν�ʵ�ʵ��**���س� **1��2��3**��
+    
+        ���ǡ�1��2��3 �� `occurrences` �� `matched_review_id` ��û�б��ڶ��鶯��������
+        \u90a3\u6761\u4e0d\u53d8\u91cf\u672c\u8eab\u3002\u26a0\ufe0f \u53ea\u65ad\u300c`review_queue` \u884c\u6570\u4e0d\u53d8\u300d\u662f**\u4e0d\u591f\u7684**:\u91cd\u5403\u7684\u5b9e\u73b0\u4f1a\u8ba9
+        1\u30012\u30013 \u547d\u4e2d\u5b83\u4eec**\u81ea\u5df1**\u5df2\u6709\u7684\u90a3\u4e09\u884c(\u4e0d\u5efa\u65b0\u884c \u21d2 \u884c\u6570\u4e00\u4e2a\u4e0d\u53d8),`occurrences`
+        ȴ�� 1 ��� 2 ���� ������������ڿ���Ψһ�ĺۼ���
+        """
+        conv = f"{PROBE_PREFIX}one"
+        probes = [
+            (1, conv, "t13 ̽��:èɰ�� Pro ��ô�˻�"),
+            (2, conv, "t13 ̽��:����һ�㼸�쵽"),
+            (3, conv, "t13 ̽��:�˷���ô��"),
+            (4, conv, "t13 ̽��:����ʱ��Ҫ���"),
+            (5, conv, "t13 ̽��:�����԰���ô��"),
+            (6, conv, "t13 ̽��:��Ʊ��ô��"),
+        ]
+        model = FakeModel(known=[q for _, _, q in probes])
+        await _cleanup()
+        try:
+            await _insert_probes(probes)
+            assert await _batch_ids(3) == [1, 2, 3], (
+                "ǰ��:��������ֻ����������̽����(id 1�C3 ��ȫ����С)"
+            )
+    
+            async with get_sessionmaker()() as session:
+                first = await run_flywheel(session=session, model=model, batch_size=3)
+            assert first == {"processed": 3, "merged": 0, "created": 3, "failed": 0}, (
+                f"��һ��Ӧ������ȫ���½�,ʵ�� {first}"
+            )
+    
+            queue_after_first = await _review_rows(conv)
+            pool_after_first = await _pool_rows(conv)
+            assert len(queue_after_first) == 3, f"Ӧ����������,ʵ�� {queue_after_first}"
+            assert [r["occurrences"] for r in queue_after_first] == [1, 1, 1]
+            assert [r["matched_review_id"] for r in pool_after_first] == (
+                [r["id"] for r in queue_after_first] + [None, None, None]
+            ), (
+                f"��һ������ǰ 1��2��3 �и�ָ���Լ����д�����;4��5��6 ��û�ֵ�,ʵ�� {pool_after_first}"
+            )
+    
+            assert await _batch_ids(3) == [4, 5, 6], (
+                "ǰ��:�ڶ���óԵ�����һ��**��Ȼ�Ǳ�������̽����**"
+                "(������һ���ȥ�����˵���,���Ի����һ���뱻����Ϊ�޹صĵط�)"
+            )
+            async with get_sessionmaker()() as session:
+                second = await run_flywheel(session=session, model=model, batch_size=3)
+    
+>           assert second == {"processed": 3, "merged": 0, "created": 3, "failed": 0}, (
+                f"\u7b2c\u4e8c\u904d\u8be5\u5403 4\u30015\u30016 \u21d2 \u4e09\u884c\u65b0\u5efa;merged \u4e0d\u4e3a 0 \u8bf4\u660e\u5b83**\u91cd\u5403\u4e86\u5df2\u5904\u7406\u7684\u884c**"
+                f"(ʵ�� {second})"
+            )
+E           AssertionError: \u7b2c\u4e8c\u904d\u8be5\u5403 4\u30015\u30016 \u21d2 \u4e09\u884c\u65b0\u5efa;merged \u4e0d\u4e3a 0 \u8bf4\u660e\u5b83**\u91cd\u5403\u4e86\u5df2\u5904\u7406\u7684\u884c**(\u5b9e\u9645 {'processed': 3, 'merged': 3, 'created': 0, 'failed': 0})
+E           assert {'processed':..., 'failed': 0} == {'processed':..., 'failed': 0}
+E             
+E             Omitting 2 identical items, use -vv to show
+E             Differing items:
+E             {'created': 0} != {'created': 3}
+E             {'merged': 3} != {'merged': 0}
+E             Use -v to get more diff
+
+tests\test_flywheel_pipeline.py:337: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_flywheel_pipeline.py::test_second_run_does_not_reprocess_already_processed_rows
+1 failed in 1.03s
+
+returncode = 1
+
+======================================================================
+### M2 a failing row aborts the whole batch (=> re-raise in except)
+file = pipeline.py
+anchor hits = 1 (must be exactly 1)
+mutated sha256 = 225a78c71661e5193e261336565840208996ebd97830c894fd649bcf0193b7a4 (changed: True)
+--- run [test_one_row_failing_does_not_kill_the_batch] ---
+F                                                                        [100%]
+================================== FAILURES ===================================
+________________ test_one_row_failing_does_not_kill_the_batch _________________
+
+    @pytest.mark.anyio
+    async def test_one_row_failing_does_not_kill_the_batch():
+        """\u6a21\u578b\u5bf9\u7b2c 2 \u884c\u629b\u5f02\u5e38 \u21d2 \u7b2c 1\u30013 \u884c\u7167\u5e38\u5165\u961f,\u7b2c 2 \u884c\u7684 `matched_review_id` \u4ecd\u662f NULL\u3002
+    
+        �������Ը���һ����:
+    
+        �� �� 1��3 ��**��Ľ��˶���**(���ǡ�������û����Ҳ�����㡸�� 2 ���� NULL��);
+        \u2461 \u7b2c 2 \u884c\u5728**\u5e93\u91cc**\u4ecd\u662f NULL \u21d2 \u5b83\u8fd8\u662f\u300c\u5f85\u5904\u7406\u300d,\u4e0b\u4e00\u6b21\u8dd1\u4f1a\u91cd\u8bd5\u5b83\u3002\u26a0\ufe0f \u5931\u8d25\u90a3\u884c
+           ���Ǳ������κ�ֵ(�����Ǵ���),����**��Զ�����ٱ�����**,��û���κζ�������;
+        �� **��־�� traceback**:ʧ��ԭ������־�Ļ�,����������ֻ�ᡸһֱ����ʧ��,
+           û��֪��Ϊʲô(spec ���Ǿ䡸ʧ��ԭ�����־�����������˼)��
+        """
+        conv = f"{PROBE_PREFIX}three"
+        q1 = "t13 ̽��:��һ���ܹ�"
+        q2 = "t13 ̽��:�ڶ�����ģ��ը"
+        q3 = "t13 ̽��:������Ҳ�ܹ�"
+        model = FakeModel(
+            known=[q1, q2, q3], fail_on=q2, exc=RuntimeError("ģ��ը��(����ע��)")
+        )
+        await _cleanup()
+        try:
+            await _insert_probes([(1, conv, q1), (2, conv, q2), (3, conv, q3)])
+            assert await _batch_ids(3) == [1, 2, 3], "ǰ��:��������ֻ����������̽����"
+    
+            async with get_sessionmaker()() as session:
+>               stats = await run_flywheel(session=session, model=model, batch_size=3)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_flywheel_pipeline.py:438: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\flywheel\pipeline.py:64: in run_flywheel
+    norm = await normalize_question(row.question, model=model)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\flywheel\normalize.py:81: in normalize_question
+    result = await chain.ainvoke(_NORMALIZE_PROMPT.format_messages(question=question))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_flywheel_pipeline.py:88: in ainvoke
+    return await self._owner.answer(self._schema, messages[-1].content)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_flywheel_pipeline.py:126: in answer
+    return self._normalize(prompt)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <test_flywheel_pipeline.FakeModel object at 0x000001A475513620>
+prompt = '�û�ԭ��:t13 ̽��:�ڶ�����ģ��ը'
+
+    def _normalize(self, prompt: str) -> NormalizeResult:
+        raw = next((q for q in self.known if q in prompt), None)
+        if raw is None:
+            raise AssertionError(
+                f"��ʾ�����ϲ����κ���֪ԭ�� ���� ��ˮ��û����һ�е�����ι��ģ��?"
+                f"��ʾ��:{prompt!r}"
+            )
+        self.calls.append(("normalize", raw))
+        if self.exc is not None and (self.fail_on is None or self.fail_on in prompt):
+>           raise self.exc
+E           RuntimeError: ģ��ը��(����ע��)
+
+tests\test_flywheel_pipeline.py:140: RuntimeError
+=========================== short test summary info ===========================
+FAILED tests/test_flywheel_pipeline.py::test_one_row_failing_does_not_kill_the_batch
+1 failed in 1.04s
+
+returncode = 1
+
+======================================================================
+### M3 hoist the pending SELECT out of the loop (=> same-run duplicate invisible)
+file = pipeline.py
+anchor hits = 1 (must be exactly 1)
+mutated sha256 = 965f24ce7d1f5089644c704aeb2f7a37bf36dd35abd1cc538ce5f654fefa76eb (changed: True)
+--- run [test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id] ---
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id __
+
+    @pytest.mark.anyio
+    async def test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id():
+        """\u67e5\u91cd\u547d\u4e2d \u21d2 `occurrences` \u7d2f\u52a0\u3001`matched_review_id` \u56de\u586b,**\u4e0d\u65b0\u5efa\u884c**\u3002
+    
+        ����**ͬ��**��̽��(ģ�⡸ͬһ�����ⱻ������ڸ�����һ�Ρ����� `entry_point`
+        ���ǳ��ӵ����ݵ�һ����,�������ڳ����ﱾ���ͻ�������,spec ��7.1):
+    
+        - ��һ��:**��**һ�� `review_queue`(`occurrences=1`);
+        - \u7b2c\u4e8c\u884c:\u547d\u4e2d\u7b2c\u4e00\u884c \u21d2 \u7d2f\u52a0\u5230 2\u3001\u56de\u586b `matched_review_id`\u3002
+    
+        \u26a0\ufe0f \u7b2c\u4e8c\u884c\u80fd\u547d\u4e2d,**\u53ea\u56e0\u4e3a\u6d41\u6c34\u7ebf\u5728\u5faa\u73af\u91cc**\u6bcf\u6b21\u91cd\u65b0\u67e5 `pending`\u3002\u628a\u90a3\u6b21 SELECT
+        \u63d0\u5230\u5faa\u73af\u5916(\u4e00\u4e2a\u770b\u8d77\u6765\u5f88\u81ea\u7136\u7684\u4f18\u5316)\u4f1a\u8ba9\u7b2c\u4e8c\u884c\u770b\u4e0d\u89c1\u521a\u5efa\u7684\u90a3\u4e00\u884c \u21d2 \u5efa\u51fa\u7b2c\u4e8c\u884c
+        \u21d2 \u8fd9\u6761\u7528\u4f8b\u7ea2\u3002\u8fd9\u4e00\u6761\u662f\u672c\u7528\u4f8b\u7684\u4e3b\u8981\u5224\u522b\u529b\u6765\u6e90\u3002
+        """
+        conv = f"{PROBE_PREFIX}two"
+        q_first = "t13 ̽��:èɰ�� Pro ���޶�ð�"
+        q_second = "t13 ̽��:�Ǹ�èɰ�� Pro �Ǳ��޼���"
+        canonical = "t13 ̽��:èɰ�� Pro �ı������Ƕ��"
+        answer = "�������� 1 ��,����Ϊ�𻵿����ά�ޡ�"
+        model = FakeModel(
+            known=[q_first, q_second],
+            canon={q_first: canonical, q_second: canonical},
+            answers={q_first: answer},
+        )
+        await _cleanup()
+        try:
+            await _insert_probes([(1, conv, q_first), (2, conv, q_second)])
+            assert await _batch_ids(2) == [1, 2], "ǰ��:��������ֻ����������̽����"
+    
+            async with get_sessionmaker()() as session:
+                stats = await run_flywheel(session=session, model=model, batch_size=2)
+    
+>           assert stats == {"processed": 2, "merged": 1, "created": 1, "failed": 0}, (
+                f"\u4e24\u884c\u540c\u4e49 \u21d2 \u4e00\u5efa\u4e00\u5e76,\u5b9e\u9645 {stats}"
+            )
+E           AssertionError: \u4e24\u884c\u540c\u4e49 \u21d2 \u4e00\u5efa\u4e00\u5e76,\u5b9e\u9645 {'processed': 2, 'merged': 0, 'created': 2, 'failed': 0}
+E           assert {'processed':..., 'failed': 0} == {'processed':..., 'failed': 0}
+E             
+E             Omitting 2 identical items, use -vv to show
+E             Differing items:
+E             {'merged': 0} != {'merged': 1}
+E             {'created': 2} != {'created': 1}
+E             Use -v to get more diff
+
+tests\test_flywheel_pipeline.py:384: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_flywheel_pipeline.py::test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id
+1 failed in 0.83s
+
+returncode = 1
+
+======================================================================
+### M4 dedupe merges on parse failure (=> return pending[0])
+file = dedupe.py
+anchor hits = 1 (must be exactly 1)
+mutated sha256 = 18903ffd20372a70a529077ad53413096731b2703eaf48fe9fb9815221398f8a (changed: True)
+--- run [test_dedupe_defaults_to_not_a_duplicate_when_parsing_fails] ---
+F                                                                        [100%]
+================================== FAILURES ===================================
+_________ test_dedupe_defaults_to_not_a_duplicate_when_parsing_fails __________
+
+    @pytest.mark.anyio
+    async def test_dedupe_defaults_to_not_a_duplicate_when_parsing_fails():
+        """\u67e5\u91cd\u89e3\u6790\u5931\u8d25 \u21d2 **\u4e0d\u5339\u914d**(\u5b81\u53ef\u591a\u5efa\u4e00\u884c,\u4e5f\u4e0d\u8981\u628a\u4e24\u4e2a\u95ee\u9898\u5e76\u6210\u4e00\u4e2a)\u3002
+    
+        �����Ĵ�����**����**��:������ȱ�ڴ˺���һ��,`occurrences` �������ĺ�,
+        �����ɾ������һ�������һ��һ��ɾ�����ཨһ�еĴ���ֻ������˶࿴һ�ۡ�
+        """
+        pending = [ReviewQueue(standard_question="t13 ̽��:��������", example_answer="",
+                               first_raw_question="t13 ̽��:��������")]
+        model = FakeModel(dedupe_exc=OutputParserException("ģ��û�� JSON"))
+    
+        hit = await find_duplicate("t13 ̽��:��ѡ����", pending, model=model)
+    
+>       assert hit is None, "����ʧ�ܱ��밴����ƥ�䡹����"
+E       AssertionError: ����ʧ�ܱ��밴����ƥ�䡹����
+E       assert <app.db.models.ReviewQueue object at 0x0000027DCB447620> is None
+
+tests\test_flywheel_pipeline.py:544: AssertionError
+------------------------------ Captured log call ------------------------------
+WARNING  app.flywheel.dedupe:dedupe.py:85 ���ؽ���ʧ��,����ƥ�䴦��:'t13 ̽��:��ѡ����'
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\dedupe.py", line 81, in find_duplicate
+    result = await chain.ainvoke(
+             ^^^^^^^^^^^^^^^^^^^^
+        _DEDUPE_PROMPT.format_messages(candidate=candidate, listed=listed)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\tests\test_flywheel_pipeline.py", line 88, in ainvoke
+    return await self._owner.answer(self._schema, messages[-1].content)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\tests\test_flywheel_pipeline.py", line 128, in answer
+    return self._dedupe(prompt)
+           ~~~~~~~~~~~~^^^^^^^^
+  File "D:\agent\MewHelp-develop\tests\test_flywheel_pipeline.py", line 150, in _dedupe
+    raise self.dedupe_exc
+langchain_core.exceptions.OutputParserException: ģ��û�� JSON
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langchain/errors/OUTPUT_PARSING_FAILURE
+=========================== short test summary info ===========================
+FAILED tests/test_flywheel_pipeline.py::test_dedupe_defaults_to_not_a_duplicate_when_parsing_fails
+1 failed in 0.94s
+
+returncode = 1
+
+======================================================================
+### M5 off-by-one in the index conversion (=> pending[index])
+file = dedupe.py
+anchor hits = 1 (must be exactly 1)
+mutated sha256 = 8e6affd24842e606724dc135bab40bcbc20996effff2c2e4d44076a03aeaedc4 (changed: True)
+--- run [test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id] ---
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id __
+
+    @pytest.mark.anyio
+    async def test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id():
+        """\u67e5\u91cd\u547d\u4e2d \u21d2 `occurrences` \u7d2f\u52a0\u3001`matched_review_id` \u56de\u586b,**\u4e0d\u65b0\u5efa\u884c**\u3002
+    
+        ����**ͬ��**��̽��(ģ�⡸ͬһ�����ⱻ������ڸ�����һ�Ρ����� `entry_point`
+        ���ǳ��ӵ����ݵ�һ����,�������ڳ����ﱾ���ͻ�������,spec ��7.1):
+    
+        - ��һ��:**��**һ�� `review_queue`(`occurrences=1`);
+        - \u7b2c\u4e8c\u884c:\u547d\u4e2d\u7b2c\u4e00\u884c \u21d2 \u7d2f\u52a0\u5230 2\u3001\u56de\u586b `matched_review_id`\u3002
+    
+        \u26a0\ufe0f \u7b2c\u4e8c\u884c\u80fd\u547d\u4e2d,**\u53ea\u56e0\u4e3a\u6d41\u6c34\u7ebf\u5728\u5faa\u73af\u91cc**\u6bcf\u6b21\u91cd\u65b0\u67e5 `pending`\u3002\u628a\u90a3\u6b21 SELECT
+        \u63d0\u5230\u5faa\u73af\u5916(\u4e00\u4e2a\u770b\u8d77\u6765\u5f88\u81ea\u7136\u7684\u4f18\u5316)\u4f1a\u8ba9\u7b2c\u4e8c\u884c\u770b\u4e0d\u89c1\u521a\u5efa\u7684\u90a3\u4e00\u884c \u21d2 \u5efa\u51fa\u7b2c\u4e8c\u884c
+        \u21d2 \u8fd9\u6761\u7528\u4f8b\u7ea2\u3002\u8fd9\u4e00\u6761\u662f\u672c\u7528\u4f8b\u7684\u4e3b\u8981\u5224\u522b\u529b\u6765\u6e90\u3002
+        """
+        conv = f"{PROBE_PREFIX}two"
+        q_first = "t13 ̽��:èɰ�� Pro ���޶�ð�"
+        q_second = "t13 ̽��:�Ǹ�èɰ�� Pro �Ǳ��޼���"
+        canonical = "t13 ̽��:èɰ�� Pro �ı������Ƕ��"
+        answer = "�������� 1 ��,����Ϊ�𻵿����ά�ޡ�"
+        model = FakeModel(
+            known=[q_first, q_second],
+            canon={q_first: canonical, q_second: canonical},
+            answers={q_first: answer},
+        )
+        await _cleanup()
+        try:
+            await _insert_probes([(1, conv, q_first), (2, conv, q_second)])
+            assert await _batch_ids(2) == [1, 2], "ǰ��:��������ֻ����������̽����"
+    
+            async with get_sessionmaker()() as session:
+                stats = await run_flywheel(session=session, model=model, batch_size=2)
+    
+>           assert stats == {"processed": 2, "merged": 1, "created": 1, "failed": 0}, (
+                f"\u4e24\u884c\u540c\u4e49 \u21d2 \u4e00\u5efa\u4e00\u5e76,\u5b9e\u9645 {stats}"
+            )
+E           AssertionError: \u4e24\u884c\u540c\u4e49 \u21d2 \u4e00\u5efa\u4e00\u5e76,\u5b9e\u9645 {'processed': 2, 'merged': 0, 'created': 1, 'failed': 1}
+E           assert {'processed':..., 'failed': 1} == {'processed':..., 'failed': 0}
+E             
+E             Omitting 2 identical items, use -vv to show
+E             Differing items:
+E             {'failed': 1} != {'failed': 0}
+E             {'merged': 0} != {'merged': 1}
+E             Use -v to get more diff
+
+tests\test_flywheel_pipeline.py:384: AssertionError
+------------------------------ Captured log call ------------------------------
+WARNING  app.flywheel.pipeline:pipeline.py:112 ���ִ���ʧ�� row id=2
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\pipeline.py", line 74, in run_flywheel
+    hit = await find_duplicate(norm["standard_question"], pending, model=model)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\app\flywheel\dedupe.py", line 101, in find_duplicate
+    return pending[index]  # MUTATION M5:��һ©��
+           ~~~~~~~^^^^^^^
+IndexError: list index out of range
+=========================== short test summary info ===========================
+FAILED tests/test_flywheel_pipeline.py::test_duplicate_hit_accumulates_occurrences_and_backfills_matched_review_id
+1 failed in 0.83s
+
+returncode = 1
+--- run [eval] ---
+---- 标准化 ----
+OK  [N1] 改写 '我买的那个猫砂盆寄到新疆要不要另外加钱啊'
+        → 标准问题='猫砂盆寄到新疆需要额外加运费吗'(15 字,上限 60)
+OK  [N2] 改写 '这个猫砂盆 Pro 到底怎么退或啊,我买了三天了'
+        → 标准问题='猫砂盆 Pro 的退货流程是什么？'(17 字,上限 40)
+OK  [N3] 改写 '我刚买的猫砂盆 Pro,它的保修期是几年啊'
+        → 标准问题='猫砂盆 Pro 的保修期是多久'(15 字,上限 30)
+OK  [N4] 改写 '退货要满足什么条件?'
+        → 标准问题='退货需要满足哪些条件？'(11 字,上限 14)
+OK  [N5] 改写 '帮我查下订单 20240915001 到哪了,都三天了还没动'
+        → 标准问题='订单20240915001物流到哪了，三天未更新'(24 字,上限 40)
+OK  [N6] 改写 '我昨天下午在你们店里拍的那个猫砂盆 Pro 到现在都还没发货,是不是要等很久啊亲'
+        → 标准问题='昨天下午下单的猫砂盆 Pro 至今未发货，是否要等很久'(27 字,上限 30)
+OK  [N7] 改写 '在吗?客服小姐姐,我想问一下你们家那个猫砂盆 Pro 保修多久'
+        → 标准问题='猫砂盆 Pro 的保修期是多久'(15 字,上限 30)
+OK  [N8] 改写 '猫砂盆 Pro 能装多少斤的猫砂呀,我家猫有点大只'
+        → 标准问题='猫砂盆 Pro 能装多少斤猫砂？'(16 字,上限 30)
+OK  [N9] 改写 '那个猫砂盆 Pro 大概几天能发货呀'
+        → 标准问题='猫砂盆 Pro 下单后多久发货'(15 字,上限 25)
+OK  [N10] 改写 '请问一下下,你们的退货郑策是怎么样的呀'
+        → 标准问题='平台的退货政策是什么'(10 字,上限 25)
+标准化 10/10 = 100.0%;原样透传 0/10 条;其中 2/10 条 [透传即可满足](这些条测不出「模型有没有做事」,只测「别把完整的问题改坏」)
+---- 查重 ----
+MISS [D1] 候选='猫砂盆 Pro 怎么退货' 期望=1  [字面全等:字符串比对即可满分]
+        清单=['猫砂盆 Pro 怎么退货', '运费怎么算']
+MISS [D2] 候选='猫砂盆 Pro 要怎么申请退掉啊' 期望=1
+        清单=['猫砂盆 Pro 怎么退货', '运费怎么算']
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\scripts\run_flywheel_eval.py", line 278, in <module>
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 196, in run
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 119, in run
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+  File "D:\agent\MewHelp-develop\scripts\run_flywheel_eval.py", line 265, in main
+  File "D:\agent\MewHelp-develop\scripts\run_flywheel_eval.py", line 198, in run_dedupe
+  File "D:\agent\MewHelp-develop\app\flywheel\dedupe.py", line 101, in find_duplicate
+IndexError: list index out of range
+returncode = 1
+
+AFTER   pipeline.py sha256 = f56de31d3a8be7db76ea66570e0745e5ba5064ecf587aa2c27ca5056db650e12
+identical to before = True
+AFTER   dedupe.py sha256 = 4c2de039f4b0c05bf6a6022d0b989499965c6c49ae065486466b9911a3df4f1b
+identical to before = True
+leftover 'MUTATION' in pipeline.py = 0
+leftover 'MUTATION' in dedupe.py = 0

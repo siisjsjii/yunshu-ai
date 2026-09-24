@@ -133,6 +133,27 @@ class Settings(BaseSettings):
     #   这不是缺陷 —— 池子行靠 `matched_review_id IS NULL` 幂等,下一轮会重新吃到;
     #   它保的是「槽**永远**能被下一次拿到」。
     flywheel_job_timeout_seconds: float = Field(default=300.0, gt=0)
+    #
+    # `retrieval_timeout_seconds`:**请求路径上两处直接调用检索/向量化组件**的墙钟上界
+    #   (ch09 最终修复轮复审 D5)。那两处**不经 `execute_tool`**,所以
+    #   `tool_timeout_seconds` 够不着它们 —— 收窄成「工具超时」那一个旋钮,
+    #   结果是「同一个 BGE-M3 + Milvus 往返,走工具那条有上界、走端点那条没有」:
+    #     - `app/api/feedback.py` 👎 那一步的**尽力回捞**(`retriever.search`);
+    #     - `app/api/review.py` 审核通过之后的**同步向量化**(`vectorize_rows`)。
+    #   **为什么另立一个而不是复用 `tool_timeout_seconds`**:后者是「工具执行器的
+    #   **每一次尝试**」的界(执行器还会按 `kind` 乘上重试次数),两个含义混在一个
+    #   旋钮上正是本仓删掉 `reranker_use_fp16` 的那个形状。10s 与它取同值,是因为
+    #   两处**干的就是同一件事**(一次嵌入 + 一次 Milvus 往返),不是随手抄的。
+    #
+    #   ⚠️ **它只圈得住 `await` 的那一半,如实记账**:两处内部的大头都是**同步调用**
+    #   (torch 前向、pymilvus 往返)—— 事件循环在它们里面根本跑不到定时器
+    #   (ch07 实测的「`wait_for` 的定时器在循环被阻塞时不触发」)。被圈住的是
+    #   两者的**收尾 `await`**(feedback 的 MySQL 回查 / review 的 `commit`)。
+    #   「Milvus 接了 TCP 但不回话」那一半**今天仍然会拖住事件循环**;要连它一起圈住
+    #   得把同步段挪进线程,而 `_load_rows` 用的是调用方的 `AsyncSession`(不可跨线程)
+    #   ⇒ 不是一次修复轮能顺手改的。详见 `app/api/feedback.py:_search_bounded`。
+    #   一句话回退:.env 里 `RETRIEVAL_TIMEOUT_SECONDS=86400`(等价于「基本不设上界」)。
+    retrieval_timeout_seconds: float = Field(default=10.0, gt=0)
 
     # ch05 编排。两个数都加了界:写错要在启动时炸,不能等运行时变成
     # 「ReAct 循环一次都不跑」或「预算恒超 → 第一步就强制收敛」这种静默故障。

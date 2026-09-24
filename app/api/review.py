@@ -96,6 +96,7 @@ from app.kb.writer import vectorize_rows, write_chunks
 from app.retrieval.embedder import get_embedder
 from app.retrieval.milvus import get_vector_store
 from app.sanitize import redact_api_key
+from app.tools.errors import ToolInfrastructureError
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +369,36 @@ async def approve_review(
             # 「通过」这件事**自己站得住** —— 一台刚起来的 Milvus(集合还没建)
             # 不该让审核台上每一次通过都 502 到有人想起来去点管理台那个按钮。
             store.ensure_collection()
-            await vectorize_rows(session, store, embedder, rows)
+            # 墙钟上界(最终修复轮,复审 D5):这一步**不经 `execute_tool`**,
+            # 所以 `tool_timeout_seconds` 够不着它 —— 没有上界时,Milvus 接了 TCP
+            # 却不回话会让这条请求**永远不返回**,而它占的是**整个事件循环**
+            # (不是只占这一个审核人)。
+            #
+            # ⚠️ **它只圈得住 `await` 的那一半,如实记账**:`vectorize_rows` 内部
+            # 先做同步的 torch 嵌入、再做同步的 pymilvus `upsert`,事件循环在它们
+            # 里面跑不到定时器(ch07 实测:定时器要等控制权回到循环才处理)。
+            # 被圈住的是**收尾那次 `commit`**。「Milvus 接了 TCP 不回话」那一半
+            # **今天仍会拖住循环**;要连它一起圈住得把同步段挪进线程,而
+            # `vectorize_rows` 是全章共用的(离线 `build_kb` / 管理台后台任务都走它)
+            # ⇒ 不在一次修复轮的射程里。同款说明见 `app/api/feedback.py:_search_bounded`。
+            try:
+                await asyncio.wait_for(
+                    vectorize_rows(session, store, embedder, rows),
+                    timeout=settings.retrieval_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                # 超时是**基础设施故障**(与 pymilvus 抛的那些同类),翻成
+                # `ToolInfrastructureError` 之后由下面那条 `except Exception` 接住:
+                # 同一个 502、同一份固定文案、同一套 502 收尾(回滚 + 清草稿)。
+                # 原始 `TimeoutError` 作为 `__cause__` 链在后面,日志里照样看得到。
+                #
+                # ⚠️ 它**不会**走上面那条 `except asyncio.CancelledError`:
+                # `wait_for` 在 3.11+ 把内部取消**换成** `TimeoutError`,调用方这个
+                # 协程**没有被取消**(实测:挂死的 `vectorize_rows` + 0.01s 上界,
+                # 响应是 502 与固定文案,不是客户端断开那一支)。
+                raise ToolInfrastructureError(
+                    f"向量化超时(超过 {settings.retrieval_timeout_seconds} 秒)"
+                ) from exc
         except asyncio.CancelledError:
             # **取消不是故障**:客户端断开时那条请求就该停,这里不许把它翻成 502。
             # 但草稿照样要清 —— 不然一次"点了通过又立刻关页面"就会留下一条

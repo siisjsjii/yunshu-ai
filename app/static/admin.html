@@ -144,6 +144,9 @@
     margin-bottom: 6px; }
   .rv-raw .rv-qtext { font-weight: 600; font-size: 13.5px; word-break: break-word; }
   .rv-raw .rv-sub { font-size: 11.5px; color: #7b8a99; margin-top: 2px; }
+  /* 「回捞失败」那一句(哨兵)要**看得出来是故障**,不能与旁边那些灰字同款 ——
+     人扫一眼就把灰字读成「这行没什么事」。 */
+  .rv-raw .rv-sub.rv-fail { color: var(--warn); font-weight: 600; }
   .rv-snap { margin: 6px 0 0; border-left: 3px solid var(--brand); padding: 4px 8px;
     background: #f5f9fd; font-size: 12.5px; }
   .rv-snap .rv-score { color: var(--brand); font-weight: 700; }
@@ -548,9 +551,15 @@
     box.appendChild(el("div", "rv-sub",
       `入口:${q.entry_point || "?"} · 落池理由:${q.reject_reason || "(无)"}`));
 
-    // ⚠️ `null` 与 `[]` 在库里是**两样东西**(`app/api/feedback.py:_snapshot`):
-    // 前者是「回捞没能拿到片段」,后者是「重跑过、零召回」。合并成一句
-    // 「无快照」会把两种不同的排查结论画成一个样子。
+    // ⚠️ 这一列在 👎 那条路上有**三个**取值(`app/api/feedback.py` 的
+    // `RECALL_FAILED_SNAPSHOT` 与 `_snapshot`),三个必须画成三句话:
+    //   `null` = 重跑过、零召回(或 ch09 之前的老行,分不开);
+    //   **对象哨兵** = **回捞失败**(检索服务不可用);
+    //   数组 = 真快照。
+    // 中间那个是最终修复轮补上的:没有它时,`Milvus` 挂掉写下来的哨兵会掉进下面
+    // 「零召回」那一句 —— 人读到的是**「知识库缺这块」这个诊断**,而真相是
+    // **服务不可用**。那正是快照这一列存在的理由(把「真缺」与「没检到」分开),
+    // 分开它比分开另外两个更要紧。
     const snap = q.evidence_snapshot;
     if (snap == null) {
       // 两种来源都落在这里:(a) 落池当轮的回捞零召回 —— `_snapshot` 返回 `None`
@@ -561,7 +570,15 @@
         "召回片段快照:无(落池时的回捞没拿到片段;早于 ch09 的池子行没有这一列,同样是空)"));
       return box;
     }
-    if (!Array.isArray(snap) || !snap.length) {
+    if (!Array.isArray(snap)) {
+      // 非数组 ⇒ 落在这一列上的对象只可能是那个哨兵(真快照一律是列表)。
+      // 不认这一支的话它会掉进下面「零召回」那一句 —— 把**故障**画成**结论**。
+      box.appendChild(el("div", "rv-sub rv-fail",
+        "召回片段快照:**召回失败(检索服务不可用)** —— 这是**没能回捞**,"
+        + "不代表知识库缺这一块;重试一次或看服务日志"));
+      return box;
+    }
+    if (!snap.length) {
       box.appendChild(el("div", "rv-sub", "召回片段快照:重跑过,零召回(那时知识库里确实没有这一块)"));
       return box;
     }

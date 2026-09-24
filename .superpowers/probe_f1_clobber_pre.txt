@@ -1,0 +1,204 @@
+
+===== A. 真 MySQL:死线取消一个慢查询,然后看 session 退出 =====
+飞轮后台任务异常结束 job=4fdee3a98624
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 212, in _run_flywheel
+    result = await run_flywheel(
+             ^^^^^^^^^^^^^^^^^^^
+        session=session, model=model,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        batch_size=settings.flywheel_batch_size)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.superpowers\probe_t16b_f1_clobber.py", line 58, in slow_query
+    await session.execute(text("SELECT SLEEP(8)"))
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\ext\asyncio\session.py", line 449, in execute
+    result = await greenlet_spawn(
+             ^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 203, in greenlet_spawn
+    result = context.switch(value)
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2373, in execute
+    return self._execute_internal(
+           ~~~~~~~~~~~~~~~~~~~~~~^
+        statement,
+        ^^^^^^^^^^
+    ...<4 lines>...
+        _add_event=_add_event,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2280, in _execute_internal
+    result = conn.execute(
+        statement, params or {}, execution_options=execution_options
+    )
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1421, in execute
+    return meth(
+        self,
+        distilled_parameters,
+        execution_options or NO_OPTIONS,
+    )
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 526, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self, distilled_params, execution_options
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1643, in _execute_clauseelement
+    ret = self._execute_context(
+        dialect,
+    ...<8 lines>...
+        cache_hit=cache_hit,
+    )
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1848, in _execute_context
+    return self._exec_single_context(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        dialect, context, statement, parameters
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1988, in _exec_single_context
+    self._handle_dbapi_exception(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        e, str_statement, effective_parameters, cursor, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2368, in _handle_dbapi_exception
+    raise exc_info[1].with_traceback(exc_info[2])
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1969, in _exec_single_context
+    self.dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        cursor, str_statement, effective_parameters, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 952, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\connectors\asyncio.py", line 228, in execute
+    return self.await_(self._execute_async(operation, parameters))
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 132, in await_only
+    return current.parent.switch(awaitable)  # type: ignore[no-any-return,attr-defined] # noqa: E501
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 196, in greenlet_spawn
+    value = await result
+            ^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.venv\Lib\site-packages\sqlalchemy\connectors\asyncio.py", line 251, in _execute_async
+    result = await self._cursor.execute(operation, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "asyncmy/cursors.pyx", line 245, in execute
+  File "asyncmy/cursors.pyx", line 490, in _query
+    await conn.query(q)
+  File "asyncmy/connection.pyx", line 740, in query
+  File "asyncmy/connection.pyx", line 1116, in _read_query_result
+    await result.read()
+  File "asyncmy/connection.pyx", line 1653, in read
+    first_packet = await self.connection.read_packet()
+  File "asyncmy/connection.pyx", line 1046, in read_packet
+    await self._fill_buffer(4)
+  File "asyncmy/connection.pyx", line 1027, in _fill_buffer
+    raise
+  File "asyncmy/connection.pyx", line 1022, in asyncmy.connection.Connection._fill_buffer
+    await proto.wait_for_data()
+  File "asyncmy/connection.pyx", line 262, in wait_for_data
+    await waiter
+asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 211, in _run_flywheel
+    async with asyncio.timeout(settings.flywheel_job_timeout_seconds):
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\timeouts.py", line 117, in __aexit__
+    raise TimeoutError from exc_val
+TimeoutError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 164, in target
+    asyncio.run(coro_fn())
+    ~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 196, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 119, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 216, in _run_flywheel
+    raise FlywheelDeadlineExceeded(
+        limit=settings.flywheel_job_timeout_seconds) from exc
+app.flywheel.tasks.FlywheelDeadlineExceeded: 任务超时(上限 0s):本轮已放弃。整批一次提交 ⇒ 这一批一行都没落地,池子里的行仍在(下一轮会重新吃到)
+  status  = 'failed'
+  message = '任务超时(上限 0s):本轮已放弃。整批一次提交 ⇒ 这一批一行都没落地,池子里的行仍在(下一轮会重新吃到)'
+  ↑ 是不是死线那句话: 是
+
+===== B. session 退出抛(替身):死线取消 + __aexit__ 抛 =====
+飞轮后台任务异常结束 job=29d25fcf7a79
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 212, in _run_flywheel
+    result = await run_flywheel(
+             ^^^^^^^^^^^^^^^^^^^
+        session=session, model=model,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        batch_size=settings.flywheel_batch_size)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agent\MewHelp-develop\.superpowers\probe_t16b_f1_clobber.py", line 113, in slow
+    await asyncio.sleep(30)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\tasks.py", line 720, in sleep
+    return await future
+           ^^^^^^^^^^^^
+asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 211, in _run_flywheel
+    async with asyncio.timeout(settings.flywheel_job_timeout_seconds):
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\timeouts.py", line 117, in __aexit__
+    raise TimeoutError from exc_val
+TimeoutError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 216, in _run_flywheel
+    raise FlywheelDeadlineExceeded(
+        limit=settings.flywheel_job_timeout_seconds) from exc
+app.flywheel.tasks.FlywheelDeadlineExceeded: 任务超时(上限 0s):本轮已放弃。整批一次提交 ⇒ 这一批一行都没落地,池子里的行仍在(下一轮会重新吃到)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 164, in target
+    asyncio.run(coro_fn())
+    ~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 196, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 119, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\agent\MewHelp-develop\app\flywheel\tasks.py", line 202, in _run_flywheel
+    async with factory() as session:
+               ~~~~~~~^^
+  File "D:\agent\MewHelp-develop\.superpowers\probe_t16b_f1_clobber.py", line 98, in __aexit__
+    raise RuntimeError(
+    ...<2 lines>...
+        "first issue Session.rollback(). Original exception was: simulated")
+RuntimeError: This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.rollback(). Original exception was: simulated
+  status  = 'failed'
+  message = "This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.roll"
+  ↑ 是不是死线那句话: ★ 不是 ★

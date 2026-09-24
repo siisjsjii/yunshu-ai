@@ -22,6 +22,7 @@ ids ≤ 305、`entry_point` 是 `置信度闸` / `生成自评`,快照是 **SQL 
 一个**忽略 `conversation_id`**、把行写到别处的实现,只按会话过滤是照不出来的。
 """
 
+import asyncio
 import json
 import logging
 
@@ -29,6 +30,7 @@ import httpx
 import pytest
 from sqlalchemy import text
 
+from app.agent.nodes import _snapshot as node_snapshot
 from app.api import feedback as feedback_api
 from app.config import Settings, get_settings
 from app.db.base import get_engine, get_sessionmaker
@@ -44,6 +46,7 @@ PROBE_DUP = "t12probe-dup"
 PROBE_FAIL = "t12probe-fail"
 PROBE_BAD = "t12probe-bad"
 PROBE_EMPTY = "t12probe-empty"
+PROBE_HANG = "t12probe-hang"
 
 #: 探针问题文本。**每个探针一句独有的** —— 顺带当第二个过滤条件(见文件头)。
 Q_UP = "t12 探针:这句话只该在日志里,不该进池子"
@@ -52,6 +55,7 @@ Q_DUP = "t12 探针:同一个 👎 连点两次"
 Q_FAIL = "t12 探针:检索挂了也得进池子"
 Q_BAD = "t12 探针:非法 value 一个字都不许落"
 Q_EMPTY = "t12 探针:知识库里没有这一条"
+Q_HANG = "t12 探针:回捞永远不返回"
 
 _REQUIRED_SETTINGS = dict(
     openai_base_url="https://example.invalid/v1",
@@ -109,6 +113,20 @@ class RaisingRetriever:
 
     async def search(self, query):
         raise self._exc
+
+
+class HangingRetriever:
+    """`search` **永不返回**的替身(最终修复轮,复审 D5)。
+
+    ⚠️ 挂的是 `await`(不是同步阻塞):端点的墙钟上界只有一个 `await` 定时器能给
+    它兑现,而本仓那条 ch07 实测「定时器在循环被阻塞时不触发」意味着**同步**挂死
+    连 `wait_for` 都救不了。这里要验的是**有上界**这件事本身 ——
+    「同步那半没被圈住」是记账,不是本用例能断的东西(见
+    `app/api/feedback.py:_search_bounded` 的说明)。
+    """
+
+    async def search(self, query):
+        await asyncio.sleep(3600)
 
 
 @pytest.fixture
@@ -273,6 +291,37 @@ def test_snapshot_is_none_when_nothing_recalled():
     assert feedback_api._snapshot(None, settings=settings) is None
 
 
+def test_both_snapshot_writers_round_the_score_to_the_same_four_places():
+    """两个 `_snapshot` 写的是**同一列**、**同一个审核页** ⇒ 分数的刻度必须一样。
+
+    `admin.html:rawBlock` 把两侧的快照混着渲染(它只认那四个键)。一边 `round(...,4)`
+    一边原样的话,同一页上会出现 `0.1958` 与 `0.19581234` 并排 —— 读的人只会
+    以为那是两个不同的量。最终修复轮把 `app/agent/nodes.py:_snapshot` 对齐到
+    本文件这一侧的写法。
+
+    **两侧都断**(只断一侧的话,「另一侧改回原样」这条回归看不见),
+    而且期望值是**字面量**,不拿任一实现自己算出来的值当判据。
+    """
+    settings = Settings(_env_file=None, **_REQUIRED_SETTINGS)
+    raw = 0.19581234
+    node_side = node_snapshot(
+        [{"chunk_id": 1, "section_path": "s", "answer": "a", "score": raw}],
+        settings=settings,
+    )
+    api_side = feedback_api._snapshot(
+        [RetrievedChunk(question="q", answer="a", category="c", chunk_id=1,
+                        section_path="s", score=raw)],
+        settings=settings,
+    )
+    assert node_side[0]["score"] == 0.1958, (
+        f"闸/自评侧的快照分数没保留四位,实际 {node_side[0]['score']!r}"
+    )
+    assert api_side[0]["score"] == 0.1958  # 这一侧原先就是四位,防它被改掉
+    assert str(node_side[0]["score"]) == str(api_side[0]["score"]), (
+        "两个写口落在同一列上,审核页只有一套读法 —— 刻度必须逐字相同"
+    )
+
+
 # --------------------------------------------------------------------------
 # 二、端点(真库)
 # --------------------------------------------------------------------------
@@ -415,10 +464,12 @@ async def test_repeated_down_for_the_same_message_writes_only_one_row(client_fac
 async def test_empty_recall_writes_a_json_null_snapshot(client_factory):
     """检索**正常返回空**(不抛异常)⇒ 快照是 JSON `null` —— 这是**另一条路**。
 
-    与下一条(检索**炸了**)共用同一个观测(快照为空),而**语义相反**:
-    正常空召回 =「知识库真缺这块」,炸了 =「没能回捞」(spec §6.2 那对区分正是
-    回捞这件事的全部意义)。只测抛异常那一支的话,一个把「空列表」当成故障
-    (或把故障当成「真缺」)的实现不会被任何断言发现。
+    语义与「检索**炸了**」相反:正常空召回 =「知识库真缺这块」,炸了 =「没能回捞」
+    (spec §6.2 那对区分正是回捞这件事的全部意义)。二者**在数据上也必须不同**
+    —— 最终修复轮之前它们是同一个值(都是 JSON `null`),于是审核页把**服务不可用**
+    读成**「知识库缺这块」**。这一条断 `null`、那一条断哨兵,**两条一起**才是那个区分。
+    只测抛异常那一支的话,一个把「空列表」当成故障(或把故障当成「真缺」)的实现
+    不会被任何断言发现。
 
     顺带钉住**回捞真的跑了**(`calls == [Q_EMPTY]`):一个「干脆不回捞、快照恒空」
     的实现能满足本用例其余全部断言,而那会让审核页永远读到「真缺这块」——
@@ -451,19 +502,25 @@ async def test_empty_recall_writes_a_json_null_snapshot(client_factory):
 async def test_retriever_failure_still_pools_the_row_and_logs_loudly(
     client_factory, caplog, exc_cls
 ):
-    """**回捞是尽力而为**:检索挂掉 ⇒ 行**照样落**,快照留空,且**响亮地留痕**。
+    """**回捞是尽力而为**:检索挂掉 ⇒ 行**照样落**,快照落**哨兵**,且**响亮地留痕**。
 
-    三个断言对应三件独立的事:
+    四个断言对应四件独立的事:
 
     ① **200 而不是 502** —— 落池才是这个端点的职责,检索只是附赠。让检索的
        故障把整个请求打掉,用户点了 👎 却什么都没发生,而池子里那**正是**
        该被审的一条问题;
-    ② **快照是 `null`** —— 注意是 JSON `null`(`json.loads(...) is None`),
-       不是空列表:`[]` 会读成「重跑过、零召回」,与「没能回捞」是两件事;
-    ③ **日志带 traceback** —— 光一句"失败了"不够:`record_low_confidence` 的
-       docstring 写着「快照为空」与「检索故障」在**数据上长得一样**,审核人
-       只能靠日志把它们分开。⚠️ 本仓硬约束复核:`tool_result`/`error` 帧那类
-       出站文本要脱敏,日志不是出站文本,所以这里带原始异常是**对的**。
+    ② **快照是哨兵**(`{"error": "recall_failed"}`),**不是 `null`** —— 这一条是
+       最终修复轮改的,它就是本用例的中心:回捞失败与「重跑过、零召回」在数据上
+       长得一样时,审核页会把**服务不可用**读成**「知识库缺这块」这个诊断**,
+       而那正是快照这一列存在的理由。下一条用例
+       (`test_empty_recall_writes_a_json_null_snapshot`)断的是另一侧的 `null`,
+       **两条一起**才说明「失败的」与「零召回的」分得开;
+    ③ **`snapshot_chunks` 是 0** —— 哨兵是个 JSON 对象,`len()` 会给出 **1**;
+       照 `len(snapshot or [])` 写的话,一次回捞失败会自报「快照里有一条」,
+       而这个数就是验收 ② 读的那个 `SNAP`(它会把 1 读成「快照居然有内容」);
+    ④ **日志带 traceback** —— 光一句"失败了"不够:哨兵只说了「没能回捞」,
+       **挂在哪条腿上**只有日志说得清。⚠️ 本仓硬约束复核:`tool_result`/`error`
+       帧那类出站文本要脱敏,日志不是出站文本,所以这里带原始异常是**对的**。
 
     **两种异常都注入**(不是随便挑一个):生产里 `search()` 抛的是翻译过的
     `ToolInfrastructureError`(Milvus / 嵌入 / 重排 / 回查四条腿,见
@@ -481,22 +538,79 @@ async def test_retriever_failure_still_pools_the_row_and_logs_loudly(
         assert r.status_code == 200, (
             f"检索故障不许把落池一起打掉,实际 {r.status_code}:{r.text}"
         )
+        assert r.json()["snapshot_chunks"] == 0, (
+            f"哨兵不是片段 —— 这个数必须是 0(照 `len(snapshot or [])` 写会得到 1),"
+            f"实际 {r.json()}"
+        )
 
         rows = await _rows(PROBE_FAIL)
         assert len(rows) == 1, f"行必须照样落,实际 {len(rows)} 行"
         assert rows[0]["entry_point"] == "用户反馈"
-        assert json.loads(rows[0]["evidence_snapshot"]) is None, (
-            f"回捞不到的快照是 JSON null,实际 {rows[0]['evidence_snapshot']!r}"
+        assert json.loads(rows[0]["evidence_snapshot"]) == {"error": "recall_failed"}, (
+            f"回捞失败的快照必须是**哨兵**(可辨认),不是 JSON null ——"
+            f"后者与「重跑过、零召回」逐字节相同,审核页读不出「服务不可用」。"
+            f"实际 {rows[0]['evidence_snapshot']!r}"
+        )
+        assert json.loads(rows[0]["evidence_snapshot"]) is not None, (
+            "哨兵**不是** null:null 在本仓的含义是「当轮确实零召回」"
         )
 
         loud = [rec for rec in caplog.records
                 if rec.name == "app.api.feedback" and rec.levelno >= logging.WARNING]
-        assert loud, "回捞失败必须留痕,否则「真缺这块」与「检索挂了」在数据上分不开"
+        assert loud, "回捞失败必须留痕,否则哨兵说不清挂在哪条腿上"
         assert any(rec.exc_info for rec in loud), (
             "只写一句「失败了」不够 —— 不带 traceback 就查不出挂在哪条腿上"
         )
     finally:
         await _teardown(PROBE_FAIL)
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+async def test_a_hanging_recall_is_bounded_and_lands_on_the_same_sentinel(
+    client_factory, caplog
+):
+    """回捞**永不返回** ⇒ 有墙钟上界,且与「炸了」落**同一个哨兵**(最终修复轮,D5)。
+
+    没有上界时这条请求**永远不返回** —— 而它占的不只是这一个用户:同步的那几段
+    会挡住**整个事件循环**(别的请求也一起停),而它连异常都没有(挂起不是异常),
+    于是没有任何日志、没有任何帧。
+
+    上界取 `retrieval_timeout_seconds=0.01`(显式传,不靠默认值 —— 传默认值的话
+    「实现把上界写死成别的数」照不亮)。落点必须与 `RaisingRetriever` 那条**同一个**
+    哨兵:对审核人来说「超时」与「连不上」是同一件事(**没能回捞**),
+    分成两个值只会让审核页多一种没人认得的形状。
+
+    ⚠️ 请求外面再套一层 5s 的 `wait_for`:上界一旦回归,这条用例会**挂死**而不是
+    变红 —— 挂死在一个没有 timeout 插件的套件里等于「没人看得见的红」。
+    """
+    client = client_factory(
+        retriever=HangingRetriever(), retrieval_timeout_seconds=0.01)
+    await _delete_probe(PROBE_HANG)
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.api.feedback"):
+            r = await asyncio.wait_for(
+                client.post("/api/feedback",
+                            json=_body(PROBE_HANG, Q_HANG, value="down")),
+                timeout=5.0,
+            )
+        assert r.status_code == 200, (
+            f"回捞超时是**尽力而为**那一支(落池照旧),实际 {r.status_code}:{r.text}"
+        )
+        assert r.json()["pooled"] is True
+        assert r.json()["snapshot_chunks"] == 0
+
+        rows = await _rows(PROBE_HANG)
+        assert len(rows) == 1, f"超时也必须把 👎 落进池子,实际 {len(rows)} 行"
+        assert json.loads(rows[0]["evidence_snapshot"]) == {"error": "recall_failed"}, (
+            f"超时的快照必须与「检索炸了」落同一个哨兵,实际 "
+            f"{rows[0]['evidence_snapshot']!r}"
+        )
+        loud = [rec for rec in caplog.records
+                if rec.name == "app.api.feedback" and rec.levelno >= logging.WARNING]
+        assert any(rec.exc_info for rec in loud), "超时也要带 traceback 留痕"
+    finally:
+        await _teardown(PROBE_HANG)
 
 
 @pytest.mark.db
