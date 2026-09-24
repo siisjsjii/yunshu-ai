@@ -110,6 +110,49 @@
   .eval-bar-fill { height: 100%; background: var(--brand); border-radius: 3px; }
   .eval-bar-val { width: 48px; font-weight: 700; flex-shrink: 0; }
   .eval-chart-note { font-size: 11px; color: #9aa7b4; margin-bottom: 4px; }
+
+  /* ── 待审队列(ch09)──────────────────────────────────
+     与上面同一套东西:`--brand` / `--badge` / `--warn` / `--ok`,2px 硬边框,
+     像素硬边的方角(3–4px),不做圆角阴影那一套。 */
+  .rv-item { background: #fff; border: 2px solid #cdd9e4; border-radius: 4px;
+    padding: 8px 10px; margin-bottom: 8px; }
+  .rv-item.busy { border-color: var(--brand); }
+  .rv-head { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .rv-caret { color: var(--badge); font-size: 12px; width: 12px; flex-shrink: 0; }
+  .rv-q { flex: 1; font-weight: 600; word-break: break-word; }
+  .rv-chip { font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    color: var(--badge); border: 1.5px dashed var(--badge); white-space: nowrap; }
+  .rv-status { font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    color: #5b7186; border: 1.5px solid #cdd9e4; white-space: nowrap; }
+  .rv-status.approved { color: var(--ok); border-color: var(--ok); }
+  .rv-status.rejected { color: var(--warn); border-color: var(--warn); }
+  .rv-ex { margin: 4px 0 0 22px; }
+  .rv-actions { display: flex; align-items: center; gap: 8px; margin: 8px 0 0 22px;
+    flex-wrap: wrap; }
+  .rv-actions button { font-size: 13px; padding: 5px 14px; }
+  .rv-state { font-size: 12.5px; color: #5b7186; }
+  .rv-state.err { color: var(--warn); }
+  .rv-state.ok { color: var(--ok); }
+  .rv-body { margin: 10px 0 0 22px; border-top: 1px dashed #cdd9e4; padding-top: 8px; }
+  .rv-section { font-size: 12.5px; color: #5b7186; margin: 10px 0 4px; }
+  .rv-kv { display: flex; gap: 8px; font-size: 13px; margin: 3px 0; }
+  .rv-k { flex: 0 0 96px; color: #7b8a99; }
+  .rv-v { flex: 1; word-break: break-word; white-space: pre-wrap; }
+  .rv-raw { border: 1.5px dashed #cdd9e4; border-radius: 3px; padding: 8px 10px;
+    margin-bottom: 6px; }
+  .rv-raw .rv-qtext { font-weight: 600; font-size: 13.5px; word-break: break-word; }
+  .rv-raw .rv-sub { font-size: 11.5px; color: #7b8a99; margin-top: 2px; }
+  .rv-snap { margin: 6px 0 0; border-left: 3px solid var(--brand); padding: 4px 8px;
+    background: #f5f9fd; font-size: 12.5px; }
+  .rv-snap .rv-score { color: var(--brand); font-weight: 700; }
+  .rv-snap .rv-ans { color: #40586e; margin-top: 2px; word-break: break-word; }
+  .rv-editor { width: 100%; min-height: 64px; margin-top: 4px; }
+  .rv-result { border: 2px solid var(--brand); border-radius: 4px; padding: 10px 12px;
+    margin-bottom: 10px; }
+  .rv-result.failed { border-color: var(--warn); }
+  .rv-result .rv-title { font-weight: 700; font-size: 13.5px; margin-bottom: 6px; }
+  .rv-result.failed .rv-title { color: var(--warn); }
+  .rv-note { font-size: 12px; color: #5b7186; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -123,6 +166,7 @@
 
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="入库" type="button">入库</button>
+    <button class="tab" data-tab="待审" type="button">待审</button>
     <button class="tab" data-tab="评测" type="button">评测</button>
   </nav>
 
@@ -180,6 +224,28 @@
   </div>
   </div>
 
+  <div id="tab-待审" style="display:none">
+    <div class="card">
+      <h2>待审队列(低置信度问题)</h2>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="q-refresh" class="secondary">刷新</button>
+        <button id="q-flywheel">跑一轮飞轮</button>
+        <span class="muted" id="q-count"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        只列 <code>pending</code> 的行。<b>通过</b>会立刻把这条问答写进知识库并向量化
+        (同一个问题再问就能答对);<b>驳回</b>只改状态、不碰知识库。
+      </div>
+      <div class="job-status" id="q-fly-status" style="display:none"></div>
+      <div id="q-list" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" id="rv-result-card" style="display:none">
+      <h2>最近一次审核(以下均为服务端返回的原样状态)</h2>
+      <div id="rv-result"></div>
+    </div>
+  </div>
+
   <div id="tab-评测" style="display:none">
     <div class="card">
       <h2>检索评测(四策略对比)</h2>
@@ -198,15 +264,28 @@
 
   const $ = (id) => document.getElementById(id);
 
-  async function api(path, opts) {
+  // 裸请求:回**状态码与已解析的 body**,不抛。
+  //
+  // 审核那两个端点必须能分辨状态码:502(向量化没成,**行还在、可重试**)、
+  // 404(这一行已经被处理过)、422(答案为空)对操作员是**三件不同的
+  // 事**,而「一律抛一句 detail」会把它们压成同一句话。飞轮那个 409
+  // (已有任务在跑)同样要指名道姓,不能与「同名文档已存在」共用一句文案。
+  async function req(path, opts) {
     const resp = await fetch(path, opts);
-    if (resp.status === 409) throw new Error("已有任务在跑,或同名文档已存在");
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try { msg = (await resp.json()).detail || msg; } catch {}
-      throw new Error(msg);
+    let body = null;
+    try { body = await resp.json(); } catch { /* 非 JSON 响应:body 留 null */ }
+    return { status: resp.status, ok: resp.ok, body };
+  }
+
+  // 抛错版(入库 / 评测那批老调用点用)。**一行不改地保留原来的语义**:
+  // 409 一句固定文案、其余取 `detail`、成功回 json。
+  async function api(path, opts) {
+    const r = await req(path, opts);
+    if (r.status === 409) throw new Error("已有任务在跑,或同名文档已存在");
+    if (!r.ok) {
+      throw new Error((r.body && r.body.detail) || `HTTP ${r.status}`);
     }
-    return resp.json();
+    return r.body;
   }
 
   // ── 统计与文档列表 ──
@@ -404,13 +483,402 @@
   $("job-vectorize").addEventListener("click", () => startJob("vectorize"));
   $("job-mine").addEventListener("click", () => startJob("mine"));
 
+  // ── 待审队列(ch09)──────────────────────────────────
+  //
+  // 四个端点都在 `app/api/review.py`(已实现、已测):
+  //   GET  /api/review/queue          —— **只回 pending**。`?status=` 是**闭集**
+  //                                      (`pending|approved|rejected`),未知取值
+  //                                      422 ⇒ 这里**根本不传**(不传即 pending)
+  //   GET  /api/review/{id}           —— 队列行 + 归并进来的用户原话(各带召回快照)
+  //   POST /api/review/{id}/approve   —— body 可省;通过 ⇒ 写知识库 + **立刻**向量化
+  //   POST /api/review/{id}/reject    —— 只改状态,一个字都不碰知识库
+  //
+  // 三条刻意的做法(都是本任务的要求,不是实现细节):
+  //   ① 通过/驳回**在请求在飞时禁用**(`setReviewBusy`)—— 后端是 check-then-set
+  //      且刻意不加行锁(T15 已接受的限制),UI 这一层是那条限制的**既定收口**;
+  //   ② 处理完**回服务器重取那一行**(`GET /api/review/{id}`),不本地改状态 ——
+  //      `chunks_added: 0` 与 **502** 必须让操作员看见,乐观 UI 恰好会盖住
+  //      本章花整章力气做出来的可见性;
+  //   ③ 502 之后那一行**必须还在**、可重试 —— 所以错误文案要说明它的当前状态
+  //      (那个状态也是问服务端要的,不是本地推的)。
+
+  const STATUS_LABEL = { pending: "待审", approved: "已通过", rejected: "已驳回" };
+
+  let rvBusy = false;            // 有审核请求在飞
+  let flywheelTimer = null;      // 飞轮任务的轮询句柄
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function kv(label, value) {
+    const row = el("div", "rv-kv");
+    row.append(el("span", "rv-k", label), el("span", "rv-v", value));
+    return row;
+  }
+
+  // 队列行 → 只读明细。**列表的详情面板与「最近一次审核」共用这一份投影** ——
+  // 两处各画一遍的话,同一行在屏幕上会有两种读法。
+  function renderRow(row) {
+    const wrap = el("div");
+    const meta = el("div", "rv-kv");
+    meta.append(
+      el("span", "rv-status " + (row.status || ""),
+         "状态:" + (STATUS_LABEL[row.status] || row.status)),
+      el("span", "muted", `出现 ${row.occurrences} 次`),
+      el("span", "muted", `#${row.id}`),
+    );
+    wrap.appendChild(meta);
+    wrap.appendChild(kv("标准化问题", row.standard_question || "(空)"));
+    wrap.appendChild(kv("示例答案", row.example_answer || "(空)"));
+    if (row.approved_answer) wrap.appendChild(kv("核准入库的答案", row.approved_answer));
+    if (row.reviewed_at) wrap.appendChild(kv("审核时间", row.reviewed_at));
+    return wrap;
+  }
+
+  // 一条池子行 = 一段用户原话 + 它自己的召回快照。
+  function rawBlock(q) {
+    const box = el("div", "rv-raw");
+    box.appendChild(el("div", "rv-qtext", q.question || "(空)"));
+    box.appendChild(el("div", "rv-sub",
+      `入口:${q.entry_point || "?"} · 落池理由:${q.reject_reason || "(无)"}`));
+
+    // ⚠️ `null` 与 `[]` 在库里是**两样东西**(`app/api/feedback.py:_snapshot`):
+    // 前者是「回捞没能拿到片段」,后者是「重跑过、零召回」。合并成一句
+    // 「无快照」会把两种不同的排查结论画成一个样子。
+    const snap = q.evidence_snapshot;
+    if (snap == null) {
+      // 两种来源都落在这里:(a) 落池当轮的回捞零召回 —— `_snapshot` 返回 `None`
+      // (库里是 JSON `null`);(b) **ch09 之前**落池的行 —— 这一列是 ch09 才加的,
+      // 老行是 SQL NULL。两者到前端都是 `null`,**分不开**,所以文案把两种都说清,
+      // 不假装知道是哪种。
+      box.appendChild(el("div", "rv-sub",
+        "召回片段快照:无(落池时的回捞没拿到片段;早于 ch09 的池子行没有这一列,同样是空)"));
+      return box;
+    }
+    if (!Array.isArray(snap) || !snap.length) {
+      box.appendChild(el("div", "rv-sub", "召回片段快照:重跑过,零召回(那时知识库里确实没有这一块)"));
+      return box;
+    }
+    for (const c of snap) {
+      const s = el("div", "rv-snap");
+      const head = el("div");
+      head.append(
+        el("span", "rv-score", c.score == null ? "?" : String(c.score)),
+        document.createTextNode(
+          ` · ${c.section_path || "(无章节路径)"} · chunk ${c.chunk_id}`),
+      );
+      s.appendChild(head);
+      s.appendChild(el("div", "rv-ans", c.answer || "(空)"));
+      box.appendChild(s);
+    }
+    return box;
+  }
+
+  // 展开时现拉详情(**懒加载**:队列可能很长,而详情每行一次查询)。
+  // 返回答案编辑框 —— 通过时读它,让「示例答案不对就改一下再通过」可行
+  // (端点的 `approved_answer` 就是为这个留的)。
+  async function loadDetail(id, box) {
+    const row = await api(`/api/review/${id}`);
+    box.replaceChildren();
+    box.appendChild(renderRow(row));
+
+    const raws = row.raw_questions || [];
+    box.appendChild(el("div", "rv-section", `归并进来的用户原话(${raws.length} 条)`));
+    if (!raws.length) {
+      box.appendChild(el("div", "muted", "(没有关联的池子行 —— 这条队列行没有 matched_review_id 指向它)"));
+    }
+    for (const q of raws) box.appendChild(rawBlock(q));
+
+    box.appendChild(el("div", "rv-section", "核准答案(可改;不改 = 用示例答案)"));
+    const ta = document.createElement("textarea");
+    ta.className = "rv-editor";
+    ta.value = row.example_answer || "";
+    box.appendChild(ta);
+    return ta;
+  }
+
+  function queueItem(r) {
+    const item = el("div", "rv-item");
+    item.dataset.id = r.id;
+
+    const head = el("div", "rv-head");
+    const caret = el("span", "rv-caret", "▸");
+    head.append(
+      caret,
+      el("span", "rv-q", r.standard_question || "(空)"),
+      el("span", "rv-chip", `出现 ${r.occurrences} 次`),
+    );
+    item.appendChild(head);
+    item.appendChild(el("div", "muted rv-ex", "示例答案:" + (r.example_answer || "(空)")));
+
+    const state = el("span", "rv-state");
+    const okBtn = el("button", null, "通过");
+    const noBtn = el("button", "secondary", "驳回");
+    const actions = el("div", "rv-actions");
+    actions.append(okBtn, noBtn, state);
+    item.appendChild(actions);
+
+    const body = el("div", "rv-body");
+    body.style.display = "none";
+    item.appendChild(body);
+
+    let loaded = false;
+    let editor = null;
+
+    head.addEventListener("click", async () => {
+      const open = body.style.display !== "none";
+      body.style.display = open ? "none" : "block";
+      caret.textContent = open ? "▸" : "▾";
+      if (open || loaded) return;
+      try {
+        editor = await loadDetail(r.id, body);
+        loaded = true;
+      } catch (e) {
+        body.replaceChildren(el("div", "muted", `⚠ 详情加载失败(${e.message})`));
+      }
+    });
+
+    const ui = { okBtn, noBtn, state, item };
+    okBtn.addEventListener("click", () => {
+      const typed = editor ? editor.value.trim() : "";
+      const override = typed && typed !== (r.example_answer || "").trim() ? typed : null;
+      return decide(r.id, "approve", override, ui);
+    });
+    noBtn.addEventListener("click", () => decide(r.id, "reject", null, ui));
+    return item;
+  }
+
+  function renderQueue(rows) {
+    const box = $("q-list");
+    box.replaceChildren();
+    $("q-count").textContent = rows.length ? `待审 ${rows.length} 条` : "队列为空";
+    if (!rows.length) {
+      box.appendChild(el("div", "muted",
+        "(没有待审的行 —— 去聊天页对一条答得不好的回复点 👎,或点上面的「跑一轮飞轮」把池子里的问题归并进来)"));
+      return;
+    }
+    for (const r of rows) box.appendChild(queueItem(r));
+  }
+
+  async function refreshQueue() {
+    // 有审核请求在飞时**不刷**:那会把这行脚下的 DOM 抽掉,屏幕上「提交中…」
+    // 会凭空消失,而请求其实还在跑。处理完那一步自己会再刷一次。
+    if (rvBusy) return;
+    try {
+      renderQueue(await api("/api/review/queue"));
+    } catch (e) {
+      $("q-list").replaceChildren(el("div", "muted", `⚠ 待审列表加载失败(${e.message})`));
+      $("q-count").textContent = "";
+    }
+  }
+
+  function setReviewBusy(on) {
+    rvBusy = on;
+    // 整列禁用,不只当前那行:两个**不同行**几乎同时点通过,虽然不会写出
+    // 重复的知识块,但会让屏幕上两个「提交中…」互相盖住结果。
+    for (const b of document.querySelectorAll("#q-list button")) b.disabled = on;
+    $("q-refresh").disabled = on;
+  }
+
+  // R3 的落点:处理结果与**该行的服务端状态**一起摆出来。
+  // 刻意不放进那一行里 —— 处理过的行马上就不是 pending、会从列表消失,
+  // 跟着它一起消失的还有「到底成没成」。
+  function showResult(fresh, info) {
+    const box = $("rv-result");
+    box.replaceChildren();
+    $("rv-result-card").style.display = "block";
+
+    const ok = !info.error;
+    const card = el("div", ok ? "rv-result" : "rv-result failed");
+    card.appendChild(el("div", "rv-title",
+      `${ok ? "✓" : "✗"} #${info.id} ${info.kind === "approve" ? "通过" : "驳回"} ` +
+      (ok ? "已提交" : "未成功")));
+
+    if (ok) {
+      if (info.kind === "approve") {
+        card.appendChild(kv("新增知识块", String(info.op.chunks_added)));
+        card.appendChild(kv("本次向量化", String(info.op.vectorized)));
+        if (!info.op.chunks_added) {
+          // `chunks_added: 0` **不是失败**(知识库里早有这条三元组)。
+          // 但它必须**看得见** —— 不然「通过之后还是答不对」会被误读成
+          // 「通过没生效」,而真正的原因在别处(spec §13-9)。
+          card.appendChild(el("div", "rv-note",
+            "新增 0 块 —— 知识库里已经有这条三元组,不是失败;" +
+            (info.op.vectorized ? "本次仍然做了向量化。" : "本次也没有需要向量化的行。") +
+            "若重问仍然答不对,原因不在这里。"));
+        }
+      } else {
+        card.appendChild(el("div", "rv-note", "驳回不改知识库(没有写入、也没有向量化)。"));
+      }
+    } else {
+      card.appendChild(el("div", "rv-note", `服务端返回:${info.error}`));
+      card.appendChild(el("div", "rv-note",
+        fresh && fresh.status === "pending"
+          ? "这一行**仍在待审队列里**(服务端状态 pending)⇒ 可以重试。"
+          : "未能从服务端确认这一行的当前状态,请在待审列表里核对。"));
+    }
+
+    box.appendChild(card);
+    if (fresh) {
+      const d = el("div");
+      d.style.marginTop = "10px";
+      d.appendChild(el("div", "rv-section", "该行当前的服务端状态(处理之后重新拉取)"));
+      d.appendChild(renderRow(fresh));
+      box.appendChild(d);
+    } else {
+      box.appendChild(el("div", "rv-note",
+        "⚠ 没能取到该行的服务端状态(GET /api/review/{id} 也失败了)。"));
+    }
+  }
+
+  async function decide(id, kind, override, ui) {
+    if (rvBusy) return;
+    setReviewBusy(true);
+    ui.item.classList.add("busy");
+    ui.state.className = "rv-state";
+    ui.state.textContent = kind === "approve"
+      ? "提交中…(通过会立刻写知识库并向量化,可能要几秒)"
+      : "提交中…";
+    try {
+      const opts = { method: "POST" };
+      if (kind === "approve") {
+        opts.headers = { "Content-Type": "application/json" };
+        // 没改答案就送一个空 body(端点声明的是可空 body,`{}` 与不带 body
+        // 等价)。**不送 `approved_answer`** 时服务端回退到 `example_answer` ——
+        // 那是「点通过而不改答案」这条最常见路径的正确语义。
+        opts.body = JSON.stringify(override ? { approved_answer: override } : {});
+      }
+      const r = await req(`/api/review/${id}/${kind}`, opts);
+      if (!r.ok) throw new Error((r.body && r.body.detail) || `HTTP ${r.status}`);
+      const op = r.body || {};
+      const fresh = await api(`/api/review/${id}`);   // 状态的权威是服务端
+      ui.state.className = "rv-state ok";
+      ui.state.textContent = kind === "approve"
+        ? `已通过 · 新增 ${op.chunks_added} 块 · 向量化 ${op.vectorized}`
+        : "已驳回";
+      showResult(fresh, { id, kind, op, error: null });
+    } catch (e) {
+      ui.state.className = "rv-state err";
+      ui.state.textContent = `⚠ ${e.message}`;
+      let fresh = null;
+      try { fresh = await api(`/api/review/${id}`); } catch (e2) { fresh = null; }
+      showResult(fresh, { id, kind, op: null, error: e.message });
+    } finally {
+      ui.item.classList.remove("busy");
+      setReviewBusy(false);
+      await refreshQueue();   // 处理过的行已不是 pending ⇒ 从列表消失
+    }
+  }
+
+  // ── 手动跑一轮飞轮(R1)────────────────────────────
+  //
+  // 落池那三处(置信度闸 / 商品咨询自评轮 / 👎)会 fire-and-forget 起一轮飞轮,
+  // 但那是**单槽**的:已有在跑就拿到 `None`(端点回 409),而**后台那次失败
+  // 就没有别的杠杆**了。这个按钮就是那把杠杆(`app/api/kb.py:start_flywheel`
+  // 的 docstring 自己写着「验收脚本与前端靠它」)。
+  //
+  // 状态必须**看得见**:`[running]` = 还没跑完;`[done] 处理 N 行:归并 x、
+  // 新建 y、失败 z` = 跑完了 —— 新建 0 就是「跑完了但没进来」,一眼分得开。
+  async function startFlywheel() {
+    clearInterval(flywheelTimer);
+    const st = $("q-fly-status");
+    st.style.display = "block";
+    st.className = "job-status";
+    st.textContent = "提交中…";
+    try {
+      const r = await req("/api/kb/jobs/flywheel", { method: "POST" });
+      if (r.status === 409) {
+        // 单槽:飞轮 / 向量化 / 挖知识**共用同一个运行槽**。这不是错误 ——
+        // 顺手把**正在跑的那个**接上,免得操作员对着 409 干等。
+        const all = await req("/api/kb/jobs");
+        const jobs = Array.isArray(all.body) ? all.body : [];
+        const running = jobs.find((j) => j.status === "running");
+        if (running) {
+          st.className = "job-status";
+          st.textContent = `已有任务在跑(${running.type} ${running.id}),接着看它的状态…`;
+          pollFlywheel(running.id);
+        } else {
+          st.className = "job-status failed";
+          st.textContent = "⚠ 已有任务在跑(飞轮 / 向量化 / 挖知识共用一个运行槽),等它结束再点。";
+        }
+        return;
+      }
+      if (!r.ok || !r.body || !r.body.job_id) {
+        st.className = "job-status failed";
+        st.textContent = `⚠ 启动失败(${(r.body && r.body.detail) || `HTTP ${r.status}`})`;
+        return;
+      }
+      pollFlywheel(r.body.job_id);
+    } catch (e) {
+      st.className = "job-status failed";
+      st.textContent = `⚠ 启动失败(${e.message})`;
+    }
+  }
+
+  // 跑了多久。**只看 `created_at` 与浏览器时钟的差**,是个显示用的辅助量 ——
+  // 两台机器的钟不一致时它就不准(所以不当判据用)。加它的理由是 R1 那句
+  // 「分得清还没跑完」:一个空着 message 的 `[running]` 分不出「慢」与「卡住」,
+  // 有一个一直在涨的秒数至少让人知道它真的还在跑。
+  function fmtDur(sec) {
+    const s = Math.max(0, Math.round(sec));
+    return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  }
+
+  function pollFlywheel(jobId) {
+    const st = $("q-fly-status");
+    const tick = async () => {
+      try {
+        const r = await req(`/api/kb/jobs/${jobId}`);
+        if (!r.ok || !r.body) {
+          clearInterval(flywheelTimer);
+          st.className = "job-status failed";
+          st.textContent = `⚠ 任务状态读取失败(HTTP ${r.status})`;
+          return;
+        }
+        const j = r.body;
+        let line = `[${j.status}] ${j.type} ${j.id} ${j.message || ""}`;
+        if (j.status === "running" && j.created_at) {
+          line += ` · 已跑 ${fmtDur(Date.now() / 1000 - j.created_at)}`;
+        }
+        if (j.result) {
+          line += ` · 处理 ${j.result.processed} 行:归并 ${j.result.merged}、` +
+                  `新建 ${j.result.created}、失败 ${j.result.failed}`;
+        }
+        st.className = "job-status " + j.status;
+        st.textContent = line;
+        if (j.status !== "running") {
+          clearInterval(flywheelTimer);
+          // 跑完才刷队列:新归并 / 新建出来的待审行是这一刻才有的。
+          await refreshQueue();
+        }
+      } catch (e) {
+        clearInterval(flywheelTimer);
+        st.className = "job-status failed";
+        st.textContent = `⚠ 任务状态轮询中断(${e.message})`;
+      }
+    };
+    tick();
+    flywheelTimer = setInterval(tick, 1000);
+  }
+
+  $("q-refresh").addEventListener("click", refreshQueue);
+  $("q-flywheel").addEventListener("click", startFlywheel);
+
   // ── 标签页切换 ──
+  const TAB_NAMES = ["入库", "待审", "评测"];
   function switchTab(name) {
     for (const b of document.querySelectorAll(".tab")) {
       b.classList.toggle("active", b.dataset.tab === name);
     }
-    $("tab-入库").style.display = (name === "入库") ? "block" : "none";
-    $("tab-评测").style.display = (name === "评测") ? "block" : "none";
+    for (const t of TAB_NAMES) {
+      $("tab-" + t).style.display = (t === name) ? "block" : "none";
+    }
+    // 进「待审」才拉队列(页面打开时它在后台、拉到的东西没人看)。
+    if (name === "待审") refreshQueue();
   }
   for (const b of document.querySelectorAll(".tab")) {
     b.addEventListener("click", () => switchTab(b.dataset.tab));

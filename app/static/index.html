@@ -243,6 +243,8 @@
   .fb { font: inherit; font-size: 13px; padding: 3px 8px; background: #fff;
     border: 1.5px solid #cdd9e4; border-radius: 999px; cursor: pointer; }
   .fb.active { background: var(--brand); border-color: var(--brand-dim); }
+  /* 请求在飞时禁用(与 #send:disabled 同一档透明度,本页既有写法) */
+  .fb:disabled { opacity: .45; cursor: default; }
   .fb-state { font-size: 11.5px; color: #5b7186; }
   .choices { display: flex; gap: 8px; margin-top: 10px; }
   .choice-btn {
@@ -458,18 +460,55 @@
     return bubble;
   }
 
+  // 最近一条**用户消息**的原文。**只给 `appendAssistantText` 用**(它没有
+  // 一个「本轮问题」的参数位,而它的两个调用点 —— 回载逐条画、转人工 ——
+  // 都正好是「紧跟在一段用户消息之后」)。
+  // 直播发送那条路**不走这个变量** —— 它把文本**当场**传给 `addAssistant`
+  // (理由见 `attachFeedback` 上方那段:回头点旧气泡时这个变量已经翻篇了)。
+  let lastUserText = null;
+
   function addUser(text) {
     addRow("user").textContent = text;
+    lastUserText = text;
   }
 
   // 助手气泡 = 徽章区 + 正文,正文边流边追加
-  function addAssistant() {
+  //
+  // `turnQuestion` = **这一轮**用户消息的原文(👎 要用它)。调用方必须当场给,
+  // 拿不到就给 `null` —— 不许在点击时现去读一个全局变量(见 `attachFeedback`)。
+  function addAssistant(turnQuestion) {
     const bubble = addRow("assistant");
     const badges = document.createElement("div");
     badges.className = "badges";
     const body = document.createElement("div");
     bubble.append(badges, body);
-    // 满意度反馈(纯前端采集,一次性锁定)
+    attachFeedback(bubble, turnQuestion);
+    return { bubble, badges, body, citations: [] };
+  }
+
+  // ── 满意度反馈(ch09:👎 真的落池)──────────────────────
+  //
+  // 点击 `POST /api/feedback {conversation_id, question, value}` —— 服务端把
+  // `down` 送进低置信度池(飞轮的第三个入口),并尽力重跑一次检索回捞片段;
+  // `up` 只留一行日志(不落池)。
+  //
+  // ⚠️ **`question` 必须当场传进来,不能在点击时读「最近一条用户消息」**:
+  // 上一轮的助手气泡**留在屏幕上不会消失**,用户完全可能问完第二轮之后回头点
+  // 第一轮那个 👎 —— 读全局变量会把**第二轮**的问题挂上去,而服务端的幂等键正是
+  // `(会话, 入口, 问题文本)`,于是那条反馈**看起来完全成功**,却指向一个
+  // 答得好好的问题(spec §6.1 的表下就是为这条写的)。
+  //
+  // ⚠️ **`message_id` 拿不到,所以不传**(契约上它是可选的,见
+  // `app/api/feedback.py:FeedbackRequest`)。本仓的 SSE 帧里**没有任何一帧**
+  // 带助手消息的 MySQL 主键:meta 只给 `session_id`,done 给
+  // trace/intent/confidence/agent_steps,`/api/conversations/{id}/messages`
+  // 回的是 role/content/created_at。**不许拿近似值(比如客户端自增的轮次序号)
+  // 去填它** —— 服务端今天不读它,但一个「看着合理的错值」会在日后有人真去读
+  // 它的那一刻变成一个查不清的错数据。缺就是缺(T16 报告里如实记了)。
+  //
+  // 两条前置判据(会话已建立 / 本轮问题原文在手上)**不满足就一个字节都不发**,
+  // 只在气泡里说清楚为什么 —— 挂错问题的 👎 比没挂更坏。
+  function attachFeedback(bubble, turnQuestion) {
     const fb = document.createElement("div");
     fb.className = "feedback";
     fb.innerHTML =
@@ -477,17 +516,53 @@
       '<button class="fb" data-v="down" type="button">👎</button>' +
       '<span class="fb-state"></span>';
     bubble.appendChild(fb);
+
+    const btns = [...fb.querySelectorAll(".fb")];
+    const st = fb.querySelector(".fb-state");
+    // 一次性锁定:锁定期间两个按钮都禁用(同一条反馈不许提交两次)。
+    // **失败要放开**(与页面里退款单/建单两条一致)—— 不放开的话一次网络抖动
+    // 就让这条回复再也反馈不了,而屏幕上写着「反馈失败」,用户以为自己可以重试。
     let locked = false;
-    fb.querySelectorAll(".fb").forEach((btn) => {
-      btn.addEventListener("click", () => {
+
+    btns.forEach((btn) => {
+      btn.addEventListener("click", async () => {
         if (locked) return;
+        if (!sessionId) { st.textContent = "会话尚未建立,未提交反馈"; return; }
+        if (!turnQuestion) { st.textContent = "拿不到这一轮的问题原文,未提交反馈"; return; }
         locked = true;
-        fb.querySelectorAll(".fb").forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        fb.querySelector(".fb-state").textContent = "已反馈";
+        btns.forEach((b) => { b.disabled = true; });
+        st.textContent = "提交中…";
+        const value = btn.dataset.v;
+        try {
+          const resp = await fetch("/api/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            // 刻意**不带 `message_id`**:见上面那段(本页拿不到它)。
+            body: JSON.stringify({
+              conversation_id: sessionId, question: turnQuestion, value: value,
+            }),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const d = await resp.json();
+          btns.forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          if (value === "up") {
+            st.textContent = "已反馈";
+          } else {
+            // `pooled:false` 有两种来源,都是服务端说的、不必本页去猜:
+            // 幂等命中(这条问题此前已进池)与 `up`。文案区分开,免得把
+            // 「早就进过池」读成「这一条没进去」。
+            st.textContent = d.pooled
+              ? "已反馈 · 已进入待审队列"
+              : "已反馈 · 该问题此前已在待审队列";
+          }
+        } catch (e) {
+          locked = false;
+          btns.forEach((b) => { b.disabled = false; });
+          st.textContent = `反馈失败(${e.message})`;
+        }
       });
     });
-    return { bubble, badges, body, citations: [] };
   }
 
   function addBadge(badges, name) {
@@ -579,7 +654,10 @@
   }
 
   async function send(text) {
-    const ctx = { ...addAssistant(), lastTool: null, failed: false };
+    // `text` 就是这一轮的用户消息原文 ⇒ 当场交给气泡(👎 要它,理由见
+    // `attachFeedback`)。resume 那条路复用**同一个 ctx**,所以它手上的
+    // `turnQuestion` 仍是这一轮的问题 —— 续跑不是新的一轮。
+    const ctx = { ...addAssistant(text), lastTool: null, failed: false };
     await streamInto(ctx, sessionId ? { session_id: sessionId, message: text }
                                     : { message: text });
   }
@@ -982,8 +1060,13 @@
     scrollToEnd();
   }
 
+  // 「直接在气泡里写一段话」的助手气泡(回载 / 转人工那两句)。
+  // 它的回合问题取 `lastUserText`:两个调用点都是「紧跟在一段用户消息之后」
+  // (回载逐条画、转人工跟在本轮提问之后),而**回载里没有这条**时(会话第一条
+  // 就是助手消息)`lastUserText` 是 `null` ⇒ 👎 会拒发并在气泡里说明,
+  // 不会拿上一个会话的问题去凑(见 `attachFeedback`)。
   function appendAssistantText(text) {
-    const ctx = addAssistant();
+    const ctx = addAssistant(lastUserText);
     ctx.body.textContent = text;
     scrollToEnd();
   }
@@ -1091,6 +1174,10 @@
   // 会长得不一样 —— 而这种漂移不截图对比是看不出来的。
   function renderHistory(items) {
     logEl.replaceChildren();
+    // 逐条重画 ⇒ `lastUserText` 也必须**从头来**:不清的话,切换到一个
+    // 「第一条就是助手消息」的会话时,它会把**上一个会话**的用户问题当成
+    // 本轮问题传给 `appendAssistantText`(👎 就会挂到别的会话的问题上)。
+    lastUserText = null;
     items.forEach((m) => {
       if (m.role === "user") addUser(m.content);
       // ⚠️ 条件是 `role === "user"`,**剩下的都画成助手气泡** —— 也就是说
