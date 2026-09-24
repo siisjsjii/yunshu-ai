@@ -3,6 +3,15 @@
 用法:
     .venv/Scripts/python.exe scripts/run_eval.py
     .venv/Scripts/python.exe scripts/run_eval.py --top-k 10
+    .venv/Scripts/python.exe scripts/run_eval.py --limit 5 --trigger manual
+
+ch09 起:跑完**追加一行** `eval_runs`(趋势表 `scripts/eval_trend.py` 的数据源)。
+`--limit 0`(默认)= 全跑,行为/输出与 ch04 那版**一字不变**;`--limit N` 只跑前 N 条,
+且那一轮 `case_count` 记的是**实际条数**(不同规模的轮次不许看起来可比 —— spec §10.2)。
+
+⚠️ **`latest.json` 是「最近跑的那一轮」,`--limit N` 的轮次同样会写它** ——
+验收脚本拿 `--limit 5` 跑两轮之后,`admin.html` 的评测页看到的就是那 5 条的结果
+(不是全量)。要它回到全量,再跑一次不带 `--limit` 的即可。
 
 读 `evals/测试集.md`(CSV:300 用例,5 桶),对每个 query 用四种策略各检索一次,
 回查 MySQL 算 Recall@K / MRR / 平均置信度,按桶分桶,写 `evals/results/latest.json`
@@ -27,12 +36,13 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Any, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import get_settings
 from app.db.base import get_engine, get_sessionmaker
-from app.db.models import KnowledgeChunk
+from app.db.models import EvalRun, KnowledgeChunk
 from app.retrieval.embedder import get_embedder
 from app.retrieval.milvus import get_vector_store
 from app.retrieval.reranker import get_reranker
@@ -96,14 +106,32 @@ def hit(chunks: dict, hit_id: str, expect_section: str) -> bool:
     return _match_sections(haystack, expect_section)
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(description="ch04 四策略检索评估")
-    parser.add_argument("--top-k", type=int, default=_K)
-    args = parser.parse_args()
-    top_k = args.top_k
+def select_cases(cases: list[dict], limit: int) -> list[dict]:
+    """`--limit`:只取前 N 条;**0(或负数)= 全跑,原样返回**。
 
-    settings = get_settings()
-    cases = load_cases()
+    单独拎出来是为了让「实际跑了几条」这件事**只有一个来源** ——
+    落库的 `case_count` 与真正喂给策略的用例必须是同一批(spec §10.2)。
+    """
+    if limit <= 0:
+        return cases
+    return cases[:limit]
+
+
+class EvalCtx(NamedTuple):
+    """四种策略要用的三件套 + 语料。
+
+    构造**不加载权重**(embedder / reranker 都是懒加载),所以单测可以拿假件组装它。
+    """
+
+    chunks: dict[str, dict]
+    store: Any
+    embedder: Any
+    reranker: Any
+    reranker_available: bool
+
+
+async def build_ctx(settings) -> EvalCtx:
+    """建 Milvus / 嵌入 / 重排三件套 + 取语料。"""
     chunks = await load_chunks()
     store = get_vector_store(settings.milvus_uri, settings.milvus_collection)
     embedder = get_embedder(
@@ -113,6 +141,17 @@ async def main() -> None:
     reranker = get_reranker(settings.reranker_model_path)
     if not reranker_available:
         emit(f"⚠ 重排权重未就绪({settings.reranker_model_path} 不存在),混合+Rerank 策略将跳过")
+    return EvalCtx(chunks=chunks, store=store, embedder=embedder,
+                   reranker=reranker, reranker_available=reranker_available)
+
+
+async def evaluate_cases(cases: list[dict], top_k: int, ctx: EvalCtx) -> dict:
+    """跑四种策略,返回 `latest.json` 的内容(**不落盘、不落库**)。
+
+    任何一步抛异常都直接向上冒 —— 调用方(`run_round`)据此保证
+    「半途而废的一轮不会被记成一条完整的评估」。
+    """
+    chunks, store, embedder = ctx.chunks, ctx.store, ctx.embedder
 
     # 预嵌入所有 query(省得每策略重复加载)
     queries = [c["query"] for c in cases]
@@ -129,7 +168,7 @@ async def main() -> None:
             if not hits:
                 return []
             texts = [(i, chunks.get(str(i), {}).get("answer", "")) for i, _ in hits]
-            scores = reranker.rerank(q, texts)
+            scores = ctx.reranker.rerank(q, texts)
             ranked = sorted(zip(hits, scores), key=lambda x: -x[1])
             return [(i, s) for (i, _), s in ranked[:top_k]]
 
@@ -137,7 +176,7 @@ async def main() -> None:
 
     results: dict = {"top_k": top_k, "strategies": {}}
     for name, fn in strategies():
-        if name == "混合+Rerank" and not reranker_available:
+        if name == "混合+Rerank" and not ctx.reranker_available:
             emit(f"⚠ {name}:权重未就绪,跳过")
             continue
         started = time.perf_counter()
@@ -185,12 +224,23 @@ async def main() -> None:
         results["strategies"][name] = strategy_result
         emit(f"{name} 完成(耗时 {time.perf_counter() - started:.1f}s)")
 
+    return results
+
+
+def write_latest(results: dict) -> Path:
+    """写 `evals/results/latest.json`。
+
+    **路径与结构一个字都不许动** —— `admin.html` 的评测页读它(spec §10.1)。
+    """
     RESULTS_DIR.mkdir(exist_ok=True)
     out = RESULTS_DIR / "latest.json"
     out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     emit(f"\n结果写入 {out}")
+    return out
 
-    # 打印对照表
+
+def print_report(results: dict, cases: list[dict]) -> None:
+    """打印按桶的对照表(口径与 ch04 那版逐字相同)。"""
     buckets = sorted({c["bucket"] for c in cases})
     strategies_names = list(results["strategies"])
     emit("\n===== Recall@10 / MRR / 置信度 对照(按桶)=====")
@@ -203,7 +253,76 @@ async def main() -> None:
             emit(f"  {s:12} recall@10={r['recall@10']:.3f} mrr={r['mrr']:.3f} "
                  f"conf={r['conf']:.3f} 应答正确={r['answer_ok']:.3f}")
 
-    await get_engine().dispose()
+
+async def _record_eval_run(*, trigger_by: str, case_count: int, metrics: dict) -> int:
+    """往 `eval_runs` 追加一行,返回它的 id。
+
+    **engine 用的是 `app/db/base.py` 的 lru_cache 单例,不另起一个。**
+    理由:`app/kb/orchestrate.py` 的**后台任务**必须自建 engine,因为那条单例绑在
+    「首次使用它的那个事件循环」上,而后台线程里是 `asyncio.run` 的**另一个**循环;
+    本脚本从头到尾只有**一条**事件循环(命令行的 `asyncio.run`),不存在跨循环复用,
+    所以单例是正确且更省的选择 —— 而且 `main` 原本就在用它的 `get_sessionmaker()`
+    读 `knowledge_chunks`。dispose 由 `main` 的 `finally` 负责(**不会再留一个没人关的
+    engine**:今天若为落库新起一个,`main` 尾部那句 dispose 管的是另一个对象)。
+    """
+    async with get_sessionmaker()() as session:
+        row = EvalRun(trigger_by=trigger_by, case_count=case_count, metrics=metrics)
+        session.add(row)
+        await session.commit()
+        return row.id
+
+
+async def run_round(cases: list[dict], top_k: int, ctx: EvalCtx, *, trigger_by: str,
+                    on_results=None) -> dict:
+    """一轮 = **评估 + 落一行 `eval_runs`**,返回 `latest.json` 的内容。
+
+    顺序是承重的:评估**完整**跑完才有落库那一步 —— `evaluate_cases` 抛出的任何
+    异常都在写行之前冒出去,所以「Milvus 挂了 / key 用尽」这类半途而废的一轮
+    **结构上不可能**被记成一条完整的评估(趋势表拿不到误导性的行)。
+
+    `on_results` 是「结果算完了、但还没落库」那个**唯一**时机的钩子:`main` 用它把
+    `latest.json` 写出去 —— 顺序与 ch04 那版一致(**先落结果文件,再落库**;
+    落库若失败,人手里至少还有那份刚算出来的结果)。用例不传它,
+    于是碰不到 `evals/results/latest.json`。
+    """
+    results = await evaluate_cases(cases, top_k, ctx)
+    if on_results is not None:
+        on_results(results)
+    await _record_eval_run(
+        trigger_by=trigger_by,
+        case_count=len(cases),
+        # **现有 latest.json 的内容原样进 metrics**,外面包一层 ——
+        # 这样「评估集的形状」与「这一轮跑了多少条」是两个独立的键,
+        # 不会因为 --limit 而在同一个键上出现两种含义(spec §10.3)。
+        metrics={"top_k": top_k, "case_count": len(cases),
+                 "strategies": results["strategies"]},
+    )
+    return results
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ch04 四策略检索评估")
+    parser.add_argument("--top-k", type=int, default=_K)
+    parser.add_argument("--limit", type=int, default=0,
+                        help="只跑前 N 条(0 = 全跑)。给验收脚本用;"
+                             "**case_count 记的是实际条数**,别让不同规模的轮次看起来可比")
+    parser.add_argument("--trigger", default="manual",
+                        help="触发方式,写进 eval_runs.trigger_by")
+    return parser.parse_args(argv)
+
+
+async def main() -> None:
+    args = _parse_args()
+    top_k = args.top_k
+    # 先取全量、再按 --limit 截 —— `--limit 0` 时原样返回,与 ch04 那版一字不变。
+    cases = select_cases(load_cases(), args.limit)
+    ctx = await build_ctx(get_settings())
+    try:
+        results = await run_round(cases, top_k, ctx, trigger_by=args.trigger,
+                                  on_results=write_latest)
+        print_report(results, cases)
+    finally:
+        await get_engine().dispose()
 
 
 if __name__ == "__main__":
