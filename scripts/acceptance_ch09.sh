@@ -32,13 +32,30 @@
 #      问法实测被判成 `其他 → 兜底`,**根本不检索** —— 那样的题面即使知识已经
 #      入库、也能召回来,重问照样答不对,而红的原因与飞轮无关(T16 走查实测 6 种
 #      说法:5 次兜底 + 1 次弹订单卡片)。C1。
-#   B. **验收 ② 的「召回片段快照」在这条链路上只能是 JSON null。**
-#      闸的判据是 `bool(evidence) and confidence >= threshold`,而证据非空时
-#      `confidence >= 0.6*0.25 + 0.2*(1/3) = 0.2667 > 0.2`(默认旋钮)⇒
-#      **闸挡下 ⟺ 检索为空**(库里 30 条闸行,**30 条** reject_reason 都是「检索为空」);
-#      检索为空 ⇒ 没有任何片段可快照。所以脚本对这一半的判据是「**null 且
-#      `reject_reason` 就是「检索为空」**」,并且**先用独立探针 `GET /api/kb/search`
-#      证明这条问题确实召不到** —— 否则一个编程错误会产生一模一样的行(C7)。
+#   B. **验收 ② 的「召回片段快照」只能是 JSON null —— 而这条断言的判别力到此为止。**
+#      ⚠️ **先说清「闸挡下 ⟺ 检索为空」是什么**:它**今天成立,但它是两个旋钮默认值的
+#      巧合,不是结构性质**(本条在复审 F1 里被订正过,原来这里写的是一条假定律):
+#        * 闸的判据是 `bool(evidence) and evidence_confidence >= evidence_confidence_threshold`;
+#        * **单条块**的合成分是 `0.8*top1 + 0.0667`(只有一块时 `gap == top1`,
+#          两个权重合起来是 0.8;`count` 项是 `0.2*(1/3)`)⇒ **过闸临界 `top1 ≥ 0.1667`**
+#          (实测于 2026-09-24,生产默认值:0.16 → 0.1947 被拦、0.1667 → 0.2000 过闸、
+#          0.19 → 0.2187 过闸。复核脚本见 `.superpowers/probe_gate_formula.py`);
+#        * 而 `retrieval_score_threshold = 0.25`(`app/tools/registry.py` 传给检索器)
+#          在**进闸之前**就把低于 0.25 的块筛掉了 ⇒ 证据非空时 `top1 ≥ 0.25 > 0.1667`,
+#          **必然过闸**;
+#        * `app/config.py:74` 自己就写着那两个旋钮是**刻意避开**的 ⇒ **把它们调近
+#          (一次很自然的调参)就会让闸开始拦「手里有块」的行**,那时这条「定律」立刻失效,
+#          而本文下面那些判据的前提也跟着变。
+#      ⇒ 由此:② 问的是**召回为空**的问题 ⇒ 没有任何片段可快照 ⇒ 那一行只能是 JSON `null`。
+#      脚本对这一半的判据是「**null 且 `reject_reason` 就是「检索为空」**」,并且
+#      **先用独立探针 `GET /api/kb/search` 证明这条问题确实召不到** —— 否则一个编程错误
+#      会产生一模一样的行(C7)。
+#      ⚠️ **并且如实说:这条断言对它本该抓的那个 bug 是不变的** —— 零召回那一支里
+#      「闸**写了**这一列」与「闸**漏了** `evidence_snapshot=` 这个 kwarg」落出来的
+#      都是 JSON `null`(闸今天传的是 `_snapshot(evidence) if evidence else None`)。
+#      「闸的快照列有内容」那一支(手里有块却被拦)在本链路**结构上够不到**,由
+#      `tests/test_agent_gate_ch09.py` 守着 —— 见脚本尾部的「局限」。**不为了凑覆盖
+#      去构造弱召回场景**(副本仓规矩:一条会自带前提的断言比没有更坏)。
 #      **「快照里有内容」那一半由验收 ④ 覆盖**:👎 那条路的 `evidence_snapshot` 是
 #      **回捞重跑**的产物,选一条召得到的问题就有内容,而且能按内容回溯到本轮的问题。
 #   C. **选题从候选表里现挑**:每跑一轮,② 会往知识库**真的写进一条**并核准,
@@ -77,7 +94,11 @@ H_USER_FEEDBACK="7528 6237 53cd 9988"      # 用户反馈
 H_WARMUP_OK="9884 70ed 5b8c 6210"          # 预热完成
 H_WARMUP_FAIL="9884 70ed 5931 8d25"        # 预热失败
 H_HOTTEST="6700 70e7"                      # 最烧(「最烧 token 的意图」那一行)
-H_WATER="996e 6c34 673a"                   # 饮水机(④ 快照的内容回溯用)
+# ④ 快照的内容回溯用。⚠️ **不能用「饮水机」** —— 那三个字**就在 ④ 的问题里**
+# (`Q_FEEDBACK`),拿它当 needl 只能抓到「回复/快照里复述了问题」这种恒真的东西。
+# 用**只该出现在被召回片段里**的串:饮水机那几块的 `section_path` 与正文都带型号,
+# 而那几块正是这个问题召回来的(实测 `624 / 0.4604 / 商品规格手册 > 自动饮水机 Plus(型号 MH-W40)`)。
+H_WATER="4d 48 2d 57"                      # MH-W(型号前缀)
 
 # ── ② 的候选(可答性由运行时的独立探针判,见 Header C)──────────────────
 # 每条:题面 / 核准答案 / 答案里的特征串(hex)。特征串是**中文四字词组**:不带空格、
@@ -465,6 +486,10 @@ def emit(text: str = "") -> None:
 DELTA = re.compile("^[" + chr(0x2193) + chr(0x2191) + r"]\s|^=\s")
 #: 轮次行的前缀:`  4 ` + 两空格 + `2026-09-24 22:50:00` + 两空格 + `     5` + 两空格。
 #: 分桶表的行**同样匹配**它 ⇒ 只取每个轮次号的**第一次**出现(头条表在前)。
+#: ⚠️ 它依赖 `eval_trend.py` 的**列宽**(`W_ROUND/W_TIME/W_COUNT` + `GAP`,即
+#: 「数字 + 空白 + 19 字时间戳 + 空白 + 条数 + 两个空格」)。**那里改了宽度,
+#: 这个正则就一条都匹配不上** —— 那种情况在本文件里**响亮地失败**:`parse()` 会返回
+#: 空 dict,两个模式都当场报错(`ROUNDS=0` / `趋势表里找不到本轮`),不会静默判绿。
 ROUND = re.compile(r"^\s*(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(\d+)\s\s")
 
 
@@ -489,6 +514,12 @@ def main() -> None:
     for n in sorted(rounds, key=int):
         emit("ROUND=%s %s 条数=%s NEXT=%s" % (n, rounds[n][0], rounds[n][1],
                                               rounds[n][2].strip()[:40]))
+    if not rounds:
+        # 一条轮次行都解析不出来 ⇒ **装置坏了**,不是被测对象坏了:多半是
+        # `eval_trend.py` 的列宽被改过(见 `ROUND` 上面那条注释),或输出被截断。
+        # 这时下面所有「找不到本轮」的判据都会命中,必须先说清是哪一种。
+        emit("!!! 趋势表的输出里解析不出任何轮次行(列宽改过?输出被截断?ROUNDS=0)")
+        raise SystemExit(8)
 
     if mode == "pair":
         ts1, ts2 = sys.argv[3][:19], sys.argv[4][:19]
@@ -518,8 +549,12 @@ def main() -> None:
     ts, count, nxt = rounds[last]
     emit("LAST=%s %s 条数=%s" % (last, ts, count))
     emit("LAST_NEXT=%s" % nxt.strip()[:60])
+    # ⚠️ 这里的 `300` 是**用例集的规模**(`evals/测试集.md`),与本脚本无关地写死:
+    # 用例集扩容/缩容之后这条会**响亮地红**(「最后一轮不是全量(条数=N)」),
+    # 而那正是想要的 —— 它守的是「⑥ 收在一轮全量上、admin 评测页看到的不是 5 条」,
+    # 换规模时把这里(以及下面 `latest.json` 那条的 300)一起改掉。
     if count != "300":
-        emit("!!! 最后一轮不是全量(条数=%s)" % count)
+        emit("!!! 最后一轮不是全量(条数=%s;用例集规模若不是 300,改本文件的这个常量)" % count)
         raise SystemExit(6)
     if not nxt.lstrip().startswith(chr(0x2260)):
         emit("!!! 全量轮那一行没有打「不可比」标记")
@@ -861,7 +896,7 @@ print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' "$WORK/lf_obs_by_tra
   break
 done
 if [ "$TRACE_OK" != "1" ]; then
-  boom "① 三轮(每轮 120s)都没从 Langfuse 读回观测 —— 写侧没落上去,或 ingestion 迟迟不到"
+  boom "① 两轮(每轮 240s)都没从 Langfuse 读回观测 —— 写侧没落上去,或 ingestion 迟迟不到"
   export_health
 fi
 
@@ -958,16 +993,20 @@ EOF
       sed 's/^/    /' "$WORK/acc2_check.txt"
       ok "② 详情里有**本轮那句原话**(逐字相等)"
       # 快照:先看独立探针的结论(候选是「此刻召回 0 块」才被选中的),再断那一行自洽。
-      if grep -q '^SNAP=none$' "$WORK/acc2_check.txt"; then
-        if has_needle "$WORK/acc2_check.txt" "$H_EMPTY_RETRIEVAL"; then
-          ok "② 快照是 null 且落池理由就是「检索为空」—— 与独立探针(0 块)一致,不是漏记"
-        else
-          bad "② 快照是 null,但落池理由不是「检索为空」—— 与独立探针矛盾,查落池那一步"
-        fi
-      elif grep -q '^SNAP=[1-9]' "$WORK/acc2_check.txt"; then
-        warn "② 快照居然有内容($(grep '^SNAP=' "$WORK/acc2_check.txt"))—— 与独立探针(0 块)不同,记一笔"
+      # ⚠️ **这条断言判据很窄,而且如实说:它对「闸漏写 `evidence_snapshot=`」是不变的**
+      # —— 零召回那一支两种写法都落 JSON `null`(闸今天传的是
+      # `_snapshot(evidence) if evidence else None`)。能断的只有「这一行是自洽的:
+      # 快照为空 **且** 理由就是「检索为空」**且** 独立探针也召不到」。见脚本尾部「局限」。
+      SNAP_SHAPE=$(grep '^SNAP=' "$WORK/acc2_check.txt" | head -1)
+      if grep -q '^SNAP=[1-9]' "$WORK/acc2_check.txt"; then
+        warn "② 快照居然有内容($SNAP_SHAPE)—— 与独立探针(0 块)不同,记一笔"
+      elif has_needle "$WORK/acc2_check.txt" "$H_EMPTY_RETRIEVAL"; then
+        # 「空」的两种形态都算自洽:JSON `null`(闸今天空证据那一支传 `None`)与
+        # 空数组(本仓约定里「记了、零召回」的那个值)。**关键是被另一个读数解释过** ——
+        # 独立探针 0 块 + 理由「检索为空」,不是「看见一个 null 就猜」(C7)。
+        ok "② 快照为空且落池理由就是「检索为空」—— 与独立探针(0 块)一致,不是漏记($SNAP_SHAPE)"
       else
-        bad "② 快照是空数组(SNAP=0):「记了、零召回」与「漏记」在这一列上分不开"
+        bad "② 快照为空,但落池理由不是「检索为空」—— 与独立探针矛盾,查落池那一步($SNAP_SHAPE)"
       fi
       echo "    $(grep '^ENTRY=' "$WORK/acc2_check.txt" | head -1)  $(grep '^REASON=' "$WORK/acc2_check.txt" | head -1)"
     else
@@ -1005,9 +1044,13 @@ import json,sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
 print("%s|%s" % (d.get("chunks_added"), d.get("vectorized")))' "$WORK/acc3_approve.json")
     echo "    chunks_added|vectorized = $CHUNKS"
+    # ⚠️ 只有**真的是 `1|1`** 才说「并向量化」:`1|0`(= 新写了块但一条都没向量化)与
+    # `None|None`(响应里没这两个键)都是**另一回事**,归进同一句绿话里等于把
+    # 「通过了、但检索里没有它」这件事说成了成功(spec §13-9 要的正是别这么读)。
     case "$CHUNKS" in
+      1\|1) ok "③ 通过写了知识块并向量化($CHUNKS)" ;;
       0\|0) bad "③ 通过写了 0 块、也没向量化 —— spec §13-9:那时「答不对」的原因不是这一条" ;;
-      *)    ok "③ 通过写了知识块并向量化($CHUNKS)" ;;
+      *)    warn "③ 通过返回 chunks_added|vectorized = $CHUNKS(写块与向量化的步数不等,核对上面那份响应)" ;;
     esac
     # Milvus 条数必须**增长**(spec §12.4 末尾那条)。
     GREW=0
@@ -1041,7 +1084,16 @@ print("%s|%s" % (d.get("chunks_added"), d.get("vectorized")))' "$WORK/acc3_appro
     if has_needle "$WORK/acc3_reply.txt" "$M2"; then
       ok "③ 回复含核准答案的特征串"
     else
+      # ⚠️ **先分清「内容回归」与「超时截断」**(C9:超时型失败先查旋钮,别叫回归)。
+      # 这一轮的请求由 `ask()` 发,带 `--max-time 300`;而每一次模型往返各自受
+      # `LLM_TIMEOUT_SECONDS`(默认 60s)约束。回复被**截断**时,现象与「模型没转述
+      # 那段知识」长得一样 —— 都是「回复里没有特征串」。
       bad "③ 回复里没有核准答案的特征串(特征串取自**核准答案**,不是模型自由文本)"
+      if [ ! -s "$WORK/acc3_reply.txt" ] || ! has_event "$WORK/acc3.sse" done; then
+        echo "     ⚠️ 这一轮的回复不完整(没有 done 帧或回复为空)⇒ **先查旋钮再叫回归**:" \
+             "LLM_TIMEOUT_SECONDS(默认 60s)/ ask() 的 curl --max-time 300 / 上游限流;"
+        echo "        证据:$WORK/acc3.sse"
+      fi
     fi
     if has_needle "$WORK/acc3_reply.txt" "$H_FALLBACK"; then
       bad "③ 重问**仍然**是兜底话术 —— 知识入库了却没被用上"
@@ -1097,10 +1149,14 @@ EOF
       if reviewcheck "$WORK/acc4_detail.json" "$WORK/q4.txt" "$H_WATER" > "$WORK/acc4_check.txt" 2>&1; then
         sed 's/^/    /' "$WORK/acc4_check.txt"
         ok "④ 待审行里有**那一轮的问题原话**(逐字相等)"
+        # **入口串味是 FAIL,不是 WARN**:三个入口(`置信度闸` / `生成自评` /
+        # `用户反馈`)存在的**全部意义**就是「这一行进池的原因分得开」——
+        # 一个 👎 落的行进成了「置信度闸」,审核人读到的原因就是错的,
+        # 而它在上一条断言(原话逐字相等)上照样绿。
         if has_needle "$WORK/acc4_check.txt" "$H_USER_FEEDBACK"; then
           ok "④ 它的入口是「用户反馈」(三个入口分得开)"
         else
-          warn "④ 入口不是「用户反馈」—— 看上面的 ENTRY 行"
+          bad "④ 入口不是「用户反馈」($(grep '^ENTRY=' "$WORK/acc4_check.txt" | head -1))—— 三入口串味了"
         fi
         if grep -q '^SNAP=[1-9]' "$WORK/acc4_check.txt"; then
           ok "④ 召回片段快照有内容($(grep '^SNAP=' "$WORK/acc4_check.txt"))"
@@ -1157,6 +1213,15 @@ if [ "$INTENT_OK" = "1" ]; then
   N_INTENTS=$(awk '/^-+$/{f=1;next} f&&/^[^ ].*  *[0-9]+  *[0-9]+$/{print $1}' \
     "$WORK/acc5_intent.txt" | sort -u | wc -l)
   ok "⑤ 输出里有 $BODY 个意图行(去重后 $N_INTENTS 个不同意图)≥ 2"
+  # ⚠️ **口径提醒**:这条断的是「窗口内至少两个 `intent:*` 行」——**窗口里的外来流量
+  # 也能满足它**(本脚本跑之前 30 分钟内若有别人打过聊天接口,一样算数)。
+  # 所以这里**标出本轮的贡献**:表里有没有本轮造的那个业务意图(物流/订单)。
+  if has_needle "$WORK/acc5_intent.txt" "$H_LOGISTICS" || \
+     has_needle "$WORK/acc5_intent.txt" "$H_ORDER"; then
+    ok "⑤ 表里有**本轮造的那个业务意图**行(物流/订单)—— 本轮的贡献就是它"
+  else
+    warn "⑤ 表里的意图行**没有一个是本轮造的**(本轮那句业务问题还没进 ingestion?)⇒ 这条断言的判别力这一轮打折,别读成「脚本造的两条都在」"
+  fi
   if has_needle "$WORK/acc5_intent.txt" "$H_HOTTEST"; then
     ok "⑤ 输出里能看出 token 最多的那个意图"
   else
@@ -1176,13 +1241,22 @@ echo "   (两轮 --limit 5;**不看「总共有几轮」** —— eval_runs 里�
 EVAL_OK=1
 TS1=""; TS2=""
 for round in 1 2; do
+  # ⚠️ **跑前跑后各取一次 `MAX(id)`**:只取跑后那一次的话,把「这一轮落的那一行」
+  # 与「上一次跑留下的那一行」当成同一个东西 —— `run_eval.py` 今天插不进去是
+  # 非零退出(`_record_eval_run` 在 `main` 里最后一步),所以眼下是**潜伏**;
+  # 一旦哪天它改成「落库失败只警告」,⑥ 就会拿旧行的时间戳去趋势表里找,
+  # 红在「找不到本轮」而不是「这一轮没落库」。
+  EVAL_ID_BEFORE=$(dbq eval-max | tr -d '\r' | cut -d'|' -f1)
   PYTHONPATH="$PWD" "$PYTHON" scripts/run_eval.py --limit 5 --trigger manual \
     > "$WORK/acc6_eval$round.log" 2>&1
   rc=$?
   LAST_ROW=$(dbq eval-max | tr -d '\r')
-  echo "  第 $round 轮 --limit 5:退出码=$rc,新落的一轮:$(echo "$LAST_ROW" | tr '|' ' ')"
-  if [ "$rc" != "0" ]; then
+  LAST_ID=$(echo "$LAST_ROW" | cut -d'|' -f1)
+  echo "  第 $round 轮 --limit 5:退出码=$rc,eval_runs 的 MAX(id):${EVAL_ID_BEFORE:-空} → ${LAST_ID:-空}"
+  echo "    新落的一轮:$(echo "$LAST_ROW" | tr '|' ' ')"
+  if [ "$rc" != "0" ] || [ -z "$LAST_ID" ] || [ "$LAST_ID" = "$EVAL_ID_BEFORE" ]; then
     EVAL_OK=0
+    boom "⑥ 第 $round 轮没有在 eval_runs 里留下新行(退出码=$rc,id ${EVAL_ID_BEFORE:-空} → ${LAST_ID:-空})"
     echo "    控制台尾:"; tail -20 "$WORK/acc6_eval$round.log" | sed 's/^/      /'
   fi
   if [ "$round" = "1" ]; then TS1=$(echo "$LAST_ROW" | cut -d'|' -f2); else TS2=$(echo "$LAST_ROW" | cut -d'|' -f2); fi
@@ -1203,10 +1277,15 @@ else
   # C4:⑥ 必须收在**一轮全量**上 —— `--limit 5` 会把 `evals/results/latest.json`
   # 写成那 5 条的结果,而 admin 评测页读的就是它。**不手工还原那个文件**(手工还原
   # 会与 `eval_runs` 里最后那一轮对不上);跑一轮不带 `--limit` 的。
+  FULL_BEFORE=$(dbq eval-max | tr -d '\r' | cut -d'|' -f1)
   PYTHONPATH="$PWD" "$PYTHON" scripts/run_eval.py --trigger manual > "$WORK/acc6_eval_full.log" 2>&1
   FULL_RC=$?
   LAST_FULL=$(dbq eval-max | tr -d '\r')
-  echo "  收尾的全量轮:退出码=$FULL_RC,最后一行:$(echo "$LAST_FULL" | tr '|' ' ')"
+  echo "  收尾的全量轮:退出码=$FULL_RC,eval_runs 的 MAX(id):${FULL_BEFORE:-空} → $(echo "$LAST_FULL" | cut -d'|' -f1)"
+  echo "    最后一行:$(echo "$LAST_FULL" | tr '|' ' ')"
+  if [ "$FULL_RC" != "0" ] || [ "$(echo "$LAST_FULL" | cut -d'|' -f1)" = "$FULL_BEFORE" ]; then
+    boom "⑥ 收尾的全量轮没有在 eval_runs 里留下新行(退出码=$FULL_RC)"   # 下面的趋势断言会跟着红,这里先说清原因
+  fi
   PYTHONPATH="$PWD" "$PYTHON" scripts/eval_trend.py > "$WORK/acc6_trend_full.txt" 2>&1
   if trendcheck full "$WORK/acc6_trend_full.txt" > "$WORK/acc6_full.txt" 2>&1; then
     sed 's/^/    /' "$WORK/acc6_full.txt"
@@ -1242,9 +1321,29 @@ echo "  ③ 通过 → 再问答对     见 $WORK/acc3_reply.txt"
 echo "  ④ 👎 → 落池 → 待审   见 $WORK/acc4_check.txt"
 echo "  ⑤ 按意图 token 花销   见 $WORK/acc5_intent.txt"
 echo "  ⑥ 评估两轮趋势        见 $WORK/acc6_trend.txt / $WORK/acc6_trend_full.txt"
+echo ""
+echo "== 局限(「6/6 通过」不等于这些也被验过)—— 如实列在这里,不许读成全绿 =="
+# ⚠️ **这几行一律用单引号**:里面有反引号(在双引号里会被 bash 当**命令替换**执行 ——
+# 实测踩过:`` `tests/test_agent_gate_ch09.py` `` 那一段让 bash 真去跑那个 py 文件,
+# 于是收尾清单里混进一屏 `import: command not found`,而脚本照样打「6/6 通过」)。
+echo '  * ① 的「界面能点开、点开之后是什么样」**没有自动化覆盖**:脚本断的只有数据在不在'
+echo '    (观测齐、同一条 trace、根是 chat)。要看界面,请人拿上面那行 traceId 去 Langfuse 打开。'
+echo '  * **闸那条 evidence_snapshot 没有端到端覆盖**:② 问的是**零召回**的问题 ⇒'
+echo '    没有任何片段可快照;而零召回那一支里「闸写了这一列」与「闸漏了 evidence_snapshot=」'
+echo '    落出来的**都是 JSON null** ⇒ ② 那条断言对它本该抓的那个 bug **不变**。'
+echo '    「手里有块却被闸拦」那一支(需要把两个旋钮调近,见本文件 Header B)在本链路'
+echo '    结构上够不到 —— 它由 tests/test_agent_gate_ch09.py 守着,不在端到端验收覆盖内。'
+echo '    **不为了凑覆盖去构造弱召回场景**(那要改服务端旋钮,验的是场景不是产品)。'
+echo '  * ⑤ 的口径是「窗口内至少两个 intent:* 行」—— **窗口里的外来流量也能满足它**;'
+echo '    本轮自己只贡献了一个业务意图轮次(输出里会标出那一行在不在)。'
+echo '  * ② 的候选每跑一轮消耗一条(CAND_Q1..CAND_Q8,8 条),用尽会**响亮地报**「请加一条」。'
+echo "  * 本脚本**会真的往共享表里写东西**(池子 / 待审队列 / 知识库 / eval_runs,以及"
+echo "    conversations / messages / tool_audit_logs),且一次跑要好几分钟(收尾那一轮是 300 条全量评估)。"
 if [ "$FAIL" -eq 0 ]; then
+  echo ""
   echo "6/6 通过"
 else
+  echo ""
   echo "有失败项 —— 证据留在 $WORK/,**不许把它读成全绿**"
 fi
 [ "$FAIL" -eq 0 ] || exit 1
