@@ -527,7 +527,7 @@ sigmoid + **全局单阈值 0.5** 作基线;验证集上做一次 **0.3–0.7 �
 | `app/tools/builtin/handoff.py` | **新增**内置工具 `transfer_to_human`(模拟):返回工号 + 预计等待。伪随机用 `hashlib.sha256` 种子(**本仓硬约束,不能用内置 `hash()`**) |
 | `app/tools/policy.py` | **显式**声明 `transfer_to_human` 是 `read` + 注释写清为什么。⚠️ 注意:`policy.py` 的规矩是「未声明 = 只读」,所以这行声明**在行为上是空操作** —— 它的价值是「让这个决定可被 grep 到、可被 review」,而**真正的守卫是一条测试**(见 §11.3) |
 | `app/agent/state.py`、`nodes.py` docstring | 「八类」→「九类」 |
-| `app/topic/taxonomy.py` | `INTENT_TO_TOPICS` 加 `"转人工": ("其他",)`(§4.3 那条测试会强制它) |
+| ~~`app/topic/taxonomy.py`~~ | ⚠️ **本条不在 A 支里做**:该文件由 B 支创建,A 支先做时它还不存在。`INTENT_TO_TOPICS` 从**诞生起就带 `"转人工"`**(§4.3 那张表已经是 9 行),§4.3 那条「`INTENT_LABELS ⊆ INTENT_TO_TOPICS`」的测试由 B 支写。**这也是 A 支必须先做的原因**:B 支写映射表时意图集已经冻结 |
 | `app/static/index.html` | 投诉出口那个「转人工」按钮**改成发一条「转人工」消息**走真实路径,不再本地模拟(Vibe Coding) |
 | `tests/test_agent_routing.py` | 穷举从 8 类扩到 9 类 |
 | `evals/intent_cases.jsonl` | 加转人工正例 + 投诉/转人工 边界负例 |
