@@ -2377,15 +2377,13 @@ Expected: 训练跑完,`models/topic-clf/` 里有 `labels.json` / `inference_con
 
 > ⚠️ 若 CUDA OOM,先把 `per_device_train_batch_size` 降到 16 —— **不要**去动 `max_length`(它由实测的句长定的)。
 
-- [ ] **Step 7: 把产物目录加进 `.gitignore`**
+- [ ] **Step 7: 确认产物目录已被忽略(已核:`models/` 早就在 `.gitignore` 里,不用新增规则)**
 
-在 `.gitignore` 末尾加:
+Run: `grep -n "^models/" .gitignore`
+Expected: 打印出 `models/`(它在 ch04 起就在了)。
 
-```
-# ch10:训练产物(400MB 二进制,与 evals/results/ 同规矩)。
-# 可复现性靠脚本 + 冻结的测试集,不靠权重入库。
-models/topic-clf/
-```
+⚠️ **不要为此新增一条 `models/topic-clf/`** —— `models/` 已经覆盖它,再加一条是噪音,
+而下一个人会以为「这条路径特殊、需要单独排除」。**真正要做的只有 Step 8 的验证。**
 
 - [ ] **Step 8: 确认真的没被 git 跟踪**
 
@@ -2757,7 +2755,7 @@ async def test_unique_key_makes_reclassification_idempotent():
     这边是**确定性重算**(同一输入就该覆盖旧值)。两件事性质相反。
     """
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         async with sm() as session:
             await session.execute(
@@ -2798,7 +2796,7 @@ async def test_labels_are_readable_with_json_type():
     去数「有快照的行」,把 JSON `null` 数成了非空)。这里把读法钉死。
     """
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         async with sm() as session:
             await session.execute(
@@ -3093,7 +3091,7 @@ async def test_aggregation_uses_json_table():
     「一次请求拉全表」,而它在演示规模下完全看不出来。
     """
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         await _seed(sm)
         async with sm() as session:
@@ -3109,7 +3107,7 @@ async def test_aggregation_uses_json_table():
 async def test_multi_label_row_counts_toward_every_label():
     """一行带两个标签,在**两个**桶里各算一次 —— 这是多标签的正确读法。"""
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         await _seed(sm)
         async with sm() as session:
@@ -3128,7 +3126,7 @@ async def test_zero_count_labels_are_still_returned():
     「这一类没问题」—— 恰恰相反,它们是一条样本都没有。
     """
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         async with sm() as session:
             body = await distribution(session=session)
@@ -3142,7 +3140,7 @@ async def test_zero_count_labels_are_still_returned():
 async def test_empty_table_returns_zeroes_not_an_error():
     """没跑过批处理时返回零值结构,而不是 500 —— 页面第一次打开就是这个状态。"""
     engine = get_engine()
-    sm = get_sessionmaker(engine)
+    sm = get_sessionmaker()
     try:
         async with sm() as session:
             body = await distribution(session=session)
