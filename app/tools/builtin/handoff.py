@@ -9,8 +9,15 @@
    它的价值是可 grep、可 review;真正的守卫是 `tests/test_handoff_tool.py`
    里那条「将来有人改成 write 会被拦下」的断言。
 
-2. **不加 `session` 依赖。** 它不落库 —— 转人工的留痕由 `conversations.status`
-   与既有的建单路径负责(ch08 的 `create_ticket` 会把会话置 `pending_human`)。
+2. **不加 `session` 依赖。** 它不落库,而且**转人工这一轮本来就没有业务行**:
+   `conversations.status` 至今只有**一个**写方 —— `app/tools/builtin/tickets.py`
+   的 `create_ticket`(置 `pending_human`),而它只在用户**另外**要建工单时才跑;
+   用户只说「转人工」时那一列**一动不动**。这轮唯一的痕是**执行器为这次调用落的
+   `tool_audit_logs` 行**(`status=success`,见 `app/tools/executor.py`)——
+   它是痕,但不是业务留痕。
+   ⚠️ 这里原先写的是「转人工的留痕由 `conversations.status` 与既有的建单路径负责」
+   —— **是错的**(审查 M3):那是**建工单**的路径,不是转人工的;
+   验收脚本自己的局限行当时也写着「它今天确实不留痕」,两处互相矛盾。
    本工具刻意**不做**那件事:用户要的是转人工,不是建工单。
 
 3. **`build()` 的签名与其他 builtin 模块一致**,包内自动发现按这个签名调用;

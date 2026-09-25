@@ -7,8 +7,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph, get_checkpointer
 from app.agent.nodes import make_resolve_references_node
+from app.agent.routing import INTENT_TO_ROUTE
 from app.config import Settings
 from app.retrieval.search import RetrievedChunk
+from app.tools.builtin.handoff import build as build_handoff
+from app.tools.registry import _spec_from_tool
 
 
 class _Intent:
@@ -145,7 +148,7 @@ def _settings(**over):
 
 
 def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None,
-           confidence=0.9):
+           confidence=0.9, tools=(), registry=None):
     session = RecordingSession()
     # rounds is None 才用默认;显式传 [] 要保留成空脚本 ——
     # 那是「碰模型就炸」的探针,`rounds or [...]` 会把空列表换掉、探针失效。
@@ -154,7 +157,14 @@ def _graph(intent, *, retriever=None, rounds=None, settings=None, frames=None,
             ScriptedModel(rounds if rounds is not None else [[FakeChunk("模型回复")]])
         ),
         intent_model=ScriptedModel([[_Intent(intent, confidence)]]),
-        tools=[], registry={}, settings=settings or _settings(),
+        tools=list(tools),
+        # `tools` 给的是**工具**,注册表要的是 `name → ToolSpec`;转换收在这里,
+        # 与 `tests/test_agent_node.py::_reg` 同款。放在调用点的话每个用到工具的
+        # 用例都要自己写一遍,而写错的样子是 `execute_tool` 报「工具不存在」
+        # —— 指向的是测试脚手架,不是实现。
+        registry={name: _spec_from_tool(tool, source="builtin")
+                  for name, tool in (registry or {}).items()},
+        settings=settings or _settings(),
         retriever=retriever or FakeRetriever(),
         session=session, conversation_id="conv-1",
         emit=(frames.append if frames is not None else (lambda p: None)),
@@ -256,6 +266,110 @@ async def test_fallback_route_for_out_of_vocabulary_intent():
     out = await _run(graph, "帮我写首诗")
     assert "没太理解" in out["reply"]
     assert "classify_intent:其他" in out["trace"]
+
+
+@pytest.mark.anyio
+async def test_handoff_intent_reaches_the_agent_and_calls_transfer_to_human():
+    """ch10-A 第九类「转人工」的**图级**接线:标签 → 路由值 → 节点 → 工具。
+
+    本文件此前那五条出口用例(商品咨询 / 物流 / 闲聊 / 投诉 / 其他)**一条都碰不到
+    「转人工」** —— 而它的接线是**两个字典各写一半的约定**:
+    `app/agent/routing.py` 把标签「转人工」映成路由值 `HANDOFF`,
+    `app/agent/graph.py` 再把 `HANDOFF` 映到节点 `"agent"`。
+    两处之间**没有任何东西把它们绑在一起**:把 graph.py 那一行删掉(或指到别的节点),
+    每一轮「转人工」都会在图这一层失败,而**没有一条快测试会红** ——
+    eval 集抓不到(分类器判得**对**),只有打网络的验收脚本会看见(审查 I1)。
+
+    ⚠️ **一定要真的走到 `agent` 节点**,不能只看 `route_by_intent` 的返回值:
+    后者是 `tests/test_agent_routing.py` 那条用例的事,它对「图怎么接」零判别力。
+    这里的证据是 `agent` 节点的 trace(`agent:step1 tool=...`,由
+    `app/agent/nodes.py` 在工具**真的执行过**之后追加)+ `tool_calls_made`
+    + 帧里的 `tool_call` / `tool_result`。
+    """
+    frames = []
+    retriever = FakeRetriever()
+    # 用**真的**内置工具(不是替身):这条要钉的名字 `transfer_to_human` 与
+    # `app/tools/builtin/handoff.py` 里那个是**同一个契约** —— 改名时这里必须跟着动。
+    # 换成替身的话,「工具改名了、而 Agent 调不到它」会**静默**过去。
+    tool = build_handoff(session=None, conversation_id="conv-1", retriever=None)[0]
+    graph, _ = _graph(
+        "转人工",
+        retriever=retriever, frames=frames,
+        tools=[tool], registry={"transfer_to_human": tool},
+        rounds=[
+            # 第 1 轮:模型调工具。`FakeChunk` 会替每条 `tool_calls` 补上
+            # `"type": "tool_call"`(缺了它 `BaseTool.ainvoke` 会把整个 dict
+            # 当成**参数**去校验,于是每次调用都返回一个假的「参数不合法」)。
+            [FakeChunk("", tool_calls=[{
+                "name": "transfer_to_human",
+                "args": {"reason": "我要转人工"},
+                "id": "call_h1",
+            }])],
+            # 第 2 轮:不绑 tools 的收尾轮(ch05 的结构保证)⇒ 这一段就是回复。
+            [FakeChunk("已为您转接人工客服,工号 A102。")],
+        ],
+    )
+    out = await _run(graph, "我要转人工")
+
+    # 转人工**不是**知识类:不检索、不过置信度闸(spec §11.3 的「不开新出口」)。
+    assert retriever.calls == []
+    assert not any(t.startswith("confidence_gate") for t in out["trace"])
+    assert "classify_intent:转人工" in out["trace"]
+    # **走到了 agent 节点,并且工具真的执行了**。两半都断,因为只看后者的话,
+    # 「路由到了别的节点、那儿碰巧也调了这个工具」也会绿。
+    assert "agent:step1 tool=transfer_to_human" in out["trace"]
+    assert [c["name"] for c in out["tool_calls_made"]] == ["transfer_to_human"]
+    assert out["tool_calls_made"][0]["ok"] is True
+    assert out["agent_steps"] == 2
+    # 帧这一层(验收 ②/②b 读的就是它):call 发出去过、result 是 ok。
+    assert {"frame": "tool_call", "name": "transfer_to_human",
+            "args": {"reason": "我要转人工"}, "tool_call_id": "call_h1"} in frames
+    results = [f for f in frames if f["frame"] == "tool_result"]
+    assert len(results) == 1 and results[0]["ok"] is True
+    assert results[0]["tool_call_id"] == "call_h1"
+    # 收尾那一轮的文本就是给用户的回复,而且这一轮走完了整张图。
+    assert out["reply"] == "已为您转接人工客服,工号 A102。"
+    assert out["trace"][-1] == "log_turn"
+
+
+def test_every_route_value_is_wired_to_a_node_in_the_graph():
+    """**完整性守卫**:`INTENT_TO_ROUTE` 的每个路由值都必须在 `classify_intent`
+    的条件边字典里当键出现(审查 I1 的第 2 半)。
+
+    为什么不靠上面那条「转人工走 agent」的用例:它只盯**一个**路由值。
+    将来加第十类意图、`INTENT_TO_ROUTE` 多一行、而忘了改 graph.py 时,
+    新增的那一类**每一次**都会在图里炸(路由值不在 path_map 里)—— 而那时红的
+    是运行时的整轮对话,不是测试。计划点名当这个守卫的
+    `test_outlets_are_still_exactly_five`(在 `tests/test_agent_routing.py`)守的是
+    **另一件事**(出口数没变多),对「加了意图却没接线」**零判别力**
+    —— 那一条按复审的意见**保持原样**,这条新的才是这个用途的守卫。
+
+    读的是**编译后的图**(`builder.branches[...].ends`),也就是 langgraph 真正
+    拿到的那份映射 —— 不是把 graph.py 的字典再抄一遍(抄一遍等于两处同源,
+    改了哪边都测不出来)。**不**用 `get_graph()`:它会把「键与值相同的 path_map」
+    折成 `data=None`(实测 `refund_fetch_order` 那两条边就是这样),于是
+    「路由值恰好与节点名同名」时这条断言会**少一个键** —— 而那不是缺陷。
+    装置本身失效时(取不到那条分支/映射)会**红在半路**,不会静默变成「集合相等」。
+    """
+    graph, _ = _graph("闲聊", rounds=[])
+    branches = graph.builder.branches["classify_intent"]
+    ends = [spec.ends for spec in branches.values()]
+    assert len(ends) == 1 and ends[0], (
+        f"读不到 classify_intent 的条件边映射(拿到 {ends})—— 这条守卫的装置坏了"
+    )
+    wired = set(ends[0])
+
+    expected = set(INTENT_TO_ROUTE.values())
+    missing = sorted(expected - wired)
+    extra = sorted(wired - expected)
+    assert not missing, (
+        f"这些路由值在 graph.py 的 classify_intent 条件边里**没有接线**:{missing} "
+        f"(实际接了 {sorted(wired)})—— 命中这些路由值的那一类意图,"
+        f"每一次都会在 langgraph 里炸,而没有任何快测试会先红"
+    )
+    assert not extra, (
+        f"这些条件边键不是任何意图的路由值:{extra} —— 死边(写错了或意图被删了)"
+    )
 
 
 @pytest.mark.anyio
