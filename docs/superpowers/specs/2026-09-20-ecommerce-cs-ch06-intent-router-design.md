@@ -308,3 +308,26 @@ app/static/index.html     订单卡片 + 退款表单(Vibe Coding)
 8. **`refund_requests` 的 DDL 去掉 `IF NOT EXISTS`**(§6.1 已就地订正)。
    原因是一个**静默**分歧:`create_all` 建的表没有 SQL DEFAULT,而 `IF NOT EXISTS` 让
    `.sql` 的每次应用都是无声 no-op ⇒ 本文件成了一张**哪儿都不存在的表**的文档。
+
+---
+
+## 后记:第九类「转人工」(2026-09-25,ch10-A 补入)
+
+**追加,不改上文。** 上文 §3.1 / §3.2 写的是**八类** —— 那是 ch06 交付时的实况,
+历史记录保持原样。
+
+ch10-A 把「转人工」补成**真正的第九类**:`INTENT_TO_ROUTE["转人工"] = HANDOFF`,
+`graph.py` 把 `HANDOFF` 指向**已有的 `agent` 节点**(不开新出口,`_OUTLETS` 仍 5 个),
+由 Agent 调 `app/tools/builtin/handoff.py` 的**模拟**工具 `transfer_to_human`。
+
+**ch06 交付时它在哪**:`app/agent/nodes.py` 的 `CHOICE_HANDOFF`,只由**投诉出口**
+发一个 `choices` 帧,`app/static/index.html` 接住后**纯前端模拟**(源码注释原文:
+「不接真人系统、不调后端」)。它当时**既不是意图、也不是出口**。
+
+**一处与 ch06 立身之本的冲突,已知情接受**:ch06 的原则是「模型只决定意图标签,
+不决定走向」(`routing.py` 模块 docstring)。而转人工走 Agent 之后,**它发生不发生
+取决于模型记不记得调工具** —— 这是全仓唯一一处例外。结构上拦不住,只能用
+`scripts/acceptance_ch10.sh` 把它测成一个**比例读数**(见 ch10 spec §11.4)。
+
+**沿革的另一半**:投诉出口那个「转人工」按钮同时改成了**发一条真实消息**走这条新路径,
+消除「同一个词两套行为」。

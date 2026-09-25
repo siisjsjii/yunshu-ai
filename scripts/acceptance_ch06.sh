@@ -149,7 +149,8 @@ except (IndexError, json.JSONDecodeError):
 sys.stdout.buffer.write(b"yes" if any(needle in t for t in trace) else b"no")' "$1"
 }
 
-# done 帧里 `intent` 是否落在**八类闭集**内(app/agent/routing.py 是那份标签表的
+# done 帧里 `intent` 是否落在**九类闭集**内(ch10-A 起「转人工」是第九类;
+# app/agent/routing.py 是那份标签表的
 # 唯一来源,这里读它而不是抄一份 —— 抄一份的话,标签表改了脚本不会跟着改)。
 # 「JSON 可解析」的落点就是这个:分类器解析失败时会**降级成「其他」**,那条路径同样
 # 输出一个非空的 intent,所以「非空」本身证明不了任何事,必须在**枚举**上断。
@@ -460,7 +461,7 @@ echo
 
 # ══════════════════════════════════════════════════════════════════════════
 echo "== 验收 2:意图 JSON 可解析 + 怪问题落「其他」 =="
-# ①「可解析」的落点是**八类闭集**。分类器解析失败时会把 intent 降级成「其他」并
+# ①「可解析」的落点是**九类闭集**。分类器解析失败时会把 intent 降级成「其他」并
 #    把 confidence 置 0 —— 那条路径同样给出一个**非空的 intent**,所以
 #    「done 帧的 intent 非空」本身证明不了任何事(它是恒真的),必须在枚举上断。
 # ② 怪问题落「其他」要三处同时成立:标签是「其他」、trace 走了 fallback_reply 出口、
@@ -470,9 +471,9 @@ ask "$SID2" "你好" > /tmp/ch06_2a.sse
 ask "$SID2" "请用 Python 写一个快速排序算法" > /tmp/ch06_2b.sse
 
 if [ "$(intent_in_enum < /tmp/ch06_2a.sse)" = "yes" ]; then
-  ok "普通问题的 intent 落在八类闭集内:$(done_field intent < /tmp/ch06_2a.sse)(confidence=$(done_field confidence < /tmp/ch06_2a.sse))"
+  ok "普通问题的 intent 落在九类闭集内:$(done_field intent < /tmp/ch06_2a.sse)(confidence=$(done_field confidence < /tmp/ch06_2a.sse))"
 else
-  bad "done 帧的 intent 不在八类闭集内或取不到:$(done_field intent < /tmp/ch06_2a.sse) —— 分类器没解析出结构化出参(降级成「其他」)"
+  bad "done 帧的 intent 不在九类闭集内或取不到:$(done_field intent < /tmp/ch06_2a.sse) —— 分类器没解析出结构化出参(降级成「其他」)"
 fi
 
 W2=$(done_field intent < /tmp/ch06_2b.sse)

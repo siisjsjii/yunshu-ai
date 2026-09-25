@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **ch04(知识库管理台)** 交付(分支 `ch04-kb-console`):文档查看/在线上传、后台触发向量化与从会话挖知识,独立管理页 `admin.html`。核心是 `app/kb/jobs.py`(JobStore)+ `app/kb/orchestrate.py`(后台任务:专用线程 + **自建独立 engine**)+ `app/api/kb.py`(7 端点)。
 - **ch04 增补(混合检索 + 重排 + 评估)** 交付:Milvus BM25(`text` 字段 jieba analyzer + BM25 Function)+ `hybrid_search` RRF + bge-reranker-v2-m3 重排(候选池 20,CPU 性能约束);生成 QC(自评 json_mode → 拒答落 `low_confidence_questions` 池 + `citations` 帧 + 负面知识 prompt);四策略评估 `scripts/run_eval.py`。设计源见 ch04 增补 spec §13。
 - **ch05(生产级架构:LangGraph 确定性编排 + 主力 ReAct Agent)** 已合并 `main`:把 `/api/chat/stream` 从「模型单轮选工具」换成 **确定性图骨架** —— `resolve_references → classify_intent → route_by_intent`(纯函数,写死在代码里)→ 五出口;知识类走强制预检索 + 置信度闸再进 Agent,业务类直交 Agent;Agent 是骨架里的**一个节点**(手写 ReAct,第二轮**不绑 tools** 是结构保证)。含 `POST /api/ticket`、聊天页两个独立按钮。设计源见 ch05 spec。
-- **ch06(分流器正式版)** 交付(分支 `ch06-intent-router`):把 ch05 里占位的前两个节点做成正式版 —— **八类意图**(含「其他」)+ `{intent, confidence}` 强制 JSON;**指代消解 + Query 改写**(失败原样透传);**退款退货/售后走一条确定性子流程**(取订单 → Query 扩写 + 强制检索政策 → 主力 Agent 判「这一单能不能退」→ 给退款表单或说明原因);**缺订单号时 `interrupt()` 真挂起**,前端渲染订单卡片,点选后 `Command(resume=...)` 同 thread 续跑;`POST /api/refund` + `refund_requests` 表。设计源见 ch06 spec。
+- **ch06(分流器正式版)** 交付(分支 `ch06-intent-router`):把 ch05 里占位的前两个节点做成正式版 —— **九类意图**(含「其他」;**第九类「转人工」是 2026-09-25 ch10-A 补入的,走主力 Agent**)+ `{intent, confidence}` 强制 JSON;**指代消解 + Query 改写**(失败原样透传);**退款退货/售后走一条确定性子流程**(取订单 → Query 扩写 + 强制检索政策 → 主力 Agent 判「这一单能不能退」→ 给退款表单或说明原因);**缺订单号时 `interrupt()` 真挂起**,前端渲染订单卡片,点选后 `Command(resume=...)` 同 thread 续跑;`POST /api/refund` + `refund_requests` 表。设计源见 ch06 spec。
 
 - **ch07(上下文管理:三层滑窗 + 后台摘要 + 多会话)** 交付(分支 `ch07-context`):把 ch01 那条「按整轮裁到 token 预算」的单层裁剪升级成**三层结构** —— 最近**原文**(层 1,预算七成)/ 中间**截短**(层 2,三成)/ 最远**梗概**(后台摘要),两个锚点(`summary_upto_msg_id` / `layer1_from_msg_id`,都是 `messages.id`)划边界,**降级只挪 id、不搬数据**;token 预算**从模型窗口倒推**(`memory/budget.py`),不写死常量;每轮打两行 JSON 上下文日志(`model_ctx` / `history_ctx`);**工具结果本章起落表**(`role='tool'`);前端加**会话侧栏 + 切换回载**。设计源见 ch07 spec。
 
@@ -44,6 +44,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   (通过 ⇒ 立刻写知识库并**同步向量化**,否则「重问就答对」要等下次 `build_kb`)或驳回;
   审核页在 `admin.html` 的「待审」标签页;`scripts/run_eval.py`(加 `--trigger`)+ `scripts/eval_trend.py`
   把每轮评估记进 `eval_runs` 并打趋势表。设计源见 ch09 spec(**§15 订正最多的一章**,15.1–15.15)。
+
+- **ch10-A(「转人工」补成第九类意图)** 交付(分支 `ch10-topic-classifier`;ch10 是两章,
+  **A 支(转人工)先做、B 支(微调多标签主题分类器)在后**)。ch06 交付时「转人工」**既不是意图、
+  也不是出口** —— 它只是投诉出口发的 `choices` 帧,由前端**纯前端模拟**。ch10-A 把它补成
+  **真正的第九类**:`app/agent/routing.py` 的 `INTENT_TO_ROUTE["转人工"] = HANDOFF`(9 键)、
+  `INTENT_LABELS` 9 元组;`app/agent/graph.py` 把 `HANDOFF` 指向**已有的 `agent` 节点**
+  (**不开新出口**,`_OUTLETS` 仍 5 个),由 Agent 调内置的**模拟**工具 `transfer_to_human`
+  (`app/tools/builtin/handoff.py`,不接真人系统)。该工具在 `app/tools/policy.py` 里
+  **显式声明为 `read`**、不在 `WRITE_TOOLS` 里 ⇒ `kind_of` 放行直调、**不过 ch08 的确认流**。
+  投诉出口那个「转人工」按钮同时改成**发一条真实消息**(消除「同一个词两套行为」)。
+  ⚠️ **一处与 ch06 立身之本的冲突,已知情接受**:ch06 的原则是「模型只决定意图标签、
+  不决定走向」(`routing.py` 模块 docstring),而转人工走 Agent 之后**它发生不发生取决于
+  模型记不记得调工具** —— 这是全仓**唯一一处**例外,结构上拦不住,只能由
+  `scripts/acceptance_ch10.sh` 把它测成一个**比例读数**(三层:意图 / 工具被调 / 回复含工号或等待)
+  并把读数如实写进 `dev-notes/ch10.md`(见 ch10 spec §11.4)。
 
 **ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop、认证。
 
@@ -357,7 +372,7 @@ SSE 事件协议:`meta` → `token` / `tool_call` → `tool_result` → `done` /
 
 **`create_ticket` 的 `conversation_id` 用闭包工厂,不用 `InjectedToolArg`**。后者对模型隐藏了字段,但值必须另行注入,而该机制在 langchain-core 1.6.3 上无文档 —— 直接用 `tool_call` 调用会抛 `ValidationError`。闭包让参数**根本不在签名里**。
 
-**工具伪随机必须用 `hashlib.sha256` 种子,不能用内置 `hash()`**。`hash()` 对 str 每进程随机化,会让「同一订单号永远返回同样数据」在重启后失效,而**同进程内的测试完全测不出来**(`test_seed_tools_random.py` 里有一条跨进程测试专钉这个)。
+**工具伪随机必须用 `hashlib.sha256` 种子,不能用内置 `hash()`**。`hash()` 对 str 每进程随机化,会让「同一订单号永远返回同样数据」在重启后失效,而**同进程内的测试完全测不出来**(`test_tools_random.py` 里有一条跨进程测试专钉这个)。
 
 **重试用白名单,不是黑名单**。只重试幂等的 `query_*`;**`create_ticket` 永不重试**(超时后重试会建出两张工单)。`ToolNotFound` 与 `ValidationError` 也都不重试 —— 重放同样的参数只会同样失败。
 
