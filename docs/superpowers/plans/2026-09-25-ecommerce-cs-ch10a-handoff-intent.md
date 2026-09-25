@@ -452,9 +452,15 @@ def handoff_record(reason: str) -> dict:
    它的价值是可 grep、可 review;真正的守卫是 `tests/test_handoff_tool.py`
    里那条「将来有人改成 write 会被拦下」的断言。
 
-2. **不加 `session` 依赖。** 它不落库 —— 转人工的留痕由 `conversations.status`
-   与既有的建单路径负责(ch08 的 `create_ticket` 会把会话置 `pending_human`)。
-   本工具刻意**不做**那件事:用户要的是转人工,不是建工单。
+2. **不加 `session` 依赖。** 它不落任何业务行 —— **转人工本身唯一的留痕是
+   `tool_audit_logs` 里那一行**(执行器的审计写口,A 支终审 M3 订正)。
+   本工具刻意**不做**建工单那件事:用户要的是转人工,不是建工单;
+   而 `conversations.status = 'pending_human'` 全仓**只有一个写点**
+   (`app/tools/builtin/tickets.py:59`),只在用户**另外**要求建单时才触发。
+
+   ⚠️ 这一条原先写的是「留痕由 `conversations.status` 与既有的建单路径负责」——
+   **那是假的**,而 `handoff.py` 的注释逐字抄了它 ⇒ 代码与验收证据互相矛盾。
+   终审抓到并两边都改了。**这里是同一个错的源头,一并订正。**
 
 3. **`build()` 的签名与其他 builtin 模块一致**,包内自动发现按这个签名调用;
    不用的参数照样要收,否则发现会失败。
