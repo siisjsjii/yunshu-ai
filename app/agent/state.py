@@ -18,13 +18,15 @@ from app.schemas import Message
 class IntentResult(BaseModel):
     """意图识别的结构化出参。取值越界由 routing 兜底,这里只描述形状。"""
 
-    # 这段枚举是**描述性的第三份标签表**:权威表是 `routing.INTENT_TO_ROUTE`
-    # (`INTENT_LABELS` 与它同源,`tests/test_agent_intent.py` 的标签守卫只看那两处,
-    # **看不见这里**)。而且 `json_mode` 这条路根本不把 schema 描述发给模型 ——
-    # 模型看到的八类在 `prompts.INTENT_SYSTEM_PROMPT` 里。所以这里的措辞改了
-    # 不会影响任何行为;留它是为了让读代码的人知道 `intent` 的取值域。
+    # ⚠️ **这里刻意不再列举标签名**(ch10-A)。原先它手写了八类,是**第三份**
+    # 标签表 —— 而 `tests/test_agent_intent.py` 的标签守卫只看
+    # `routing.INTENT_TO_ROUTE` 与提示词那两处,**看不见这里**(旧注释自己
+    # 写着这句)。加第九类时它就会静默过期,且**没有任何测试会红**。
+    # 唯一权威表是 `routing.INTENT_TO_ROUTE`;`json_mode` 这条路本来就
+    # 不把 schema 描述发给模型,所以这段文字只服务于读代码的人 ——
+    # 那就让它指向权威表,而不是再抄一份。
     intent: str = Field(
-        description="物流 / 订单 / 商品咨询 / 退款退货 / 售后 / 投诉 / 闲聊 之一;"
+        description="意图标签之一;取值域见 app.agent.routing.INTENT_TO_ROUTE。"
         "无法归入任何一类时为「其他」。"
     )
     confidence: float = Field(
@@ -130,7 +132,7 @@ class ChatState(TypedDict):
     resolved_input: str           # 本章 = user_input 原样
 
     # ---- 意图与检索 ----
-    intent: str                   # 八类之一(含「其他」)
+    intent: str                   # 九类之一(含「其他」)
     # 必须在这里**声明**:通道集合由 `StateGraph(ChatState)` 的注解决定,而
     # LangGraph 对未声明通道的写入是**静默丢弃**的(`wrote to unknown channel
     # ..., ignoring it`,只 warning 不抛)。T4 初版漏了这一行 —— `classify_intent`

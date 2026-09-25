@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def make_classify_intent_node(*, model):
-    """意图识别:一次 LLM(json_mode),输出八类之一。
+    """意图识别:一次 LLM(json_mode),输出九类之一。
 
     解析失败或越界一律降级为「其他」 —— **不抛异常**。理由:意图识别是骨架
     的第一步,它失败时整轮对话不该跟着崩;降级后由 `route_by_intent` 送进

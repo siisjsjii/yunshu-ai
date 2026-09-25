@@ -43,6 +43,7 @@ from app.agent.routing import (
     CHITCHAT,
     COMPLAINT,
     FALLBACK,
+    HANDOFF,
     KNOWLEDGE,
     REFUND,
     route_by_intent,
@@ -195,6 +196,9 @@ def build_graph(
             CHITCHAT: "chitchat_reply",
             FALLBACK: "fallback_reply",
             REFUND: "refund_pick_order",
+            # ch10-A:转人工走**主力 Agent**(不是新出口)。Agent 会调
+            # `transfer_to_human` 把工号与等待时长交给用户。
+            HANDOFF: "agent",
         },
     )
     # ---- 退款子流程的走向(三个条件边,判据都是 state 的纯函数)----

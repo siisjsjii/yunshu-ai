@@ -77,8 +77,10 @@ class _FakeIntentModel:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("intent", ["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"])
-async def test_seven_labels_pass_through(intent):
+@pytest.mark.parametrize(
+    "intent", ["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊", "转人工"]
+)
+async def test_every_declared_label_passes_through(intent):
     model = FakeStructuredModel(result=_Intent(intent))
     node = make_classify_intent_node(model=model)
     out = await node({"user_input": "随便问点什么"})
@@ -125,7 +127,7 @@ async def test_prompt_carries_the_user_utterance():
 
 
 def _enumerated_labels(prompt: str) -> set[str]:
-    """取 Prompt 里**八类枚举段**的标签(冒号前的名字)。
+    """取 Prompt 里**九类枚举段**的标签(冒号前的名字)。
 
     **必须限定段落,不能整篇跑正则**:输出契约段(ch06 起)也是
     `- intent: ...` / `- confidence: ...` 的形状,整篇扫会把 `intent`/
@@ -133,19 +135,19 @@ def _enumerated_labels(prompt: str) -> set[str]:
     prompt 上报红(实测:stale=['confidence','intent'])—— 假红会诱人
     去改 prompt,而真正的守卫(标签名两处对齐)反而被放过。
 
-    两个边界 = `八类` → `**输出一个 JSON 对象`(契约段标题),都 `assert` 在。
+    两个边界 = `九类` → `**输出一个 JSON 对象`(契约段标题),都 `assert` 在。
     这两条 assert 只是**让失效时报得清楚**(改名/删段时给一句人话),
     **不是**为了防「空集恒真假绿」—— 解析成空集会被下面的 `missing` 断言挡下
     (`INTENT_LABELS` 非空)。这里真正的风险是**解析得太多**(把契约段当标签),
     也就是上面那段说的假红。
 
-    另外,下边界 `partition("八类")` 命中的是**介绍句**里的「八类」
-    (`判断用户这一句话属于下面八类中的哪一类…`),不是段头那一行。
+    另外,下边界 `partition("九类")` 命中的是**介绍句**里的「九类」
+    (`判断用户这一句话属于下面九类中的哪一类…`),不是段头那一行。
     介绍句里没有 `- 标签:` 形状的行,所以结果不受影响 —— 但这是**偶然**,
     不是设计;真要换文案时留意这里。
     """
-    _, sep, tail = prompt.partition("八类")
-    assert sep, "Prompt 里找不到「八类」段标题,标签守卫已失效"
+    _, sep, tail = prompt.partition("九类")
+    assert sep, "Prompt 里找不到「九类」段标题,标签守卫已失效"
     body, contract, _ = tail.partition("**输出一个 JSON 对象")
     assert contract, "Prompt 里找不到输出契约段标题,标签守卫已失效"
     return set(re.findall(r"^\s*-\s*(.+?):", body, re.MULTILINE))
@@ -270,3 +272,20 @@ async def test_log_turn_trace_frame_carries_confidence():
     )
     payload = next(f for f in frames if f["frame"] == "trace")
     assert payload["confidence"] == pytest.approx(0.87)
+
+
+def test_complaint_and_handoff_are_kept_apart():
+    """「投诉」与「转人工」不能揉成一个 —— 揉了的后果是**投诉出口被绕过**。
+
+    投诉出口除了安抚话术,还会发一个 `choices` 帧把「转人工 / 建工单」两个选项
+    交给用户。如果模型把「我要投诉」直接判成转人工,用户就**再也拿不到那两个选项**,
+    而 `complaint_reply` 那段固定话术永远不会出现 —— 没有任何东西会报错。
+
+    这条只断「提示词里同时写着这两条边界样例」,不断模型行为(模型行为由
+    `evals/intent_cases.jsonl` 的边界负例覆盖,见任务 3)。
+    """
+    from app.prompts import INTENT_SYSTEM_PROMPT
+
+    assert "不是**转人工" in INTENT_SYSTEM_PROMPT or "不是转人工" in INTENT_SYSTEM_PROMPT, (
+        "提示词里缺少「投诉 ≠ 转人工」的边界样例"
+    )
