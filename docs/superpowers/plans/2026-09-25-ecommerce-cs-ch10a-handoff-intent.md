@@ -296,11 +296,21 @@ git commit -m "ch10-A T1: 转人工进路由表与提示词(第九类,走主力 
 - Create: `app/tools/builtin/handoff.py`
 - Create: `tests/test_handoff_tool.py`
 - Modify: `app/tools/mock_data.py`(加一个确定性的转人工记录函数,与其余 mock 数据同源)
+- Modify: `tests/test_builtin_discovery.py`、`tests/test_registry.py`、`tests/test_api_chat.py` ——
+  ⚠️ **这三个不在原计划的清单里,是实现时补上的**(T2 执行时发现,已核实):
+  加一个内置工具会打破**三个文件里的四条精确相等断言**
+  (`test_builtin_discovery.py` 的内置名集合、`test_registry.py` 的 `build_tools` 集合、
+  `test_api_chat.py` 的两条 `bound_tools` 集合)。**不改它们分支就是红的**。
+  每处**只加 `"transfer_to_human"` 一项,不许削弱或删掉别的断言**。
+  另外 `test_builtin_discovery.py` 那条测试的名字要跟着改(它叫 `test_four_builtin_tools_...`,
+  而 ch08 已有按数量改名的先例)。**改名后 grep 一遍旧 node id 有没有被别处引用。**
 
 **Interfaces:**
 - Consumes: `app.tools.mock_data.rng`(sha256 种子工厂)
 - Produces:
-  - `app.tools.mock_data.handoff_record(agent_pool: str) -> dict` —— 返回 `{"agent_no": str, "queue_position": int, "eta_minutes": int, "status": "connected"}`
+  - `app.tools.mock_data.handoff_record(reason: str) -> dict` —— 返回 `{"agent_no": str, "queue_position": int, "eta_minutes": int, "status": "connected"}`。
+    ⚠️ 参数名是 **`reason`**(有用户原话来源),不是 `agent_pool` —— 后者是坐席池常量 `AGENT_POOL`。
+    这两者一度在本计划的 Interfaces 块与 Step 3 之间不一致,以 **Step 3 的代码为准**。
   - `app.tools.builtin.handoff.build(*, session, conversation_id, retriever) -> list` —— 与其他 builtin 模块同签名(包内自动发现按这个签名调用)
   - 工具名 **`transfer_to_human`**,`ainvoke({"reason": ...})` 返回 JSON 字符串
 
@@ -576,10 +586,13 @@ Create `scripts/acceptance_ch10.sh`。**照 `scripts/acceptance_ch09.sh` 的既�
 | helper | 用途 |
 |---|---|
 | `ok` / `bad` / `warn` | 判词计数(`PASS`/`FAIL`/`WARN`) |
+| **`boom`** | **装置故障**(与 `bad` 分开计)—— 起不了服务、转录不完整这类 |
+| **`ask <sid> <消息> <输出文件>`** | **发一条中文消息并录 SSE**。中文请求体走 stdin heredoc,**不走 argv** —— 现成的,直接用 |
 | `frames_sane <file>` | **每个断言块都要先跑它** —— 「没有这一帧」这类断言在一份空文件上恒真 |
 | `join_tokens` | 从 stdin 读 SSE,把所有 `token` 帧拼回整段回复 |
 | `intent_label <file>` | 取 `done` 帧的 `intent`(**注意它吃文件参数,不是 stdin**) |
 | `has_needle` / `assert_needle_absent` | 回复里找 needle,**三值退出码**(见下) |
+| `cleanup` / `trap` 那套 | 起停服务、跑完自己收干净。**⚠️ `EXIT` 与 `INT TERM HUP` 要分开 trap**(关终端那条路径不经过 `EXIT`),且打了 trap 之后 bash 不会因为收到信号就退出 —— 信号处理里必须自己 `exit` |
 
 ⚠️ **`has_needle` 是三个退出码,别把 1 与 2 混成一个非零**:`0` = 针在;`1` = 文件读得动、针确实不在;`2` = **文件读不了/解不开(装置故障)**。混成一个非零的后果很具体:一句 `has_needle ... || ok "不再是兜底话术"` 会把一次 `OSError` **静默判绿**。**凡否定断言一律走 `assert_needle_absent`**,不要自己写 `else` 分支。
 
@@ -726,6 +739,15 @@ git commit -m "ch10-A T4: 投诉出口的转人工按钮改走真实路径(消�
 **Interfaces:**
 - Consumes: 任务 1–4 的全部改动
 - Produces: 无代码接口
+
+- [ ] **Step 0: 顺手订正 `CLAUDE.md` 里一个**不存在的文件名**(既有陈旧记录,与 ch10 无关)**
+
+`CLAUDE.md` 引了 `tests/test_seed_tools_random.py`,而**该文件不存在** ——
+真实的是 `tests/test_tools_random.py`(已核,2026-09-25)。
+这是 T2 的实现者撞出来的:它照计划去找那个文件、没找到。
+
+**为什么顺手修**:T5 本来就改 `CLAUDE.md`;而「引用一个不存在的文件」正是本仓最贵的那类教训
+(ch09 记账的正是「引用必须逐条解析得开」)。**只改文件名,不动那句话的其余部分。**
 
 - [ ] **Step 1: 同步 `scripts/acceptance_ch06.sh` 的四处措辞**
 

@@ -3288,9 +3288,18 @@ _VERSIONS = text(
 
 > ⚠️ `LABELS` 必须 `from app.topic.taxonomy import LABELS` —— **补零这件事正是「17 类表是唯一来源」的一个用法**:类目清单从权威表来,不从已有数据来。
 
-- [ ] **Step 4: 挂 router**
+- [ ] **Step 4: 挂 router(⚠️ **两行**,不是一行)**
 
-在 `app/main.py` 的 `app.include_router(review_router)` 之后加:
+本仓的 router 是**成套**的:`app/main.py:10-16` 的 import 块 + `:116-129` 的 include 块。
+**只加 include 会 `NameError`。**
+
+① 在 import 块里按字母序加(`topics` 排在 `review` 之后,即**最后一行**):
+
+```python
+from app.api.topics import router as topics_router
+```
+
+② 在 `app.include_router(review_router)` 之后加:
 
 ```python
 app.include_router(topics_router)
