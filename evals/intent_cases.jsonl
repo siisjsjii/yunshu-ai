@@ -36,3 +36,9 @@
 {"text": "where is my package", "expected": "物流"}
 {"text": "我要退货,退回的运费谁出", "expected": "退款退货"}
 {"text": "帮我查一下明天北京的天气", "expected": "其他"}
+{"text": "我要转人工", "expected": "转人工", "fewshot": "verbatim"}
+{"text": "帮我转接一下人工客服", "expected": "转人工"}
+{"text": "有真人在吗,这问题我想找人处理", "expected": "转人工"}
+{"text": "你们的客服太差了,我要投诉", "expected": "投诉", "fewshot": "near"}
+{"text": "这个我要投诉到消费者协会", "expected": "投诉"}
+{"text": "转人工之前先问一句,退货政策是什么", "expected": "退款退货"}
