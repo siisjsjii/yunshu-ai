@@ -517,8 +517,9 @@ git commit -m "ch10-A T2: 新增模拟转人工工具 transfer_to_human(显式�
 
 **Files:**
 - Modify: `evals/intent_cases.jsonl`
-- Modify: `scripts/run_intent_eval.py`
 - Create: `scripts/acceptance_ch10.sh`
+
+> `scripts/run_intent_eval.py` **不需要改**:它本来就算「按标签分组」的准确率(`per_label`)与三个口径(`fewshot` 标记)。动手前先跑它确认这一点,别凭计划的一行字就去改一个不用改的文件。
 
 **Interfaces:**
 - Consumes: 任务 1 的 `HANDOFF` / 第九类;任务 2 的 `transfer_to_human`
@@ -568,30 +569,75 @@ Expected: 打印逐条结果、总准确率、**按标签分组**的准确率、
 
 - [ ] **Step 4: 写验收脚本(转人工那一节)**
 
-Create `scripts/acceptance_ch10.sh`。**照 `scripts/acceptance_ch09.sh` 的既有形状写**(它自己起服务、跑完自己收干净、把本轮输出转录一份再自检)。下面是**转人工那一节的判词骨架**,起停服务的样板从 acceptance_ch09.sh 抄:
+Create `scripts/acceptance_ch10.sh`。**照 `scripts/acceptance_ch09.sh` 的既有形状写**(它自己起服务、跑完自己收干净、把本轮输出转录一份再自检)。
+
+**先用 `grep -nE "^[a-z_]+\(\)" scripts/acceptance_ch09.sh` 把可复用的 helper 名抄下来** —— 下面是它真实提供的(已核,2026-09-25):
+
+| helper | 用途 |
+|---|---|
+| `ok` / `bad` / `warn` | 判词计数(`PASS`/`FAIL`/`WARN`) |
+| `frames_sane <file>` | **每个断言块都要先跑它** —— 「没有这一帧」这类断言在一份空文件上恒真 |
+| `join_tokens` | 从 stdin 读 SSE,把所有 `token` 帧拼回整段回复 |
+| `intent_label <file>` | 取 `done` 帧的 `intent`(**注意它吃文件参数,不是 stdin**) |
+| `has_needle` / `assert_needle_absent` | 回复里找 needle,**三值退出码**(见下) |
+
+⚠️ **`has_needle` 是三个退出码,别把 1 与 2 混成一个非零**:`0` = 针在;`1` = 文件读得动、针确实不在;`2` = **文件读不了/解不开(装置故障)**。混成一个非零的后果很具体:一句 `has_needle ... || ok "不再是兜底话术"` 会把一次 `OSError` **静默判绿**。**凡否定断言一律走 `assert_needle_absent`**,不要自己写 `else` 分支。
+
+先加一个本脚本自己的 helper(`acceptance_ch09.sh` 没有它)—— **「工具有没有被调」要看 `tool_call` 帧,不是看回复的措辞**:
+
+```bash
+# 取 SSE 里所有 tool_call 帧的工具名(空格分隔)。
+#
+# ⚠️ **为什么不看回复里的「预计/等待」**:那是在断**模型的措辞**。
+#    模型完全可能把工具返回改写措辞(「客服马上接入,您的号码是 A205」),
+#    于是真实故障与措辞差异分不开 —— 而这条断言的全部意义是回答
+#    「模型到底调工具了没有」,那是个**结构**问题,SSE 里有直接证据。
+called_tools() {   # $1=文件
+  "$PYTHON" -c '
+import json, sys
+lines = open(sys.argv[1], "rb").read().decode("utf-8", "replace").splitlines()
+names = []
+for i, l in enumerate(lines):
+    if l.strip() == "event: tool_call" and i + 1 < len(lines) and lines[i+1].startswith("data: "):
+        names.append(json.loads(lines[i+1][6:]).get("name", "?"))
+sys.stdout.buffer.write(" ".join(names).encode("utf-8"))' "$1"
+}
+```
+
+转人工那一节的判词骨架:
 
 ```bash
 # ---- 验收:转人工是**真意图**,而且**真的发生了** ----
 #
-# 这一节断两件事,缺一不可:
-#   ① 分类对:done 帧的 intent == 转人工
-#   ② **真的发生了**:回复里出现工号(A 开头 + 数字)与等待时长
+# 三层,缺一不可 —— 每一层失败的原因**不同**,所以分开报:
+#   ① 分类对     :done 帧的 intent == 转人工      (分类器的问题)
+#   ② 工具被调了 :SSE 里有 transfer_to_human 的 tool_call 帧 (模型没调工具 —— §11.4 的那个风险)
+#   ③ 用户拿到了 :回复里有工号 A###                (调了但没转述)
 #
 # 只断 ① 的话,「分类对了但模型没调工具、用户什么也没得到」会**全绿通过** ——
 # 那正是本仓 ch08「缺必填项追问」翻过车的形状(没测也测不出,只能写"未达成")。
+frames_sane "$SSE_HANDOFF" || { bad "SSE 转录不完整,这一节判不了"; }
+HANDOFF_INTENT=$(intent_label "$SSE_HANDOFF")
 HANDOFF_REPLY=$(join_tokens < "$SSE_HANDOFF")
-if ! grep -q '转人工' <<< "$(done_field intent < "$SSE_HANDOFF")"; then
-  bad "意图没落「转人工」:$(done_field intent < "$SSE_HANDOFF")"
-elif grep -qE 'A[0-9]{3}' <<< "$HANDOFF_REPLY" && grep -qE '预计|等待' <<< "$HANDOFF_REPLY"; then
-  ok "转人工已发生:$(grep -oE 'A[0-9]{3}' <<< "$HANDOFF_REPLY" | head -1)"
+HANDOFF_TOOLS=$(called_tools "$SSE_HANDOFF")
+
+if [ "$HANDOFF_INTENT" != "转人工" ]; then
+  bad "① 意图没落「转人工」:$HANDOFF_INTENT"
+elif ! printf '%s' "$HANDOFF_TOOLS" | grep -qw transfer_to_human; then
+  bad "② 意图是「转人工」但**模型没调 transfer_to_human** —— 用户什么也没得到。实际调用:[$HANDOFF_TOOLS]"
+elif ! printf '%s' "$HANDOFF_REPLY" | grep -qE 'A[0-9]{3}'; then
+  bad "③ 工具调了,但回复里没有工号 —— 用户看不到结果。回复:${HANDOFF_REPLY:0:120}"
 else
-  bad "意图是「转人工」但**回复里没有工号/等待时长** —— 模型没调 transfer_to_human。回复:${HANDOFF_REPLY:0:120}"
+  ok "转人工三层全过:intent=转人工,调了 transfer_to_human,工号=$(printf '%s' "$HANDOFF_REPLY" | grep -oE 'A[0-9]{3}' | head -1)"
 fi
 ```
 
-> ⚠️ 含中文的请求体**不能走 `curl` 的 argv**(MSYS2 按 CP936 重编码,服务端回 `error parsing the body`)。照 acceptance_ch09.sh 的既有做法走 stdin heredoc 或 httpx。
->
-> ⚠️ 断言**不能直接 grep 原始 SSE 流** —— 回复逐 token 推送,`A205` 会被切成独立帧。必须先 `join_tokens` 拼回来(上面已经这么写了)。
+> ⚠️ 三层分开报是刻意的:**第 ② 层失败就是要写进报告的那个比例读数**(spec §11.4),它与「分类器不行」(第 ① 层)是两件完全不同的事,混成一句判词就再也分不出来了。
+
+> ⚠️ 两条都已核过、都必须遵守:
+> ① 含中文的请求体**不能走 `curl` 的 argv**(MSYS2 按 CP936 重编码,服务端回 `error parsing the body`)—— 走 stdin heredoc 或 httpx,照 acceptance_ch09.sh 的既有做法;
+> ② 断言**不能直接 grep 原始 SSE 流** —— 回复逐 token 推送,`A205` 会被切成独立帧,必须先 `join_tokens` 拼回来(上面已经这么写了)。
+> ③ 上面这两条断言都是**肯定**断言(针必须在),所以用 `grep` 就够;若你后面要加否定断言,**必须**走 `assert_needle_absent`。
 
 - [ ] **Step 5: 跑验收脚本,拿到真实读数**
 
