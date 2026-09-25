@@ -2191,6 +2191,23 @@ def test_unknown_label_raises_loudly():
                     FakeTokenizer(), max_length=16)
 
 
+def test_topic_dataset_is_indexable_and_declares_columns():
+    """`Trainer` 会读 `column_names`(`trainer.py:1174`),而普通的 list 没有它。
+
+    这条测试钉的是「包了一层」这件事本身:去掉 `TopicDataset` 直接传 list,
+    训练会在 `Trainer` 内部 `AttributeError` —— 报错指向 transformers,
+    读起来像它的 bug。
+    """
+    from app.topic.model import TopicDataset
+
+    encoded = encode_rows([{"question": "买大了想退", "labels": ["尺码"]}],
+                          FakeTokenizer(), max_length=16)
+    ds = TopicDataset(encoded)
+    assert len(ds) == 1
+    assert ds[0]["labels"].dtype.is_floating_point
+    assert ds.column_names == ["input_ids", "attention_mask", "labels"]
+
+
 def test_save_and_load_artifacts_roundtrip(tmp_path):
     """`labels.json` 是**推理侧标签顺序的唯一来源**,必须能原样读回。"""
     save_artifacts(tmp_path, tokenizer=None, max_length=64, threshold=0.5, labels=LABELS,
@@ -2260,6 +2277,34 @@ def encode_rows(rows: list[dict], tokenizer, *, max_length: int) -> list[dict]:
             "labels": vec,
         })
     return out
+
+
+class TopicDataset:
+    """把 `encode_rows` 的产物包成 `Trainer` 能吃的数据集。
+
+    ⚠️ **不能直接把 `list[dict]` 交给 `Trainer`。** 已核安装版源码
+    (`transformers/trainer.py:1165-1174`):默认 `remove_unused_columns=True` 时,
+    `_remove_unused_columns` 会读 `dataset.column_names` —— 普通 list 或裸
+    `torch.utils.data.Dataset` 都没有这个属性,直接 `AttributeError`,而报错
+    指向 `Trainer` 内部,读起来像 transformers 的 bug。
+
+    两条路:包成 `datasets.Dataset`(要多一层格式转换),或者**包成最小的
+    torch Dataset + 关掉 `remove_unused_columns`**(见训练脚本)。这里选后者:
+    样本量小、字段就是我们自己编的那三个,少一层格式转换就少一处出错的地方。
+    """
+
+    #: `Trainer` 会读它 —— 有了它 `remove_unused_columns` 那条路才走得到,
+    #: 但因为我们在 `TrainingArguments` 里关掉了那个开关,它只是让报错更友好。
+    column_names = ["input_ids", "attention_mask", "labels"]
+
+    def __init__(self, encoded: list[dict]):
+        self.rows = encoded
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, i: int) -> dict:
+        return self.rows[i]
 
 
 def save_artifacts(out_dir, *, tokenizer, max_length: int, threshold: float,
@@ -2338,12 +2383,20 @@ def main() -> None:
         logging_steps=20,
         seed=SEED,
         report_to=[],
+        # ⚠️ **必须关掉**:默认 True 时 `Trainer._remove_unused_columns` 会读
+        #    `dataset.column_names` 并按 signature 删列(`trainer.py:1165-1174`)。
+        #    我们的数据集是自己包的最小 torch Dataset(字段就是模型 forward 要的
+        #    那三个),关掉它既避开那条 AttributeError 路径,也避免它按名字误删
+        #    `labels`(那会让训练**静默**变成无监督)。
+        remove_unused_columns=False,
     )
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
+        # ⚠️ `Trainer` **不能**直接收 `list[dict]` —— 见 `app/topic/model.py`
+        #    的 `TopicDataset` docstring。
+        train_dataset=TopicDataset(train_encoded),
+        eval_dataset=TopicDataset(val_encoded),
         # ⚠️ v5 叫 `processing_class`,**不是** v4 的 `tokenizer`。
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
