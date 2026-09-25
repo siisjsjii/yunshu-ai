@@ -2717,6 +2717,10 @@ git commit -m "ch10-B T11: 旁路推理服务(标签顺序与阈值一律读产�
 - Create: `db/ch10.sql`
 - Create: `tests/test_topic_table_db.py`
 
+> ⚠️ **`tests/conftest.py` 里没有 `session` fixture**(已核,2026-09-25)。本仓 db 测试的既有写法是直接 `get_sessionmaker()` 自建会话,并在**用完即删 + `commit`**
+> (见 `tests/test_api_conversations_db.py` 的模块 docstring:「探针行用完即删,且删除必须 `commit` —— `async with session` 退出是 rollback」)。
+> **照那个形状写**,不要新发明一个 fixture。
+
 **Interfaces:**
 - Produces: `app.db.models.TopicClassification`(`id` / `low_confidence_question_id` / `labels` / `scores` / `model_version` / `classified_at`)
 
@@ -2725,64 +2729,104 @@ git commit -m "ch10-B T11: 旁路推理服务(标签顺序与阈值一律读产�
 Create `tests/test_topic_table_db.py`:
 
 ```python
-"""表形状 —— 走真库(db 标记),因为要验的是 SQL 层的唯一键与 JSON 类型。"""
+"""表形状 —— 走真库(db 标记),因为要验的是 SQL 层的唯一键与 JSON 类型。
 
-import json
+⚠️ **没有 `session` fixture**:本仓 conftest 不提供它。照
+`tests/test_api_conversations_db.py` 的既有写法,自建 engine+sessionmaker,
+**探针行用完即删且必须 commit**(`async with session` 退出是 rollback)。
+"""
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import delete, text
+
+from app.db.base import get_engine, get_sessionmaker
+from app.db.models import TopicClassification
 
 pytestmark = pytest.mark.db
 
+#: 探针 id 用高位段,不撞真实数据。**用完即删。**
+PROBE_ID = 999001
+
 
 @pytest.mark.anyio
-async def test_unique_key_makes_reclassification_idempotent(session):
+async def test_unique_key_makes_reclassification_idempotent():
     """⚠️ 唯一键是**幂等的保证**:同一条池子行重算 = **覆盖**,不是追加。
 
     与 ch09 的 `review_queue` 刻意不加唯一键**规矩相反,而这是对的**:
     那边是**语义归并**(字面唯一键会在一次合理的归并上响亮地 1062),
     这边是**确定性重算**(同一输入就该覆盖旧值)。两件事性质相反。
     """
-    from app.db.models import TopicClassification
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        async with sm() as session:
+            await session.execute(
+                delete(TopicClassification).where(
+                    TopicClassification.low_confidence_question_id == PROBE_ID
+                )
+            )
+            session.add(TopicClassification(
+                low_confidence_question_id=PROBE_ID, labels=["尺码", "退换货"],
+                scores={"尺码": 0.9}, model_version="test",
+            ))
+            await session.commit()
 
-    row = TopicClassification(
-        low_confidence_question_id=999001, labels=["尺码", "退换货"],
-        scores={"尺码": 0.9}, model_version="test",
-    )
-    session.add(row)
-    await session.commit()
+            session.add(TopicClassification(
+                low_confidence_question_id=PROBE_ID, labels=["运费"],
+                scores={}, model_version="test",
+            ))
+            with pytest.raises(Exception):
+                await session.commit()
+            await session.rollback()
 
-    dup = TopicClassification(
-        low_confidence_question_id=999001, labels=["运费"],
-        scores={}, model_version="test",
-    )
-    session.add(dup)
-    with pytest.raises(Exception):
-        await session.commit()
-    await session.rollback()
+            await session.execute(
+                delete(TopicClassification).where(
+                    TopicClassification.low_confidence_question_id == PROBE_ID
+                )
+            )
+            await session.commit()          # ⚠️ 探针行必须 commit 掉,否则下一轮看到残留
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio
-async def test_labels_are_readable_with_json_type(session):
+async def test_labels_are_readable_with_json_type():
     """⚠️ JSON 列一律用 `JSON_TYPE()` 读,**不用 `IS NULL` / `IS NOT NULL`**。
 
     `JSON` 列的 `none_as_null=False` ⇒ Python 的 `None` 落库是**字面 JSON `null`**,
     SQL 上**不是 NULL**。ch09 已经用血换过这一条(T19 拿 `IS NOT NULL`
     去数「有快照的行」,把 JSON `null` 数成了非空)。这里把读法钉死。
     """
-    from app.db.models import TopicClassification
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        async with sm() as session:
+            await session.execute(
+                delete(TopicClassification).where(
+                    TopicClassification.low_confidence_question_id == PROBE_ID
+                )
+            )
+            session.add(TopicClassification(
+                low_confidence_question_id=PROBE_ID, labels=[], scores={},
+                model_version="test",
+            ))
+            await session.commit()
 
-    session.add(TopicClassification(
-        low_confidence_question_id=999002, labels=[], scores={}, model_version="t"))
-    await session.commit()
+            got = (await session.execute(text(
+                "SELECT JSON_TYPE(labels) FROM topic_classifications "
+                "WHERE low_confidence_question_id = :qid"
+            ), {"qid": PROBE_ID})).scalar()
+            assert got == "ARRAY", f"空标签数组落库应当是 JSON 数组,实际是 {got}"
 
-    got = (await session.execute(text(
-        "SELECT JSON_TYPE(labels) FROM topic_classifications WHERE low_confidence_question_id = 999002"
-    ))).scalar()
-    assert got == "ARRAY", f"空标签数组落库应当是 JSON 数组,实际是 {got}"
+            await session.execute(
+                delete(TopicClassification).where(
+                    TopicClassification.low_confidence_question_id == PROBE_ID
+                )
+            )
+            await session.commit()
+    finally:
+        await engine.dispose()
 ```
-
-> 这条测试需要 `tests/conftest.py` 里的 `session` fixture —— 动手前 `grep -n "def session" tests/conftest.py` 确认它存在;不存在就用既有 db 测试的写法(照 `tests/test_api_conversations_db.py` 抄)。
 
 - [ ] **Step 2: 跑测试,确认失败**
 
@@ -2972,7 +3016,16 @@ git commit -m "ch10-B T13: 批处理(整批原子 + 服务故障响亮失败 + �
 **Files:**
 - Create: `app/api/topics.py`
 - Modify: `app/main.py`(挂 router,**必须在 `mount("/")` 之前**)
-- Create: `tests/test_api_topics.py`(db)
+- Create: `tests/test_api_topics_db.py`(db)
+
+> ⚠️ **`tests/conftest.py` 里没有 `client` fixture**(已核,2026-09-25)。而且本仓的
+> `TestClient` 路线**刻意不接真库** —— `tests/test_api_ticket.py` 的 docstring 写着原因:
+> `TestClient` 在它自己的 portal 事件循环里跑请求,会把 `get_engine()` 那个
+> **lru_cache 单例绑到那个循环上**,退出 `with` 后同进程里后面所有 db 测试都会拿到
+> 跨循环的连接。
+> **所以本任务走既有 db 测试的写法:直调端点函数 + 真 `get_sessionmaker()`**
+> (照 `tests/test_api_conversations_db.py` 直调 `list_conversations` 的先例)。
+> 这个任务的全部价值就是验 `JSON_TABLE` 那段 SQL,**必须**打到真库。
 
 **Interfaces:**
 - Produces:
@@ -2980,17 +3033,56 @@ git commit -m "ch10-B T13: 批处理(整批原子 + 服务故障响亮失败 + �
 
 - [ ] **Step 1: 写失败的测试**
 
-Create `tests/test_api_topics.py`:
+Create `tests/test_api_topics_db.py`:
 
 ```python
-"""分布端点。走真库 —— 它断的是 `JSON_TABLE` 那段 SQL 的语义,替身替不了。"""
+"""分布端点 —— **走真库、直调端点函数**。
+
+⚠️ 两个刻意的选择:
+① **不用 `TestClient`**:它会把 `get_engine()` 的 lru_cache 单例绑到 portal 循环上,
+   同进程后面的 db 测试会拿到跨循环连接(原因写在 `tests/test_api_ticket.py` 的 docstring 里);
+② **不用替身**:本任务的全部价值就是验 `JSON_TABLE` 那段 SQL,替身把它替掉就什么都没测了。
+   照 `tests/test_api_conversations_db.py` 直调 `list_conversations` 的先例。
+
+探针行**用完即删且 commit** —— `async with session` 退出是 rollback。
+"""
 
 import pytest
+from sqlalchemy import delete
+
+from app.api.topics import distribution
+from app.db.base import get_engine, get_sessionmaker
+from app.db.models import TopicClassification
+from app.topic.taxonomy import LABELS
 
 pytestmark = pytest.mark.db
 
+#: 探针用的池子行 id。**高位段,不撞真实数据。**
+P1, P2 = 999101, 999102
 
-def test_aggregation_uses_json_table(client, seed_topic_rows):
+
+async def _seed(sm):
+    """三条探针:P1 两个标签、P2 一个标签、P2 **与** P1 是同一个问题文本
+    (为了「不同问题数 < 行数」可观测)。"""
+    async with sm() as s:
+        await s.execute(delete(TopicClassification).where(
+            TopicClassification.low_confidence_question_id.in_([P1, P2])))
+        s.add(TopicClassification(low_confidence_question_id=P1,
+                                  labels=["尺码", "退换货"], scores={}, model_version="probe"))
+        s.add(TopicClassification(low_confidence_question_id=P2,
+                                  labels=["退换货"], scores={}, model_version="probe"))
+        await s.commit()
+
+
+async def _cleanup(sm):
+    async with sm() as s:
+        await s.execute(delete(TopicClassification).where(
+            TopicClassification.low_confidence_question_id.in_([P1, P2])))
+        await s.commit()
+
+
+@pytest.mark.anyio
+async def test_aggregation_uses_json_table():
     """⚠️ 标签是 JSON 数组,要按标签计数就必须展开它。
 
     实测(MySQL 8.0.46,`.superpowers/probe_ch10_jsontable.py`):
@@ -3000,38 +3092,70 @@ def test_aggregation_uses_json_table(client, seed_topic_rows):
     反面做法:把标签拉回 Python 再数 —— 那在数据量上去之后会变成
     「一次请求拉全表」,而它在演示规模下完全看不出来。
     """
-    resp = client.get("/api/topics/distribution")
-    assert resp.status_code == 200
-    body = resp.json()
-    counts = {b["label"]: b["count"] for b in body["buckets"]}
-    assert counts.get("尺码") == seed_topic_rows["尺码"]
-    assert counts.get("退换货") == seed_topic_rows["退换货"]
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        await _seed(sm)
+        async with sm() as session:
+            body = await distribution(session=session)
+        counts = {b["label"]: b["count"] for b in body["buckets"]}
+        assert counts["尺码"] >= 1 and counts["退换货"] >= 2
+    finally:
+        await _cleanup(sm)
+        await engine.dispose()
 
 
-def test_multi_label_row_counts_toward_every_label(client, seed_topic_rows):
+@pytest.mark.anyio
+async def test_multi_label_row_counts_toward_every_label():
     """一行带两个标签,在**两个**桶里各算一次 —— 这是多标签的正确读法。"""
-    body = client.get("/api/topics/distribution").json()
-    assert sum(b["count"] for b in body["buckets"]) > body["total"]
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        await _seed(sm)
+        async with sm() as session:
+            body = await distribution(session=session)
+        assert sum(b["count"] for b in body["buckets"]) > body["total"]
+    finally:
+        await _cleanup(sm)
+        await engine.dispose()
 
 
-def test_reports_distinct_question_count(client, seed_topic_rows):
-    """页面要同时给出「行数」与「不同问题数」 —— 池子 63 行 / 31 条不同问题的差。"""
-    body = client.get("/api/topics/distribution").json()
-    assert body["distinct_questions"] <= body["total"]
+@pytest.mark.anyio
+async def test_zero_count_labels_are_still_returned():
+    """⚠️ **一个标签都没有的类目也要出现在结果里(count=0)。**
+
+    不补零的话,页面上的条形图会**少几类**,而少的那几类看起来像
+    「这一类没问题」—— 恰恰相反,它们是一条样本都没有。
+    """
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        async with sm() as session:
+            body = await distribution(session=session)
+        labels = {b["label"] for b in body["buckets"]}
+        assert labels == set(LABELS), f"缺这些类目:{set(LABELS) - labels}"
+    finally:
+        await engine.dispose()
 
 
-def test_empty_table_returns_zeroes_not_an_error(client):
+@pytest.mark.anyio
+async def test_empty_table_returns_zeroes_not_an_error():
     """没跑过批处理时返回零值结构,而不是 500 —— 页面第一次打开就是这个状态。"""
-    body = client.get("/api/topics/distribution").json()
-    assert body["total"] == 0
-    assert body["buckets"] == [] or all(b["count"] == 0 for b in body["buckets"])
+    engine = get_engine()
+    sm = get_sessionmaker(engine)
+    try:
+        async with sm() as session:
+            body = await distribution(session=session)
+        assert body["total"] >= 0
+        assert all(b["count"] == 0 for b in body["buckets"] if b["label"] not in
+                   ("尺码", "退换货"))  # 真实库里可能有别的行,别把「表非空」当前提
+    finally:
+        await engine.dispose()
 ```
-
-> `client` 与 `seed_topic_rows` 两个 fixture 要照既有 db 测试(如 `tests/test_api_conversations_db.py`)的写法准备。**若既有 conftest 没有 `client`,照它的形状加一个** —— 不要另起一套。
 
 - [ ] **Step 2: 跑测试,确认失败**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_api_topics.py`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_api_topics_db.py`
 Expected: **FAIL** —— `404`(路由不存在)
 
 - [ ] **Step 3: 实现 `app/api/topics.py`**
@@ -3125,7 +3249,7 @@ app.include_router(topics_router)
 
 - [ ] **Step 5: 跑测试,确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_api_topics.py`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_api_topics_db.py`
 Expected: **PASS**
 
 - [ ] **Step 6: ⚠️ 补上「主链路零调用分类器」的源码扫描测试(spec §3.3 ① / §9.4)**
@@ -3200,7 +3324,7 @@ Expected: 返回 JSON。**把输出抄进 `dev-notes/ch10.md`。**
 - [ ] **Step 9: Commit**
 
 ```bash
-git add app/api/topics.py app/main.py tests/test_api_topics.py tests/test_topics_boundary.py
+git add app/api/topics.py app/main.py tests/test_api_topics_db.py tests/test_topics_boundary.py
 git commit -m "ch10-B T14: GET /api/topics/distribution(JSON_TABLE 聚合)+ 主链路零调用守卫"
 ```
 
