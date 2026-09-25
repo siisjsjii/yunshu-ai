@@ -1217,14 +1217,16 @@ def test_chat_stream_emits_tool_call_event(client_factory):
     # 绑给模型的就是生产工具集(绑一批、能执行另一批是本章的接线隐患;
     # "执行批"那一半由下面替换注册表的那条测试钉住)。
     #
-    # ch08 T7 起内置是**四个** —— `query_logistics` 已下线,它由 MCP 那条路
-    # 每请求现问现拿,不在这个函数的射程里(夹具的 `mcp_specs` 默认为空)。
+    # **ch10-A T2 起内置是五个** —— 新增 `transfer_to_human`(模拟转人工,只读)。
+    # ch08 T7 起 `query_logistics` 已下线,它由 MCP 那条路每请求现问现拿,
+    # 不在这个函数的射程里(夹具的 `mcp_specs` 默认为空)。
     # 「MCP 那半真的并进来了」由下面 `test_endpoint_merges_mcp_specs_...` 钉。
     assert {t.name for t in model.bound_tools} == {
         "query_order",
         "query_product",
         "query_faq",
         "create_ticket",
+        "transfer_to_human",
     }
 
     # **调过工具的一轮落库的是完整往返**(ch07 起):user / assistant(tool_calls)
@@ -1315,11 +1317,14 @@ def test_endpoint_starts_with_builtin_tools_when_no_mcp_server_is_up(client_fact
 
     assert resp.status_code == 200
     assert [name for name, _ in events][-1] == "done"
+    # 内置五个(ch10-A T2 起多了 `transfer_to_human`)—— 精确相等,同
+    # `tests/test_registry.py::test_build_tools_includes_all_builtin_names`。
     assert {t.name for t in model.bound_tools} == {
         "query_order",
         "query_product",
         "query_faq",
         "create_ticket",
+        "transfer_to_human",
     }
 
 

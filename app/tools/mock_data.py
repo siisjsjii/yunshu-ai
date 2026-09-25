@@ -121,3 +121,26 @@ def logistics_record(order_no: str) -> dict:
             {"time": latest.strftime(fmt), "desc": f"{city} {status}"},
         ],
     }
+
+
+#: 转人工的模拟坐席池(ch10-A)。工号形如 `A123`。
+AGENT_POOL = tuple(f"A{n}" for n in (102, 118, 205, 233, 247, 311, 356, 402, 429, 470))
+
+
+def handoff_record(reason: str) -> dict:
+    """模拟的转人工结果:**由入参决定性派生**(与其余 mock 数据同规矩)。
+
+    用 `rng(...)` 而不是内置 `hash()` —— 理由见 `rng` 的 docstring:
+    同进程内测不出来,重启后才炸。
+    """
+    r = rng("handoff", reason)
+    agent_no = r.choice(AGENT_POOL)
+    queue_position = r.randint(0, 6)
+    return {
+        "agent_no": agent_no,
+        "queue_position": queue_position,
+        # 队首(0)也要给一个非零的等待,否则前端会显示「预计等待 0 分钟」,
+        # 读起来像没接上。
+        "eta_minutes": max(1, queue_position * 2 + r.randint(1, 3)),
+        "status": "connected",
+    }

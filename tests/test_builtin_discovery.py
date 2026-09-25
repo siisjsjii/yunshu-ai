@@ -27,16 +27,23 @@ def _registry(session=None):
     )
 
 
-def test_four_builtin_tools_are_registered():
-    """**四个**,不再是五个。
+def test_five_builtin_tools_are_registered():
+    """**五个**(ch10-A 起)。名字跟着数走 —— 上一版叫 `test_four_...`。
 
-    ch08 T7 把 `query_logistics` 从内置下线(物流 MCP Server 接管,名字不变),
-    所以它**不该**出现在这张表里。这里断言的是**精确相等**:多一个少一个
-    都要显式改这一行。少一个 → 模型永远调不到;多一个 → 模型调了却没有执行体。
+    ch10-A T2 新增 `app/tools/builtin/handoff.py` ⇒ `transfer_to_human` 进表。
+    这里断言的是**精确相等**:多一个少一个都要显式改这一行。少一个 →
+    模型永远调不到;多一个 → 模型调了却没有执行体。
 
-    配套的那条 `test_query_logistics_is_still_builtin_before_t7`(T3 写、
-    T7 删)**已按计划删除** —— 它的存在意义就是守「T3 与 T7 之间物流还有
-    提供者」那段空窗,窗口关了就作废。
+    ⚠️ **这条测试就是「新增一个内置模块」的连带成本,别当成噪音**:T2 之前
+    这里是四个名字,而 T2 的 `git add` 清单里**没有本文件** ⇒ 若只照 brief 提交,
+    本文件、`tests/test_registry.py`、`tests/test_api_chat.py`(两处)**一共四条**
+    精确相等断言会一起变红。它们的判别力都只是「工具集被改过就得有人承认」——
+    按各自的规矩**显式改这一行**即可,不是实现坏了。
+
+    历史沿革(两次都是同一个形状):ch08 T7 把 `query_logistics` 从内置下线
+    (物流 MCP Server 接管,名字不变)⇒ 四个;ch10-A T2 加 `transfer_to_human`
+    ⇒ 五个。名字里的数字逐次跟着改,是为了让「工具集变了」这件事**永远需要
+    有人动手**,而不是悄悄跟着实现漂移。
     """
     reg = _registry()
     assert set(reg) == {
@@ -44,6 +51,7 @@ def test_four_builtin_tools_are_registered():
         "query_product",
         "query_faq",
         "create_ticket",
+        "transfer_to_human",
     }
     # 反面:它**只**换了提供者,不是消失了 —— 物流那半在 `app/mcp/client.py`。
     assert "query_logistics" not in reg
@@ -131,7 +139,7 @@ def test_new_module_is_picked_up_without_touching_core_code(tmp_path, monkeypatc
     # ⚠️ **写文件也必须在 `try` 里**:它一旦落在外面,测试被中止(Ctrl-C /
     # `delitem` 抛错 / 超时)就会把 `zz_scratch_probe.py` 留在包目录里 ——
     # 此后 `discover()` 会把它装进**每一个请求**,模型凭空多出一个
-    # `echo_probe` 工具,而 `test_four_builtin_tools_are_registered` 变红;
+    # `echo_probe` 工具,而 `test_five_builtin_tools_are_registered` 变红;
     # 一次 `git add -A` 还会把它带进提交。
     try:
         new_module.write_text(
