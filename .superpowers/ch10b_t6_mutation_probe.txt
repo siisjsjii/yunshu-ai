@@ -1,0 +1,51 @@
+
+=== M1 ★必查:删掉 `rng.shuffle(shuffled)`  [app\topic\labeling.py]
+  ✅ 红  test_different_seeds_pick_different_samples  (期望 failed)   [{'failed': 1}]
+  绿灯  test_pick_review_sample_is_reproducible_with_a_seed  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M2 只记第一个标签(`row['labels'][:1]`)  [app\topic\labeling.py]
+  ✅ 红  test_multi_label_rows_are_reachable_via_a_label_that_is_not_the_first  (期望 failed)   [{'failed': 1}]
+  绿灯  test_multi_label_rows_count_toward_every_label  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M3 `random.Random(seed)` → `random.Random()`(种子被丢掉)  [app\topic\labeling.py]
+  ✅ 红  test_pick_review_sample_is_reproducible_with_a_seed  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M4 每类多抽一条(`[:per_label + 1]`)  [app\topic\labeling.py]
+  ✅ 红  test_pick_review_sample_takes_from_every_label  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M5 导出时把预标标签写进「最终标签」列  [scripts\export_label_review.py]
+  ✅ 红  test_export_writes_the_stratified_sample_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M6 去掉表头缺列的响亮报错  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M7 最终标签**不**逐段 strip(逗号后带空格就炸)  [scripts\export_label_review.py]
+  ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M8 「判定」认不出时不当成「没改」  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  绿灯  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M9 `verdict == "改"` → `if verdict:`(空判定也算改)  [scripts\export_label_review.py]
+  ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M10 删掉 `main()` 里的钉编码  [scripts\export_label_review.py]
+  ✅ 红  test_export_script_pins_stdout_encoding  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M11 合法类目检查改成静默丢弃  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  绿灯  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+============================================================
+问题数:0

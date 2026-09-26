@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from app.topic.labeling import dedupe_questions, validate_evidence
+from app.topic.labeling import dedupe_questions, pick_review_sample, validate_evidence
 
 
 def test_dedupe_keeps_first_occurrence_and_source():
@@ -437,3 +437,276 @@ def test_main_pins_stdout_encoding():
     )
     assert proc.returncode == 0, f"钉编码没生效(main() 里那一行被删了?):\n{proc.stderr}"
     assert "解析失败不为 0" in proc.stdout
+
+
+# ---- 人工抽审的分层抽样(ch10 spec §6.3)—— 纯函数,零 IO ----
+
+
+def _rows():
+    rows = []
+    for label in ("尺码", "退换货", "运费"):
+        for i in range(20):
+            rows.append({"id": f"{label}-{i}", "labels": [label], "question": f"{label}问题{i}"})
+    return rows
+
+
+def test_pick_review_sample_takes_from_every_label():
+    """**按类分层**抽 —— 不是随机抽。
+
+    随机抽 15 条很可能一条「评价」都抽不到,而人审看不出那个类的系统性错误。
+    """
+    sample = pick_review_sample(_rows(), per_label=5, seed=0)
+    assert len(sample) == 15
+    from collections import Counter
+    assert Counter(next(iter(r["labels"])) for r in sample) == {
+        "尺码": 5, "退换货": 5, "运费": 5
+    }
+
+
+def test_pick_review_sample_is_reproducible_with_a_seed():
+    """同一种子两次结果相同 —— 否则「我审的是哪 85 条」说不清。
+
+    ⚠️ **计划订正 6-C(controller,2026-09-26):这条**自己**是**同义反复**,
+    光有它**不足以**说明 seed 被用上了** —— 一个**完全忽略 seed** 的实现
+    (根本不 shuffle、或每次都按 id 排序返回)同样满足「同一种子两次相同」。
+    ⇒ **必须配下面那条 `test_different_seeds_pick_different_samples`**,
+    两条合起来才把「随机且可复现」这件事钉住。
+    """
+    a = pick_review_sample(_rows(), per_label=5, seed=42)
+    b = pick_review_sample(_rows(), per_label=5, seed=42)
+    assert [r["id"] for r in a] == [r["id"] for r in b]
+
+
+def test_different_seeds_pick_different_samples():
+    """**不同种子给出不同样本** —— 这一条才是「seed 真的被用上了」的判据。
+
+    只有上面那条时,把 `rng.shuffle(shuffled)` 整行删掉,**上面那条照样绿**
+    (输入 20 条里取 5 条,不洗牌就是固定取前 5 条 —— 确定,但**不是抽样**)。
+    本仓把这种叫「断言在它本该禁止的实现下依然通过」。
+
+    ⚠️ 用 `per_label=5` / 每类 20 条:`C(20,5)` 很大,两个种子撞出**同一集合**
+    的概率可忽略;万一将来有人把样本调小,这条会**偶发红**,
+    那时该改的是**这条测试的规模**,不是把它删掉。
+    """
+    a = pick_review_sample(_rows(), per_label=5, seed=0)
+    b = pick_review_sample(_rows(), per_label=5, seed=1)
+    assert [r["id"] for r in a] != [r["id"] for r in b]
+
+
+def test_pick_review_sample_takes_what_is_available():
+    """某类只有 2 条时,拿 2 条而不是报错 —— 但要**如实少拿**。"""
+    rows = [{"id": "a", "labels": ["尺码"], "question": "x"}] * 1 + \
+           [{"id": f"b{i}", "labels": ["运费"], "question": f"y{i}"} for i in range(10)]
+    sample = pick_review_sample(rows, per_label=5, seed=0)
+    from collections import Counter
+    got = Counter(next(iter(r["labels"])) for r in sample)
+    assert got["尺码"] == 1 and got["运费"] == 5
+
+
+def test_multi_label_rows_count_toward_every_label():
+    """多标签行对**每个**它带的标签都算一个样本。
+
+    只按第一个标签计数的话,多标签样本会集中在某一个类的抽样里,
+    而另一个类的「5 条」里一条多标签都没有 —— 人审就看不到那类的多标签错误。
+    """
+    rows = [{"id": "m1", "labels": ["尺码", "退换货"], "question": "买大了想退"}]
+    sample = pick_review_sample(rows, per_label=5, seed=0)
+    assert [r["id"] for r in sample] == ["m1"]
+
+
+def test_multi_label_rows_are_reachable_via_a_label_that_is_not_the_first():
+    """⚠️ **实现者补的一条(2026-09-26)——上面那条对它**命名的那件事**零判别力。**
+
+    上面那条 `..._count_toward_every_label` 的输入里 `m1` **每个标签的桶都只有它自己**,
+    所以把实现改成「只用 `row["labels"][0]`」(只记第一个标签)**照样绿** ——
+    少的那个桶对结果毫无影响。而它 docstring 说的正是「只按第一个标签计数的话……」。
+    本仓把这种叫「断言在它本该禁止的实现下依然通过」(与订正 6-C 同族)。
+
+    下面这条让「第二个标签」成为 `a-multi` **唯一**可靠的入口:
+    「尺码」桶里有 **30** 条而只抽 3 条 ⇒ 靠第一个标签进来是**碰运气**;
+    而「评价」桶只有 `a-multi` 一条 ⇒ 只要那一桶被处理过,它**必然**在样本里。
+    ⇒ 正确实现下这条**恒绿**;把 `for label in row["labels"]` 改成只取第一个标签,
+    则「评价」桶为空 ⇒ 红(变异实测过,见 task-6-report)。
+
+    ⚠️ **如实记账**:这里的判别力**依赖种子**(种子固定 ⇒ 结果固定,不抖),
+    但它不是「构造上必然」的 —— 30 选 3 里选中 `a-multi` 的概率约 10%,
+    正好落到那个种子上时这条就**测不出**那个变异了。
+    ⇒ 若将来 RNG 的消费顺序变了导致这条**变红**,先跑一遍变异确认,
+    再**换一个种子/加大桶的规模**,不要删掉它。
+    """
+    rows = [{"id": f"z{i:02d}", "labels": ["尺码"], "question": "x"} for i in range(30)]
+    rows.append({"id": "a-multi", "labels": ["尺码", "评价"], "question": "买大了想晒单"})
+    ids = [r["id"] for r in pick_review_sample(rows, per_label=3, seed=0)]
+    assert "a-multi" in ids
+
+
+# ---- 抽审 CSV 的导出/回收接线(ch10 spec §6.3/§6.4)—— 不联网、不碰真产物 ----
+#
+# ⚠️ 这几条钉的是 `scripts/export_label_review.py` 的**接线**,不是纯函数:
+# 那条链上有两个「错了也看不出来」的地方 —— ① 表头/列名对不上时,回收**逐行静默回落**成
+# 预标标签,而打印出来的读数是「判『改』的 0 条」(看着像「用户什么都没改」);
+# ② 「最终标签」列被顺手填成预标时,**用户改了哪几条就再也分不出来**了(B6-A 的承重不变量)。
+# 两者都取 `tmp_path`,所以这几条**不碰** `evals/topic/labels/trainval.csv` 那份真产物。
+
+
+def _write_review_csv(path, rows, header=None):
+    import csv
+    from scripts import export_label_review as exp
+
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(exp.HEADER if header is None else header)
+        w.writerows(rows)
+
+
+def test_export_writes_the_stratified_sample_with_the_judgement_columns_blank(
+    monkeypatch, tmp_path, capsys
+):
+    """`export` 的接线:分层抽样(不是全量、不是随机)、后三列**空着**、BOM 在。
+
+    ⚠️ **「后两列空着」是 B6-A 的承重不变量**(2026-09-26):那份 CSV 是**空着两列入库**的
+    —— 用户改完之后 `git diff` 才是「他改了什么」的逐字记录(计划那句「进 git,可追溯」)。
+    实现里若顺手把预标标签也写进「最终标签」,表看起来**更完整**,而**改了哪几条永远分不出来**。
+    """
+    import csv
+    import io
+
+    from scripts import export_label_review as exp
+
+    src = tmp_path / "prelabeled.jsonl"
+    src.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in (
+            [{"id": f"{lb}-{i:02d}", "question": f"{lb}问题{i}", "labels": [lb]}
+             for lb in ("尺码", "退换货", "运费") for i in range(20)]
+        )) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exp, "PRELABELED", src)
+    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path / "labels")
+
+    exp.export()
+
+    raw = (tmp_path / "labels" / "trainval.csv").read_bytes()
+    # utf-8-sig:中文 Windows 的 Excel 打开无 BOM 的 CSV 会乱码。
+    assert raw.startswith(b"\xef\xbb\xbf"), "BOM 没了 —— Excel 打开会乱码"
+    table = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+    assert table[0] == exp.HEADER
+    body = table[1:]
+    assert len(body) == 15, "抽的不是 per_label=5 × 3 类(或没去重)"
+    from collections import Counter
+    assert Counter(r[2] for r in body) == {"尺码": 5, "退换货": 5, "运费": 5}
+    assert all(r[1] for r in body), "「问题」列必须填(人要照着它判)"
+    assert {(r[3], r[4], r[5]) for r in body} == {("", "", "")}, (
+        "「判定」/「最终标签」/「备注」必须是**空**的 —— 填了就把用户改了什么这件事提前毁掉"
+    )
+    printed = capsys.readouterr().out
+    assert "导出 15 条" in printed
+    assert "每类条数" in printed
+
+
+def test_import_takes_the_final_labels_and_falls_back_to_the_prelabels(
+    monkeypatch, tmp_path, capsys
+):
+    """`import` 的接线:以「最终标签」为准、空了才回落预标、「改」的条数是读数、`reviewed` 标上。
+
+    分隔符:`|` 与 `,` 都要认,且**两边的空白无所谓**(`尺码, 退换货` 是人最常打的形态)。
+    """
+    from scripts import export_label_review as exp
+
+    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path)
+    monkeypatch.setattr(exp, "REVIEWED", tmp_path / "reviewed.jsonl")
+    _write_review_csv(tmp_path / "trainval.csv", [
+        ["a", "买大了想退", "尺码", "改", "尺码, 退换货", "两个诉求"],
+        ["b", "快递到哪了", "物流", "ok", "", ""],
+        ["c", "能便宜点吗", "优惠活动", "", "价保", "只填了最终标签"],
+    ])
+
+    exp.do_import()
+
+    rows = [
+        json.loads(l) for l in
+        (tmp_path / "reviewed.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(r["id"], r["question"], r["labels"]) for r in rows] == [
+        ("a", "买大了想退", ["尺码", "退换货"]),   # 用户填的(逗号 + 空格)
+        ("b", "快递到哪了", ["物流"]),              # 没填 ⇒ 回落预标
+        ("c", "能便宜点吗", ["价保"]),              # 只填了最终标签也认(「判定」只影响报表)
+    ]
+    assert all(r["reviewed"] is True for r in rows)
+    printed = capsys.readouterr().out
+    assert "回收 3 条" in printed
+    assert "判「改」的 1 条" in printed
+
+
+def test_import_refuses_input_that_would_silently_change_the_reading(monkeypatch, tmp_path):
+    """三种「不响亮就会静默给出错读数」的输入 —— 每一种都必须在**写产物之前**停住。
+
+    ① **表头缺列**:`row.get("最终标签")` 恒为 None ⇒ 每行静默回落预标,而读数是「判『改』的 0 条」;
+    ② **判定值认不出**(`改了`):若当成「没改」,错误率被**少算** —— 一个乐观方向的错答案;
+    ③ **标签是错字**(`尺碼`):静默丢弃的话,训练集里就少一个标签,而没人会知道。
+
+    ⚠️ 每条都断 `产物不存在` —— 「拦住了」与「拦住了但先写了一份错的」是两回事。
+    """
+    from scripts import export_label_review as exp
+
+    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path)
+    monkeypatch.setattr(exp, "REVIEWED", tmp_path / "reviewed.jsonl")
+    csv_path = tmp_path / "trainval.csv"
+    out = tmp_path / "reviewed.jsonl"
+
+    # ① 表头缺列(少了「最终标签」)
+    _write_review_csv(
+        csv_path, [["a", "买大了想退", "尺码", "改", "备注"]],
+        header=["id", "问题", "预标标签", "判定(ok/改)", "备注"],
+    )
+    with pytest.raises(SystemExit) as e1:
+        exp.do_import()
+    assert "表头缺列" in str(e1.value), str(e1.value)
+    assert not out.exists()
+
+    # ② 判定值认不出
+    _write_review_csv(csv_path, [["a", "买大了想退", "尺码", "改了", "退换货", ""]])
+    with pytest.raises(SystemExit) as e2:
+        exp.do_import()
+    assert "认不出的值" in str(e2.value), str(e2.value)
+    assert not out.exists()
+
+    # ③ 标签错字
+    _write_review_csv(csv_path, [["a", "买大了想退", "尺码", "改", "尺碼", ""]])
+    with pytest.raises(SystemExit) as e3:
+        exp.do_import()
+    assert "不合法类目" in str(e3.value), str(e3.value)
+    assert not out.exists()
+
+
+def test_export_script_pins_stdout_encoding():
+    """`main()` **自己**必须把 stdout 钉成 UTF-8 —— 本机 locale 是 cp936。
+
+    ⚠️ **为什么必须有这一条**:`⚠️`(U+26A0 + VS16)编不进 GBK(实测 2026-09-26),
+    而它只出现在「某类一条都没抽到」那条 print 里 ⇒ **用真实数据跑一次 `export` 碰不到它**,
+    那样测必然假绿(事实:当天的语料 17 类**每类都抽到了**,那行一次都不打印)。
+    这里在**子进程里**跑 `main()`,再由**测试自己**打印一个 `⚠️` —— 钉没钉住当场见分晓。
+
+    ⚠️ 子进程故意**不加 `-X utf8`**:加的话 stdout 恒是 UTF-8,这条断言就**恒真**。
+    它的判别力**依赖本机是 cp936**,换一台 UTF-8 locale 的机器就退化成「函数存在」检查
+    (如实记下来,不装作它到哪都同样有力)。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    code = "\n".join([
+        "import sys",
+        "from scripts import export_label_review as e",
+        "e.export = lambda: None",       # 只桩掉写文件那一半(断言的是 stdout,不是产物)
+        'sys.argv = ["export_label_review.py", "export"]',
+        "e.main()",
+        "print('⚠️ 某类一条都没抽到')",
+    ])
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    assert proc.returncode == 0, f"钉编码没生效(main() 里那一行被删了?):\n{proc.stderr}"
+    assert "某类一条都没抽到" in proc.stdout
