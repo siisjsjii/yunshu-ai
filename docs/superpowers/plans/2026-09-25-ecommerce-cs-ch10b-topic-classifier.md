@@ -1565,6 +1565,20 @@ git commit -m "ch10-B T5: 大模型预标(证据串校验 + 解析失败可见 +
 
 ## Task 6: 人工复核 CSV(导出 → 用户改 → 回收)
 
+> ⚠️ **计划订正 6-B(controller,2026-09-26):本任务**跨**了人工检查点 CP-2,必须拆成两段执行。**
+>
+> 原稿把「写代码 + 导出 + **等用户改** + 回收」串成一条任务,而 **Step 6 之后是人的时间**,
+> 不是 agent 的时间。照原样派,实现者会在 Step 7 无输入可回收(CSV 还是空的)。
+>
+> - **B6-A(agent 做,做完就停)**:Step 1–6。写 `pick_review_sample` + `export_label_review.py`,
+>   跑 `export`,**把「代码 + 那份空着两列的 CSV」一起 commit**(CSV 里 `判定` / `最终标签`
+>   两列为空 —— 这正是刻意的:用户改完之后 `git diff` 就是**他改了什么的逐字记录**),
+>   然后把 CSV 交给用户,**停**。
+> - **B6-B(用户改完之后才做)**:Step 7–8。跑 `import` 回收 → `reviewed.jsonl`,
+>   用「总条数 / 判『改』的条数」两个读数补 `dev-notes/ch10.md`,再 commit。
+>
+> ⚠️ **B6-B 之前不许开工 Task 7** —— 切分要用**用户改过的标签**(spec §6.3)。
+
 **Files:**
 - Modify: `app/topic/labeling.py`(加 `pick_review_sample`)
 - Modify: `tests/test_topic_labeling.py`
@@ -1573,7 +1587,11 @@ git commit -m "ch10-B T5: 大模型预标(证据串校验 + 解析失败可见 +
 **Interfaces:**
 - Consumes: `evals/topic/prelabeled.jsonl`
 - Produces:
-  - `app.topic.labeling.pick_review_sample(rows, *, per_label: int, seeds=None) -> list[dict]` —— 按类分层各抽 N 条,纯函数、**可注入随机种子**
+  - `app.topic.labeling.pick_review_sample(rows, *, per_label: int, seed: int = 20260925) -> list[dict]`
+    —— 按类分层各抽 N 条,纯函数、**可注入随机种子**
+    ⚠️ **计划订正 6-A(controller,2026-09-26)**:这行原先写的是 `seeds=None`(**拼错**,复数),
+    而本任务正文的测试、实现、以及 `export_label_review.py` 的调用点**全都用 `seed`(单数)**。
+    以**单数 `seed`** 为准 —— 真在 `app/topic/labeling.py`。
   - `scripts/export_label_review.py export` → `evals/topic/labels/trainval.csv`
   - `scripts/export_label_review.py import` → 把用户改完的 CSV 写回 `evals/topic/reviewed.jsonl`
 
@@ -1607,10 +1625,33 @@ def test_pick_review_sample_takes_from_every_label():
 
 
 def test_pick_review_sample_is_reproducible_with_a_seed():
-    """同一种子两次结果相同 —— 否则「我审的是哪 85 条」说不清。"""
+    """同一种子两次结果相同 —— 否则「我审的是哪 85 条」说不清。
+
+    ⚠️ **计划订正 6-C(controller,2026-09-26):这条**自己**是**同义反复**,
+    光有它**不足以**说明 seed 被用上了** —— 一个**完全忽略 seed** 的实现
+    (根本不 shuffle、或每次都按 id 排序返回)同样满足「同一种子两次相同」。
+    ⇒ **必须配下面那条 `test_different_seeds_pick_different_samples`**,
+    两条合起来才把「随机且可复现」这件事钉住。
+    """
     a = pick_review_sample(_rows(), per_label=5, seed=42)
     b = pick_review_sample(_rows(), per_label=5, seed=42)
     assert [r["id"] for r in a] == [r["id"] for r in b]
+
+
+def test_different_seeds_pick_different_samples():
+    """**不同种子给出不同样本** —— 这一条才是「seed 真的被用上了」的判据。
+
+    只有上面那条时,把 `rng.shuffle(shuffled)` 整行删掉,**上面那条照样绿**
+    (输入 20 条里取 5 条,不洗牌就是固定取前 5 条 —— 确定,但**不是抽样**)。
+    本仓把这种叫「断言在它本该禁止的实现下依然通过」。
+
+    ⚠️ 用 `per_label=5` / 每类 20 条:`C(20,5)` 很大,两个种子撞出**同一集合**
+    的概率可忽略;万一将来有人把样本调小,这条会**偶发红**,
+    那时该改的是**这条测试的规模**,不是把它删掉。
+    """
+    a = pick_review_sample(_rows(), per_label=5, seed=0)
+    b = pick_review_sample(_rows(), per_label=5, seed=1)
+    assert [r["id"] for r in a] != [r["id"] for r in b]
 
 
 def test_pick_review_sample_takes_what_is_available():
