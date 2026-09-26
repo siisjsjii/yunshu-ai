@@ -296,11 +296,16 @@ INTENT_TO_TOPICS: dict[str, tuple[str, ...]] = {
 }
 
 
+# ⚠️⚠️ **计划订正 5-A(controller,2026-09-26)—— 这是 Task 1 的原稿,已被 Task 5 Step 0 取代** ⚠️⚠️
+# 照抄下面这一版会**静默回退「计划订正 D」**(把 `POSITIVE` 重新挤出 prompt)。
+# 现在多加一行:每类的正例也要渲染(形如 `    · 例:「{text}」`),`COUNTER` 没声明的 7 类照样有。
+# 改的是**渲染函数**,`POSITIVE` / `BOUNDARY` / `COUNTER` 常量表与用户签过字的
+# `evals/topic/taxonomy.csv` **一字未动**。真在 `app/topic/taxonomy.py`。
 def render_taxonomy_for_prompt() -> str:
     """渲染成类目表文本块,供预标与合成的 prompt 使用。
 
     **不含花括号**(`ChatPromptTemplate` 按 f-string 解析)。
-    含边界说明与反例 —— 反例是「近邻类目怎么划开」的实际内容,
+    含边界说明、正例与反例 —— 反例是「近邻类目怎么划开」的实际内容,
     只给边界说明不给反例的话,模型对「刚收到就坏了」会犹豫。
     """
     lines = []
@@ -1092,7 +1097,7 @@ def build_prompt(label: str, form: str, n: int) -> str:
     }[form]
     return f"""你在为一个电商客服系统造**训练语料**。
 
-下面是本系统权威的类目表(含每类的边界说明与容易混的反例):
+下面是本系统权威的类目表(含每类的边界说明与容易混的反例):  # ⚠️ 订正 5-C:真实现已改成「边界说明、**正例**与容易混的反例」
 
 {render_taxonomy_for_prompt()}
 
@@ -1395,6 +1400,14 @@ CORPUS = ROOT / "evals" / "topic" / "corpus.jsonl"
 SYNTH = ROOT / "evals" / "topic" / "synthetic.jsonl"
 OUT = ROOT / "evals" / "topic" / "prelabeled.jsonl"
 
+# ⚠️ **计划订正 5-B(controller,2026-09-26)**:下面这段与真实现有两处差 ——
+#   ① `render_taxonomy_for_prompt()` 现在**也渲染正例**(Step 0 / 订正 D),
+#      所以描述它的那句从「含每类的**边界说明与**容易混的反例」
+#      **必须改成「含每类的边界说明、正例与容易混的反例」**
+#      —— 不改的话,这句话本身就是**假的**(本仓那条「代码里一句看起来成立、
+#      其实描述的不是代码」的形状)。
+#   ② `run()` 里取模型的那行是 `_bind_json(create_extract_model(settings))`,
+#      不是裸的 `create_extract_model(settings)`(见 Step 5 的 `_bind_json`)。
 PROMPT = """你在为一款电商客服系统做**多标签主题标注**。
 
 权威类目表(含每类的边界说明与容易混的反例):
@@ -1805,6 +1818,20 @@ git commit -m "ch10-B T6: 人工抽审 CSV(按类分层各 5 条,测错误率而
 *(计划续:任务 7–16 见下)*
 
 ## Task 7: 分层抽样 + 冻结测试集
+
+> ⚠️ **本任务多承接一条(T5 复审发现,controller 2026-09-26 裁定交给这里)**:
+> **必须加一条 train-vs-test 的重复/近重复检查。**
+>
+> 起因:T5 的 Step 0 把 `POSITIVE` 的 34 句正例接进了渲染块,而该渲染块**同时被 T4 的生成器用**
+> ⇒ **(a) 已发生**:冻结测试集(`source=evalmd`,299 行)里 **8 行含渲染块里的例句原句** ——
+> 6 行含「运费怎么算」(`COUNTER` 那句,T1 起就在 prompt 里)+ **2 行含「什么材质」**
+> (`POSITIVE['商品信息']`,**本次新带入**,占 2/299 = 0.7%);
+> **(b) 未来风险**:T4 的禁词表只覆盖**类目名 + 边界说明原词**、**不覆盖这些例句**
+> ⇒ **下次重跑 T4 可能把「买大了」「175 穿什么码」整句抄进问句** ⇒ 训练侧抄了测试侧的句子。
+> ⇒ 本任务的切分**不能只按标签分层**,还要**按清洗后的文本做一次 train-vs-test 重复检查**
+> (完全相同 ⇒ 必须移出训练侧;近重复 ⇒ 报出条数并入账)。
+> **并把这条风险的量写进 spec §8「对外报数的唯一依据」那一段的账里** ——
+> 报测试集分数时要知道其中 8 行与 prompt 里的例句字面重叠。
 
 **Files:**
 - Modify: `app/topic/labeling.py`(加 `stratified_split`)
