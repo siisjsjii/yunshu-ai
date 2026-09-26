@@ -81,6 +81,39 @@ def test_clean_runs_the_whole_pipeline():
     assert clean("手机１３８００１３８０００,退货!!!  怎么走?") == "手机<手机号>,退货! 怎么走?"
 
 
+def test_clean_output_is_nfkc_normalized_across_placeholder_boundaries():
+    """修复轮 2:`clean` **第二遍** `normalize` 的用途,钉在这里。
+
+    `redact` 插进去的尖括号会与**紧随其后的组合标记**规范组合:
+    `<` + U+0338 → U+226E,`>` + U+0338 → U+226F
+    (0x110000 全码点穷举,`<` / `>` 各**恰好一个**这样的码点)。
+    所以「手机号 + U+0338」洗出来必须是**合成后**的 U+226F 一个码点,
+    不是裸的 `>` 加 U+0338 两个码点。
+
+    ⚠️ **这条就该对着「删掉第二遍 `normalize`」判红**(实测过:删掉 ⇒ 红)。
+    修复轮 1 曾把那一步当「可证的 no-op」删掉 —— 它的理由来自一次**字母表里
+    没有组合记号**的模糊测试,而采样空间(字母表 × 形状 × 长度)决定了结论的适用范围:
+    `len <= 6` 的随机串既造不出 11 位手机号,也就撞不上这个边界。
+
+    ⚠️ 组合记号写在源码里是**看不见**的 —— 所以它们一律用 `chr(0x0338)` 这种码点写法,不写裸字符。
+    """
+    import unicodedata
+
+    mark = chr(0x0338)  # COMBINING LONG SOLIDUS OVERLAY —— 看不见,故用码点写
+    gt = chr(0x226F)  # 上面那个记号紧跟 `>` 时合成出来的字
+
+    cases = (
+        ("我的手机号是13800138000" + mark + ",发货了吗", "我的手机号是<手机号" + gt + ",发货了吗"),
+        ("订单20240915001" + mark + "什么时候到", "订单<订单号" + gt + "什么时候到"),
+        ("邮箱 a.b@example.com" + mark + " 能改吗", "邮箱 <邮箱" + gt + " 能改吗"),
+    )
+    for raw, expected in cases:
+        got = clean(raw)
+        assert got == expected
+        # 真正的性质:输出本身落在 NFKC 规范形里(上面那条钉的是具体文本)
+        assert unicodedata.normalize("NFKC", got) == got
+
+
 def test_both_sides_use_the_same_clean():
     """⚠️ **训练侧与推理侧必须 import 同一个 `clean`。**
 
