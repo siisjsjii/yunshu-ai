@@ -631,8 +631,11 @@ def test_dedupe_keeps_first_occurrence_and_source():
 def test_dedupe_is_on_the_cleaned_text():
     """「退货  怎么走」与「退货怎么走」是同一句 —— 按原文去重会漏。
 
-    池子里的问题来自不同轮次,空白/全角差异很常见;按原文去重会
-    让同一条问题在合成配额里被算两次,分布跟着偏。
+    ⚠️ **这条测试自证的是「机制对」,不是「今天差多少」。** 实测(2026-09-26):
+    按清洗后去重与按原文去重,在当天的 1259 行真实语料上**只差 1 条**,
+    而且那 1 条的差异来自**脱敏**(手机号被换成占位符后与另一条撞上),
+    **不是**空白/全角。⇒ 设计仍然对(清洗后才是真正要分类的文本),
+    但**别把这个理由当成实测事实引用** —— 它是「应该如此」,不是「测得如此」。
     """
     rows = [
         {"question": "退货 怎么走", "source": "pool"},
@@ -724,12 +727,16 @@ async def _from_db() -> list[dict]:
     rows: list[dict] = []
     eng = get_engine()
     async with eng.connect() as conn:
-        for q in (
-            text("SELECT question FROM low_confidence_questions ORDER BY id"),
-            text("SELECT content FROM messages WHERE role='user' ORDER BY id"),
+        # ⚠️ **两条查询的 source 必须不同**(`pool` / `chat`)。这里一度两处都写成 `"pool"`,
+        #    与下面 `collect()` 里那段优先级注释自相矛盾。
+        #    它是**承重的**,不是标签洁癖 —— 实测(2026-09-26):**池子那 33 条全部与对话重复**
+        #    ⇒ 两边写同一个值的话,来源分布里池子会读成 `pool 0`,而**没有任何东西会报错**。
+        for q, src in (
+            (text("SELECT question FROM low_confidence_questions ORDER BY id"), "pool"),
+            (text("SELECT content FROM messages WHERE role='user' ORDER BY id"), "chat"),
         ):
             for (value,) in (await conn.execute(q)).all():
-                rows.append({"question": value, "source": "pool"})
+                rows.append({"question": value, "source": src})
     await eng.dispose()
     return rows
 
