@@ -10,7 +10,14 @@ import json
 
 import pytest
 
-from app.topic.labeling import dedupe_questions, pick_review_sample, validate_evidence
+from app.topic.labeling import (
+    dedupe_questions,
+    is_unusable_target,
+    pick_review_sample,
+    stratified_split,
+    train_test_overlap,
+    validate_evidence,
+)
 
 
 def test_dedupe_keeps_first_occurrence_and_source():
@@ -1011,3 +1018,466 @@ def test_export_script_pins_stdout_encoding(tmp_path):
     assert after == before, (
         f"{artifact} 在这次子进程里**被改动了** —— 这就是 F1 那条雷(用户的 CP-2 记录被覆盖)"
     )
+
+
+# ---- 分层抽样与测试集冻结(ch10 spec §5.3 / §5.5)—— 纯函数,零 IO ----
+#
+# ⚠️ 这一节钉**抽样机制**;脚本侧(`split` 子命令)的接线 —— 合并 `reviewed.jsonl`、
+#    两条零标签行的去向、train-vs-test 重复的摘除、三个产物名 —— 在**再下面那一节**。
+
+
+def _mixed(n_real=100, n_synth=200):
+    rows = []
+    for i in range(n_real):
+        rows.append({"id": f"r{i}", "provenance": "real", "labels": ["尺码"],
+                     "question": f"真问题{i}"})
+    for i in range(n_synth):
+        rows.append({"id": f"s{i}", "provenance": "synthetic", "labels": ["运费"],
+                     "question": f"合成问题{i}"})
+    return rows
+
+
+def test_test_set_has_the_prescribed_composition():
+    """⚠️ **测试集构成是抽样的硬条件,不是抽完再看结果**(spec §5.3)。
+
+    「真实 80 + 合成 40」是 §8.4 那三层报告能打出来的前提:
+    少了它,「只看真实」那一列就没有足够的样本。
+    """
+    parts = stratified_split(_mixed(), test_real=80, test_synth=40, seed=0)
+    test = parts["test"]
+    from collections import Counter
+    c = Counter(r["provenance"] for r in test)
+    assert len(test) == 120
+    assert c["real"] == 80 and c["synthetic"] == 40
+
+
+def test_splits_do_not_overlap():
+    """三份**互不相交** —— 有交集就是数据泄漏,而 F1 会因此虚高。"""
+    parts = stratified_split(_mixed(), test_real=80, test_synth=40, seed=0)
+    ids = [r["id"] for part in parts.values() for r in part]
+    assert len(ids) == len(set(ids))
+
+
+def test_all_rows_are_used():
+    parts = stratified_split(_mixed(), test_real=80, test_synth=40, seed=0)
+    assert sum(len(p) for p in parts.values()) == 300
+
+
+def test_split_is_reproducible():
+    a = stratified_split(_mixed(), test_real=80, test_synth=40, seed=7)
+    b = stratified_split(_mixed(), test_real=80, test_synth=40, seed=7)
+    assert [r["id"] for r in a["test"]] == [r["id"] for r in b["test"]]
+
+
+def test_different_seeds_give_different_test_sets():
+    """**不同种子给出不同切分** —— 这一条才把「`seed` 真的被用上」钉住。
+
+    ⚠️ **上面那条「同一种子两次相同」是**同义反复**(计划订正 6-C 已在
+    `pick_review_sample` 上记过同一个形状):一个**完全忽略 seed** 的实现
+    (根本不 shuffle、每次都按 id 排序返回)同样满足它 —— 确定,但**不是抽样**。
+    ⇒ 两条合起来才成立;少了这一条,把 `rng` 换成一个固定顺序的实现照样全绿。
+
+    ⚠️ 判别力**依赖规模**:`_mixed()` 的真实池 100 条里取 80 条,
+    `C(100,20)` 极大 ⇒ 两个种子撞出**同一集合**的概率可忽略。
+    将来若有人把语料调小,这条会**偶发红**;那时该改的是**这条测试的规模**,
+    而不是把它删掉(与 `test_different_seeds_pick_different_samples` 同款记账)。
+    """
+    a = stratified_split(_mixed(), test_real=80, test_synth=40, seed=0)
+    b = stratified_split(_mixed(), test_real=80, test_synth=40, seed=1)
+    assert [r["id"] for r in a["test"]] != [r["id"] for r in b["test"]]
+
+
+def test_head_labels_are_oversampled_into_the_test_set():
+    """头四类在测试集里每类 ≥15 条(spec §5.3)—— 否则那条 F1 是噪声。
+
+    这条测试用的语料**故意让头四类样本充足**,好让「配额」这件事可观测;
+    真实语料不够时,`stratified_split` 应当**如实少给**并在返回里标注,
+    而不是硬凑(硬凑会重复使用同一样本 ⇒ 数据泄漏)。
+
+    ⚠️ **如实记账:这条对「分层 vs 按比例随机」的判别力很弱。** 语料四类**等量**
+    (各 60 条)、测试集要 80 条 ⇒ 按比例随机抽也**期望**每类 20 条,
+    `>= 8` 在两种实现下都过(无变异可红)。真正钉「轮转取」的是下面
+    `test_rare_labels_are_not_squeezed_out_of_the_test_set`(小类必须露面)。
+    """
+    rows = []
+    for label in ("退换货", "物流", "尺码", "发票"):
+        for i in range(60):
+            rows.append({"id": f"{label}{i}", "provenance": "real",
+                         "labels": [label], "question": f"{label}问题{i}"})
+    for i in range(60):
+        rows.append({"id": f"x{i}", "provenance": "synthetic",
+                     "labels": ["评价"], "question": f"评价问题{i}"})
+    parts = stratified_split(rows, test_real=80, test_synth=40, seed=0)
+    from collections import Counter
+    c = Counter(lb for r in parts["test"] for lb in r["labels"])
+    for label in ("退换货", "物流", "尺码", "发票"):
+        assert c[label] >= 8, f"头四类里的 {label} 在测试集只有 {c[label]} 条"
+
+
+def test_rare_labels_are_not_squeezed_out_of_the_test_set():
+    """★ 小类必须**露面** —— 这一条才是「分层」区别于「按比例」的判据。
+
+    语料:两个大类各 100 条 + **10 个小类各 2 条**(共 220 条真实),测试集 80 条。
+
+    - **轮转取**(实现如此):12 个桶轮着弹,80 次里每个桶都被弹到 6–7 次
+      ⇒ 那 10 个小类各自的 2 条**全部**进测试集 ⇒ 正确实现下这条**恒绿**;
+    - **按比例取**(变异):小类占 20/220 ≈ 9%,期望每类 1.6 条 ——
+      某个小类**一条不剩**的概率约 0.4,十个全露面只有 ≈ 0.6% ⇒ 变异约 99% 红。
+
+    ⚠️ **判据**:上面那条 `>= 8` 断的是「头四类够不够多」,而**等量语料下随机抽
+    也够多** ⇒ 它对「有没有分层」零判别力。这一条断的是「**小类还在不在**」——
+    那正是 `take()` 里那句「轮转取,保证每个类都有代表」在说的事。变异 **M5** 实测过。
+    """
+    rows = []
+    for label in ("尺码", "退换货"):
+        for i in range(100):
+            rows.append({"id": f"{label}{i}", "provenance": "real",
+                         "labels": [label], "question": f"{label}问题{i}"})
+    rare = ("发票", "价保", "支付", "账号", "会员积分", "评价", "商品信息", "保修维修",
+            "库存补货", "订单修改")
+    for label in rare:
+        for i in range(2):
+            rows.append({"id": f"{label}{i}", "provenance": "real",
+                         "labels": [label], "question": f"{label}问题{i}"})
+    parts = stratified_split(rows, test_real=80, test_synth=0, seed=0)
+    appeared = {lb for r in parts["test"] for lb in r["labels"]}
+    missing = [lb for lb in rare if lb not in appeared]
+    assert missing == [], f"这些小类在测试集里一条都没有:{missing}"
+
+
+# ---- 靶子不可信的行(计划订正 9-E)----
+
+
+def test_unusable_target_predicate():
+    """9-E 的判据:零标签**且****有**被证据校验拒掉的标签。
+
+    ⚠️ 两行零标签在产物里**逐字节相同**(都是 `labels: []`)⇒ **只按 `labels` 分不开**
+    `r-0049`「你是」(模型真判零诉求)与 `s-0423`「首重多少,超了咋算?」
+    (证据校验机械拒到空,`rejected_labels == ['运费']`)—— 后者的真实主题几乎肯定是运费。
+    """
+    assert is_unusable_target({"labels": [], "rejected_labels": ["运费"]}) is True
+    # 模型真判了零诉求 ⇒ 留着(它就是「该判 `其他`」的样本)
+    assert is_unusable_target({"labels": [], "rejected_labels": []}) is False
+    # 有标签 ⇒ 被拒的那几个不影响这行是个正常样本
+    assert is_unusable_target({"labels": ["运费"], "rejected_labels": ["尺码"]}) is False
+    assert is_unusable_target({"labels": ["运费"], "rejected_labels": []}) is False
+    # 键缺失(别的调用方 / 老产物):**有**被拒的标签才成立,缺键不算
+    assert is_unusable_target({"labels": []}) is False
+
+
+def test_rows_with_an_untrusted_target_are_dropped_out_of_the_split():
+    """★ 9-E:靶子不可信的行**哪一份都不进**(排除出 train/val,也不许挪进测试集)。
+
+    以空标签喂进训练是在教模型「这句话没有主题」—— 而那是个**处理产物、不是判断**。
+
+    ⚠️ **反面对照是这条的一半**:模型真判零诉求的那行(`r-0049` 的形状)**要留着**,
+    测试集里正缺一条「该判 `其他`」的样本。⇒ 少了下面第二句,把过滤写成
+    `labels == []`(两行一起排除)照样绿。
+    """
+    rows = _mixed(n_real=20, n_synth=20)
+    rows.append({"id": "s-bad", "provenance": "synthetic", "labels": [],
+                 "rejected_labels": ["运费"], "question": "首重多少,超了咋算?"})
+    rows.append({"id": "r-judged", "provenance": "real", "labels": [],
+                 "rejected_labels": [], "question": "你是"})
+    parts = stratified_split(rows, test_real=8, test_synth=4, seed=0)
+    ids = [r["id"] for part in parts.values() for r in part]
+    assert "s-bad" not in ids, "靶子不可信的行还是进了某一份"
+    assert "r-judged" in ids, "模型真判零诉求的行被一起排除了 —— 过度处置"
+
+
+# ---- train-vs-test 重复检查(计划订正 9-C)----
+
+
+def test_train_test_overlap_reports_exact_duplicates_and_near_pairs():
+    """★ 9-C:`train_test_overlap` 必须**报得出**训练侧抄了测试侧的句子。
+
+    ⚠️ **为什么要有这一步**(T5 复审发现,见 Task 7 节首):`POSITIVE` 的 34 句正例
+    进了 **T4 生成器**的 prompt,而 T4 的禁词表**不覆盖这些例句** ⇒
+    重跑 T4 可能把「买大了」「175 穿什么码」整句抄进问句 ⇒ **训练侧抄了测试侧**。
+    已发生的一半:冻结测试集里 8 行与渲染块例句字面重叠。
+
+    两档判据、两种处置(混起来处置就错了):
+    - **完全相同**(**清洗后**文本相等)⇒ 报进 `exact_train_ids`,`split()` 据此**移出训练侧**;
+    - **近重复**(字符二元组 Jaccard ≥ `near`)⇒ **只报不删** ——
+      删了就是拿一条**启发式判据**改数据。
+
+    这条用例的两个输入各自钉一件事:
+    - `r-exact` 与 `t-exact` **原文不同**(一个是全角空格 U+3000)而**清洗后相同**
+      ⇒ 把 `clean()` 换成原文比较,第一条断言就红(变异 **M6**);
+    - `r-near` 与 `t-near` 只差最后一个字(「呢」/「啊」)⇒ Jaccard ≈ 0.83 ≥ 0.8,
+      但**不是**完全相同 ⇒ 把 `near` 抬到 1.0 就红(变异 **M7**);
+    - 同时 `pairs == [...]` 也钉住「完全相同的那对**不重复计入** near」
+      (它在 `exact` 里,谁也不会漏看;重复报会让「近重复 N 对」这个读数虚高)。
+    """
+    train = [
+        {"id": "r-exact", "question": "首重　多少", "labels": ["运费"]},       # 全角空格
+        {"id": "r-near", "question": "这个订单什么时候能发货呢", "labels": ["物流"]},
+        {"id": "r-unrelated", "question": "完全无关的一句", "labels": ["其他"]},
+    ]
+    test = [
+        {"id": "t-exact", "question": "首重 多少", "labels": ["运费"]},
+        {"id": "t-near", "question": "这个订单什么时候能发货啊", "labels": ["物流"]},
+    ]
+    out = train_test_overlap(train, test)          # ← 用**默认** `near`,见变异 M7
+    assert out["exact_train_ids"] == ["r-exact"]
+    pairs = [(a, b) for a, b, _ in out["near_pairs"]]
+    assert pairs == [("r-near", "t-near")], out["near_pairs"]
+    sim = out["near_pairs"][0][2]
+    assert 0.8 <= sim < 1.0, f"近重复的相似度不该落在 [0.8, 1.0) 之外:{sim}"
+
+
+def test_train_test_overlap_is_empty_when_nothing_matches():
+    """什么都没抄时两个读数都必须是**空的** —— 否则「报出 0 条」这句话没有基准。
+
+    (上面那条只钉了「有重复时报得出来」;一个**恒报**的实现照样能过它。)
+    """
+    train = [{"id": "r1", "question": "买大了想退", "labels": ["尺码"]}]
+    test = [{"id": "t1", "question": "发票多久寄到", "labels": ["发票"]}]
+    assert train_test_overlap(train, test) == {"exact_train_ids": [], "near_pairs": []}
+
+
+def test_train_test_overlap_honours_the_near_threshold():
+    """`near` 是**参数**,不是写死的常数 —— 两个方向各钉一次。
+
+    默认 0.8 是「报数」那一档(只报很像的);排查时可以调低看全一些。
+    把默认值改成 1.0(等价于「只认完全相同」)或把阈值写死,都会让**其中一个方向**红:
+
+    - `near=0.2` 那一句:写死 0.8 的实现会返回空 ⇒ 红;
+    - 默认那一句:默认值抬到 1.0 的实现也会返回空 ⇒ 红(变异 **M7**)。
+
+    这对句子的相似度实测约 **0.5**(「买大了想退」vs「买大了想换货」):
+    共享「买大/大了/了想」三个二元组,并集 6 个 —— 硬编码一个能同时满足
+    两个方向的常数是做不到的。
+    """
+    train = [{"id": "r1", "question": "买大了想退", "labels": ["尺码"]}]
+    test = [{"id": "t1", "question": "买大了想换货", "labels": ["退换货"]}]
+    assert train_test_overlap(train, test)["near_pairs"] == [], "默认阈值不该把 0.5 相似度算进来"
+    low = train_test_overlap(train, test, near=0.2)["near_pairs"]
+    assert len(low) == 1 and low[0][:2] == ("r1", "t1"), low
+
+
+# ---- `split` 子命令的接线(ch10 spec §5.3 / §5.5)—— 不联网、不碰库、不碰真产物 ----
+#
+# ⚠️ 这一节的全部理由是:上面那些纯函数**对了**,接不上也照样全绿。四处接线各自
+#    对应一个「看起来做完了、其实没接上」:
+#   ① `reviewed.jsonl` 的**覆盖**没做 ⇒ 用户那 84 条的复核成果不进训练集(只影响报表);
+#   ② 两行零标签没有显式处置 ⇒ 靶子不可信的那行以空标签喂进训练;
+#   ③ train-vs-test 的**完全相同**没有摘除 ⇒ 数据泄漏,而 F1 虚高;
+#   ④ 产物写成了 `test.jsonl`(订正 9-B)⇒ 用户那 120 条的复核对指标**零影响**。
+
+
+def _read_jsonl(path):
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _bind_split(monkeypatch, tmp_path):
+    """`split` 的三个路径全指到 `tmp_path` —— 真产物 `evals/topic/*.jsonl` 此刻不该被写。"""
+    from scripts import prepare_topic_data as p
+
+    monkeypatch.setattr(p, "TOPIC_DIR", tmp_path)
+    monkeypatch.setattr(p, "PRELABELED", tmp_path / "prelabeled.jsonl")
+    monkeypatch.setattr(p, "REVIEWED", tmp_path / "reviewed.jsonl")
+    return p
+
+
+def _split_corpus(tmp_path):
+    """给接线用例造语料。⚠️ **`exact_train_ids` 非空是有论证的,不是靠运气**:
+
+    真实池 **122** 条,其中 **61** 条是**同一个文本**;切走 80 条后训练侧(含验证)
+    剩 **42** 条 ⇒ 那 61 份**不可能全落在训练侧**(42 < 61)⇒ **至少有一份在测试侧**
+    ⇒ 那个文本两侧都有 ⇒ 必然报出「完全相同」。
+    (本仓规矩:构造输入前先算一遍它会不会走到那条分支。)
+    """
+    rows = [{"id": f"r-{i:04d}", "provenance": "real", "source": "chat",
+             "labels": ["尺码"], "question": "重复句"} for i in range(61)]
+    rows += [{"id": f"r-1{i:03d}", "provenance": "real", "source": "chat",
+              "labels": ["尺码"], "question": f"独有问题{i}"} for i in range(60)]
+    # 9-E 的两行形状:模型真判零诉求 / 证据校验机械拒到空
+    rows.append({"id": "r-9001", "provenance": "real", "source": "chat",
+                 "labels": [], "rejected_labels": [], "question": "你是"})
+    rows += [{"id": f"s-{i:04d}", "provenance": "synthetic", "source": "gen",
+              "labels": ["运费"], "question": f"合成问题{i}"} for i in range(80)]
+    rows.append({"id": "s-9002", "provenance": "synthetic", "source": "gen",
+                 "labels": [], "rejected_labels": ["运费"], "question": "首重多少,超了咋算?"})
+    tmp_path.joinpath("prelabeled.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    # 人工改过的那一条:`s-0000` 的标签被改成「发票」—— 覆盖必须生效,
+    # 否则用户那 84 条的复核成果进不了语料(只影响报表)。
+    tmp_path.joinpath("reviewed.jsonl").write_text(
+        json.dumps({"id": "s-0000", "question": "合成问题0", "labels": ["发票"]},
+                   ensure_ascii=False) + "\n", encoding="utf-8")
+    return rows
+
+
+def test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal(
+    monkeypatch, tmp_path, capsys
+):
+    """`split` 的四条接线一次钉住(逐条见本节节首那张表)。"""
+    import re
+
+    p = _bind_split(monkeypatch, tmp_path)
+    rows = _split_corpus(tmp_path)
+
+    p.split()
+
+    out = capsys.readouterr().out
+    files = {name: _read_jsonl(tmp_path / f"{name}.jsonl") for name in ("train", "val")}
+    files["test"] = _read_jsonl(tmp_path / "topic_test.jsonl")
+    # ⚠️ **订正 9-B**:测试集产物叫 `topic_test.jsonl`。写成 `test.jsonl` 的话
+    #    下面这行直接红 —— 而那正是「用户那 120 条的复核对指标零影响、报告照常打印」
+    #    在测试里的样子。
+    assert not (tmp_path / "test.jsonl").exists(), "写出了 `test.jsonl`(订正 9-B 那个名字)"
+    written = [(name, r) for name, items in files.items() for r in items]
+    ids = [r["id"] for _, r in written]
+
+    # ---- ① `reviewed.jsonl` 的覆盖 ----
+    s0 = [r for _, r in written if r["id"] == "s-0000"]
+    assert len(s0) == 1 and s0[0]["labels"] == ["发票"], (
+        "人工改过的标签没覆盖进语料 ⇒ 用户那 84 条的复核成果只影响报表、不进训练"
+    )
+
+    # ---- ② 两行零标签的去向 ----
+    assert "零标签行" in out, "没有显式列出零标签行的去向"
+    for rid in ("r-9001", "s-9002"):
+        assert f"{rid} " in out, f"{rid} 没被列出去向"
+    assert "'运费'" in out, "不可信那行必须把 `rejected_labels` 打出来(否则与真判零诉求分不开)"
+    assert "s-9002" not in ids, "靶子不可信的行还是进了某一份"
+    assert ids.count("r-9001") == 1, (
+        "模型真判零诉求的行被一起丢了 —— 过度处置(它该留在某一份里)"
+    )
+
+    # ---- ③ train-vs-test 的完全相同被摘除 ----
+    m = re.search(r"完全相同 (\d+) 条", out)
+    assert m, f"没有打印完全相同条数:\n{out}"
+    exact = int(m.group(1))
+    assert exact > 0, "这份语料的构造保证了至少一条,读到 0 ⇒ 检查没接上"
+    assert len(ids) == len(set(ids)), "三份有交集 —— 数据泄漏"
+    total_in = len(rows)
+    assert len(ids) == total_in - 1 - exact, (
+        f"写出的条数与「输入 {total_in} − 不可信靶子 1 − 完全相同 {exact}」对不上"
+        f"(实际 {len(ids)})⇒ 摘除那一步没接上"
+    )
+    masked = set(r["id"] for r in rows) - set(ids) - {"s-9002"}
+    assert len(masked) == exact
+    assert not (masked & {r["id"] for r in files["train"] + files["val"] + files["test"]})
+
+    # ---- ④ 测试集构成(与 `split()` 里那条 assert 同源,这里独立复算一遍)----
+    from collections import Counter
+    c = Counter(r["provenance"] for r in files["test"])
+    assert len(files["test"]) == 120 and c["real"] == 80 and c["synthetic"] == 40
+
+
+def test_main_dispatches_split(monkeypatch):
+    """`main()` 的分派:`split` 必须走到 `split()`,不是「还没实现」那条路。
+
+    ⚠️ 守的是**命令行那一半**:上面那条直接调 `p.split()`,所以把 `main()` 里
+    `elif args.step == "split"` 那一支删掉(或写错分支名)时它**照样绿** ——
+    而 `bash` 里那一行 `.venv/.../prepare_topic_data.py split` 会变成
+    `SystemExit: split 还没实现(由后续任务补上)`,读起来像「这功能没做」。
+    """
+    import sys
+
+    from scripts import prepare_topic_data as p
+
+    called: list[str] = []
+    monkeypatch.setattr(p, "split", lambda: called.append("split"))
+    monkeypatch.setattr(sys, "argv", ["prepare_topic_data.py", "split"])
+
+    p.main()
+
+    assert called == ["split"]
+
+
+def test_export_test_writes_every_row_with_the_judgement_columns_blank(
+    monkeypatch, tmp_path, capsys
+):
+    """`export-test` 的接线:全量(不是抽 5 条)、后三列**空着**、BOM 在。
+
+    ⚠️ **「全部 120 条」是 spec §6.4 的原文**(测试集 100% 人工裁决),
+    而它与训练/验证那份抽审(`per_label=5`,84 条)**不是同一条路** ——
+    照抄 `export()` 会把测试集抽成「5 条一类」,而**报告里那句话会是「已 100% 复核」**。
+
+    ⚠️ **「后三列空着」在这里同样承重**:填了就把「用户改了什么」提前毁掉
+    (B6-A 的承重不变量,`git diff` 是唯一的逐字记录)。
+    """
+    import csv
+    import io
+
+    from scripts import export_label_review as exp
+
+    src = tmp_path / "topic_test.jsonl"
+    src.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in (
+            [{"id": f"t{i:03d}", "question": f"测试问题{i}", "labels": ["尺码"],
+              "provenance": "real", "split": "test"} for i in range(7)]
+            + [{"id": "t007", "question": "多标签的", "labels": ["尺码", "退换货"],
+                "provenance": "synthetic", "split": "test"}]
+        )) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exp, "TOPIC_TEST", src)
+    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path / "labels")
+
+    exp.export_test()
+
+    raw = (tmp_path / "labels" / "test.csv").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "BOM 没了 —— Excel 打开会乱码"
+    table = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+    assert table[0] == exp.HEADER, "表头必须与 trainval.csv **同一个**(订正 9-D)"
+    body = table[1:]
+    assert len(body) == 8, f"不是全量导出(应是 8 条,实际 {len(body)})"
+    assert body[0][1] == "测试问题0", "「问题」列必须填(人要照着它判)"
+    assert body[0][2] == "尺码"
+    assert body[7][2] == "尺码|退换货", "多标签要原样带出来(分隔符与 trainval 一致)"
+    assert {(r[3], r[4], r[5]) for r in body} == {("", "", "")}, (
+        "「判定」/「最终标签」/「备注」必须是**空**的 —— 填了就把用户改了什么提前毁掉"
+    )
+    printed = capsys.readouterr().out
+    assert "导出 8 条" in printed
+
+
+def test_the_frozen_test_set_path_points_at_topic_test_jsonl():
+    """★ 订正 9-B 的**名字**要有一条直接断言 —— 读端与写端**逐字相同**。
+
+    ⚠️ **为什么不能只靠上一条**:上一条 `monkeypatch` 掉了 `TOPIC_TEST`
+    ⇒ `export_test` 里的常量**指错文件它也照样绿**(变异 **M15** 实测:全绿)。
+    而它指错时的后果分两种,只有一种响:
+
+    - 指到不存在的文件(`test.jsonl`)⇒ 真实链路上 `FileNotFoundError`,**响**;
+    - 指到 `prelabeled.jsonl` 那类**存在**的文件 ⇒ **导出 1424 条给人看**,
+      而**没有任何东西会报错** —— 用户会照着那份 CSV 做 100% 复核,
+      而评测读的仍是 120 条的那份。
+
+    ⇒ 下面两句:第一句钉**字面**,第二句钉**两侧一致**(切分端写哪里、导出端读哪里)。
+    第二句是本任务最值钱的一处 —— 「同一个文件名散落四处」正是订正 9-B 的成因。
+    """
+    from scripts import export_label_review as exp
+    from scripts import prepare_topic_data as p
+
+    assert exp.TOPIC_TEST == exp.ROOT / "evals" / "topic" / "topic_test.jsonl"
+    assert exp.TOPIC_TEST == p.TOPIC_DIR / p.TEST_NAME, (
+        "切分端写的名字与导出端读的名字不是同一个 —— 用户那 120 条的复核对指标零影响"
+    )
+
+
+def test_main_dispatches_export_test(monkeypatch):
+    """`main()` 的命令行分派:`export-test` 必须走到 `export_test()`,不是 `do_import()`。
+
+    ⚠️ **不做这一步的后果是「动作存在但够不着」**:`export_test()` 写好了、单测也绿,
+    而命令行打 `export-test` 时**跑的是回收端**(它读 `trainval.csv`,
+    在用户那份文件上以「预标标签列不同源」之类的理由停住,或者更糟 —— 真的写产物)。
+    这一个位置没有任何别的东西能守住:上一条测的是**函数体**,这条测的是**分派**。
+    """
+    import sys
+
+    from scripts import export_label_review as exp
+
+    called: list[str] = []
+    monkeypatch.setattr(exp, "export", lambda: called.append("export"))
+    monkeypatch.setattr(exp, "do_import", lambda: called.append("import"))
+    monkeypatch.setattr(exp, "export_test", lambda: called.append("export-test"))
+    monkeypatch.setattr(sys, "argv", ["export_label_review.py", "export-test"])
+
+    exp.main()
+
+    assert called == ["export-test"]

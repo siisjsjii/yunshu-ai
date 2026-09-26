@@ -24,11 +24,24 @@ from app.db.base import get_engine
 #    训练侧必须与推理侧用**同一份** `clean`。它在本文件里也被真的用到(数「洗后为空」那几行),
 #    不是一条只为过守卫而存在的 import。
 from app.topic.clean import clean
-from app.topic.labeling import dedupe_questions
+from app.topic.labeling import dedupe_questions, is_unusable_target, stratified_split, train_test_overlap
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "evals" / "topic" / "corpus.jsonl"
+TOPIC_DIR = ROOT / "evals" / "topic"
+OUT = TOPIC_DIR / "corpus.jsonl"
 TESTING_MD = ROOT / "evals" / "测试集.md"
+
+#: 切分端的输入。两个都**不入库**(与 `corpus.jsonl` / `synthetic.jsonl` 同例,
+#: 见 `dev-notes/ch10.md`):能进 git 的是切分的**产物**。
+#: `reviewed.jsonl` 是**人工劳动的唯一记录**,它入库(与 `labels/trainval.csv` 同理)。
+PRELABELED = TOPIC_DIR / "prelabeled.jsonl"
+REVIEWED = TOPIC_DIR / "reviewed.jsonl"
+
+#: ⚠️ **订正 9-B**:测试集产物叫 `topic_test.jsonl` —— 不是 `test.jsonl`。
+#: 本任务其余几处(`Interfaces` / `export-test` / 评测脚本 / `git add`)全按它读写;
+#: 名字写错**不报错**,只是评测读到一个空的/不存在的文件 ⇒
+#: **用户那 120 条的复核对指标零影响,而报告照常打印**。做成常量,别在循环里拼字符串。
+TEST_NAME = "topic_test.jsonl"
 
 
 def _out(message: str) -> None:
@@ -102,12 +115,118 @@ async def collect() -> None:
     #    所以引用它时必须带日期,别当常量。
 
 
+def _load_prelabeled() -> dict[str, dict]:
+    """`prelabeled.jsonl` → `{id: row}`,并把 `reviewed.jsonl` 里的**覆盖**上去。
+
+    ⚠️ **覆盖那一步是承重的**:不这么做的话,用户改过的标签不进语料 ——
+    而它**只影响报表、不影响模型**(训练用的是这份语料)。那正是本仓编目过的
+    「看起来做完了、其实没接上」。
+    """
+    pre: dict[str, dict] = {}
+    for line in PRELABELED.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            pre[row["id"]] = row
+    if REVIEWED.exists():
+        for line in REVIEWED.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                pre[r["id"]] = {**pre[r["id"]], "labels": r["labels"], "human_reviewed": True}
+    return pre
+
+
+def split() -> None:
+    """切分并**冻结测试集**。
+
+    ⚠️ 标签以**人改过的**为准(见 `_load_prelabeled`)。
+
+    这个函数里有四处「错了也不报错」的东西,各自对应下面一段:
+
+    1. **两行零标签**(订正 9-E)—— 它们 `labels` 都是 `[]`,而来源不同
+       (`r-0049` 模型真判零诉求 / `s-0423` 证据校验机械拒到空)。
+       `stratified_split` 把**靶子不可信**的那种先摘掉;这里负责把**去向**打出来 ——
+       不打印的话,「那行到底进没进训练」没有任何地方看得见。
+    2. **train-vs-test 的完全相同**(订正 9-C)—— 必须**移出训练侧**,否则是数据泄漏。
+    3. **头四类在测试集里的条数** —— < 15 的类那条 F1 不成结论,报告里要标 `†`。
+    4. **产物名**(订正 9-B)—— `topic_test.jsonl`,不是 `test.jsonl`。
+    """
+    pre = _load_prelabeled()
+    rows = list(pre.values())
+    n_human = sum(1 for r in rows if r.get("human_reviewed"))
+    _out(f"读入 {len(rows)} 条;其中 {n_human} 条用的是**人工复核过的**标签"
+         f"({REVIEWED.name} 的覆盖{'生效' if n_human else '不存在/为空'})")
+
+    parts = stratified_split(rows, test_real=80, test_synth=40)
+
+    # ---- 【第 2 条】train-vs-test 的重复检查(9-C)----
+    # 验证集也算**训练侧**:它参与早停与阈值选择,泄漏的后果与训练集同级。
+    over = train_test_overlap(parts["train"] + parts["val"], parts["test"])
+    exact_ids = set(over["exact_train_ids"])
+    near_pairs = over["near_pairs"]
+    removed = 0
+    if exact_ids:
+        for name in ("train", "val"):
+            before = len(parts[name])
+            parts[name] = [r for r in parts[name] if r["id"] not in exact_ids]
+            removed += before - len(parts[name])
+    _out(f"  train-vs-test:完全相同 {len(exact_ids)} 条(其中 {removed} 条在训练侧,已移出)、"
+         f"近重复 {len(near_pairs)} 对(只报不删 —— 那是启发式判据,删了就是拿判据改数据)")
+    # ⚠️ **不许** `assert` 近重复为 0:它是**预期的**(T4 的 prompt 里就有那些例句),
+    #    而这条判据是启发式 ⇒ 「报出来给人看」才是它的全部用途。
+    for tid, xid, score in near_pairs[:10]:
+        _out(f"    {tid} ~ {xid}  相似度 {score:.3f}")
+    if len(near_pairs) > 10:
+        _out(f"    …另有 {len(near_pairs) - 10} 对")
+
+    # ---- 【第 1 条】零标签行的去向(9-E)----
+    # ⚠️ 放在**摘除之后**:要报的是「落在哪一侧」,**摘除也会改这个答案**。
+    # ⚠️ 处置靠**与 `stratified_split` 里那次摘除同一个谓词**(`is_unusable_target`),
+    #    不在这里再写一遍 `labels == [] and rejected_labels` ——
+    #    两处各自维护的判据就是本仓记过的漂移形状。
+    zero = [r for r in rows if not (r.get("labels") or [])]
+    if zero:
+        side = {r["id"]: name for name, items in parts.items() for r in items}
+        _out(f"零标签行 {len(zero)} 条 —— **来源不同 ⇒ 处置不同**,逐条列去向:")
+        for r in zero:
+            if is_unusable_target(r):
+                where = "**已排除**(靶子不可信:零标签 + rejected_labels 非空)"
+            else:
+                where = side.get(r["id"], "**不在任何一份里**(不该发生,去查 split)")
+            _out(f"  {r['id']} 「{r['question']}」 rejected_labels={r.get('rejected_labels')}"
+                 f" → {where}")
+
+    # ---- 【第 4 条】写出三份(测试集的名字见订正 9-B)----
+    for name, items in parts.items():
+        path = TOPIC_DIR / (TEST_NAME if name == "test" else f"{name}.jsonl")
+        path.write_text(
+            "\n".join(json.dumps({**r, "split": name}, ensure_ascii=False) for r in items) + "\n",
+            encoding="utf-8",
+        )
+        _out(f"{name}: {len(items)} 条 → {path}")
+
+    # 三层报告的构成核对(spec §8.4)—— 数不对说明硬条件没满足,响亮地报。
+    c = Counter(r["provenance"] for r in parts["test"])
+    assert c["real"] == 80 and c["synthetic"] == 40, f"测试集构成不对:{dict(c)}"
+    from app.topic.taxonomy import HEAD_LABELS
+    per = Counter(lb for r in parts["test"] for lb in r["labels"])
+    thin = [lb for lb in HEAD_LABELS if per[lb] < 15]
+    if thin:
+        _out(f"  ⚠️ 头四类里这些在测试集不到 15 条:{thin} —— 它们的 F1 **不成结论**,"
+             f"报告里要标 †(spec §8.3)")
+    # ⚠️ 三个数**分开打**:`human_reviewed` 的条数(人工劳动的覆盖面)与
+    #    测试集构成(报数依据)是两件事,合起来报会让人以为「测试集也审过了」。
+    _out(f"  ⚠️ 以上是**训练侧**的读数;测试集 {len(parts['test'])} 条要 100% 人工过"
+         f"(`export-test` → 用户改 → `import-test`),那之前它**还不能用来报数**。")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("step", choices=["collect", "split", "augment"])
     args = ap.parse_args()
     if args.step == "collect":
         asyncio.run(collect())
+    elif args.step == "split":
+        split()
     else:
         raise SystemExit(f"{args.step} 还没实现(由后续任务补上)")
 

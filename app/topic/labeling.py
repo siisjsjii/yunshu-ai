@@ -5,6 +5,7 @@
 """
 
 import random
+from collections import defaultdict
 
 from app.topic.clean import clean
 
@@ -99,3 +100,151 @@ def pick_review_sample(
         for row in shuffled[:per_label]:
             picked[row["id"]] = row
     return [picked[k] for k in sorted(picked)]
+
+
+def is_unusable_target(row: dict) -> bool:
+    """这行的**靶子不可信**吗 —— 零标签**且****有**被证据校验拒掉的标签。
+
+    ⚠️ **为什么要把这件事单列成一个谓词**(计划订正 9-E,controller 2026-09-26):
+    `prelabeled.jsonl` 里**两行**是零标签,而来源**不同**:
+
+    - `r-0049`「你是」—— 模型**真判了零诉求**(`rejected_labels == []`);
+    - `s-0423`「首重多少,超了咋算?」—— **证据校验机械拒到空**
+      (`rejected_labels == ['运费']`),而它的真实主题**几乎肯定是运费**。
+
+    后者是**处理产物,不是判断**。把 `labels == []` 喂进训练,是在教模型
+    「这句话没有主题」(一条**负样本**),而那句话不成立。而这两行在产物里
+    **逐字节相同** ⇒ 只看 `labels` 分不开它们。
+
+    ⚠️ 判据是「**有**被拒的标签」,不是「有 `rejected_labels` 这个键」:
+    键在本章产物里**每行都有**(值可能是 `[]`),缺键只可能是别的调用方。
+
+    ⚠️ **谓词只在这一处实现**:`stratified_split` 用它**排除**、`split()` 用它
+    **打印去向**。两处各写一遍 `labels == [] and rejected_labels` 就是本仓记过的
+    漂移形状(「不变量要放在唯一写口上,不要靠每个调用方自觉」)。
+    """
+    return not (row.get("labels") or []) and bool(row.get("rejected_labels"))
+
+
+def stratified_split(
+    rows: list[dict], *, test_real: int, test_synth: int,
+    ratios: tuple[float, float, float] = (0.8, 0.1, 0.1), seed: int = 20260925,
+) -> dict[str, list[dict]]:
+    """按主标签分层切 训练/验证/测试。
+
+    **测试集构成是硬条件**(spec §5.3):先从 real 与 synthetic 里各取
+    `test_real` / `test_synth` 条进测试集,**剩下的**再按 8:1:1 切训练与验证。
+    反过来做(先整体 8:1:1 再调整)会得到「看起来对、构成不对」的测试集,
+    而 §8.4 那三层报告会因此打不出来。
+
+    「主标签」= `labels[0]`。用它分层而不是用全部标签,是因为一个样本
+    只能进一份;用全部标签分层会产生归属冲突,而解决冲突的规则又是一处
+    需要被解释的实现细节。
+
+    ⚠️ **靶子不可信的行先被摘掉**(`is_unusable_target`,订正 9-E)——
+    它们**哪一份都不进**,包括测试集:一条靶子错的样本在测试集里只会
+    把「模型对了」记成「模型错了」。排除掉的行不在返回值里 —— 调用方要报它们的
+    去向,得自己按 `labels == []` 把零标签行找出来,再用**同一个谓词**分辨
+    「靶子不可信」与「模型真判零诉求」(`split()` 就是这么做的)。
+    """
+    usable = [r for r in rows if not is_unusable_target(r)]
+    rng = random.Random(seed)
+    by_prov: dict[str, list[dict]] = defaultdict(list)
+    for r in usable:
+        by_prov[r["provenance"]].append(r)
+
+    def take(pool: list[dict], n: int) -> tuple[list[dict], list[dict]]:
+        """按主标签分层取 n 条,返回 (取出, 剩下)。"""
+        buckets: dict[str, list[dict]] = defaultdict(list)
+        for r in pool:
+            buckets[(r.get("labels") or ["其他"])[0]].append(r)
+        for b in buckets.values():
+            b.sort(key=lambda r: r["id"])
+            rng.shuffle(b)
+        # 轮转取,保证每个类都有代表(而不是某个大类被抽干)。
+        picked: list[dict] = []
+        keys = sorted(buckets)
+        i = 0
+        while len(picked) < n and any(buckets[k] for k in keys):
+            k = keys[i % len(keys)]
+            if buckets[k]:
+                picked.append(buckets[k].pop())
+            i += 1
+        picked_ids = {r["id"] for r in picked}
+        rest = [r for r in pool if r["id"] not in picked_ids]
+        return picked, rest
+
+    test = take(by_prov.get("real", []), test_real)[0] + \
+        take(by_prov.get("synthetic", []), test_synth)[0]
+    test_ids = {r["id"] for r in test}
+    rest = [r for r in usable if r["id"] not in test_ids]
+
+    rest_sorted = sorted(rest, key=lambda r: r["id"])
+    rng.shuffle(rest_sorted)
+    n_train = round(len(rest_sorted) * ratios[0] / (ratios[0] + ratios[1]))
+    return {"train": rest_sorted[:n_train], "val": rest_sorted[n_train:], "test": test}
+
+
+def _char_bigrams(text: str) -> set[str]:
+    """字符二元组(短于 2 字时退化成一个「整串」元素)。
+
+    用**字符**而不是词:`jieba` 那类分词会引入一份需要被解释的词典,
+    而这里的用途只是「这两句像不像」。
+    """
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i:i + 2] for i in range(len(text) - 1)}
+
+
+def train_test_overlap(train: list[dict], test: list[dict],
+                       near: float = 0.8) -> dict[str, object]:
+    """报出训练侧与测试侧的重复/近重复。**纯函数、零依赖。**
+
+    ⚠️ **为什么要这一步**(T5 复审发现,见 Task 7 节首那段):
+    `POSITIVE` 的 34 句正例进了 **T4 生成器**的 prompt,而 T4 的禁词表
+    **不覆盖这些例句** ⇒ 重跑 T4 可能把「买大了」「175 穿什么码」整句抄进问句。
+    已发生的一半:**冻结测试集里 8 行与渲染块例句字面重叠**(6 行「运费怎么算」自 T1 起、
+    2 行「什么材质」由 T5 的 Step 0 新带入)。
+
+    **判据分两档,处置不同**:
+    - **完全相同**(清洗后文本相等)⇒ 报进 `exact_train_ids`(`split()` 负责移出训练侧),
+      它在测试侧留着;
+    - **近重复**(字符二元组 Jaccard ≥ `near`)⇒ **只报不删** —— 删了就是拿判据改数据,
+      而这条判据本身是启发式。
+
+    返回 `{"exact_train_ids": [...], "near_pairs": [(train_id, test_id, 相似度), ...]}`。
+
+    ⚠️ **三处口径,少一处读数就会虚高或虚低**:
+    - 比较的是**清洗后**的文本(`clean()`,与训练侧同口径)—— 用原文比会把
+      「全角空格 / 重复标点」这种差异漏成两个不同的句子;
+    - 与测试侧某行**完全相同**的训练行**不再进 `near_pairs`**:同一个事实报两遍
+      会让「近重复 N 对」这个读数虚高,而 `exact` 那一档谁也不会漏看;
+    - `train` 是**训练侧**(调用方把 `train + val` 一起传进来)—— 验证集参与早停与
+      阈值选择 ⇒ 它泄漏的后果与训练集同级。
+    """
+    by_text: dict[str, list[str]] = defaultdict(list)
+    for row in test:
+        text = clean(row.get("question") or "")
+        if text:
+            by_text[text].append(row["id"])
+    test_items = [(text, _char_bigrams(text), ids) for text, ids in by_text.items()]
+
+    exact: list[str] = []
+    near_pairs: list[tuple[str, str, float]] = []
+    for row in train:
+        text = clean(row.get("question") or "")
+        if not text:
+            continue
+        if text in by_text:
+            exact.append(row["id"])
+            continue
+        grams = _char_bigrams(text)
+        for test_text, test_grams, test_ids in test_items:
+            union = grams | test_grams
+            if not union:
+                continue
+            score = len(grams & test_grams) / len(union)
+            if score >= near:
+                near_pairs.extend((row["id"], tid, score) for tid in test_ids)
+    near_pairs.sort(key=lambda p: (-p[2], p[0], p[1]))
+    return {"exact_train_ids": exact, "near_pairs": near_pairs}

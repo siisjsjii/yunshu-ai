@@ -8,6 +8,15 @@
     # ← 用户改 evals/topic/labels/trainval.csv 之后
     .venv/Scripts/python.exe scripts/export_label_review.py import
 
+    # 测试集(spec §6.4 的 100% 人工裁决)—— **另一条路**,目前只有导出那一半:
+    .venv/Scripts/python.exe scripts/export_label_review.py export-test
+    # ⚠️ 回收那一半(`import-test`)还没做 —— 它属于 B7-B(用户把那 120 条过完之后),
+    #    届时**必须复用** `do_import` 那套校验,基线换成 `topic_test.jsonl`。
+
+⚠️ **两条路的输入不同,别混**:`export`/`import` 走 `prelabeled.jsonl`(**抽审** 84 条,
+用来估错误率);`export-test` 走**冻结的** `topic_test.jsonl`(**全量** 120 条,
+是对外报数的**唯一**依据)。用错一条,报告会写着「测试集已 100% 复核过」而实际只看了 5 条一类。
+
 ⚠️ **`export` 出来的那份 CSV 是**空着后三列**入库的**(B6-A,2026-09-26):
 `判定(ok/改)` / `最终标签` / `备注` 留空**不是漏填**,而是刻意的 —— 用户改完之后
 `git diff` 就是**他改了什么的逐字记录**(计划那句「进 git,可追溯」的落地)
@@ -37,6 +46,14 @@ PRELABELED = ROOT / "evals" / "topic" / "prelabeled.jsonl"
 LABELS_DIR = ROOT / "evals" / "topic" / "labels"
 REVIEWED = ROOT / "evals" / "topic" / "reviewed.jsonl"
 
+#: **冻结的**测试集 —— `evals/topic/topic_test.jsonl`。
+#: ⚠️ **订正 9-B**:不是 `test.jsonl`。这个名字在本任务里有四处读写
+#: (切分端 `prepare_topic_data.split` / 这里 / `import-test` / 评测脚本),
+#: 写错**不报错**,只是读到一个空集合 ⇒ 用户那 120 条的复核**对指标零影响**。
+#: 与切分端各写一份字面量是有意的:两个脚本之间没有 import 关系,
+#: 而**多一条 import 边**的代价比这里多一行注释高(真正的守卫是评测脚本会响亮地报「文件不存在」)。
+TOPIC_TEST = ROOT / "evals" / "topic" / "topic_test.jsonl"
+
 #: 抽审量:每类 5 条 × 17 类 ≈ 85 条(spec §6.3)。
 #: ⚠️ **实际导出条数会**少于** 85** —— 同一条多标签行会被多个类抽中,再按 id 去重
 #: (`pick_review_sample` 的 docstring)。实测(2026-09-26,`prelabeled.jsonl` 逐行同序):**84 条**。
@@ -63,24 +80,58 @@ def _load() -> list[dict]:
     ]
 
 
-def export() -> None:
-    rows = _load()
-    sample = pick_review_sample(rows, per_label=PER_LABEL)
+def _write_review_csv(rows: list[dict], out: Path) -> None:
+    """把待改样本写成 CSV(表头 + 后三列**空着**)。**导出端只有这一个写口。**
+
+    ⚠️ 两个动作(`export` 抽审 / `export-test` 全量)共用它,不各写一份:
+    写法一旦漂移(列序、有没有 BOM、多标签用什么分隔符),两处的 CSV 就再也
+    读不出「一致」的味道,而**两处都不会报错**。本仓那条「不变量要放在唯一写口上,
+    不要靠每个调用方自觉」。
+
+    ⚠️ 后三列**空着**是 B6-A 的承重不变量:用户改完之后 `git diff` 才是
+    「他改了什么的逐字记录」(计划那句「进 git,可追溯」的落地)。
+    """
     LABELS_DIR.mkdir(parents=True, exist_ok=True)
-    out = LABELS_DIR / "trainval.csv"
     with out.open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(HEADER)
-        for r in sample:
+        for r in rows:
             w.writerow([r["id"], r["question"], "|".join(r["labels"]), "", "", ""])
-    print(f"导出 {len(sample)} 条 → {out}")
+    print(f"导出 {len(rows)} 条 → {out}")
     # ⚠️ 打印**按类的覆盖**,让人一眼看出哪类抽得少(某类样本不足时会少拿)。
     from collections import Counter
-    c = Counter(lb for r in sample for lb in r["labels"])
+    c = Counter(lb for r in rows for lb in r["labels"])
     missing = [lb for lb in LABELS if c[lb] == 0]
     print(f"  每类条数:{dict(c)}")
     if missing:
         print(f"  ⚠️ 这些类**一条都没抽到**(样本不足):{missing} —— 它们没有人工复核覆盖")
+
+
+def export() -> None:
+    """训练/验证集的**抽审**:按类分层各 5 条(spec §6.3),目的是**估错误率**。"""
+    rows = _load()
+    _write_review_csv(pick_review_sample(rows, per_label=PER_LABEL),
+                      LABELS_DIR / "trainval.csv")
+
+
+def export_test() -> None:
+    """把**冻结测试集全部**导成 CSV —— spec §6.4 的「100% 人工裁决」。
+
+    ⚠️ **与 `export` 不是同一条路,别顺手抄它**:那份是**抽审**(每类 5 条 ⇒ 84 条,
+    用来估错误率),这份是**全量**(120 条,是对外报数的唯一依据)。
+    照 `export` 写成抽样的话,报告会写着「测试集已 100% 复核过」而实际只看了 5 条一类。
+
+    ⚠️ 读的是 `TOPIC_TEST`(`topic_test.jsonl`,订正 9-B),不是 `test.jsonl`。
+
+    ⚠️ **用户改完之后不许再跑它** —— 与 `export` 同款:它会**照当前语料重新导出并覆盖**
+    那份 CSV,用户填的东西一个字都不剩。
+    """
+    rows = [
+        json.loads(l)
+        for l in TOPIC_TEST.read_text(encoding="utf-8").splitlines()
+        if l.strip()
+    ]
+    _write_review_csv(rows, LABELS_DIR / "test.csv")
 
 
 def do_import() -> None:
@@ -288,9 +339,17 @@ def _pin_stdout_encoding() -> None:
 def main() -> None:
     _pin_stdout_encoding()
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["export", "import"])
+    # ⚠️ `import-test` **不在**这一轮的清单里(B7-A 只做导出那一半,订正 9-A/9-D):
+    #    用户还没过那 120 条,回收端没有输入可收,而它必须复用 `do_import` 那套校验
+    #    (基线换成 `topic_test.jsonl`),那是 B7-B 的活。
+    ap.add_argument("action", choices=["export", "import", "export-test"])
     args = ap.parse_args()
-    export() if args.action == "export" else do_import()
+    if args.action == "export":
+        export()
+    elif args.action == "export-test":
+        export_test()
+    else:
+        do_import()
 
 
 if __name__ == "__main__":

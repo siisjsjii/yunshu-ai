@@ -1,0 +1,115 @@
+树洁癖复查(开跑那一刻的版本;要跟报告的其余读数对上):
+  · app/topic/labeling.py  11945 B  sha256=d783529d0f878a14  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · scripts/prepare_topic_data.py  11507 B  sha256=0735a0deef5b6d8a  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · scripts/export_label_review.py  21893 B  sha256=b6ee3740cd454631  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · tests/test_topic_labeling.py  77499 B  sha256=0d8f12512f6c2583  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · 真产物 trainval.csv  sha256=201f1c77daad862c(开工前)
+  · 真产物 test.csv  sha256=30542ad40718b349(开工前)
+
+=== M1 ★必查:删掉 take() 里的 `rng.shuffle(b)`  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_different_seeds_give_different_test_sets  (期望 failed)   [{'failed': 1}]
+  绿灯  test_split_is_reproducible  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M2 `random.Random(seed)` → `random.Random()`(种子被丢掉)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_is_reproducible  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M3 去掉「靶子不可信先摘掉」(`usable = list(rows)`)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_rows_with_an_untrusted_target_are_dropped_out_of_the_split  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M4 谓词过度处置:零标签就排除(不看 rejected_labels)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_unusable_target_predicate  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_rows_with_an_untrusted_target_are_dropped_out_of_the_split  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M5 轮转取 → 每次从**最大的桶**取(小类被挤没)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_rare_labels_are_not_squeezed_out_of_the_test_set  (期望 failed)   [{'failed': 1}]
+  绿灯  test_head_labels_are_oversampled_into_the_test_set  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M6 train_test_overlap 用**原文**比较(不过 clean)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M7 `near` 默认值 0.8 → 1.0(近重复只剩「完全相同」)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+  绿灯  test_train_test_overlap_honours_the_near_threshold  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M7b 阈值写死 `0.8`(参数被忽略)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_train_test_overlap_honours_the_near_threshold  (期望 failed)   [{'failed': 1}]
+  绿灯  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M8 完全相同的那对**也**计入 near_pairs(读数虚高)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M9 ★订正 9-B:产物名写成 `test.jsonl`  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M10 ★订正 9-C:完全相同的不摘除(数据泄漏)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M11 `reviewed.jsonl` 的覆盖不生效(人工复核成果进不了语料)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M12 ★订正 9-E:零标签行的去向不打印  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M13 测试集构成那条 assert 不再拦(synth 41 也照写)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M14 ★命令行分派:删掉 `elif args.step == "split"`  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_main_dispatches_split  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M15 ★订正 9-B:export-test 读 `test.jsonl`  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_the_frozen_test_set_path_points_at_topic_test_jsonl  (期望 failed)   [{'failed': 1}]
+  绿灯  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M16 export-test 写成**抽样**(照抄 export 的 per_label=5)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M17 导出时把预标标签写进「最终标签」列  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_export_writes_the_stratified_sample_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M18 ★命令行分派:删掉 `elif args.action == "export-test"`  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_main_dispatches_export_test  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+真产物 trainval.csv: 未被动过 ✅(sha256=201f1c77daad862c)
+
+真产物 test.csv: 未被动过 ✅(sha256=30542ad40718b349)
+============================================================
+问题数:0
