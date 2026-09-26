@@ -16,6 +16,8 @@ from app.topic.model import (
     TopicDataset,
     data_fingerprint,
     encode_rows,
+    ensure_label_metadata,
+    label_metadata,
     load_artifacts,
     load_rows,
     save_artifacts,
@@ -135,12 +137,18 @@ def test_train_script_never_reads_the_frozen_test_set():
     「有没有人写下这个路径」。它不证明训练没读,它证明**没有人写出那个路径** ——
     而这是这条红线今天唯一可自动化的形态。
 
-    ⚠️ 因此 `scripts/train_topic_clf.py` 的注释里只说「冻结的测试集」,
-    **不写文件名** —— 写了就会把这条扫描变成一条自咬的断言
-    (扫描命中自己那句「我们不读它」)。
+    ⚠️ 因此这两个文件的注释里只说「冻结的测试集」,**不写文件名** ——
+    写了就会把这条扫描变成一条自咬的断言(扫描命中自己那句「我们不读它」)。
+
+    ⚠️⚠️ **订正轮 1 · M2:扫描面从 1 个文件扩到 2 个。** 第一版只扫
+    `scripts/train_topic_clf.py`,而**真正的读盘口是 `app/topic/model.py::load_rows`**
+    (训练脚本只是调它)—— 往 `load_rows` 里塞一个默认路径,这条扫描原来看不见。
+    复审实测那条扫描**确实有牙**(把路径写进脚本就红,R1),只是覆盖比它读起来窄。
+    ⚠️ **残余(如实记账,别假装已覆盖)**:`--train <path>` 是**命令行参数**,
+    运行期传进来的路径扫不到;这条扫描守的是「**源码里有没有写死那个路径**」。
     """
-    src = Path("scripts/train_topic_clf.py").read_text(encoding="utf-8")
-    assert "topic_test" not in src
+    for rel in ("scripts/train_topic_clf.py", "app/topic/model.py"):
+        assert "topic_test" not in Path(rel).read_text(encoding="utf-8"), rel
 
 
 def test_train_script_passes_problem_type_explicitly():
@@ -178,6 +186,58 @@ def test_train_script_early_stops_on_micro_f1_not_macro():
     assert 'metric_for_best_model="micro_f1"' in src
 
 
+def test_val_metrics_carry_the_checkpoint_they_came_from():
+    """⚠️ **订正轮 1 · M1**:`Trainer.evaluate()` 返回的 `epoch` 是
+    `trainer.state.epoch` = **最后一轮**,而这批数来自 `load_best_model_at_end`
+    载回的那个 checkpoint ⇒ 落进 `train_meta.json` 后,
+    `best_epoch: 13.0` 与 `val_metrics.epoch: 15.0` **并排却矛盾**
+    (复审用 `eval_loss` 对上了:0.07422567 正是第 13 轮那一行)。
+    ⇒ 那个键**必须**被换掉,并标出处。
+    """
+    from scripts.train_topic_clf import annotate_metrics
+
+    fake = {"eval_loss": 0.07422567, "eval_micro_f1": 0.8804, "epoch": 15.0}
+    out = annotate_metrics(fake, epoch=13.0, checkpoint="models/topic-clf/_ckpt/checkpoint-949")
+
+    assert "epoch" not in out, "那个 epoch 是最后一轮、不是这批数的来源"
+    assert out["_metrics_epoch"] == 13.0
+    assert out["_metrics_checkpoint"].endswith("checkpoint-949")
+    assert out["eval_micro_f1"] == 0.8804, "别的键一个都不许丢"
+    assert out["eval_loss"] == 0.07422567
+
+
+def test_repair_train_meta_drops_the_lying_epoch_and_is_idempotent(tmp_path):
+    """与 `ensure_label_metadata` 同一类活:**纯元数据缺陷,不重训**。
+
+    这条同时钉住「只动那三个键」—— 指纹 / 行数 / 四个指标 / 超参必须**原样**。
+    """
+    from scripts.train_topic_clf import repair_train_meta
+
+    meta = {
+        "base": "hfl/chinese-roberta-wwm-ext",
+        "data_fingerprint": "74bd7d056f68b68c",
+        "data_rows": 2315,
+        "best_epoch": 13.0,
+        "best_model_checkpoint": "models/topic-clf/_ckpt/checkpoint-949",
+        "val_metrics": {"eval_loss": 0.0742, "eval_micro_f1": 0.8804, "epoch": 15.0},
+    }
+    (tmp_path / "train_meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    assert repair_train_meta(tmp_path) is True
+    fixed = json.loads((tmp_path / "train_meta.json").read_text(encoding="utf-8"))
+
+    assert "epoch" not in fixed["val_metrics"]
+    assert fixed["val_metrics"]["_metrics_epoch"] == 13.0
+    assert fixed["val_metrics"]["eval_micro_f1"] == 0.8804
+    # 「只动那三个键」:别的一律原样
+    assert fixed["data_fingerprint"] == "74bd7d056f68b68c"
+    assert fixed["data_rows"] == 2315
+    assert fixed["val_metrics"]["eval_loss"] == 0.0742
+
+    assert repair_train_meta(tmp_path) is False, "第二次必须无事可做"
+    assert json.loads((tmp_path / "train_meta.json").read_text(encoding="utf-8")) == fixed
+
+
 def test_metrics_from_logits_honours_the_threshold_it_is_given():
     """阈值是训练早停(`compute_metrics`)与阈值扫描**共用的那一个参数**。
 
@@ -199,6 +259,25 @@ def test_metrics_from_logits_honours_the_threshold_it_is_given():
     assert metrics_from_logits(logits, truth, 0.6)["micro_f1"] == 0.0
     # 阈值 0.5:「退换货」也过线 ⇒ 多报了一个「物流」⇒ P=0.5 / R=1.0 ⇒ F1 = 2/3
     assert metrics_from_logits(logits, truth, 0.5)["micro_f1"] == pytest.approx(2 / 3)
+
+    # ⚠️⚠️ **订正轮 1 · I1:两个键必须分别断言,而且要用「两个值不相等」的输入。**
+    #    上面那条只断 `micro_f1`,而 `subset_accuracy` 与 `label_count_match` 的
+    #    **装配处**(这个 dict 字面量)没有任何东西走到 —— 复审变异 R6 把这两个键
+    #    **对调**,33 条测试全绿、exit 0。而它们在 `train_meta.json` 里互换之后
+    #    (0.7655 ↔ 0.8345,都在合理区间),Task 10 会把「整条完全一致率」贴到
+    #    「标签个数一致率」下面 —— **没有任何东西会红**,而这两个数正是 §8.1
+    #    点名的那两句需求原话。
+    #    这组输入:真值 {退换货, 尺码}、预测 {退换货, 物流} ⇒ **个数相同、集合不同**
+    #    ⇒ subset=0.0 而 count=1.0,两个键**必然可分辨**。
+    logits2 = [[-5.0] * len(LABELS)]
+    logits2[0][LABELS.index("退换货")] = 3.0
+    logits2[0][LABELS.index("物流")] = 3.0
+    truth2 = [[0.0] * len(LABELS)]
+    truth2[0][LABELS.index("退换货")] = 1.0
+    truth2[0][LABELS.index("尺码")] = 1.0
+    got = metrics_from_logits(logits2, truth2, 0.5)
+    assert got["subset_accuracy"] == 0.0, "集合不同(退换货+尺码 vs 退换货+物流)"
+    assert got["label_count_match"] == 1.0, "个数相同(都是 2)"
 
 
 # ---------------------------------------------------------------- 数据集包装
@@ -270,6 +349,96 @@ def test_save_artifacts_does_not_require_a_tokenizer(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "inference_config.json", "labels.json", "train_meta.json",
     ]
+
+
+# ------------------------------------------- 标签映射(订正轮 1 · I2)
+
+
+def _decoy_config(num_labels: int) -> dict:
+    """HF `save_pretrained` 落下来的那份**诱饵** config.json(实测形状)。"""
+    return {
+        "architectures": ["BertForSequenceClassification"],
+        "model_type": "bert",
+        "num_labels": None,  # 实测:这个键真的存在,值是 null
+        "problem_type": "multi_label_classification",
+        "id2label": {str(i): f"LABEL_{i}" for i in range(num_labels)},
+        "label2id": {f"LABEL_{i}": i for i in range(num_labels)},
+    }
+
+
+def _write_decoy(tmp_path, num_labels: int) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(_decoy_config(num_labels), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def test_label_metadata_is_the_single_source_of_the_label_map():
+    """三个键由 `labels` **一处**生成。`id2label` 的键是**字符串**(JSON 的键只能是字符串)。"""
+    meta = label_metadata(LABELS)
+    assert meta["num_labels"] == len(LABELS)
+    assert [meta["id2label"][str(i)] for i in range(len(LABELS))] == list(LABELS)
+    assert meta["label2id"]["退换货"] == 0
+    assert meta["label2id"]["其他"] == len(LABELS) - 1
+
+
+def test_ensure_label_metadata_repairs_the_hf_default_decoy(tmp_path):
+    """⚠️ **订正轮 1 · I2:HF 落的 `config.json` 里 `id2label` 默认是 `LABEL_0…`。**
+
+    **加载不报错**(`num_labels` 由 `len(id2label)` 推出来,实测仍得 17),所以
+    这条路走到 Task 11 / 任何一段顺手代码里就是:
+
+        model.config.id2label[j]  或  pipeline("text-classification", model=...)
+
+    ⇒ **17 个类目全叫 `LABEL_5`**,而 scores 正常、写库成功、页面画得出来、
+    **日志里没有一行不对** —— 正是 spec §2.7 逐字点名的那条静默陷阱。
+
+    类目名的权威来源只有一个:`labels.json`。这条用例断的就是**两者逐位一致**。
+    """
+    save_artifacts(tmp_path, tokenizer=None, max_length=64, threshold=0.5, labels=LABELS, meta={})
+    _write_decoy(tmp_path, len(LABELS))
+
+    assert ensure_label_metadata(tmp_path, labels=LABELS) is True
+
+    cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    on_disk = json.loads((tmp_path / "labels.json").read_text(encoding="utf-8"))
+    assert cfg["num_labels"] == len(on_disk)
+    assert [cfg["id2label"][str(i)] for i in range(len(on_disk))] == on_disk
+    assert cfg["label2id"] == {label: i for i, label in enumerate(on_disk)}
+    assert cfg["model_type"] == "bert", "别的键一个都不许丢"
+    assert cfg["problem_type"] == "multi_label_classification"
+
+
+def test_ensure_label_metadata_is_idempotent(tmp_path):
+    """**幂等**:第二次必须返回 `False` 且**字节不变** —— 它是给已有目录重跑用的。"""
+    save_artifacts(tmp_path, tokenizer=None, max_length=64, threshold=0.5, labels=LABELS, meta={})
+    _write_decoy(tmp_path, len(LABELS))
+
+    assert ensure_label_metadata(tmp_path, labels=LABELS) is True
+    after_first = (tmp_path / "config.json").read_bytes()
+    assert ensure_label_metadata(tmp_path, labels=LABELS) is False
+    assert (tmp_path / "config.json").read_bytes() == after_first
+
+
+def test_ensure_label_metadata_fixes_a_wrong_mapping_not_just_a_missing_one(tmp_path):
+    """⚠️ **反向断言**:映射**顺序错了**(两个类目对调)也必须被纠正。
+
+    一个「只在缺键时补」的实现(`if "id2label" not in data`)会在这条上绿 ——
+    而「键在、值错」正是最危险的那种(它看起来已经设好了)。这个变异由
+    `--only R2b` 的探针实测钉着。
+    """
+    save_artifacts(tmp_path, tokenizer=None, max_length=64, threshold=0.5, labels=LABELS, meta={})
+    _write_decoy(tmp_path, len(LABELS))
+
+    wrong = _decoy_config(len(LABELS))
+    wrong["id2label"] = {str(i): LABELS[i] for i in range(len(LABELS))}
+    wrong["id2label"]["0"], wrong["id2label"]["1"] = wrong["id2label"]["1"], wrong["id2label"]["0"]
+    (tmp_path / "config.json").write_text(
+        json.dumps(wrong, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    assert ensure_label_metadata(tmp_path, labels=LABELS) is True
+    cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert [cfg["id2label"][str(i)] for i in range(len(LABELS))] == list(LABELS)
 
 
 # ---------------------------------------------------------------- 数据指纹(12-A)

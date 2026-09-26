@@ -72,6 +72,8 @@ from app.topic.model import (
     TopicDataset,
     data_fingerprint,
     encode_rows,
+    ensure_label_metadata,
+    label_metadata,
     load_rows,
     save_artifacts,
 )
@@ -115,6 +117,45 @@ def metrics_from_logits(logits, label_matrix, threshold: float = THRESHOLD) -> d
     }
 
 
+def annotate_metrics(eval_result: dict, *, epoch, checkpoint) -> dict:
+    """给 `Trainer.evaluate()` 的返回值**补出处**,并**删掉那个会撒谎的 `epoch`**。
+
+    ⚠️ **订正轮 1 · M1**:`evaluate()` 返回的 `epoch` 是 `trainer.state.epoch`,
+    对 trainer 而言那是**最后一轮**(实测 15);而这批数来自
+    `load_best_model_at_end` 载回的那个 checkpoint(**实测第 13 轮**,
+    用 `eval_loss 0.07422567` 与 `log_history` 对上了)。
+    ⇒ 原样落进 `train_meta.json` 会让 `best_epoch: 13.0` 与
+    `val_metrics.epoch: 15.0` **并排却矛盾** —— 而两个数都「看起来有出处」。
+    """
+    out = {key: value for key, value in eval_result.items() if key != "epoch"}
+    out["_metrics_epoch"] = epoch
+    out["_metrics_checkpoint"] = checkpoint
+    return out
+
+
+def repair_train_meta(out_dir) -> bool:
+    """把 `train_meta.json` 的 `val_metrics` 修成 `annotate_metrics` 的形状。**幂等。**
+
+    与 `ensure_label_metadata` 同一类活:**纯元数据缺陷,权重一个字节都不动**,
+    所以对一份已经训好的产物补它**不需要重训**(重训会让已复核的读数全部作废)。
+
+    ⚠️ 它**只动 `val_metrics` 里的那三个键**(去掉会撒谎的 `epoch`,补上
+    `_metrics_epoch` / `_metrics_checkpoint`),**指纹 / 行数 / 四个指标 /
+    超参一个都不碰**。
+    """
+    path = Path(out_dir) / "train_meta.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} 不存在")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    fixed = annotate_metrics(meta["val_metrics"], epoch=meta.get("best_epoch"),
+                             checkpoint=meta.get("best_model_checkpoint"))
+    if fixed == meta["val_metrics"]:
+        return False
+    meta["val_metrics"] = fixed
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
 def make_compute_metrics(label_matrix):
     """`Trainer` 要的 `compute_metrics` —— 只是把真值多热绑上去。"""
 
@@ -133,9 +174,19 @@ def main() -> int:
                     help="⚠️ CUDA OOM 时降这个(先试 16);**不要**动 max_length —— 它由实测句长定的")
     ap.add_argument("--train", default=str(TRAIN_PATH))
     ap.add_argument("--val", default=str(VAL_PATH))
+    #: 纯元数据修复口:只读 `out_dir/config.json`,**不加载模型、不碰权重**。
+    #: 给「已经训好的产物补 `id2label`」用(订正轮 1 · I2)——
+    #: 那类缺陷不需要重训,而重训会让已复核的读数全部作废。
+    ap.add_argument("--fix-metadata-only", action="store_true",
+                    help="只补 out_dir 的元数据(config.json 的标签映射 + train_meta.json 的"
+                         " val_metrics 出处),不加载模型、不碰权重,然后退出")
     cli = ap.parse_args()
 
     out_dir = Path(cli.out_dir)
+    if cli.fix_metadata_only:
+        print(f"ensure_label_metadata changed={ensure_label_metadata(out_dir, labels=LABELS)}")
+        print(f"repair_train_meta     changed={repair_train_meta(out_dir)}")
+        return 0
 
     print(f"torch={torch.__version__} cuda_available={torch.cuda.is_available()} "
           f"cuda={torch.version.cuda} n_gpu={torch.cuda.device_count()}")
@@ -173,8 +224,14 @@ def main() -> int:
 
     # ⚠️ `problem_type` **显式传**,不靠 transformers 从 labels.dtype 猜 ——
     #    那个猜测在第一个 batch 上写进 config 就锁死(§2.3)。
+    # ⚠️⚠️ **订正轮 1 · I2:`id2label` / `label2id` 也必须显式传。** 不传的话
+    #    `save_model` 落下来的 config.json 里是 `LABEL_0…LABEL_16`(实测),
+    #    而**加载不报错** ⇒ 任何走 `config.id2label` 的代码会把 17 个类目全叫
+    #    `LABEL_5`,scores 正常、写库成功、页面画得出来、日志里没有一行不对。
+    _label_meta = label_metadata(LABELS)
     model = AutoModelForSequenceClassification.from_pretrained(
         BASE, num_labels=len(LABELS), problem_type="multi_label_classification",
+        id2label=_label_meta["id2label"], label2id=_label_meta["label2id"],
     )
 
     args = TrainingArguments(
@@ -232,7 +289,8 @@ def main() -> int:
     evals = [h for h in trainer.state.log_history if "eval_micro_f1" in h]
     best = max(evals, key=lambda h: h["eval_micro_f1"]) if evals else {}
 
-    val_metrics = trainer.evaluate()
+    val_metrics = annotate_metrics(trainer.evaluate(), epoch=best.get("epoch"),
+                                   checkpoint=trainer.state.best_model_checkpoint)
     # spec §7.6:阈值扫描。走**同一个** `metrics_from_logits`,所以「0.5 那一行」
     # 与上面的 `val_metrics` 必然一致(不一致就是这里错了,不是巧合)。
     sweep = {f"{t:.1f}": metrics_from_logits(
@@ -240,6 +298,9 @@ def main() -> int:
 
     # 权重 + config.json。`save_artifacts` 只写那三个 json 与 tokenizer。
     trainer.save_model(str(out_dir))
+    # 兜底:即使 `from_pretrained` 那两行被人挪掉,标签映射也必须与 `labels.json` 逐位一致。
+    # 幂等 ⇒ 正常情况下这里是 no-op(返回 False)。
+    print(f"ensure_label_metadata changed_config={ensure_label_metadata(out_dir, labels=LABELS)}")
     save_artifacts(
         out_dir, tokenizer=tokenizer, max_length=MAX_LEN, threshold=THRESHOLD, labels=LABELS,
         meta={

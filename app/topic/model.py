@@ -134,12 +134,70 @@ class TopicDataset(torch.utils.data.Dataset):
         return self.rows[i]
 
 
+def label_metadata(labels) -> dict:
+    """由 `labels` 生成 HF config 的三个标签键 —— **一处生成,两处用**。
+
+    返回 `num_labels` / `id2label` / `label2id`。⚠️ `id2label` 的键是**字符串**
+    (JSON 的键只能是字符串),所以它可以直接与从磁盘读回来的那份 `dict` 比相等。
+
+    为什么要它:HF 保存的 `config.json` 里 `id2label` 默认是
+    `{"0": "LABEL_0", ...}` —— 见 `ensure_label_metadata`。
+    """
+    return {
+        "num_labels": len(labels),
+        "id2label": {str(i): label for i, label in enumerate(labels)},
+        "label2id": {label: i for i, label in enumerate(labels)},
+    }
+
+
+def ensure_label_metadata(out_dir, *, labels) -> bool:
+    """把 `config.json` 的标签映射**补齐 / 纠正**成 `labels`。**幂等**,可对已有目录重跑。
+
+    返回「这次有没有真的动过文件」(第二次调用必须是 `False`,而且字节不变)。
+
+    ⚠️⚠️ **为什么需要它(订正轮 1 · I2)** —— 本仓「静默无效」家族的又一名成员:
+
+    `AutoModelForSequenceClassification.from_pretrained(BASE, num_labels=17)` 存下来的
+    `config.json`,`id2label` 实测是 `{"0": "LABEL_0", …, "16": "LABEL_16"}`、
+    `num_labels` 是 `null`。**加载不报错**(HF 用 `len(id2label)` 补出 17)。
+    于是任何一段走 `model.config.id2label[j]` 或
+    `pipeline("text-classification", model=…)` 的代码会拿到
+    **17 个类目全叫 `LABEL_5`** —— 而 scores 正常、写库成功、页面画得出来、
+    **日志里没有一行不对**。那正是 spec §2.7 逐字点名的陷阱。
+
+    **纠正的是值,不只是缺键**:`data.get(k) == v` 比的是值 ⇒ 顺序错、对调过
+    也会被改写回 `labels` 的顺序(`tests/test_topic_model.py` 有一条反向断言钉着)。
+
+    ⚠️ 它是**幂等**的,所以「对一份已经训好的产物补元数据」不需要重训
+    —— 纯元数据缺陷,权重一个字节都不动。
+    """
+    path = Path(out_dir) / "config.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} 不存在 —— 先 save_model / save_pretrained 再来补标签映射")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    want = label_metadata(labels)
+    if all(data.get(key) == value for key, value in want.items()):
+        return False
+    data.update(want)
+    # `sort_keys=True` + 末尾换行是与 HF 自己的 `to_json_string` 同款,
+    # 免得下一次 `save_pretrained` 把整个文件重排一遍(那会让「改动前后 sha256」
+    # 变得没法解释)。
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+    return True
+
+
 def save_artifacts(out_dir, *, tokenizer, max_length: int, threshold: float,
                    labels, meta: dict) -> None:
     """写产物。**`labels.json` 是推理侧标签顺序的唯一来源。**
 
     服务读它、**不自己写一份** —— 两侧顺序不一致会产出一张完全错的分布图,
     而每个组件都工作正常(模型有输出、scores 在 0–1、写库成功、页面画得出来)。
+
+    ⚠️ **不要用 `config.json` 的 `id2label` 拿类目名 —— 以 `labels.json` 为准。**
+    那个 `id2label` 是给 HF 自己看的元数据,而它**可以是错的**(出厂默认
+    `LABEL_0…`);`labels.json` 才是本仓的权威来源,`ensure_label_metadata`
+    的职责只是把 config 对齐到它。
 
     `tokenizer=None` 时不写 tokenizer(单测走这条路)。⚠️ `save_pretrained`
     会往 `out_dir` 写好几个文件,所以别指望 `out_dir` 里只有那三个 json。
@@ -162,7 +220,11 @@ def save_artifacts(out_dir, *, tokenizer, max_length: int, threshold: float,
 
 
 def load_artifacts(model_dir) -> dict:
-    """读产物。服务与评测脚本都走这里 —— **不要各自 `open()` 一遍**。"""
+    """读产物。服务与评测脚本都走这里 —— **不要各自 `open()` 一遍**。
+
+    ⚠️ **不要用 `config.json` 的 `id2label` 拿类目名 —— 以 `labels.json` 为准**
+    (见 `save_artifacts` 与 `ensure_label_metadata` 的 docstring)。
+    """
     d = Path(model_dir)
     return {
         "labels": json.loads((d / "labels.json").read_text(encoding="utf-8")),

@@ -30,6 +30,24 @@ def _as_sets(rows) -> list[set]:
     return [set(r) for r in rows]
 
 
+def _aligned(y_true, y_pred) -> tuple[list[set], list[set]]:
+    """真值与预测**对齐**后再变成集合 —— 行数不同就**响亮地抛**。
+
+    ⚠️ **订正轮 1 · M4**:不查行数的话,`zip(y_true, y_pred)` 会**静默截断**到较短的
+    那一边,而分母(`len(y_true_sets)`)没变 ⇒ 指标算在一个**没人指定的子集**上,
+    数字落在 0–1 之间、看起来完全正常。这是本仓「静默无效」家族的又一名成员。
+
+    ⚠️ 守卫放在这里而不是各函数里,是为了让 `micro_f1` / `macro_f1`(它们走
+    `per_class_prf`)**也**跟着生效 —— 本仓那条「不变量要放在唯一写口上」。
+    """
+    if len(y_true) != len(y_pred):
+        raise ValueError(
+            f"真值与预测的行数必须相同(现在 {len(y_true)} vs {len(y_pred)})—— "
+            "`zip` 会静默截断到较短的那一边,而分母不变"
+        )
+    return _as_sets(y_true), _as_sets(y_pred)
+
+
 def per_class_prf(y_true, y_pred, labels) -> list[dict]:
     """每类的支持数、TP/FP/FN 与 P/R/F1 —— §8.1 那张 17 行表的**唯一来源**。
 
@@ -42,8 +60,7 @@ def per_class_prf(y_true, y_pred, labels) -> list[dict]:
       `2*tp/(2*tp+fp+fn)` 之后再单独兜底,那样两种写法在 P=R=0 而 tp>0 时
       给出不同的数(tp>0 时 P、R 不可能都是 0,所以今天不会踩;但口径只能有一个)。
     """
-    y_true_sets = _as_sets(y_true)
-    y_pred_sets = _as_sets(y_pred)
+    y_true_sets, y_pred_sets = _aligned(y_true, y_pred)
     rows = []
     for label in labels:
         tp = sum(1 for t, p in zip(y_true_sets, y_pred_sets) if label in t and label in p)
@@ -67,8 +84,7 @@ def subset_accuracy(y_true, y_pred) -> float:
     这是需求原话「一个不多一个不少」的最严读法;字面读法是 `label_count_match`。
     **两个都要报,不要合并**(§6.5)。
     """
-    y_true_sets = _as_sets(y_true)
-    y_pred_sets = _as_sets(y_pred)
+    y_true_sets, y_pred_sets = _aligned(y_true, y_pred)
     if not y_true_sets:
         return 0.0
     hit = sum(1 for t, p in zip(y_true_sets, y_pred_sets) if t == p)
@@ -82,8 +98,7 @@ def label_count_match(y_true, y_pred) -> float:
     这条只看 `len`。测试里有一条反向断言钉着这一点
     (`label_count_match` 写成 `subset_accuracy` 会红)。
     """
-    y_true_sets = _as_sets(y_true)
-    y_pred_sets = _as_sets(y_pred)
+    y_true_sets, y_pred_sets = _aligned(y_true, y_pred)
     if not y_true_sets:
         return 0.0
     hit = sum(1 for t, p in zip(y_true_sets, y_pred_sets) if len(t) == len(p))

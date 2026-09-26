@@ -137,6 +137,31 @@ def test_macro_f1_uses_the_given_labels_as_the_denominator():
     assert got == pytest.approx(0.5)  # 账号 那一类:tp=fp=fn=0 ⇒ F1=0.0
 
 
+def test_unequal_row_counts_raise_instead_of_silently_truncating():
+    """⚠️ **订正轮 1 · M4:`zip` 会静默截断。**
+
+    `zip(y_true, y_pred)` 只在较短的那一边上跑,**而分母也没变** ⇒
+    指标会算在一个**没人指定的子集**上,数字看起来完全正常。
+    三个入口(`per_class_prf` / `subset_accuracy` / `label_count_match`)都要拦。
+    """
+    with pytest.raises(ValueError, match="行数"):
+        per_class_prf([["评价"]], [["评价"], ["评价"]], ["评价"])
+    with pytest.raises(ValueError, match="行数"):
+        subset_accuracy([["评价"]], [["评价"], ["评价"]])
+    with pytest.raises(ValueError, match="行数"):
+        label_count_match([["评价"]], [["评价"], ["评价"]])
+
+
+def test_micro_and_macro_also_raise_on_unequal_row_counts():
+    """它们走 `per_class_prf`,所以那条守卫**必须**跟着生效 ——
+    只守直调的那三个函数、把 micro/macro 漏掉,是一条看起来严、实际松的写法。"""
+    labels = ["评价", "账号"]
+    with pytest.raises(ValueError, match="行数"):
+        micro_f1([["评价"]], [["评价"], ["评价"]], labels)
+    with pytest.raises(ValueError, match="行数"):
+        macro_f1([["评价"]], [["评价"], ["评价"]], labels)
+
+
 def test_per_class_prf_covers_every_label_in_LABELS_order():
     """行的顺序 = 传进来的 `labels` 的顺序 —— 报告直接按它排版。
 
