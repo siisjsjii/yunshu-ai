@@ -108,12 +108,21 @@ def render_taxonomy_for_prompt() -> str:
     """渲染成类目表文本块,供预标与合成的 prompt 使用。
 
     **不含花括号**(`ChatPromptTemplate` 按 f-string 解析)。
-    含边界说明与反例 —— 反例是「近邻类目怎么划开」的实际内容,
-    只给边界说明不给反例的话,模型对「刚收到就坏了」会犹豫。
+    每类渲染**三样**:边界说明、正例(`POSITIVE`)、反例(`COUNTER`)——
+    三样都是「怎么裁决这一类」的实际内容,少一样都会让模型退回字面词猜测。
+
+    ⚠️ **正例此前从没进过任何 prompt**(订正 D,2026-09-26) —— 而 `POSITIVE`
+    自己的 docstring 就写着「边界说明**不足以**让模型学会认它(`其他`),
+    给一句原话比给一句否定式更有效」⇒ 那是一句看起来会生效、其实什么都没做的话,
+    本仓「静默无效」家族(ch06 未声明通道 / ch07 `add_messages` 赋 uuid4 /
+    ch09 `response_format` / ch09 `Span.update` kwargs)的又一名成员。
+    **`COUNTER` 没声明的 7 类照样有正例** —— 正例与反例是两份独立的表,不共键。
     """
     lines = []
     for label in LABELS:
         lines.append(f"- {label}:{BOUNDARY[label]}")
+        for text in POSITIVE.get(label, ()):
+            lines.append(f"    · 例:「{text}」")
         for text, target in COUNTER.get(label, ()):
             lines.append(f"    · 「{text}」归 {target},不归 {label}")
     return "\n".join(lines)

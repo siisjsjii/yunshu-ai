@@ -1,14 +1,16 @@
 """标注相关的纯函数:去重、证据串校验、标签漂移、分层抽样。
 
-末条(`test_collect_...`)不测纯函数,测的是 `collect` 的**接线** —— 它没有 DB、
-没有网络,所以留在这一份里、也在 `not db` 套件里。
+末两条(`test_collect_...` 与 `test_prelabel_...`)不测纯函数,测的是**接线** ——
+`collect`(三源合流)与 `prelabel_topics.run`(三个读数 + 断点续跑)。两处都
+**没有 DB、没有网络**(模型替身替在 `ainvoke` 这一层),所以留在这一份里、
+也在 `not db` 套件里。
 """
 
 import json
 
 import pytest
 
-from app.topic.labeling import dedupe_questions
+from app.topic.labeling import dedupe_questions, validate_evidence
 
 
 def test_dedupe_keeps_first_occurrence_and_source():
@@ -157,3 +159,216 @@ def test_from_db_gives_the_two_queries_different_sources(monkeypatch):
         {"question": "第1条查询的行", "source": "pool"},
         {"question": "第2条查询的行", "source": "chat"},
     ]
+
+
+# ---- 证据串校验(ch10 spec §6.2)----
+
+
+def test_evidence_must_be_a_substring_of_the_question():
+    """**这是「字面提到」这个口径的结构性保证。**
+
+    没有它,「字面提到」只是 prompt 里的一句话,模型可以凭语义联想打标签,
+    而你从输出上看不出来。有了证据串校验,它变成一个**可自动检验**的条件。
+    """
+    ok, bad = validate_evidence(
+        "买大了想退", ["尺码", "退换货"], {"尺码": "买大了", "退换货": "想退"}
+    )
+    assert ok == ["尺码", "退换货"]
+    assert bad == []
+
+
+def test_fabricated_evidence_is_rejected():
+    """模型编了一个原文里没有的片段 —— 这一条必须被挑出来。"""
+    ok, bad = validate_evidence(
+        "买大了想退", ["尺码", "退换货"],
+        {"尺码": "买大了", "退换货": "退款政策"},   # 原文里没有「退款政策」
+    )
+    assert ok == ["尺码"]
+    assert bad == ["退换货"]
+
+
+def test_label_without_evidence_is_rejected():
+    ok, bad = validate_evidence("买大了想退", ["尺码"], {})
+    assert ok == []
+    assert bad == ["尺码"]
+
+
+def test_empty_evidence_string_is_rejected_not_accepted():
+    """空串是任何字符串的子串 —— **不特判的话这条会假绿**。
+
+    `"" in "任意文本"` 为 True,所以只写 `if ev in question` 的话,
+    模型返回 `"尺码": ""` 会被判为「证据合法」。
+    """
+    ok, bad = validate_evidence("买大了想退", ["尺码"], {"尺码": "   "})
+    assert ok == []
+    assert bad == ["尺码"]
+
+
+def test_evidence_is_matched_after_cleaning():
+    """证据比对在**清洗后**的文本上做 —— 与预标时喂进去的文本口径一致。"""
+    ok, _ = validate_evidence("买大了 想退", ["尺码"], {"尺码": "买大了"})
+    assert ok == ["尺码"]
+
+
+def test_both_sides_of_the_evidence_check_are_cleaned():
+    """两侧都要过 `clean()` —— 上面那条用例**两个方向都钉不住**(变异实测,2026-09-26)。
+
+    ⚠️ 实测:把 `clean(ev)` 去掉、或把 `normalized` 换成裸的 `question`,
+    上面那条的输入(`"买大了 想退"` / `"买大了"`)**在两种错法下都照绿** ——
+    因为那条证据本身不含任何需要清洗的字符(三次独立计算:真实现 / 错法 A / 错法 B
+    全是 True)。判据是本仓那条:**构造输入前先算一遍它会不会走到那条分支。**
+
+    下面两条输入各自只钉一侧,且都对着 `validate_evidence` docstring 里那句
+    「证据本身也要过一遍清洗,否则全角/空白差异会造成假拒」:
+
+    - 证据侧带**双空格** ⇒ 少一遍 `clean(ev)` 就红(错法 A:False);
+    - 问句侧带**全角空格** ⇒ 少一遍 `clean(question)` 就红(错法 B:False)。
+    """
+    # 证据侧
+    ok, _ = validate_evidence("买大了 想退", ["尺码"], {"尺码": "买大了  想退"})
+    assert ok == ["尺码"], "证据侧的清洗没了 —— 双空格的证据被误拒"
+    # 问句侧
+    ok, _ = validate_evidence("买大了　　想退", ["尺码"], {"尺码": "买大了 想退"})
+    assert ok == ["尺码"], "问句侧的清洗没了 —— 全角空格的问句匹配不上"
+
+
+def test_rejected_labels_are_returned_not_silently_dropped():
+    """被拒的标签要**返回出来**,不能悄悄吞掉。
+
+    吞掉的后果:一条问题从「3 个标签」变成「1 个标签」而无人知晓,
+    而这会**改变训练分布** —— 多标签样本会系统性变少,正是方案 A 要防的。
+    """
+    _, bad = validate_evidence("买大了想退", ["尺码", "退换货"], {"尺码": "买大了"})
+    assert bad == ["退换货"]
+
+
+# ---- 预标脚本的接线(ch10 spec §6.2/§6.3;不联网、不碰库)----
+
+
+def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_path, capsys):
+    """`prelabel_topics.run` 的三个读数与断点续跑 —— **都是接线,不是纯函数**。
+
+    ⚠️ 为什么必须有这一条:**Step 6 的「被拒 0 条」在「标签本来就都对」与
+    「校验器根本没接进来」两种实现下读数完全相同**(本仓编目过的假绿形态)。
+    上面六条只钉了 `validate_evidence` 的**机制**,没有一条钉 `run` 真的调它。
+    同理「parse_failed 全 false」在「解析失败被写成空标签行」的实现下也读数相同
+    (那正是订正 C 的形状)—— 所以这里**造**一条解析失败的输入,并要求它落成
+    `parse_failed: true` 这一列。
+
+    替身替在 **`create_extract_model`** 这一层(不是替 `_label`),所以
+    `bind(response_format=…)` → `ainvoke` → 去围栏 → `json.loads` → 形状闸 →
+    `validate_evidence` → 写盘 → 计数,**整条真跑**;JSON 也真的从文本解出来。
+    """
+    import asyncio
+
+    from scripts import prelabel_topics as p
+
+    class _Msg:
+        def __init__(self, text):
+            self.text = text
+
+    class _Model:
+        """只实现被测代码真的用到的那两样:`bind` 与 `ainvoke`。"""
+
+        def __init__(self, texts):
+            self._texts = list(texts)
+            self.bound = None
+
+        def bind(self, **kwargs):
+            self.bound = kwargs
+            return self
+
+        async def ainvoke(self, _messages):
+            return _Msg(self._texts.pop(0))
+
+    model = _Model([
+        # ① 正常:两个标签、证据都是原句子串
+        '{"labels": ["尺码", "退换货"], "evidence": {"尺码": "买大了", "退换货": "想退"}}',
+        # ② 编造:「退款政策」不在原文里 ⇒ 只该留下「尺码」,且被拒标签要**写出来**
+        '{"labels": ["尺码", "退换货"], "evidence": {"尺码": "买大了", "退换货": "退款政策"}}',
+        # ③ 散文:JSON 没解出来 ⇒ parse_failed
+        "抱歉,我无法判断。",
+        # ④ JSON 是合法的,但**形状**不是约定的那样(evidence 是一个字符串)
+        '{"labels": ["尺码"], "evidence": "买大了"}',
+    ])
+    monkeypatch.setattr(p, "create_extract_model", lambda _settings: model)
+    monkeypatch.setattr(p, "get_settings", lambda: object())
+
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
+        {"id": "r-0001", "question": "买大了想退", "source": "pool", "provenance": "real"},
+        {"id": "r-0002", "question": "买大了想退", "source": "pool", "provenance": "real"},
+        {"id": "r-0003", "question": "在吗", "source": "pool", "provenance": "real"},
+        {"id": "r-0004", "question": "买大了想退", "source": "pool", "provenance": "real"},
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(p, "CORPUS", corpus)
+    monkeypatch.setattr(p, "SYNTH", tmp_path / "不存在.jsonl")
+    out = tmp_path / "prelabeled.jsonl"
+    monkeypatch.setattr(p, "OUT", out)
+
+    asyncio.run(p.run(None))
+
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["id"] for r in rows] == ["r-0001", "r-0002", "r-0003", "r-0004"]
+    # ① 原样通过,evidence 保留
+    assert rows[0]["labels"] == ["尺码", "退换货"]
+    assert rows[0]["rejected_labels"] == []
+    assert rows[0]["parse_failed"] is False
+    assert rows[0]["evidence"] == {"尺码": "买大了", "退换货": "想退"}
+    # ② 被拒的标签**返回出来**、**落进产物**,且它那条 evidence 不留在产物里
+    assert rows[1]["labels"] == ["尺码"]
+    assert rows[1]["rejected_labels"] == ["退换货"]
+    assert rows[1]["evidence"] == {"尺码": "买大了"}
+    assert rows[1]["parse_failed"] is False
+    # ③ 解析失败必须**在产物里分得开**(订正 C:与「模型真的判了零标签」逐字节相同的那个坑)
+    assert rows[2]["labels"] == [] and rows[2]["parse_failed"] is True
+    # ④ 形状不对**不是**「JSON 没解出来」,但也不是正常结果 ⇒ 同样归 parse_failed。
+    #    ⚠️ 少了那道形状闸,`dict("买大了")` 会直接 ValueError 打断整跑 ——
+    #    这条输入探的正是「校验器有没有被接进来」的另一半。
+    assert rows[3]["labels"] == [] and rows[3]["parse_failed"] is True
+
+    # 三个读数都打出来(只为「人看得到」,但读数本身就是交付物的一部分)
+    printed = capsys.readouterr().out
+    assert "被证据校验拒掉标签的 1 条" in printed
+    assert "JSON 解析失败 2 条" in printed
+    assert "空标签 2 条" in printed
+
+    # 决策钉住:`response_format` 是**网关侧**保证它是 JSON 对象的那个旋钮
+    # (为什么不用 `with_structured_output(method="json_mode")` 见 `_bind_json` 的 docstring)
+    assert model.bound == {"response_format": {"type": "json_object"}}
+
+    # ---- 断点续跑:再跑一次,四条 id 都已在产物里 ⇒ 一条都不处理、一行都不追加 ----
+    asyncio.run(p.run(None))
+    assert "本次处理 0 条" in capsys.readouterr().out
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_main_pins_stdout_encoding():
+    """`main()` 必须把 stdout 钉成 UTF-8 —— **本机 locale 是 cp936**。
+
+    `⚠️`(U+26A0)与 `⇒`(U+21D2)编不进 GBK,而它们只出现在「解析失败不为 0」那条
+    print 里 ⇒ 不钉的话,**恰恰在最需要它输出的那条路径上**抛 `UnicodeEncodeError`:
+    脚本以退出码 1 结束、那行警告消失,而产物(逐行 flush)是好的 ——
+    「产物是好的」与「日志里没有警告」叠在一起是最难分辨的一种假绿。
+
+    ⚠️ **子进程故意不加 `-X utf8`**:加的话 stdout 恒是 UTF-8,这条断言就**恒真**
+    (本仓那条「平台陷阱的断言要么带可复现证据、要么标未验证」)。
+    它的判别力**依赖本机是 cp936** —— 换一台 UTF-8 locale 的机器,这条就退化成
+    「函数存在」检查(如实记下来,不装作它到哪都同样有力)。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    code = (
+        "from scripts.prelabel_topics import _pin_stdout_encoding;"
+        "_pin_stdout_encoding();"
+        "print('⚠️ 解析失败不为 0 ⇒ 先停下看产物')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    assert proc.returncode == 0, f"钉编码没生效:\n{proc.stderr}"
+    assert "解析失败不为 0" in proc.stdout

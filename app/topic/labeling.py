@@ -22,3 +22,29 @@ def dedupe_questions(rows: list[dict]) -> list[dict]:
         seen.add(text)
         out.append({**row, "question": text})
     return out
+
+
+def validate_evidence(
+    question: str, labels: list[str], evidence: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """校验每个标签的「证据串」是不是原文的子串。
+
+    返回 `(通过的标签, 被拒的标签)` —— **被拒的也要返回**,不能悄悄吞掉:
+    从 3 个标签缩成 1 个会改变训练分布,而那是静默的。
+
+    ⚠️ **空证据串必须显式拒绝**:`"" in "任意文本"` 恒为 True,
+    不特判的话 `{"尺码": ""}` 会被判成「证据合法」—— 一个一眼看不见的假绿。
+
+    两侧都过 `clean()`:问句侧与预标喂进 prompt 的文本同口径,
+    证据侧则防止全角/空白差异把一条**真的**证据误拒。
+    """
+    normalized = clean(question)
+    accepted, rejected = [], []
+    for label in labels:
+        ev = (evidence.get(label) or "").strip()
+        # 证据本身也要过一遍清洗,否则全角/空白差异会造成假拒。
+        if ev and clean(ev) and clean(ev) in normalized:
+            accepted.append(label)
+        else:
+            rejected.append(label)
+    return accepted, rejected

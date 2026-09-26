@@ -159,7 +159,7 @@ def test_rendered_block_carries_every_label_and_boundary():
 def test_rendered_block_carries_every_counter_pair():
     """反例必须**逐条进渲染块** —— 只断类目名与边界说明的话,一个「把反例行整段丢掉」
     的渲染会**通过全部断言**,而 `render_taxonomy_for_prompt` 的 docstring 明说
-    「含边界说明与反例」,近邻类目的裁决内容**就是那些反例**。
+    它渲染「边界说明、正例、反例」三样,近邻类目的裁决内容**就是那些反例**。
 
     这里断的是整行文本(而不是「两个词都出现过」)—— 指向与归属任一写错都会红。
     """
@@ -168,6 +168,26 @@ def test_rendered_block_carries_every_counter_pair():
         for text, target in pairs:
             line = f"「{text}」归 {target},不归 {label}"
             assert line in block, f"渲染块里没有反例行:{line}"
+
+
+def test_rendered_block_carries_every_positive_example():
+    """正例必须**逐条进渲染块** —— 与上面那条反例守卫同款(计划订正 D,2026-09-26)。
+
+    `POSITIVE` 按 spec §4.1 的「正例」列逐类收齐(上面 `test_every_label_has_positive_examples`
+    守住了「每类 ≥1 条」),**但它此前一个 prompt 都没进过** —— 而 `POSITIVE` 自己的
+    docstring 明说「边界说明**不足以**让模型学会认它(其他),给一句原话比给一句否定式更有效」。
+    ⇒ 缺这条断言的话,「把正例行整段丢掉」的渲染会**通过其余全部断言**:
+    类目名在、边界说明在、反例在,而正例静默消失。
+
+    这里断的是**整行文本**(含与反例行对齐的四空格缩进),而不是「那个词出现过」——
+    少写 `例:` 前缀、或缩进写歪都会红。
+    """
+    block = render_taxonomy_for_prompt()
+    for label, examples in POSITIVE.items():
+        assert examples, f"{label} 在 POSITIVE 里是空的,这条断言对它零判别力"
+        for text in examples:
+            line = f"    · 例:「{text}」"
+            assert line in block, f"渲染块里没有正例行:{line}"
 
 
 def test_rendered_block_has_no_curly_braces():

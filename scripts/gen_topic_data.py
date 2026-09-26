@@ -182,7 +182,7 @@ def build_prompt(label: str, form: str, n: int) -> str:
         labels_line += ",**本批应当是 2 个**"
     return f"""你在为一个电商客服系统造**训练语料**。
 
-下面是本系统权威的类目表(含每类的边界说明与容易混的反例):
+下面是本系统权威的类目表(含每类的边界说明、正例与容易混的反例):
 
 {render_taxonomy_for_prompt()}
 
