@@ -1,90 +1,132 @@
+树洁癖复查(开跑那一刻的版本;要跟报告的其余读数对上):
+  · app/topic/labeling.py  4622 B  sha256=a5754c903f6aa85f  == HEAD(逐字节)
+  · scripts/export_label_review.py  18456 B  sha256=679dac9da66ab687  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · tests/test_topic_labeling.py  52784 B  sha256=0c8bb299fdc6b2b5  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · 真产物 trainval.csv  sha256=201f1c77daad862c(它**正被用户改**,本轮不许动它)
 
 === M1 ★B6-A 必查:删掉 `rng.shuffle(shuffled)`  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_different_seeds_pick_different_samples  (期望 failed)   [{'failed': 1}]
   绿灯  test_pick_review_sample_is_reproducible_with_a_seed  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M2 只记第一个标签(`row['labels'][:1]`)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_multi_label_rows_are_reachable_via_a_label_that_is_not_the_first  (期望 failed)   [{'failed': 1}]
   绿灯  test_multi_label_rows_count_toward_every_label  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M3 `random.Random(seed)` → `random.Random()`(种子被丢掉)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_pick_review_sample_is_reproducible_with_a_seed  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 labeling.py
 
 === M4 每类多抽一条(`[:per_label + 1]`)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_pick_review_sample_takes_from_every_label  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 labeling.py
 
 === M5 导出时把预标标签写进「最终标签」列  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_export_writes_the_stratified_sample_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M10 删掉 `main()` 里的钉编码  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_export_script_pins_stdout_encoding  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-F1 ★订正轮 2:桩失效(main() 走的是**导入时绑死**的别名)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_export_script_pins_stdout_encoding  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-C1 ★必查:读数改回「只数判定列」(订正前的行为)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict  (期望 failed)   [{'failed': 1}]
   绿灯  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-C1b 少填「改」时不再警告(读数仍对,但看不见了)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-I1 去掉「字段比表头多」那条(列错位被吞)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-I2a 去掉「id 不在预标语料里」那条  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-I2b 去掉「id 重复」那条  [scripts\export_label_review.py]
-  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
-  · 已逐字节还原 export_label_review.py
-
-=== M-I2c 去掉「预标标签列与语料同源」那条  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-I3 题面照抄 CSV 那份(不取预标)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_takes_the_question_from_the_prelabels_not_from_the_csv  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-S18 去掉「判定=改 但标签没变」那条(两边互相拆台)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-Mn3 空产物不再拒绝(只有表头也照写)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-Mn4 重复类目不去重  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_dedupes_repeated_labels  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M-Mn5 不再把「不是 UTF-8」翻成人话  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_explains_a_file_that_is_not_utf8  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
+=== M-N1 ★订正轮 2:集合比较 → 列表比较(顺序敏感)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_import_is_not_fooled_by_ordering_or_padding  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-N4 ★订正轮 2:id 不 strip()  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_import_is_not_fooled_by_ordering_or_padding  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-N5 ★订正轮 2:同源护栏「集合相等」→「子集」  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
 === M7 最终标签不逐段 strip(逗号后带空格就炸)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M12 去掉表头缺列那条  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M13 「判定」认不出也不再报(静默当成没改)  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M14 不合法类目改成静默丢弃  [scripts\export_label_review.py]
+  · 树洁癖复查 ✅
   ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
+真产物 trainval.csv: 未被动过 ✅(sha256=201f1c77daad862c)
 ============================================================
 问题数:0

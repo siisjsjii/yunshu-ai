@@ -1,20 +1,30 @@
 """T6 变异探针:把实现改坏,确认**这条测试真的会红**。
 
+⚠️ **同时只许一个人跑这个探针。** 复审自己踩过:两个运行器跑在同一棵树上,
+一个把另一个的变异当成了「原始」⇒ **同一天先报 `问题数:0`、后报 `问题数:2`**,
+而「逐字节还原」的日志**照样打印**(那是还原到了被污染的那一份)。
+⇒ 本探针因此有两道自己的检查:开跑时把三份源码的 sha256 打出来(并对照 `HEAD`),
+**每次变异前**再断言三份源码与开跑那一刻**逐字节相同**(`树洁癖复查 ✅`)。
+
 规矩(本仓 ch07 全章复盘的元教训,逐条照做):
 - 锚点**锚在代码上,不锚在注释上**,且每次变异后**断言锚点命中数恰好为 1**;
 - **绝不用 `Path.write_text` 还原**(上一轮有人在 Windows 上把整份文件改成 CRLF、
   探针自己报了假警)⇒ 全程**字节**读写,并在 `finally` 里用 `read_bytes() == 原始字节` 复核;
 - **绝不把证据输出接进任何截断/过滤管道**;看不到 `N passed|failed` 就打 `!!!`;
 - **一条测试一次 pytest 调用** —— 汇总行的 `N failed` 说不清「是哪一条红」,
-  而这次探针的全部价值就在于「**红在哪条**」。
+  而这次探针的全部价值就在于「**红在哪条**」;
+- **真产物不许被动**:开跑与收工时都量一次 `evals/topic/labels/trainval.csv`
+  (它此刻**正被用户改**,是 CP-2 的输入)。
 
-订正轮 1 新增:C1(读数来源)/ I1(列错位)/ I2(未知 id、重复 id)/ I3(题面来源)/
-S18(判定与标签矛盾)/ Mn2·Mn3·Mn4·Mn5。
+订正轮 1:C1 / I1 / I2a-c / I3 / S18 / Mn3-5。
+订正轮 2 新增:F4 的 N1(顺序敏感)/ N4(id 不 strip)/ N5(同源护栏放松成子集)/
+F1(桩失效 ⇒ 子进程跑真 export)。
 
 用法:
     .venv/Scripts/python.exe -X utf8 .superpowers/ch10b_t6_mutation_probe.py
 """
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -25,6 +35,11 @@ T = "tests/test_topic_labeling.py"
 
 LAB = ROOT / "app" / "topic" / "labeling.py"
 EXP = ROOT / "scripts" / "export_label_review.py"
+TEST = ROOT / "tests" / "test_topic_labeling.py"
+ARTIFACT = ROOT / "evals" / "topic" / "labels" / "trainval.csv"
+
+#: 树洁癖盯的三份源码。
+SRC = (LAB, EXP, TEST)
 
 #: 复用同一条测试名,免得每处都抄一长串
 T_EVERY_LABEL = f"{T}::test_pick_review_sample_takes_from_every_label"
@@ -37,6 +52,7 @@ T_ROUNDTRIP = f"{T}::test_import_takes_the_final_labels_and_falls_back_to_the_pr
 T_C1 = f"{T}::test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict"
 T_I3 = f"{T}::test_import_takes_the_question_from_the_prelabels_not_from_the_csv"
 T_DEDUPE = f"{T}::test_import_dedupes_repeated_labels"
+T_ORDER_PAD = f"{T}::test_import_is_not_fooled_by_ordering_or_padding"
 T_REFUSE = f"{T}::test_import_refuses_input_that_would_silently_change_the_reading"
 T_MALFORMED = f"{T}::test_import_refuses_malformed_rows"
 T_NOT_UTF8 = f"{T}::test_import_explains_a_file_that_is_not_utf8"
@@ -97,6 +113,25 @@ MUTATIONS = [
         "    ap = argparse.ArgumentParser()",
         [(T_PIN, "failed")],
     ),
+    (
+        "M-F1 ★订正轮 2:桩失效(main() 走的是**导入时绑死**的别名)",
+        EXP,
+        # ⚠️ **两处修改,缺一不成**:光是 `main()` 改个写法没用 —— `export` 是**全局查找**,
+        #    调用那一刻读的仍是测试替换过的那个属性(第一版这么写,实测**全绿**)。
+        #    真正让桩失效的是「**导入时**就把函数对象绑到一个别名上」——
+        #    这正是「改个名 / 换个封装」在真实重构里的样子。
+        [
+            ("    export() if args.action == \"export\" else do_import()\n",
+             "    _REAL_EXPORT() if args.action == \"export\" else do_import()\n"),
+            ("if __name__ == \"__main__\":\n    main()\n",
+             "_REAL_EXPORT = export      # 变异:导入时绑死(桩从此拦不住它)\n\n\n"
+             "if __name__ == \"__main__\":\n    main()\n"),
+        ],
+        None,       # ← 多处修改时用上面那个列表,这一格不用
+        # 红在哪句:桩失效 ⇒ 子进程里真跑了 export ⇒ 它写进 **tmp**(路径已被测试改过)
+        # ⇒ `assert not (tmp / "trainval.csv").exists()` 失配。**真产物一行不动。**
+        [(T_PIN, "failed")],
+    ),
     # ---- ★订正轮 1:回收端 ----
     (
         "M-C1 ★必查:读数改回「只数判定列」(订正前的行为)",
@@ -144,13 +179,6 @@ MUTATIONS = [
         [(T_MALFORMED, "failed")],
     ),
     (
-        "M-I2c 去掉「预标标签列与语料同源」那条",
-        EXP,
-        "                if set(raw_pre) != set(pre[\"labels\"]):",
-        "                if False:",
-        [(T_MALFORMED, "failed")],
-    ),
-    (
         "M-I3 题面照抄 CSV 那份(不取预标)",
         EXP,
         "                out_rows.append({\"id\": rid, \"question\": pre[\"question\"],\n"
@@ -187,7 +215,29 @@ MUTATIONS = [
         "    except ZeroDivisionError as exc:   # 变异:不再拦解码错",
         [(T_NOT_UTF8, "failed")],
     ),
-    # ---- B6-A 那几条护栏(锚点跟着重写挪过,这里重验一遍)----
+    # ---- ★订正轮 2 的 F4:复审实测「全绿」的那三个 ----
+    (
+        "M-N1 ★订正轮 2:集合比较 → 列表比较(顺序敏感)",
+        EXP,
+        "                if set(labels) != set(pre[\"labels\"]):",
+        "                if list(labels) != list(pre[\"labels\"]):",
+        [(T_ORDER_PAD, "failed")],
+    ),
+    (
+        "M-N4 ★订正轮 2:id 不 strip()",
+        EXP,
+        "                rid = (row.get(\"id\") or \"\").strip()",
+        "                rid = row.get(\"id\") or \"\"",
+        [(T_ORDER_PAD, "failed")],
+    ),
+    (
+        "M-N5 ★订正轮 2:同源护栏「集合相等」→「子集」",
+        EXP,
+        "                if set(raw_pre) != set(pre[\"labels\"]):",
+        "                if not set(raw_pre) <= set(pre[\"labels\"]):",
+        [(T_MALFORMED, "failed")],
+    ),
+    # ---- B6-A / 订正轮 1 的其余护栏(锚点跟着重写挪过,每次重验)----
     (
         "M7 最终标签不逐段 strip(逗号后带空格就炸)",
         EXP,
@@ -223,6 +273,43 @@ MUTATIONS = [
 SUMMARY_RE = re.compile(r"(\d+) (passed|failed)")
 
 
+def _git_blob(rel):
+    r = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=ROOT, capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _revision_report(snapshot) -> None:
+    """开跑前把「我到底在测哪一版」记下来,并对照 `HEAD`。"""
+    print("树洁癖复查(开跑那一刻的版本;要跟报告的其余读数对上):")
+    for p in SRC:
+        rel = p.relative_to(ROOT).as_posix()
+        cur = snapshot[p]
+        blob = _git_blob(rel)
+        if blob is None:
+            state = "未入库"
+        elif cur == blob:
+            state = "== HEAD(逐字节)"
+        elif cur.replace(b"\r\n", b"\n") == blob:
+            state = "== HEAD(仅行尾差异 / autocrlf)"
+        else:
+            state = "与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)"
+        print(f"  · {rel}  {len(cur)} B  sha256={hashlib.sha256(cur).hexdigest()[:16]}  {state}")
+
+
+def _hygiene_ok(snapshot) -> bool:
+    """每次变异**前**:三份源码必须与开跑那一刻逐字节相同。"""
+    for p, b in snapshot.items():
+        if p.read_bytes() != b:
+            print(f"  !!! 树被污染:{p.relative_to(ROOT)} 与开跑时不同"
+                  f" —— 是不是**有别人在同一棵树上跑**?这次变异不作数")
+            return False
+    return True
+
+
 def _run(test_id):
     return subprocess.run(
         [sys.executable, "-m", "pytest", test_id, "-p", "no:cacheprovider"],
@@ -231,19 +318,38 @@ def _run(test_id):
 
 
 def main() -> None:
+    snapshot = {p: p.read_bytes() for p in SRC}
+    art_before = ARTIFACT.read_bytes() if ARTIFACT.exists() else None
+    _revision_report(snapshot)
+    print(f"  · 真产物 {ARTIFACT.name}  sha256={_sha256(ARTIFACT)[:16]}"
+          f"(它**正被用户改**,本轮不许动它)")
+
     problems = 0
     for name, path, old, new, expects in MUTATIONS:
         original = path.read_bytes()
-        old_b, new_b = old.encode("utf-8"), new.encode("utf-8")
         print(f"\n=== {name}  [{path.relative_to(ROOT)}]")
-        hits = original.count(old_b)
-        # ⚠️ 锚点必须**恰好命中一次** —— 0 次是「变异压根没生效」,>1 次是「改的不止一处」。
-        if hits != 1:
-            print(f"  !!! 锚点命中 {hits} 次(应为 1)⇒ 这次变异**不作数**")
+        if not _hygiene_ok(snapshot):
             problems += 1
             continue
+        print("  · 树洁癖复查 ✅")
+        # 一个变异可以是**多处**修改(`old` 给成 [(原文, 替换), …]);单处时就是 (old, new)。
+        edits = old if isinstance(old, list) else [(old, new)]
         try:
-            path.write_bytes(original.replace(old_b, new_b, 1))
+            ok = True
+            for o, n in edits:
+                ob, nb = o.encode("utf-8"), n.encode("utf-8")
+                cur = path.read_bytes()
+                # ⚠️ 锚点必须**恰好命中一次** —— 0 次是「变异压根没生效」,>1 次是「改的不止一处」。
+                hits = cur.count(ob)
+                if hits != 1:
+                    print(f"  !!! 锚点命中 {hits} 次(应为 1):{o.splitlines()[0][:50]!r}"
+                          f" ⇒ 这次变异**不作数**")
+                    problems += 1
+                    ok = False
+                    break
+                path.write_bytes(cur.replace(ob, nb, 1))
+            if not ok:
+                continue
             for test_id, want in expects:
                 proc = _run(test_id)
                 counts = {w: int(n) for n, w in SUMMARY_RE.findall(proc.stdout)}
@@ -267,7 +373,15 @@ def main() -> None:
                 problems += 1
             else:
                 print(f"  · 已逐字节还原 {path.name}")
-    print(f"\n{'=' * 60}\n问题数:{problems}")
+
+    art_after = ARTIFACT.read_bytes() if ARTIFACT.exists() else None
+    same = art_after == art_before
+    print(f"\n真产物 {ARTIFACT.name}:"
+          f" {'未被动过 ✅' if same else '!!! 被改动了 —— 立刻停下'}"
+          f"(sha256={_sha256(ARTIFACT)[:16]})")
+    if not same:
+        problems += 1
+    print(f"{'=' * 60}\n问题数:{problems}")
     sys.exit(1 if problems else 0)
 
 

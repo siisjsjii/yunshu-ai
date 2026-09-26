@@ -668,7 +668,7 @@ def test_import_takes_the_final_labels_and_falls_back_to_the_prelabels(
     assert all(r["reviewed"] is True for r in rows)
     printed = capsys.readouterr().out
     assert "回收 3 条" in printed
-    assert "判「改」的 2 条" in printed
+    assert "标签与预标不同的 2 条" in printed
 
 
 def test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict(
@@ -700,7 +700,7 @@ def test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict(
     printed = capsys.readouterr().out
     # ⚠️ 旧实现(以及「把 changed 改回只数判定列」那个变异 **M-C1**)在这里读 **1**,不是 3
     #    —— 变异 M-C1 实测过,证据在 `.superpowers/ch10b_t6_mutation_probe.py`(已入库)。
-    assert "判「改」的 3 条" in printed, printed
+    assert "标签与预标不同的 3 条" in printed, printed
     assert [r["labels"] for r in _read_reviewed(tmp_path)] == [
         ["尺码", "退换货"], ["物流", "商品信息"], ["价保"],
     ]
@@ -755,6 +755,44 @@ def test_import_dedupes_repeated_labels(monkeypatch, tmp_path, capsys):
     assert [r["labels"] for r in _read_reviewed(tmp_path)] == [["尺码", "退换货"]]
     printed = capsys.readouterr().out
     assert "重复类目" in printed and "'a'" in printed, printed
+
+
+def test_import_is_not_fooled_by_ordering_or_padding(monkeypatch, tmp_path, capsys):
+    """★ 订正轮 2 的 **F4(N1 + N4)**:两个「用户顺手多敲的字符」不该改变读数。
+
+    复审跑了两个变异,**都是全绿**(即没有任何用例钉住它们):
+
+    - **N1:把 `set(labels) != set(pre)` 换成列表比较(顺序敏感)**。
+      标签是**集合**(spec §6.5 的「整条完全一致率」按集合比)⇒ 用户把
+      `尺码|退换货` 写成 `退换货|尺码` 时,「改了没有」必须还是**没有**;
+      按列表比会把它算成一次改动 ⇒ spec §6.3 的错误率**虚高**(而两边的标签一模一样)。
+    - **N4:id 不 `strip()`**。文本编辑器里很容易在 id 两端多打空格;而 id 是任务 7 的
+      合并键 —— 不洗的话要么在这里**硬失败**、要么把 `" a "` 写进产物(那边 `KeyError`)。
+      (就这条断言:产物里的 id 必须是洗过的 `"a"`。)
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码", "退换货"]},
+        {"id": "b", "question": "快递到哪了", "labels": ["物流"]},
+    ])
+    # ⚠️ 裸文本:要造出「id 两端带空格」这种格子,csv.writer 写不出来(它会当普通字段)。
+    _write_raw_csv(
+        tmp_path / "trainval.csv",
+        "id,问题,预标标签,判定(ok/改),最终标签,备注\r\n"
+        + " a ,买大了想退,尺码|退换货,ok,退换货|尺码,\r\n"   # 只调序 + id 带空格
+        + "b,快递到哪了,物流,ok,,\r\n",
+    )
+
+    exp.do_import()
+
+    rows = _read_reviewed(tmp_path)
+    assert [r["id"] for r in rows] == ["a", "b"], "id 两端没洗掉 ⇒ 写进产物的就是 `\" a \"`"
+    # 标签保留**用户写的那个顺序**(我们不去重排),但「改了没有」按集合算 ⇒ 0 条
+    assert [r["labels"] for r in rows] == [["退换货", "尺码"], ["物流"]]
+    printed = capsys.readouterr().out
+    assert "标签与预标不同的 0 条" in printed, (
+        "只调序被算成了改动 ⇒ 错误率虚高(变异 N1 就是在这里红)"
+    )
+    assert "没写「改」" not in printed, "调序不该被当成「漏填判定」"
 
 
 def test_import_refuses_input_that_would_silently_change_the_reading(monkeypatch, tmp_path):
@@ -819,9 +857,14 @@ def test_import_refuses_malformed_rows(monkeypatch, tmp_path):
     ⑤ **Mn3**:只剩表头 ⇒ 空产物 + 「回收 0 条」,不拒绝;
     ⑥ **(实现者补的护栏)「预标标签」列与 `prelabeled.jsonl` 不同源** ⇒ 「改了没有」就没有基准 ——
        `生效标签 ≠ 预标标签` 那个机械定义会**照着错的基准**算,读数与标签一起错。
+       两种形状(写成别的类目 / **少了后半截**)都要拦 —— 后者是 **F4 的 N5** 钉的,
+       复审实测「集合相等 → 子集」这个放松**全绿**,而它的后果是错误率读成 ~100% 而不报错。
     """
     exp = _bind_import(monkeypatch, tmp_path, [
         {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+        # ⚠️ `c` 是**两**个标签的 —— 第 ⑥ 条的「子集」形状必须有一个**更大的**语料行
+        #    才造得出来(第一版拿单标签的 `a` 去写「截断」,结果那根本不是子集、当场红)。
+        {"id": "c", "question": "买大了想退货", "labels": ["尺码", "退换货"]},
     ])
     csv_path = tmp_path / "trainval.csv"
     out = tmp_path / "reviewed.jsonl"
@@ -869,13 +912,22 @@ def test_import_refuses_malformed_rows(monkeypatch, tmp_path):
     assert "一行数据都没有" in str(e5.value), str(e5.value)
     assert not out.exists()
 
-    # ⑥ 「预标标签」列与语料不同源(把预标写成别的类目)——
-    #    它是「改了没有」的比较基准,基准错了 ⇒ 读数与标签一起错,而且都看不出来。
-    _write_review_csv(csv_path, [["a", "买大了想退", "物流", "改", "退换货", ""]])
-    with pytest.raises(SystemExit) as e6:
-        exp.do_import()
-    assert "不同源" in str(e6.value), str(e6.value)
-    assert not out.exists()
+    # ⑥ 「预标标签」列与语料不同源 —— 两种形状都要拦:
+    #    ① 写成**别的类目**;② **少了后半截**(子集)。它是「改了没有」的比较基准,
+    #    基准错了 ⇒ 读数与标签一起错,而且都看不出来。
+    #    ⚠️ ② 是**订正轮 2 的 F4(N5)** 钉的那条:复审实测把「集合相等」放松成「子集」后
+    #    **全绿** —— 而子集版的后果最重:被截断的格子(CSV 写 `尺码`、语料是 `尺码|退换货`)
+    #    会让**每一行未改动的行**都满足 `生效标签 ≠ 预标标签` ⇒ 错误率读成 ~100%,
+    #    而**没有任何东西报错**(与 C1 同族的静默错读数)。
+    for rid, question, wrong_pre in (
+        ("a", "买大了想退", "物流"),        # ① 写成**别的类目**
+        ("c", "买大了想退货", "尺码"),      # ② **少了后半截**(语料是 尺码|退换货)
+    ):
+        _write_review_csv(csv_path, [[rid, question, wrong_pre, "改", "退换货", ""]])
+        with pytest.raises(SystemExit) as e6:
+            exp.do_import()
+        assert "不同源" in str(e6.value), f"预标={wrong_pre!r} -> {e6.value}"
+        assert not out.exists()
 
 
 def test_import_explains_a_file_that_is_not_utf8(monkeypatch, tmp_path):
@@ -900,7 +952,7 @@ def test_import_explains_a_file_that_is_not_utf8(monkeypatch, tmp_path):
     assert not out.exists()
 
 
-def test_export_script_pins_stdout_encoding():
+def test_export_script_pins_stdout_encoding(tmp_path):
     """`main()` **自己**必须把 stdout 钉成 UTF-8 —— 本机 locale 是 cp936。
 
     ⚠️ **为什么必须有这一条**:`⚠️`(U+26A0 + VS16)编不进 GBK(实测 2026-09-26),
@@ -911,15 +963,33 @@ def test_export_script_pins_stdout_encoding():
     ⚠️ 子进程故意**不加 `-X utf8`**:加的话 stdout 恒是 UTF-8,这条断言就**恒真**。
     它的判别力**依赖本机是 cp936**,换一台 UTF-8 locale 的机器就退化成「函数存在」检查
     (如实记下来,不装作它到哪都同样有力)。
+
+    ⚠️⭐ **订正轮 2 的 F1(复审实测的一条悬着的雷)**:这条测试的桩原来是
+    `e.export = lambda: None`。**桩一旦静默失效**(有人给 `main()` 的调用路径改名 / 换个封装,
+    桩就再也拦不住),子进程会跑到**真的 `export()`** —— 而它写的正是
+    `evals/topic/labels/trainval.csv`,**用户此刻正在改的那份、被 git 跟踪的 CP-2 记录**
+    ⇒ **用户的改动被覆盖,而这条测试照样绿**(它只断 stdout,不管产物)。
+    ⇒ 所以子进程里**先**把 `LABELS_DIR` / `REVIEWED` 指到 `tmp_path`、**再**调 `main()`,
+    并在父进程里补两句:**`tmp_path` 里没有 trainval.csv**(真 export 没跑过)+
+    **真产物的字节前后相同**。这两句都**不依赖 print 措辞**。
     """
     import subprocess
     import sys
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
+    # 真产物:断「它没被这次子进程动过」。⚠️ 它可能**还不存在**(全新 checkout 上没跑过 export)
+    #  —— 那就断「跑完之后仍然不存在」,同样是「没被动过」。
+    artifact = root / "evals" / "topic" / "labels" / "trainval.csv"
+    before = artifact.read_bytes() if artifact.exists() else None
+    tmp = tmp_path / "labels"
     code = "\n".join([
         "import sys",
+        "from pathlib import Path",
         "from scripts import export_label_review as e",
+        # ⚠️ **先改路径,再调 main()** —— 顺序反了就白改:真 export 会先落在真目录里。
+        f"e.LABELS_DIR = Path({str(tmp)!r})",
+        f"e.REVIEWED = Path({str(tmp / 'reviewed.jsonl')!r})",
         "e.export = lambda: None",       # 只桩掉写文件那一半(断言的是 stdout,不是产物)
         'sys.argv = ["export_label_review.py", "export"]',
         "e.main()",
@@ -931,3 +1001,13 @@ def test_export_script_pins_stdout_encoding():
     )
     assert proc.returncode == 0, f"钉编码没生效(main() 里那一行被删了?):\n{proc.stderr}"
     assert "某类一条都没抽到" in proc.stdout
+    # ---- F1 的两句:「桩真的拦住了」与「真产物真的没被动」----
+    # ⚠️ 两句都**不依赖 print 措辞**(措辞会变,而「有没有真的跑 export」不会)。
+    assert not (tmp / "trainval.csv").exists(), (
+        "子进程里**真的跑了 export**(桩失效了:main() 的调用路径被改名 / 换了封装?)"
+        " —— 这次它落在 tmp 里、没伤人;但桩失效本身就意味着那条雷又回来了"
+    )
+    after = artifact.read_bytes() if artifact.exists() else None
+    assert after == before, (
+        f"{artifact} 在这次子进程里**被改动了** —— 这就是 F1 那条雷(用户的 CP-2 记录被覆盖)"
+    )
