@@ -258,6 +258,16 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
     替身替在 **`create_extract_model`** 这一层(不是替 `_label`),所以
     `bind(response_format=…)` → `ainvoke` → 去围栏 → `json.loads` → 形状闸 →
     `validate_evidence` → 写盘 → 计数,**整条真跑**;JSON 也真的从文本解出来。
+
+    ⚠️ **订正轮 1 改了三处**(都是评审实测出来的假绿):
+    - **F1**:原来「空标签」的两条输入**同时也是 `parse_failed`** ⇒ `zero_label` 这个读数
+      **零判别力**(把实现改成「只在解析失败时 +1」照样绿)。⇒ 补 ⑤ 一条
+      **解析成功但零标签**的输入——真产物里正是这种行(`r-0049`「你是」)。
+    - **F3**:替身 `bind` 原来 `return self`(真 `ChatOpenAI.bind()` 返回的是**新对象**)⇒
+      「返回值有没有被用上」**不可观测**:`_bind_json` 写成 `model.bind(…); return model`
+      时 `response_format` 在真实链路上静默丢掉,**而断言照样绿**(本仓「替身替被测对象
+      完成了语义」形态,同 ch07 的 `FakeSession` 自己 `sorted(...)`)。
+    - **Mn1**:非字符串标签原来被**静默丢掉** ⇒ 补 ⑦ 一条 `["尺码", 5]`。
     """
     import asyncio
 
@@ -267,18 +277,28 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
         def __init__(self, text):
             self.text = text
 
-    class _Model:
-        """只实现被测代码真的用到的那两样:`bind` 与 `ainvoke`。"""
+    bound_instances = []
 
-        def __init__(self, texts):
-            self._texts = list(texts)
-            self.bound = None
+    class _Model:
+        """只实现被测代码真的用到的那两样:`bind` 与 `ainvoke`。
+
+        ⚠️ `bind` **返回一个新对象**(共用同一条文本队列),与真 `ChatOpenAI.bind()` 同形:
+        源码逐字「Bind arguments to a `Runnable`, **returning a new `Runnable`**」。
+        返回 `self` 的话,「调了 bind 却把返回值丢了」这种写法就**测不出来**。
+        """
+
+        def __init__(self, texts, bound=None):
+            self._texts = texts          # 故意**共用**同一个 list(新对象也要能取到文本)
+            self.bound = bound
+            self.used = False
 
         def bind(self, **kwargs):
-            self.bound = kwargs
-            return self
+            new = _Model(self._texts, bound=kwargs)
+            bound_instances.append(new)
+            return new
 
         async def ainvoke(self, _messages):
+            self.used = True
             return _Msg(self._texts.pop(0))
 
     model = _Model([
@@ -290,6 +310,12 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
         "抱歉,我无法判断。",
         # ④ JSON 是合法的,但**形状**不是约定的那样(evidence 是一个字符串)
         '{"labels": ["尺码"], "evidence": "买大了"}',
+        # ⑤ **解析成功、零标签**(F1) —— 与 ③④ 不是一回事,而它是 `r-0049` 的形状
+        '{"labels": [], "evidence": {}}',
+        # ⑥ 带 ```json 围栏(Mn3:那条去围栏分支原来零覆盖)
+        '```json\n{"labels": ["退换货"], "evidence": {"退换货": "想退"}}\n```',
+        # ⑦ 标签数组里混了一个**非字符串**(Mn1:原来会被静默丢掉)
+        '{"labels": ["尺码", 5], "evidence": {"尺码": "买大了"}}',
     ])
     monkeypatch.setattr(p, "create_extract_model", lambda _settings: model)
     monkeypatch.setattr(p, "get_settings", lambda: object())
@@ -300,6 +326,9 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
         {"id": "r-0002", "question": "买大了想退", "source": "pool", "provenance": "real"},
         {"id": "r-0003", "question": "在吗", "source": "pool", "provenance": "real"},
         {"id": "r-0004", "question": "买大了想退", "source": "pool", "provenance": "real"},
+        {"id": "r-0005", "question": "在吗", "source": "pool", "provenance": "real"},
+        {"id": "r-0006", "question": "买大了想退", "source": "pool", "provenance": "real"},
+        {"id": "r-0007", "question": "买大了想退", "source": "pool", "provenance": "real"},
     ]) + "\n", encoding="utf-8")
     monkeypatch.setattr(p, "CORPUS", corpus)
     monkeypatch.setattr(p, "SYNTH", tmp_path / "不存在.jsonl")
@@ -309,7 +338,9 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
     asyncio.run(p.run(None))
 
     rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
-    assert [r["id"] for r in rows] == ["r-0001", "r-0002", "r-0003", "r-0004"]
+    assert [r["id"] for r in rows] == [
+        "r-0001", "r-0002", "r-0003", "r-0004", "r-0005", "r-0006", "r-0007",
+    ]
     # ① 原样通过,evidence 保留
     assert rows[0]["labels"] == ["尺码", "退换货"]
     assert rows[0]["rejected_labels"] == []
@@ -326,25 +357,50 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
     #    ⚠️ 少了那道形状闸,`dict("买大了")` 会直接 ValueError 打断整跑 ——
     #    这条输入探的正是「校验器有没有被接进来」的另一半。
     assert rows[3]["labels"] == [] and rows[3]["parse_failed"] is True
+    # ⑤ **解析成功、零标签**(F1):这一条**必须**与 ③④ 分得开 ——
+    #    它是 `r-0049`「你是」的形状(模型真的判了「没有主题」),不是故障。
+    #    ⚠️ 少了这一条,`zero_label` 这个读数就**零判别力**:
+    #    写成「只在 bad 时 +1」照样全绿(评审 M1 实测)。
+    assert rows[4]["labels"] == [] and rows[4]["parse_failed"] is False
+    # ⑥ 围栏(Mn3)
+    assert rows[5]["labels"] == ["退换货"]
+    assert rows[5]["parse_failed"] is False
+    # ⑦ 非字符串标签**不静默丢**(Mn1):`5` → `"5"`,查不到证据 ⇒ 被拒 ⇒ **可见**
+    assert rows[6]["labels"] == ["尺码"]
+    assert rows[6]["rejected_labels"] == ["5"]
+    assert rows[6]["parse_failed"] is False
 
     # 三个读数都打出来(只为「人看得到」,但读数本身就是交付物的一部分)
     printed = capsys.readouterr().out
-    assert "被证据校验拒掉标签的 1 条" in printed
+    assert "被证据校验拒掉标签的 2 条" in printed
     assert "JSON 解析失败 2 条" in printed
-    assert "空标签 2 条" in printed
+    assert "空标签 3 条" in printed
 
-    # 决策钉住:`response_format` 是**网关侧**保证它是 JSON 对象的那个旋钮
-    # (为什么不用 `with_structured_output(method="json_mode")` 见 `_bind_json` 的 docstring)
-    assert model.bound == {"response_format": {"type": "json_object"}}
+    # ---- F3:`bind` 的**返回值**真的被用上了 ----
+    # ⚠️ 真 `ChatOpenAI.bind()` 返回的是**新对象**,所以这里断的是三件事:
+    #   ① 传出的那个新对象拿到了 kwargs;② **是它**被 `ainvoke` 了;
+    #   ③ 原对象**一次都没被用过**。
+    #   写成 `model.bind(...); return model`(丢掉返回值)⇒ ②③ 红
+    #   —— 而那在真实链路上意味着 `response_format` 静默丢掉、网关侧的保证没了。
+    assert len(bound_instances) == 1, "bind 必须被调用恰好一次"
+    assert bound_instances[0].bound == {"response_format": {"type": "json_object"}}
+    assert bound_instances[0].used is True, "ainvoke 收到的不是 bind 返回的那个对象"
+    assert model.bound is None and model.used is False, (
+        "原对象被用过了 ⇒ bind 的返回值没有生效"
+    )
 
-    # ---- 断点续跑:再跑一次,四条 id 都已在产物里 ⇒ 一条都不处理、一行都不追加 ----
+    # ---- 断点续跑:再跑一次,七条 id 都已在产物里 ⇒ 一条都不处理、一行都不追加 ----
     asyncio.run(p.run(None))
-    assert "本次处理 0 条" in capsys.readouterr().out
-    assert len(out.read_text(encoding="utf-8").splitlines()) == 4
+    resume_out = capsys.readouterr().out
+    assert "本次处理 0 条" in resume_out
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 7
+    # Mn2:**空批不许打成 `0.0%`** —— 那个数看着像「质量又被确认了一次」,其实一个样本都没测。
+    assert "0.0%" not in resume_out
+    assert "本批无读数" in resume_out
 
 
 def test_main_pins_stdout_encoding():
-    """`main()` 必须把 stdout 钉成 UTF-8 —— **本机 locale 是 cp936**。
+    """`main()` **自己**必须把 stdout 钉成 UTF-8 —— **本机 locale 是 cp936**。
 
     `⚠️`(U+26A0)与 `⇒`(U+21D2)编不进 GBK,而它们只出现在「解析失败不为 0」那条
     print 里 ⇒ 不钉的话,**恰恰在最需要它输出的那条路径上**抛 `UnicodeEncodeError`:
@@ -355,20 +411,29 @@ def test_main_pins_stdout_encoding():
     (本仓那条「平台陷阱的断言要么带可复现证据、要么标未验证」)。
     它的判别力**依赖本机是 cp936** —— 换一台 UTF-8 locale 的机器,这条就退化成
     「函数存在」检查(如实记下来,不装作它到哪都同样有力)。
+
+    ⚠️ **订正轮 1 的 F2:这一跑的是 `main()`,不是 `_pin_stdout_encoding()`。**
+    原来写的是 `from … import _pin_stdout_encoding; _pin_stdout_encoding()`,
+    测的是**函数体**,不是它命名的那件事(「`main()` **必须**把 stdout 钉住」)——
+    评审 M8 实测:把 `main()` 里那一行调用**删掉**(函数留着)照样全绿。
+    ⇒ 现在在子进程里直接跑 `main()`,只把 `run` 换成 no-op 桩(不联网、不碰产物)。
     """
     import subprocess
     import sys
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    code = (
-        "from scripts.prelabel_topics import _pin_stdout_encoding;"
-        "_pin_stdout_encoding();"
-        "print('⚠️ 解析失败不为 0 ⇒ 先停下看产物')"
-    )
+    code = "\n".join([
+        "from scripts import prelabel_topics as p",
+        "async def _noop(_limit):",
+        "    return None",
+        "p.run = _noop",              # 只桩掉网络那一半;`main()` 的其余部分照跑
+        "p.main()",
+        "print('⚠️ 解析失败不为 0 ⇒ 先停下看产物')",
+    ])
     proc = subprocess.run(
         [sys.executable, "-c", code], cwd=root, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
     )
-    assert proc.returncode == 0, f"钉编码没生效:\n{proc.stderr}"
+    assert proc.returncode == 0, f"钉编码没生效(main() 里那一行被删了?):\n{proc.stderr}"
     assert "解析失败不为 0" in proc.stdout

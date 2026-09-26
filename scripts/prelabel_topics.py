@@ -99,8 +99,17 @@ async def run(limit: int | None) -> None:
     #    `flagged`      = 有标签被证据校验拒掉 —— **质量读数**,直接进 spec §6.3
     #    `parse_failed` = JSON 没解出来 —— **故障读数,它是 0 才正常**
     #    `zero_label`   = 一个标签都没落下(含上面那种,也含「模型真的判了零诉求」)
-    print(f"完成。被证据校验拒掉标签的 {flagged} 条({flagged / max(1, len(todo)):.1%});"
-          f"**JSON 解析失败 {parse_failed} 条**;空标签 {zero_label} 条")
+    #
+    # ⚠️ **空批不打百分比**(订正轮 1 的 Mn2)。分母是**本批**(`len(todo)`),而断点续跑那一跑
+    # 本批就是 0 —— 靠 `max(1, …)` 兜出来的那个 `0.0%` **看着像「质量又被确认了一次」,
+    # 其实什么都没测**(一个样本都没过校验器)。`--limit 10` 里 3 条被拒时同理:
+    # 它打 `30.0%`,照 brief 那条「>30% 先别往下跑」会让人去改一个**没坏**的 prompt。
+    if todo:
+        print(f"完成。被证据校验拒掉标签的 {flagged} 条({flagged / len(todo):.1%});"
+              f"**JSON 解析失败 {parse_failed} 条**;空标签 {zero_label} 条")
+    else:
+        print("完成。**本次处理 0 条 ⇒ 本批无读数**(所有 id 都已在产物里);"
+              "别把这一行当质量结论,三个读数看上一次真正处理过行的那一跑。")
     if parse_failed:
         print("⚠️ 解析失败不为 0 ⇒ **先停下看产物,别直接进 Task 6** ——"
               "这些行的标签是空的,而不是「判定了没有主题」。")
@@ -149,6 +158,7 @@ async def _label(model, question: str) -> tuple[list[str], dict[str, str], bool]
     这两种都不是「JSON 没解出来」,但都不是正常结果 ⇒ 归 `parse_failed`。
     单个 evidence 的值不是 str 时**只丢那一个键**(它那一条会被证据校验拒掉,
     进 `flagged` —— 质量读数,正是该看见的地方),不整行作废。
+    `labels` 里的元素不是 str 时同理**不静默过滤**,见 `_as_label`(订正轮 1 的 Mn1)。
     """
     from langchain_core.messages import HumanMessage
 
@@ -169,10 +179,28 @@ async def _label(model, question: str) -> tuple[list[str], dict[str, str], bool]
     if not isinstance(raw_labels, list) or not isinstance(raw_ev, dict):
         return [], {}, True
     return (
-        [x for x in raw_labels if isinstance(x, str)],
+        [_as_label(x) for x in raw_labels],
         {k: v for k, v in raw_ev.items() if isinstance(v, str)},
         False,
     )
+
+
+def _as_label(x: object) -> str:
+    """把 `labels` 里的一个元素变成字符串 —— **但绝不静默丢掉它**(订正轮 1 的 Mn1)。
+
+    ⚠️ 原来那一行是 `[x for x in raw_labels if isinstance(x, str)]`:
+    模型吐 `{"labels": ["尺码", 5]}` 时,那个 `5` **既不进 `parse_failed` 也不进 `flagged`**
+    —— **没有任何读数**,一个标签凭空消失。而 `validate_evidence` 的 docstring 要防的
+    正是这件事(「静默改变训练分布」):证据值不是 str 的那一半挡住了,标签这一半漏了。
+
+    现在的写法:非字符串照原样**留下来**(转成它的 JSON 文本,`5` → `"5"`、`None` → `"null"`),
+    于是它一定**查不到证据 ⇒ 被拒 ⇒ 落进产物的 `rejected_labels` 并计入 `flagged`** ——
+    可见、可查、可数。它**永远不会**是一个合法类目名,所以不会污染标签集合。
+
+    (不直接原样传:`evidence.get(x)` 对 dict/list 会抛 `TypeError: unhashable type`,
+    那会**打断整跑** —— 用可见的替代方案解决,不靠「模型不会那么吐」。)
+    """
+    return x if isinstance(x, str) else json.dumps(x, ensure_ascii=False)
 
 
 def _already_done() -> set[str]:
