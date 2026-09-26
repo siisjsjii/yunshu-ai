@@ -1,0 +1,84 @@
+{"id": "r-0001", "question": "你们招不招加盟商,怎么加盟代理", "labels": ["其他"], "reviewed": true}
+{"id": "r-0013", "question": "会员积分怎么获得?", "labels": ["会员积分"], "reviewed": true}
+{"id": "r-0065", "question": "你是?", "labels": ["其他"], "reviewed": true}
+{"id": "r-0088", "question": "你好,我又来麻烦你了,想请你帮我看看订单 <订单号> 的物流。这次买的是那个静音无线鼠标,下单之后我一直在等,可是页面上显示的物流信息好像停在一个中转站好几天都没有更新了,我不确定是不是丢件了,还是只是扫描没及时同步。你能不能帮我查一下它最后一次扫描是什么时候、在哪个城市,以及如果确实卡住了,我这边可以做什么,是不是需要你们去联系快递公司发起查询。另外我想确认一下,如果包裹在途中损坏了,签收之后还能不能申请处理,需要保留哪些照片或者凭证。还有,我这个订单是帮同事一起买的,收货人写的是他的名字,如果需要本人签收或者出示取件码,我能不能拿着他的手机号去代领?这一单我比较着急,麻烦你尽量帮我查得细一点,谢谢。", "labels": ["物流", "质量问题"], "reviewed": true}
+{"id": "r-0112", "question": "好嘞", "labels": ["其他"], "reviewed": true}
+{"id": "r-0159", "question": "我刚才问了什么", "labels": ["其他"], "reviewed": true}
+{"id": "r-0190", "question": "2000 积分能兑换什么,要不要自己付运费", "labels": ["会员积分", "运费"], "reviewed": true}
+{"id": "r-0194", "question": "订单完成后多少天之内可以申请开票", "labels": ["发票"], "reviewed": true}
+{"id": "r-0202", "question": "哪些商品在非质量问题的情况下不支持退货", "labels": ["退换货"], "reviewed": true}
+{"id": "r-0203", "question": "换货能不能换成别的型号或者别的颜色", "labels": ["退换货", "商品信息"], "reviewed": true}
+{"id": "r-0208", "question": "预售商品的发货时间怎么确定", "labels": ["库存补货", "物流"], "reviewed": true}
+{"id": "r-0221", "question": "保修期是从下单那天算还是签收那天算", "labels": ["保修维修"], "reviewed": true}
+{"id": "r-0231", "question": "MH-W20 水箱容量是多大", "labels": ["商品信息"], "reviewed": true}
+{"id": "r-0290", "question": "定做的东西不满意能退吗", "labels": ["退换货"], "reviewed": true}
+{"id": "r-0297", "question": "我在新疆你们能给送不,要不要多掏钱", "labels": ["物流", "运费"], "reviewed": true}
+{"id": "r-0344", "question": "MH-LP100 猫砂盆容量多少,保修多长时间", "labels": ["商品信息", "保修维修"], "reviewed": true}
+{"id": "r-0373", "question": "摄像头支持以旧换新吗,下单能开发票吗", "labels": ["优惠活动", "发票"], "reviewed": true}
+{"id": "r-0381", "question": "预售定金能退吗,发货时间以什么为准", "labels": ["库存补货", "退换货", "物流"], "reviewed": true}
+{"id": "r-0394", "question": "缺货补货要多久,等不了能退款吗", "labels": ["库存补货", "退换货"], "reviewed": true}
+{"id": "r-0398", "question": "会员积分退货会扣回吗,退款多久到账", "labels": ["会员积分", "退换货"], "reviewed": true}
+{"id": "r-0404", "question": "你们卖不卖活体宠物,能在这买猫吗", "labels": ["库存补货"], "reviewed": true}
+{"id": "r-0409", "question": "退货之后能不能额外补偿我一些积分", "labels": ["退换货", "会员积分"], "reviewed": true}
+{"id": "r-0412", "question": "支持数字人民币支付吗", "labels": ["支付"], "reviewed": true}
+{"id": "r-0416", "question": "能不能额外购买延长保修服务", "labels": ["保修维修"], "reviewed": true}
+{"id": "r-0432", "question": "能寄到日本吗,有没有国际快递", "labels": ["物流"], "reviewed": true}
+{"id": "s-0019", "question": "这个款式不适合我，能退吗", "labels": ["退换货"], "reviewed": true}
+{"id": "s-0053", "question": "退回去的邮费谁出啊", "labels": ["退换货", "运费"], "reviewed": true}
+{"id": "s-0075", "question": "号登不上，钱还多扣了，能退吗", "labels": ["账号", "支付", "退换货"], "reviewed": true}
+{"id": "s-0079", "question": "衣服有点紧想调个号，以后扣子松了还管吗？", "labels": ["尺码", "退换货", "保修维修"], "reviewed": true}
+{"id": "s-0091", "question": "裙子买大了想调小号，以后拉链卡住还给弄吗？", "labels": ["尺码", "退换货", "保修维修"], "reviewed": true}
+{"id": "s-0163", "question": "去年买的这个不转了，弄的话要多久？快递几时到？", "labels": ["保修维修", "物流"], "reviewed": true}
+{"id": "s-0171", "question": "你们送我们镇上不，送的话邮费另算不？", "labels": ["物流", "运费"], "reviewed": true}
+{"id": "s-0173", "question": "我买的那单现在离我还有多远，邮费会随距离涨吗？", "labels": ["物流", "运费"], "reviewed": true}
+{"id": "s-0177", "question": "我买的咋绕去外省了，这样走邮费不会变吧？", "labels": ["物流", "运费"], "reviewed": true}
+{"id": "s-0185", "question": "平时穿38，这个选几号？", "labels": ["尺码"], "reviewed": true}
+{"id": "s-0223", "question": "我105斤，拍M还是S？", "labels": ["尺码"], "reviewed": true}
+{"id": "s-0253", "question": "我170 130斤穿哪个，穿一年开胶了能管吗", "labels": ["尺码", "保修维修"], "reviewed": true}
+{"id": "s-0268", "question": "这件棉服重不重，我180 160选XL还是2XL", "labels": ["商品信息", "尺码"], "reviewed": true}
+{"id": "s-0302", "question": "一般纳税人能抵扣吗？", "labels": ["发票"], "reviewed": true}
+{"id": "s-0387", "question": "电脑键盘有个键按下去弹不起来。", "labels": ["质量问题"], "reviewed": true}
+{"id": "s-0406", "question": "拆开发现按键不灵，后面要是又这样能帮弄吗", "labels": ["质量问题", "保修维修"], "reviewed": true}
+{"id": "s-0418", "question": "满99就不收邮费了吧？", "labels": ["运费"], "reviewed": true}
+{"id": "s-0436", "question": "买大了想换小一码，寄回去的邮费谁出？", "labels": ["尺码", "退换货", "运费"], "reviewed": true}
+{"id": "s-0455", "question": "送到镇上要加几块？东西现在还在你们仓库吗", "labels": ["运费", "物流"], "reviewed": true}
+{"id": "s-0459", "question": "第二件是不是半价呀", "labels": ["优惠活动"], "reviewed": true}
+{"id": "s-0474", "question": "第二件不要钱是真的吗", "labels": ["优惠活动"], "reviewed": true}
+{"id": "s-0481", "question": "团购价咋弄", "labels": ["优惠活动"], "reviewed": true}
+{"id": "s-0491", "question": "凑单能省点吗，能用花呗不", "labels": ["优惠活动", "支付"], "reviewed": true}
+{"id": "s-0505", "question": "买的时候贵了，现在便宜不少，能返我多付的吗？", "labels": ["价保"], "reviewed": true}
+{"id": "s-0516", "question": "买早了半天就便宜，能补一下不？", "labels": ["价保"], "reviewed": true}
+{"id": "s-0524", "question": "前几天下单，现在价格掉了，能补给我不？", "labels": ["价保"], "reviewed": true}
+{"id": "s-0534", "question": "我拿到的杯子有个口子，而且刚买就便宜了，能补我多花的吗？", "labels": ["质量问题", "价保"], "reviewed": true}
+{"id": "s-0537", "question": "能开公司名头的报销单吗？刚买又便宜了，补我多花的中不？", "labels": ["发票", "价保"], "reviewed": true}
+{"id": "s-0544", "question": "我买完第二天就出活动了，能给我退点再领那个新的吗？", "labels": ["优惠活动", "价保"], "reviewed": true}
+{"id": "s-0557", "question": "能换张卡付吗？", "labels": ["支付"], "reviewed": true}
+{"id": "s-0586", "question": "晒图给的那点，能直接打到卡上吗？", "labels": ["评价"], "reviewed": true}
+{"id": "s-0593", "question": "我进不去自己的号了，能用别人的卡扣钱吗？", "labels": ["账号", "支付"], "reviewed": true}
+{"id": "s-0598", "question": "两笔单子能合到一块儿处理吗", "labels": ["订单修改"], "reviewed": true}
+{"id": "s-0610", "question": "我不小心下了两单，能合成一单吗", "labels": ["订单修改"], "reviewed": true}
+{"id": "s-0611", "question": "收货地址写错小区了，能帮忙变一下吗", "labels": ["订单修改"], "reviewed": true}
+{"id": "s-0615", "question": "两个单子想并到一起，可以吗", "labels": ["订单修改"], "reviewed": true}
+{"id": "s-0627", "question": "用了减钱买的，换收货人后优惠还在吗？", "labels": ["订单修改", "优惠活动"], "reviewed": true}
+{"id": "s-0648", "question": "这款还卖不卖了", "labels": ["库存补货"], "reviewed": true}
+{"id": "s-0655", "question": "还会上这个样式吗", "labels": ["库存补货"], "reviewed": true}
+{"id": "s-0669", "question": "还会再上吗？等我买到后要是又便宜了能返差额吗", "labels": ["库存补货", "价保"], "reviewed": true}
+{"id": "s-0719", "question": "这洗衣液香味浓不，能开公司名头的报销单吗", "labels": ["商品信息", "发票"], "reviewed": true}
+{"id": "s-0720", "question": "这充电宝能带上飞机吗，刚买完就便宜30咋弄", "labels": ["商品信息", "价保"], "reviewed": true}
+{"id": "s-0724", "question": "这耳机延迟高不，买两个能用会员价吗", "labels": ["商品信息", "会员积分"], "reviewed": true}
+{"id": "s-0773", "question": "收到一周就时灵时不灵，能返厂给看看不？", "labels": ["质量问题", "保修维修"], "reviewed": true}
+{"id": "s-0775", "question": "刚用两次就渗水，能找师傅弄还是寄回去？", "labels": ["质量问题", "保修维修"], "reviewed": true}
+{"id": "s-0784", "question": "口令重置在哪弄", "labels": ["账号"], "reviewed": true}
+{"id": "s-0786", "question": "原来号码不用了，咋换", "labels": ["账号"], "reviewed": true}
+{"id": "s-0807", "question": "我号进不去，买的东西有毛病咋弄", "labels": ["账号", "质量问题"], "reviewed": true}
+{"id": "s-0821", "question": "登不进我的号，之前买的东西为啥多收一次？", "labels": ["账号", "支付"], "reviewed": true}
+{"id": "s-0823", "question": "号被人挤下线，昨晚那笔多收的找谁核对？", "labels": ["账号", "支付"], "reviewed": true}
+{"id": "s-0825", "question": "买完东西怎么没给我积分啊？", "labels": ["会员积分"], "reviewed": true}
+{"id": "s-0833", "question": "分享给朋友能拿分吗？", "labels": ["会员积分"], "reviewed": true}
+{"id": "s-0851", "question": "我的积分怎么少了两百，这单能换收货信息不？", "labels": ["会员积分", "订单修改"], "reviewed": true}
+{"id": "s-0863", "question": "我积分能换那个吗，它是啥材料做的？", "labels": ["会员积分", "商品信息"], "reviewed": true}
+{"id": "s-0880", "question": "评论审核要多久？", "labels": ["评价"], "reviewed": true}
+{"id": "s-0890", "question": "写多少字才能领红包？", "labels": ["评价"], "reviewed": true}
+{"id": "s-0891", "question": "评论被折叠了怎么弄出来？", "labels": ["评价"], "reviewed": true}
+{"id": "s-0899", "question": "评论完成长值咋没加，是不是吞了？", "labels": ["评价", "会员积分"], "reviewed": true}
+{"id": "s-0960", "question": "在线客服咋转人工？我付了一半卡住了", "labels": ["其他", "支付"], "reviewed": true}
