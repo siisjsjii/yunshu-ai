@@ -2558,6 +2558,38 @@ git commit -m "ch10-B T8: 数据增强(只扩训练集 + 标签漂移自检 + �
 > **M3** —— `_TYPO_MAP` 的 8 对**全是同音替换**,而 spec 两处写「(同音/形近/**多字漏字**)」;
 > **裁定改 spec 措辞、不改表**(改表会让已提交的产物与代码不再对应,而重跑 89 分钟且改写那半本就不确定)。
 > **M6** —— dev-notes 里两条 `.superpowers` 引用解析不开(T5/T18 时期就在),按 ch09 判据落进那张例外表。
+>
+> ⚠️⚠️ **计划订正 13(controller,2026-09-27)—— T9 实现者与复审**各自实测**推翻了四处;
+> 其中两处推翻了 spec 正文** ⚠️⚠️
+>
+> **13-A `spec §2.3` 那句「静默」对 17 列 `long` 不成立 —— 它是当场抛。**
+> 实测(实现者与复审**各自**在本地小 `BertConfig` 上跑过,报文**一字不差**):
+> ```python
+> # 小 BertConfig + problem_type=None
+> #   labels 是 (2, 17) 的 long  ⇒ ValueError: Expected input batch_size (2) to match target batch_size (34)
+> #   而且抛之后 model.config.problem_type 已经是 single_label_classification
+> #   ⇒ 那个「猜」确实在第一个 batch 之前/当刻就锁死
+> #   labels 是 1-D long        ⇒ 【静默】loss 逐位等于手算 cross_entropy,一路训下去
+> #   labels 是 float 多热      ⇒ multi_label_classification,loss 逐位等于 BCEWithLogitsLoss
+> ```
+> ⇒ **结论不变但更锋利**:**「会抛」不等于「有防线」** —— 第一跳唯一拦得住的**只有防线②(labels 必须 float)**。
+> 已写成 4 条**真跑 forward** 的离线用例(本地小 `BertConfig`,不联网)。
+>
+> **13-B `warmup_ratio` 在 transformers 5.17.0 被整个删掉**(不是改名,**是删参数** ——
+> `grep -rl warmup_ratio .venv/.../transformers/` **0 个文件**;
+> `inspect.signature(TrainingArguments.__init__)` 113 个参数里**有** `warmup_steps`、**没有** `warmup_ratio`)。
+> ⇒ **spec §2.2 那张「v5 三处差异」表漏了最贵的一条**(另两条只是改名),§7.3 还写着 `warmup_ratio = 0.1`。
+> 已换算 `warmup_steps = int(0.1 × 73 × 15) = 109`,并把**换算依据落进 `train_meta.json`**。
+>
+> **13-C 本节的 `TopicDataset` 理由错了。** `transformers/trainer.py:987-991` 是
+> `if is_datasets_available() and isinstance(dataset, datasets.Dataset): … else: _get_collator_with_removed_columns`
+> ⇒ **只有 `datasets.Dataset` 才走 `column_names`**。实测(`list[dict]`、`TopicDataset`、**裸对象** × 开/关
+> `remove_unused_columns`)**5 种组合全部正常训完**。⇒ 这一层**保留但不再写成防线**(docstring 已如实改)。
+>
+> **13-D `spec §7.4` 说验证集 120 条,实为 145。**(`wc -l val.jsonl = 145`,205 个标签槽。)
+>
+> ⚠️ 另:**本节 Step 1 的 `label_count_match` 用例期望值写错了**(应 **2/3** 不是 `1.0`),
+> 实现者已在自己的测试文件里改对 —— **订正 13 把它同步进计划**,免得后来人照抄得到一条必红的测试。
 
 **Files:**
 - Create: `scripts/train_topic_clf.py`
@@ -2917,12 +2949,53 @@ git commit -m "ch10-B T9: RoBERTa-wwm-ext 全参微调(显式 problem_type + mic
 > 120 行的测试集**算术上装不下**「17 类各 ≥15」。**如实标,不许把阈值从 15 调低** ——
 > 那是拿判据迁就数据。
 > ⚠️ 报告里**必须**出现一句人话解释这件事,否则读的人会把它读成「模型不行」。
+>
+> ⚠️⚠️ **计划订正 13(controller,2026-09-27)—— 本任务再有六处;前两处照抄就出错** ⚠️⚠️
+>
+> **13-E(照抄会覆盖已有文件)**:上面 Files 写的是 **Create `app/topic/metrics.py` 与
+> `tests/test_topic_metrics.py`** —— ⚠️ **这两个文件 B9 已经建出来了**
+> (`per_class_prf` / `subset_accuracy` / `label_count_match` / `metrics_from_logits` 都在里面)。
+> ⇒ **改成 Modify**。本任务只**追加** `mislabelled_flow`(B9 刻意留给这里的那一个)。
+> ⇒ 连带 Step 2「Expected: **FAIL**」的**红因只有一条**:
+> `ImportError: cannot import name 'mislabelled_flow'`(复审实测过这个报文)。
+> **不是**「整个文件不存在」—— 别把它读成全红。
+>
+> **13-F(一条必红的测试)**:Step 1 里
+> `assert label_count_match(Y_TRUE, Y_PRED) == 1.0` —— ⚠️ **按给定数据答案是 `2/3`**
+> (三行:1==1 ✓、**1 != 2** ✗、1==1 ✓)⇒ 照抄必红。
+> B9 的实现者**已经独立发现并改对了自己的那份**,只是**计划文本没跟上**。⇒ **同步改成 `pytest.approx(2/3)`。**
+>
+> **13-G(Step 5.6 那条会把 CP-2 读数读大)**:原稿要报告印「训练集标签错误率(来自任务 6 的
+> `judged 改` 比例)与 F1 并排,并写一句『训练标签的错误率是本章 F1 的已知上界』」。
+> ⚠️ **CP-2 的实际读数是 `0 / 84 = 0.0%`,而它是一次「看图通过」、没有逐条核对痕迹**
+> (样本 70% 是合成;按更严的口径 **13/17 类零真实覆盖**)。
+> ⇒ 把 `0%` 印在 F1 旁边会让人读成「F1 被一个零错误的标签集兜着」——**那是这个数撑不起的结论**。
+> **改法**:两个数**都给**,但**必须带上那三条限定**(见 `dev-notes/ch10.md` 阶段 7);
+> 或者只印读数不印那句「已知上界」。**二选一,不许只印数。**
+>
+> **13-H(B9 复审留给本任务的一条,原稿没有)**:报告要**在冻结测试集上把 `t=0.5` 与 `t=0.3`
+> 两行都算出来**。理由:测试集**没有参与任何选择**(切分、早停、阈值扫描都在 val / train 上),
+> 所以这一行**不是数据窥探**,是「`0.3` 到底真不真好」的**无偏读数**。
+> ⚠️ 同时**如实写一句**「`0.3` 在 val 上高 **2.47** 点,但 **val 同时是选择集**,
+> 在同一批行上挑出来的增益没有判别力」。
+> ⚠️ **不要改 `THRESHOLD`**(保持 0.5),**更不要重训** —— 阈值是**纯后处理**,
+> 重训会换掉权重并让 `train_meta.json` 那份被复核过的四指标**全部作废**,而**没有任何东西会报错**。
+>
+> **13-I(测试集标签的来源必须印在报告里)**:`topic_test.jsonl` 的标签**是预标产物**,
+> **120 行里只有 12 行带 `human_reviewed`**(从 CP-2 那 84 条流过来的)。
+> ⇒ 报告里那个 F1 **必须带这个限定**,不许被读成「在人工标注的黄金集上测出来的」。
+>
+> **13-J(`macro-F1` 进三层表时的口径)**:若把 `macro_f1` 打进「全体 / 只看真实 / 只看合成」三列,
+> **必须写明「support = 0 的类贡献 0 ⇒ 三列的 macro 不可互比」** ——
+> 否则那三个数会被读成「模型在合成子集上更差」。B9 复审已把这条写进 `metrics.py` 的 docstring,
+> 报告照抄一句即可。
 
 
 
 **Files:**
-- Create: `app/topic/metrics.py`(纯函数)
-- Create: `tests/test_topic_metrics.py`
+- Modify: `app/topic/metrics.py`(⚠️ **订正 13-E:不是 Create** —— B9 已建,
+  本任务只追加 `mislabelled_flow`)
+- Modify: `tests/test_topic_metrics.py`(⚠️ **同样不是 Create**)
 - Create: `scripts/eval_topic_clf.py`
 
 **Interfaces:**
@@ -2984,7 +3057,9 @@ def test_subset_accuracy_is_exact_set_match():
 def test_label_count_match_is_about_the_count_only():
     """**个数**对就算对(标签内容可以错)—— 这是需求原话「一个不多一个不少」
     的字面读法,与 `subset_accuracy` 是两个不同的问题,不要合并。"""
-    assert label_count_match(Y_TRUE, Y_PRED) == 1.0
+    # ⚠️ 订正 13-F:原稿这里写 `== 1.0`,**按给定数据答案是 2/3**
+    #    (三行:1==1 ✓、1 != 2 ✗、1==1 ✓)⇒ 照抄必红。B9 的实现者已独立发现并改对了自己的那份。
+    assert label_count_match(Y_TRUE, Y_PRED) == pytest.approx(2 / 3)
     assert label_count_match([["尺码", "退换货"]], [["运费", "物流"]]) == 1.0
 
 
