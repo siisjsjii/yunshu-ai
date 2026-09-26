@@ -1,5 +1,5 @@
 
-=== M1 ★必查:删掉 `rng.shuffle(shuffled)`  [app\topic\labeling.py]
+=== M1 ★B6-A 必查:删掉 `rng.shuffle(shuffled)`  [app\topic\labeling.py]
   ✅ 红  test_different_seeds_pick_different_samples  (期望 failed)   [{'failed': 1}]
   绿灯  test_pick_review_sample_is_reproducible_with_a_seed  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
@@ -21,30 +21,69 @@
   ✅ 红  test_export_writes_the_stratified_sample_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
-=== M6 去掉表头缺列的响亮报错  [scripts\export_label_review.py]
-  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
-  · 已逐字节还原 export_label_review.py
-
-=== M7 最终标签**不**逐段 strip(逗号后带空格就炸)  [scripts\export_label_review.py]
-  ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
-  · 已逐字节还原 export_label_review.py
-
-=== M8 「判定」认不出时不当成「没改」  [scripts\export_label_review.py]
-  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
-  绿灯  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 passed)   [{'passed': 1}]
-  · 已逐字节还原 export_label_review.py
-
-=== M9 `verdict == "改"` → `if verdict:`(空判定也算改)  [scripts\export_label_review.py]
-  ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
-  · 已逐字节还原 export_label_review.py
-
 === M10 删掉 `main()` 里的钉编码  [scripts\export_label_review.py]
   ✅ 红  test_export_script_pins_stdout_encoding  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
-=== M11 合法类目检查改成静默丢弃  [scripts\export_label_review.py]
-  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+=== M-C1 ★必查:读数改回「只数判定列」(订正前的行为)  [scripts\export_label_review.py]
+  ✅ 红  test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict  (期望 failed)   [{'failed': 1}]
   绿灯  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-C1b 少填「改」时不再警告(读数仍对,但看不见了)  [scripts\export_label_review.py]
+  ✅ 红  test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-I1 去掉「字段比表头多」那条(列错位被吞)  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-I2a 去掉「id 不在预标语料里」那条  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-I2b 去掉「id 重复」那条  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-I2c 去掉「预标标签列与语料同源」那条  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-I3 题面照抄 CSV 那份(不取预标)  [scripts\export_label_review.py]
+  ✅ 红  test_import_takes_the_question_from_the_prelabels_not_from_the_csv  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-S18 去掉「判定=改 但标签没变」那条(两边互相拆台)  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-Mn3 空产物不再拒绝(只有表头也照写)  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_malformed_rows  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-Mn4 重复类目不去重  [scripts\export_label_review.py]
+  ✅ 红  test_import_dedupes_repeated_labels  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M-Mn5 不再把「不是 UTF-8」翻成人话  [scripts\export_label_review.py]
+  ✅ 红  test_import_explains_a_file_that_is_not_utf8  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M7 最终标签不逐段 strip(逗号后带空格就炸)  [scripts\export_label_review.py]
+  ✅ 红  test_import_takes_the_final_labels_and_falls_back_to_the_prelabels  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M12 去掉表头缺列那条  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M13 「判定」认不出也不再报(静默当成没改)  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 export_label_review.py
+
+=== M14 不合法类目改成静默丢弃  [scripts\export_label_review.py]
+  ✅ 红  test_import_refuses_input_that_would_silently_change_the_reading  (期望 failed)   [{'failed': 1}]
   · 已逐字节还原 export_label_review.py
 
 ============================================================

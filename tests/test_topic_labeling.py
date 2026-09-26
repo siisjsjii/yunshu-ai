@@ -526,7 +526,8 @@ def test_multi_label_rows_are_reachable_via_a_label_that_is_not_the_first():
     「尺码」桶里有 **30** 条而只抽 3 条 ⇒ 靠第一个标签进来是**碰运气**;
     而「评价」桶只有 `a-multi` 一条 ⇒ 只要那一桶被处理过,它**必然**在样本里。
     ⇒ 正确实现下这条**恒绿**;把 `for label in row["labels"]` 改成只取第一个标签,
-    则「评价」桶为空 ⇒ 红(变异实测过,见 task-6-report)。
+    则「评价」桶为空 ⇒ 红(变异 **M2** 实测过,证据在
+    `.superpowers/ch10b_t6_mutation_probe.py` 与它的 `.txt` 转录,两份都已入库)。
 
     ⚠️ **如实记账**:这里的判别力**依赖种子**(种子固定 ⇒ 结果固定,不抖),
     但它不是「构造上必然」的 —— 30 选 3 里选中 `a-multi` 的概率约 10%,
@@ -542,11 +543,14 @@ def test_multi_label_rows_are_reachable_via_a_label_that_is_not_the_first():
 
 # ---- 抽审 CSV 的导出/回收接线(ch10 spec §6.3/§6.4)—— 不联网、不碰真产物 ----
 #
-# ⚠️ 这几条钉的是 `scripts/export_label_review.py` 的**接线**,不是纯函数:
-# 那条链上有两个「错了也看不出来」的地方 —— ① 表头/列名对不上时,回收**逐行静默回落**成
-# 预标标签,而打印出来的读数是「判『改』的 0 条」(看着像「用户什么都没改」);
-# ② 「最终标签」列被顺手填成预标时,**用户改了哪几条就再也分不出来**了(B6-A 的承重不变量)。
-# 两者都取 `tmp_path`,所以这几条**不碰** `evals/topic/labels/trainval.csv` 那份真产物。
+# ⚠️ 这几条钉的是 `scripts/export_label_review.py` 的**接线**,不是纯函数。这条链上
+# 有四个「错了也看不出来」的地方(①②出在 B6-A,③④出在订正轮 1):
+#   ① 表头/列名对不上时,回收**逐行静默回落**成预标标签,而读数看着完全正常;
+#   ② 「最终标签」列被顺手填成预标时,**用户改了哪几条就再也分不出来**了(B6-A 的承重不变量);
+#   ③ **错误率读数**原本取自「判定」列 —— 用户忘了填判定 ⇒ 读数 0,而更正躺在文件里;
+#   ④ 列错位(文本编辑器里打了逗号没加引号)/ id 不存在 / id 重复 ⇒ 无声吞掉用户的更正。
+# 全部取 `tmp_path`,所以这几条**不碰** `evals/topic/labels/trainval.csv` 那份真产物
+# (它此刻**正被用户改**,是 CP-2 的输入)。
 
 
 def _write_review_csv(path, rows, header=None):
@@ -557,6 +561,37 @@ def _write_review_csv(path, rows, header=None):
         w = csv.writer(f)
         w.writerow(exp.HEADER if header is None else header)
         w.writerows(rows)
+
+
+def _write_raw_csv(path, text):
+    """**裸文本**写 CSV —— `csv.writer` 会自动加引号,复现不出「文本编辑器里手打逗号」那种行。"""
+    path.write_bytes(text.encode("utf-8-sig"))
+
+
+def _bind_import(monkeypatch, tmp_path, prelabeled_rows):
+    """把回收端的三条路径都指到 `tmp_path`,并写好**配套的** `prelabeled.jsonl`。
+
+    回收端从语料那边取题面、拿它当「改了没有」的基准(`prelabeled` 的 id 集合也是白名单),
+    所以每个用例都必须给一份与 CSV **同源**的语料 —— 这也正是真产物的形状。
+    """
+    from scripts import export_label_review as exp
+
+    pre = tmp_path / "prelabeled.jsonl"
+    pre.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in prelabeled_rows) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exp, "PRELABELED", pre)
+    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path)
+    monkeypatch.setattr(exp, "REVIEWED", tmp_path / "reviewed.jsonl")
+    return exp
+
+
+def _read_reviewed(tmp_path):
+    return [
+        json.loads(l) for l in
+        (tmp_path / "reviewed.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def test_export_writes_the_stratified_sample_with_the_judgement_columns_blank(
@@ -607,50 +642,135 @@ def test_export_writes_the_stratified_sample_with_the_judgement_columns_blank(
 def test_import_takes_the_final_labels_and_falls_back_to_the_prelabels(
     monkeypatch, tmp_path, capsys
 ):
-    """`import` 的接线:以「最终标签」为准、空了才回落预标、「改」的条数是读数、`reviewed` 标上。
+    """`import` 的接线:以「最终标签」为准、空了才回落预标、`reviewed` 标上、题面取预标那份。
 
     分隔符:`|` 与 `,` 都要认,且**两边的空白无所谓**(`尺码, 退换货` 是人最常打的形态)。
     """
-    from scripts import export_label_review as exp
-
-    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path)
-    monkeypatch.setattr(exp, "REVIEWED", tmp_path / "reviewed.jsonl")
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+        {"id": "b", "question": "快递到哪了", "labels": ["物流"]},
+        {"id": "c", "question": "能便宜点吗", "labels": ["优惠活动"]},
+    ])
     _write_review_csv(tmp_path / "trainval.csv", [
         ["a", "买大了想退", "尺码", "改", "尺码, 退换货", "两个诉求"],
         ["b", "快递到哪了", "物流", "ok", "", ""],
-        ["c", "能便宜点吗", "优惠活动", "", "价保", "只填了最终标签"],
+        ["c", "能便宜点吗", "优惠活动", "改", "价保", ""],
     ])
 
     exp.do_import()
 
-    rows = [
-        json.loads(l) for l in
-        (tmp_path / "reviewed.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    rows = _read_reviewed(tmp_path)
     assert [(r["id"], r["question"], r["labels"]) for r in rows] == [
         ("a", "买大了想退", ["尺码", "退换货"]),   # 用户填的(逗号 + 空格)
         ("b", "快递到哪了", ["物流"]),              # 没填 ⇒ 回落预标
-        ("c", "能便宜点吗", ["价保"]),              # 只填了最终标签也认(「判定」只影响报表)
+        ("c", "能便宜点吗", ["价保"]),
     ]
     assert all(r["reviewed"] is True for r in rows)
     printed = capsys.readouterr().out
     assert "回收 3 条" in printed
-    assert "判「改」的 1 条" in printed
+    assert "判「改」的 2 条" in printed
+
+
+def test_import_counts_the_error_rate_from_the_labels_not_from_the_verdict(
+    monkeypatch, tmp_path, capsys
+):
+    """★ 订正轮 1 的 **C1**(复审的 S1/S15):读数取自**标签变了没有**,不取自「判定」列。
+
+    用户填了「最终标签」却**忘了填「判定」**(或判定还写着 `ok`)时,旧实现打印的是
+    「判『改』的 0 条」—— 一个**看着像「用户什么都没改」的错答案**,而两条更正就躺在文件里;
+    spec §6.3 会照着那个 0% 判「≤10% ⇒ 接受、开训」。
+
+    机械定义(文件里 `生效标签 ≠ 预标标签` **就是**「这条被改了」,**不需要用户再报一次**)
+    ⇒ 下面三条全算「改」,而「判定」只当交叉校验:少填的那两行**列出来**,但**不拦下整跑**
+    (我们对用户说过「没填的按预标算」;而「少算错误率」这个后果由「照算」直接解决)。
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+        {"id": "b", "question": "快递到哪了", "labels": ["物流"]},
+        {"id": "c", "question": "能便宜点吗", "labels": ["优惠活动"]},
+    ])
+    _write_review_csv(tmp_path / "trainval.csv", [
+        ["a", "买大了想退", "尺码", "", "尺码, 退换货", "忘了填判定"],
+        ["b", "快递到哪了", "物流", "ok", "物流|商品信息", "判定还写着 ok"],
+        ["c", "能便宜点吗", "优惠活动", "改", "价保", ""],
+    ])
+
+    exp.do_import()
+
+    printed = capsys.readouterr().out
+    # ⚠️ 旧实现(以及「把 changed 改回只数判定列」那个变异 **M-C1**)在这里读 **1**,不是 3
+    #    —— 变异 M-C1 实测过,证据在 `.superpowers/ch10b_t6_mutation_probe.py`(已入库)。
+    assert "判「改」的 3 条" in printed, printed
+    assert [r["labels"] for r in _read_reviewed(tmp_path)] == [
+        ["尺码", "退换货"], ["物流", "商品信息"], ["价保"],
+    ]
+    warn = [l for l in printed.splitlines() if "没写「改」" in l]
+    assert len(warn) == 1 and "'a', 'b'" in warn[0], printed
+
+
+def test_import_takes_the_question_from_the_prelabels_not_from_the_csv(
+    monkeypatch, tmp_path, capsys
+):
+    """★ 订正轮 1 的 **I3**(Controller 裁定):题面**以预标为准**,并把不一致的行**打出来**。
+
+    任务 7 的合并是 `{**pre[id], "labels": ...}` ⇒ 训练语料本来就取预标那份;
+    照抄 CSV 那份只会让 `reviewed.jsonl` 这个「人工劳动的记录」里题面与**证据串**不同源。
+    代价:用户有意订正题面时会被忽略 ⇒ 靠那行打印 + `git diff` 兜底,**不是无声丢弃**。
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+        {"id": "b", "question": "快递到哪了", "labels": ["物流"]},
+    ])
+    _write_review_csv(tmp_path / "trainval.csv", [
+        ["a", "买大了想退货!!!", "尺码", "改", "尺码|退换货", "顺手改了题面"],
+        ["b", "快递到哪了", "物流", "ok", "", ""],
+    ])
+
+    exp.do_import()
+
+    rows = _read_reviewed(tmp_path)
+    assert [r["question"] for r in rows] == ["买大了想退", "快递到哪了"], (
+        "题面必须取自 prelabeled.jsonl —— 照抄 CSV 那份会让记录里题面与证据串不同源"
+    )
+    printed = capsys.readouterr().out
+    note = [l for l in printed.splitlines() if "「问题」列与预标不一致" in l]
+    assert len(note) == 1 and "'a'" in note[0], printed
+
+
+def test_import_dedupes_repeated_labels(monkeypatch, tmp_path, capsys):
+    """★ 订正轮 1 的 **Mn4**:`退换货|退换货` 不原样入库,也不静默。
+
+    重复类目对训练没有额外含义(标签集本来就当集合用),原样写进产物只是脏数据;
+    而去重这件事必须**看得见**(打出来),不然「用户的输入被改过」就是无声的。
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+    ])
+    _write_review_csv(tmp_path / "trainval.csv", [
+        ["a", "买大了想退", "尺码", "改", "尺码|尺码|退换货", ""],
+    ])
+
+    exp.do_import()
+
+    assert [r["labels"] for r in _read_reviewed(tmp_path)] == [["尺码", "退换货"]]
+    printed = capsys.readouterr().out
+    assert "重复类目" in printed and "'a'" in printed, printed
 
 
 def test_import_refuses_input_that_would_silently_change_the_reading(monkeypatch, tmp_path):
-    """三种「不响亮就会静默给出错读数」的输入 —— 每一种都必须在**写产物之前**停住。
+    """四种「不响亮就会静默给出错读数」的输入 —— 每一种都必须在**写产物之前**停住。
 
-    ① **表头缺列**:`row.get("最终标签")` 恒为 None ⇒ 每行静默回落预标,而读数是「判『改』的 0 条」;
+    ① **表头缺列**:`row.get("最终标签")` 恒为 None ⇒ 每行静默回落预标,而读数看着正常;
     ② **判定值认不出**(`改了`):若当成「没改」,错误率被**少算** —— 一个乐观方向的错答案;
-    ③ **标签是错字**(`尺碼`):静默丢弃的话,训练集里就少一个标签,而没人会知道。
+    ③ **标签是错字**(`尺碼`):静默丢弃的话,训练集里就少一个标签,而没人会知道;
+    ④ ★**S18**:`判定=改` 而标签与预标**一模一样**(最常见成因:更正写进了「备注」列)
+       ⇒ 那一行会以**旧标签**入库而记录说「改过」,两份记录互相拆台。
 
     ⚠️ 每条都断 `产物不存在` —— 「拦住了」与「拦住了但先写了一份错的」是两回事。
     """
-    from scripts import export_label_review as exp
-
-    monkeypatch.setattr(exp, "LABELS_DIR", tmp_path)
-    monkeypatch.setattr(exp, "REVIEWED", tmp_path / "reviewed.jsonl")
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+    ])
     csv_path = tmp_path / "trainval.csv"
     out = tmp_path / "reviewed.jsonl"
 
@@ -676,6 +796,107 @@ def test_import_refuses_input_that_would_silently_change_the_reading(monkeypatch
     with pytest.raises(SystemExit) as e3:
         exp.do_import()
     assert "不合法类目" in str(e3.value), str(e3.value)
+    assert not out.exists()
+
+    # ④ 判定说改过、标签却没变 ⇒ 两边互相拆台(注释里点了「备注」这个成因)
+    _write_review_csv(csv_path, [["a", "买大了想退", "尺码", "改", "", "其实该是退换货"]])
+    with pytest.raises(SystemExit) as e4:
+        exp.do_import()
+    assert "一模一样" in str(e4.value) and "备注" in str(e4.value), str(e4.value)
+    assert not out.exists()
+
+
+def test_import_refuses_malformed_rows(monkeypatch, tmp_path):
+    """结构坏了要**响亮**停 —— 否则产物里会出现幽灵记录 / 互相矛盾的同 id 记录。
+
+    ① ★**I1**(复审的 S17):在**文本编辑器**里往「最终标签」打了半角逗号却没加引号
+       ⇒ 该行字段数比表头多,`DictReader` 把多出来的塞进 `row[None]`,而按列名取值**看不见它**
+       ⇒ `最终标签` 只剩 `尺码`,**两个更正被无声吞掉**(条数一致、校验全过、产物照写)。
+       Excel 存盘会自动加引号 ⇒ 这条**只在文本编辑器那条路上**炸,而计划推荐的正是那条路;
+    ② **I2/S4**:用户自编号的行(`zz-9999`)⇒ 要到任务 7 才炸成 `KeyError`,报错指向别处;
+    ③ **I2/S3**:两行同 id ⇒ 产物里两条标签互相矛盾的记录,而任务 7 的按 id 合并**静默**只留后者;
+    ④ **Mn2**:纯逗号行 / 纯空格行 ⇒ id 洗成空串的幽灵记录(`{"id": "", "labels": []}`);
+    ⑤ **Mn3**:只剩表头 ⇒ 空产物 + 「回收 0 条」,不拒绝;
+    ⑥ **(实现者补的护栏)「预标标签」列与 `prelabeled.jsonl` 不同源** ⇒ 「改了没有」就没有基准 ——
+       `生效标签 ≠ 预标标签` 那个机械定义会**照着错的基准**算,读数与标签一起错。
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+    ])
+    csv_path = tmp_path / "trainval.csv"
+    out = tmp_path / "reviewed.jsonl"
+    head = "id,问题,预标标签,判定(ok/改),最终标签,备注\r\n"
+
+    # ① 列错位(7 个字段 > 6 列表头)——
+    #    ⚠️ 必须用**裸文本**写:csv.writer 会自动给含逗号的格子加引号,复现不出来。
+    _write_raw_csv(csv_path, head + "a,买大了想退,尺码,改,尺码,退换货,物流\r\n")
+    with pytest.raises(SystemExit) as e1:
+        exp.do_import()
+    assert "列错位" in str(e1.value) and "物流" in str(e1.value), str(e1.value)
+    assert not out.exists()
+
+    # ② 未知 id
+    _write_raw_csv(csv_path, head + "a,买大了想退,尺码,改,退换货,\r\n"
+                                + "zz-9999,我编的,尺码,改,退换货,\r\n")
+    with pytest.raises(SystemExit) as e2:
+        exp.do_import()
+    assert "不在预标语料里" in str(e2.value) and "zz-9999" in str(e2.value), str(e2.value)
+    assert not out.exists()
+
+    # ③ 同 id 两行
+    _write_raw_csv(csv_path, head + "a,买大了想退,尺码,改,退换货,\r\n"
+                                + "a,买大了想退,尺码,ok,物流,\r\n")
+    with pytest.raises(SystemExit) as e3:
+        exp.do_import()
+    assert "id 重复" in str(e3.value), str(e3.value)
+    assert not out.exists()
+
+    # ④ 幽灵行:纯逗号(5 个逗号 = **恰好** 6 个空字段,不会先撞上 I1 那条)+ 纯空格
+    #    ⚠️ 这两条数据行必须**正好 6 个字段**:多一个逗号就会变成「字段比表头多」,
+    #    于是 I1 那条先炸、而报的是**上一行**的 id —— 那会让这条用例测到别的东西上。
+    #    (第一版就是这么写的,当场红;判据是本仓那句「先算一遍输入会不会走到那条分支」。)
+    for ghost in (",,,,,\r\n", "   ,   ,   ,   ,   ,   \r\n"):
+        _write_raw_csv(csv_path, head + "a,买大了想退,尺码,ok,,\r\n" + ghost)
+        with pytest.raises(SystemExit) as e4:
+            exp.do_import()
+        assert "不在预标语料里" in str(e4.value), f"{ghost!r} -> {e4.value}"
+        assert not out.exists()
+
+    # ⑤ 只剩表头
+    _write_raw_csv(csv_path, head)
+    with pytest.raises(SystemExit) as e5:
+        exp.do_import()
+    assert "一行数据都没有" in str(e5.value), str(e5.value)
+    assert not out.exists()
+
+    # ⑥ 「预标标签」列与语料不同源(把预标写成别的类目)——
+    #    它是「改了没有」的比较基准,基准错了 ⇒ 读数与标签一起错,而且都看不出来。
+    _write_review_csv(csv_path, [["a", "买大了想退", "物流", "改", "退换货", ""]])
+    with pytest.raises(SystemExit) as e6:
+        exp.do_import()
+    assert "不同源" in str(e6.value), str(e6.value)
+    assert not out.exists()
+
+
+def test_import_explains_a_file_that_is_not_utf8(monkeypatch, tmp_path):
+    """★ 订正轮 1 的 **Mn5**:Excel 存成「CSV(逗号分隔)」⇒ GBK 字节。
+
+    默认报的是 codec 措辞(`'utf-8' codec can't decode byte 0xc2 …`),读起来像代码坏了;
+    真实成因只有一个常见解 ⇒ 报错要说人话。(不含糊、也**不写产物**这两点原本就对。)
+    """
+    exp = _bind_import(monkeypatch, tmp_path, [
+        {"id": "a", "question": "买大了想退", "labels": ["尺码"]},
+    ])
+    csv_path = tmp_path / "trainval.csv"
+    out = tmp_path / "reviewed.jsonl"
+    csv_path.write_bytes(
+        "id,问题,预标标签,判定(ok/改),最终标签,备注\r\na,买大了想退,尺码,改,退换货,\r\n"
+        .encode("gbk")
+    )
+
+    with pytest.raises(SystemExit) as e:
+        exp.do_import()
+    assert "不是 UTF-8" in str(e.value) and "CSV(逗号分隔)" in str(e.value), str(e.value)
     assert not out.exists()
 
 
