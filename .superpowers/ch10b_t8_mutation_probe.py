@@ -16,9 +16,14 @@
 
 覆盖本任务的三处订正:
 - **11-B**(冻结产物没有装置守着)⇒ M1 / M2 / M3 三个变异;
-- **11-C**(循环下标当种子)⇒ M4 / M5;
+- **11-C**(循环下标当种子)⇒ M4 / M5 / **M16**;
 - **11-D**(那条断言零判别力)⇒ M6 + 一段**直接读数**(见文件末尾的 `_note_11d`);
 - **11-A**(`--limit` 那把脚枪)⇒ M13。
+
+**订正轮 1**(复审的 F1 / F2 / F3)⇒ **M17 / M18 / M19**,并加了「**红在那一句**」的锚点:
+每个变异可以带第三格 `anchor` —— 红出来的输出里**必须**含这段字(断言消息),否则报 `!!!`。
+复审指出的正是这件事:**「收集成功、但测试因无关原因失败」也会被算成红**,判别力是零。
+(锚点比对要 `-X utf8`:`_run` 里钉了,否则中文断言消息在 cp936 管道上是乱码、永远对不上。)
 
 用法:
     .venv/Scripts/python.exe -X utf8 .superpowers/ch10b_t8_mutation_probe.py
@@ -61,6 +66,7 @@ T_ORDER = f"{T}::test_augment_gives_the_same_typo_no_matter_the_row_order"
 T_DRIFTED = f"{T}::test_augment_drops_the_rows_whose_labels_drifted"
 T_LIMIT = f"{T}::test_augment_limit_only_samples_the_rewriting"
 T_MALFORMED = f"{T}::test_augment_reports_a_malformed_answer_without_counting_it_as_drift"
+T_NOT_JSON = f"{T}::test_augment_keeps_a_json_syntax_failure_out_of_the_drift_count"
 T_PATHS = f"{T}::test_the_augment_paths_point_at_the_right_files"
 T_DISPATCH = f"{T}::test_main_dispatches_augment_and_forwards_the_limit"
 T_LIMIT_OTHER = f"{T}::test_main_refuses_limit_on_the_other_steps"
@@ -74,7 +80,7 @@ MUTATIONS = [
         "    assert train_path.name == TRAIN_NAME, (\n",
         "    assert True or train_path.name == TRAIN_NAME, (   # 变异:守卫拆掉\n",
         # 红在哪句:`pytest.raises(AssertionError)` **没有**收到异常
-        [(T_READ_GUARD, "failed"),
+        [(T_READ_GUARD, "failed", "DID NOT RAISE"),
          # 证据:另外两条**照样绿** ⇒ 少了输入守卫就没别的东西守得住它
          (T_FROZEN, "passed"), (T_WRITE_GUARD, "passed")],
     ),
@@ -84,7 +90,7 @@ MUTATIONS = [
         "    assert out_path.name == AUGMENTED_NAME, (\n",
         "    assert True or out_path.name == AUGMENTED_NAME, (   # 变异:守卫拆掉\n",
         # 红在哪句:`topic_test.jsonl` 的字节前后不同(真的被覆盖了)
-        [(T_WRITE_GUARD, "failed"),
+        [(T_WRITE_GUARD, "failed", "DID NOT RAISE"),
          (T_FROZEN, "passed"), (T_READ_GUARD, "passed")],
     ),
     (
@@ -95,7 +101,7 @@ MUTATIONS = [
         "            (TOPIC_DIR / \"val.jsonl\").open(\"a\", encoding=\"utf-8\").write(\"x\\n\")\n",
         # ⚠️ 两条名字守卫都对 `train_path`/`out_path` 生效、这里一个都不碰
         #    ⇒ **只有** sha256 那条断言会红。这正是「逐字节相同」那句的存在理由。
-        [(T_FROZEN, "failed"),
+        [(T_FROZEN, "failed", "被改动了"),
          # 证据:别的用例不读冻结产物 ⇒ 它们对这一条**零判别力**
          (T_LIMIT, "passed"), (T_DRIFTED, "passed")],
     ),
@@ -114,7 +120,7 @@ MUTATIONS = [
         #    id 种子撞出同一个候选 ⇒ 那条断言对 11-C **零判别力**。
         #    夹具加了两行(**M14** 反过来钉住那段自检)之后才有判别力。
         #    这是本次任务最值钱的一处发现:**「跑过变异」不等于「变异能被测出来」**。
-        [(T_ORDER, "failed"),
+        [(T_ORDER, "failed", "同一行在两份行序里"),
          # 证据:其余各条**全绿** ⇒ 「行序无关」只有那一条守得住
          (T_FROZEN, "passed"), (T_SEED_ID, "passed")],
     ),
@@ -124,9 +130,15 @@ MUTATIONS = [
         '    return int.from_bytes(hashlib.sha256(row_id.encode("utf-8")).digest(), "big")\n',
         "    return hash(row_id)   # 变异:对 str 每进程随机化\n",
         # 红在哪句:两个子进程算出的种子不同
-        [(T_CROSSPROC, "failed"),
-         # 证据:**同进程内的两条全绿** —— 这正是本仓那句「同进程的测试完全测不出来」
-         (T_SEED_ID, "passed"), (T_ORDER, "passed")],
+        [(T_CROSSPROC, "failed", "两个进程算出的种子不同"),
+         # ⚠️ **订正轮 1 之后这一格也红了**(F3 加的 ⑧ 断言比的是 `typo_seed(id)`,
+         #    而 `hash()` 给的是另一个数)⇒ 判别力比上一轮更强。
+         #    但「`hash()` 换进程就不稳」这件事**只有跨进程那条测得出来** ——
+         #    ⑧ 抓的是「不是 `typo_seed`」,另一件事。
+         (T_ORDER, "failed", "种子没从 id 派生"),
+         # 证据:**同进程内的 `typo_seed` 专属用例全绿** ——
+         # 这正是本仓那句「同进程的测试完全测不出来」
+         (T_SEED_ID, "passed")],
     ),
     # ---- ★ 11-D:那条「不许注成空串」的断言 ----
     (
@@ -135,7 +147,7 @@ MUTATIONS = [
         "    src, dst = rng.choice(candidates)\n    return text.replace(src, dst, 1)\n",
         "    return text   # 变异:恒等\n",
         # 红在哪句:`out != "退货"`(加固后的那半);顺带 `any(c != …)`
-        [(T_NEVER_EMPTY, "failed"), (T_CHANGES, "failed"),
+        [(T_NEVER_EMPTY, "failed", "那等于一条错别字都没注入"), (T_CHANGES, "failed"),
          # 证据:**原稿那条断言在恒等实现下照样绿** —— 直接读数见 `_note_11d()`
          (T_REPRO, "passed")],
     ),
@@ -145,7 +157,8 @@ MUTATIONS = [
         LAB,
         "    return set(before) != set(after)\n",
         "    return True   # 变异:恒判漂移\n",
-        [(T_DRIFT, "failed"), (T_DRIFT_SET, "failed"), (T_DRIFTED, "failed")],
+        [(T_DRIFT, "failed", "顺序不算变化"), (T_DRIFT_SET, "failed"),
+         (T_DRIFTED, "failed")],
     ),
     (
         "M8 `label_drift` 改成**比长度**(重复被算成漂移)",
@@ -154,7 +167,7 @@ MUTATIONS = [
         "    return len(before) != len(after)   # 变异:比长度\n",
         # ⚠️ 证据:**brief 给的那条 `test_label_drift_detects_changed_count` 照样绿**
         #    ⇒ 少了 `test_label_drift_is_set_semantics_…`,那个错法没有任何东西守着。
-        [(T_DRIFT_SET, "failed"), (T_DRIFT, "passed")],
+        [(T_DRIFT_SET, "failed", "重复不该被算成漂移"), (T_DRIFT, "passed")],
     ),
     # ---- `_rewrite` 的两道闸 ----
     (
@@ -162,7 +175,7 @@ MUTATIONS = [
         SCR,
         "    cleaned = clean(new_q)\n",
         "    cleaned = new_q   # 变异:不洗\n",
-        [(T_FROZEN, "failed"), (T_MALFORMED, "passed")],
+        [(T_FROZEN, "failed", "增强行的题面没过清洗"), (T_MALFORMED, "passed")],
     ),
     (
         "M10 形状闸失效后**返回空标签**(原稿那种错法:把故障记成漂移)",
@@ -174,7 +187,7 @@ MUTATIONS = [
         "            or not all(isinstance(x, str) for x in new_labels)):\n"
         "        return \"\", [], True   # 变异:返回空标签 ⇒ 被算成「漂移」\n",
         # 红在哪句:那两行按原句写回的断言(它们被 `label_drift` 判成漂移丢掉了)
-        [(T_MALFORMED, "failed"), (T_FROZEN, "passed")],
+        [(T_MALFORMED, "failed", "解析失败的行被丢了"), (T_FROZEN, "passed")],
     ),
     # ---- ★ 11-A:`--limit` 与命令行 ----
     (
@@ -182,7 +195,7 @@ MUTATIONS = [
         SCR,
         "        asyncio.run(augment(args.limit or None))\n",
         "        asyncio.run(augment())   # 变异:limit 丢掉\n",
-        [(T_DISPATCH, "failed"),
+        [(T_DISPATCH, "failed", "没被转发到"),
          # 证据:直接调 `p.augment(limit=…)` 的那条**照样绿**
          (T_LIMIT, "passed")],
     ),
@@ -191,7 +204,7 @@ MUTATIONS = [
         SCR,
         '    if args.limit and args.step != "augment":\n',
         '    if False and args.limit and args.step != "augment":   # 变异:不拦\n',
-        [(T_LIMIT_OTHER, "failed")],
+        [(T_LIMIT_OTHER, "failed", "DID NOT RAISE")],
     ),
     (
         "M13 ★11-A 那把脚枪:**就地裁掉 train.jsonl**",
@@ -203,7 +216,7 @@ MUTATIONS = [
         "            \"\\n\".join(json.dumps(r, ensure_ascii=False) for r in todo) + \"\\n\",\n"
         "            encoding=\"utf-8\")\n",
         # 红在哪句:`train.jsonl` 跑前跑后的**字节相同**那句
-        [(T_LIMIT, "failed"), (T_DISPATCH, "passed")],
+        [(T_LIMIT, "failed", "被就地改了"), (T_DISPATCH, "passed")],
     ),
     # ---- ★ 用例自检本身:夹具失去判别力时,**它**要先红 ----
     (
@@ -221,7 +234,39 @@ MUTATIONS = [
         #   夹具一旦悄悄失去判别力,自检先报出来,而不是让主断言变成一条**恒真**。
         #   (M4 第一次跑时这里报的是绿灯 —— 那时自检用的是 0 起的下标,
         #    与实现的 `enumerate(todo, 1)` 差一,于是它**替假绿背了书**。)
-        [(T_ORDER, "failed")],
+        [(T_ORDER, "failed", "夹具没有判别力")],
+    ),
+    # ================= 订正轮 1(F1 / F2 / F3)=================
+    (
+        "M17 ★F1 JSON **语法**那一支返回空标签(复审实测:67 条全绿)",
+        SCR,
+        "    except json.JSONDecodeError:\n"
+        "        return row[\"question\"], row[\"labels\"], True\n",
+        "    except json.JSONDecodeError:\n"
+        "        return \"\", [], True   # 变异:语法错也返回空标签 ⇒ 被算成漂移\n",
+        # 红在哪句:那条新用例里 `set(aug) == {…}` 的**断言消息**
+        #   (「语法没解出来的那行被丢了(该按原句写回)」)。
+        # ⚠️ 证据:**形状那一支的用例照样绿** —— 两支各要一条用例,这就是 F1 的全部理由。
+        [(T_NOT_JSON, "failed", "语法没解出来的那行被丢了"),
+         (T_MALFORMED, "passed")],
+    ),
+    (
+        "M18 ★F2 `TOPIC_DIR` 少一层(`ROOT / \"evals\"`)",
+        SCR,
+        'TOPIC_DIR = ROOT / "evals" / "topic"\n',
+        'TOPIC_DIR = ROOT / "evals"   # 变异:少一层\n',
+        # 红在哪句:新加的那句**字面量**断言(消息里有「TOPIC_DIR 指错目录了」)。
+        # ⚠️ 复原先验过:少了那句字面量断言,这一格**全绿**(同义反复)。
+        [(T_PATHS, "failed", "TOPIC_DIR 指错目录了")],
+    ),
+    (
+        "M19 ★F3 种子换成**常数 0**(复审实测:67 条全绿)",
+        SCR,
+        'inject_typo(new_text, typo_seed(r["id"]))',
+        "inject_typo(new_text, 0)",
+        # 红在哪句:行序无关那条里 ⑧ 的 `expected` 断言(消息里有「种子没从 id 派生」)。
+        # ⚠️ **行序那条断言自己是绿的**(常数种子当然与行序无关)—— 所以 ⑧ 必须存在。
+        [(T_ORDER, "failed", "种子没从 id 派生")],
     ),
     # ---- 两条「替身/断言本身有没有判别力」的钉子 ----
     (
@@ -231,7 +276,7 @@ MUTATIONS = [
         '        labels="",   # 变异:原标签不进 prompt\n',
         # 红在哪句:替身里那句 `assert joined in prompt`(spec §5.4 的第二条硬约束)
         # —— 少了它,「逐条带原标签」这件事**没有任何东西守着**。
-        [(T_FROZEN, "failed"), (T_LIMIT, "failed")],
+        [(T_FROZEN, "failed", "prompt 里没有这一行的原标签"), (T_LIMIT, "failed")],
     ),
     (
         "M16 `typo_seed` 返回常数(id 被丢掉)",
@@ -239,9 +284,11 @@ MUTATIONS = [
         '    return int.from_bytes(hashlib.sha256(row_id.encode("utf-8")).digest(), "big")\n',
         "    return 0   # 变异:与 id 无关\n",
         # 红在哪句:`len(set(seeds)) == len(ids)`(400 个 id 撞成一个种子)。
-        # ⚠️ 行序那条**照样绿** —— 常数种子当然与行序无关 ⇒ 「可复现」与「与 id 无关」
-        #    是两件事,少了 `test_typo_seed_comes_from_the_row_id` 就分不开。
-        [(T_SEED_ID, "failed"), (T_ORDER, "passed")],
+        # ⚠️ **订正轮 1 之前这一格的 `T_ORDER` 是绿的**(常数种子当然与行序无关)
+        #    ⇒ 「可复现」与「与 id 有关」是两件事,少了 F3 加的那条 ⑧ 断言就分不开 ——
+        #    它现在红在「种子没从 id 派生」。
+        [(T_SEED_ID, "failed", "撞出了重复种子"),
+         (T_ORDER, "failed", "种子没从 id 派生")],
     ),
 ]
 
@@ -287,8 +334,12 @@ def _hygiene_ok(snapshot) -> bool:
 
 
 def _run(test_id: str):
+    # ⚠️ `-X utf8` 是给**断言文本的锚点比对**用的:本机 locale 是 cp936,
+    # 不钉的话 pytest 把中文断言消息按 GBK 写进管道、这边按 UTF-8 解 ⇒ 全是乱码,
+    # 于是「红在哪句」这一步永远对不上。它只影响本进程的编码,不改任何测试语义
+    # (子进程的编码各自由它们自己的 `-X utf8` 决定,见那两条用例的注释)。
     return subprocess.run(
-        [sys.executable, "-m", "pytest", test_id, "-p", "no:cacheprovider"],
+        [sys.executable, "-X", "utf8", "-m", "pytest", test_id, "-p", "no:cacheprovider"],
         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
 
@@ -346,7 +397,13 @@ def main() -> None:
                 path.write_bytes(cur.replace(ob, nb, 1))
             if not ok:
                 continue
-            for test_id, want in expects:
+            for exp in expects:
+                test_id, want = exp[0], exp[1]
+                #: 订正轮 1 的复审指出:**「收集成功、但测试因无关原因失败」也会被算成红**。
+                #  第三格是**期望红在哪句**的锚点(断言消息里必有的一段字);给了它就要求
+                #  红出来的那份输出**真的含这段字**,否则报 `!!!` 并计问题数。
+                #  (期望绿的那几项是「零判别力」的证据,锚点无意义 ⇒ 一律留空。)
+                anchor = exp[2] if len(exp) > 2 else None
                 proc = _run(test_id)
                 # ⚠️ **语法错的红不算红**(ch07 全章复盘那条):变异把源码改成语法错时,
                 #    pytest 照样打 `1 failed` —— 而它一个断言都没跑到。
@@ -366,7 +423,18 @@ def main() -> None:
                 got = "failed" if counts.get("failed") else "passed"
                 mark = "✅ 红" if got == "failed" else "绿灯"
                 flag = "" if got == want else "   !!! 与期望不符"
-                print(f"  {mark}  {test_id.split('::')[-1]}  (期望 {want}){flag}   [{counts}]")
+                where = ""
+                if got == "failed" and anchor is not None:
+                    # ⚠️ 这一步问的是**「红在那一句上吗」**,不是「红没红」。
+                    #    (复审自己在 T8 的探针上指出:有 `1 failed` 不够 ——
+                    #     无关理由失败的红,判别力是零。)
+                    if anchor in proc.stdout:
+                        where = f"   红在含「{anchor}」那句 ✅"
+                    else:
+                        where = f"   !!! 红了但**不是**期望那句(找「{anchor}」没找到)"
+                        problems += 1
+                print(f"  {mark}  {test_id.split('::')[-1]}  (期望 {want}){flag}{where}"
+                      f"   [{counts}]")
                 if got != want:
                     problems += 1
         finally:
