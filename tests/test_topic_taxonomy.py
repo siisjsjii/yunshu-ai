@@ -1,5 +1,7 @@
 """17 类权威表:它是**全章的唯一类目来源**,所以这里断的是它的形状与自洽。"""
 
+import csv
+import io
 import re
 
 import pytest
@@ -15,12 +17,28 @@ from app.topic.taxonomy import (
     POSITIVE,
     render_taxonomy_for_prompt,
 )
+from scripts.export_taxonomy_review import (
+    FOOTNOTE,
+    HEADER,
+    OUT as CSV_OUT,
+    render_csv_text,
+)
 
 EXPECTED = (
     "退换货", "物流", "尺码", "发票", "质量问题", "运费", "优惠活动", "价保",
     "支付", "订单修改", "库存补货", "商品信息", "保修维修", "账号", "会员积分",
     "评价", "其他",
 )
+
+#: spec §4.1 那 10 行**有**反例的类目 —— 是**故意双写**的清单(与 `EXPECTED` 同理):
+#: 正本在 spec §4.1,这里是它的代码化看守。
+COUNTER_KEYS = (
+    "退换货", "物流", "尺码", "质量问题", "运费",
+    "优惠活动", "价保", "订单修改", "商品信息", "保修维修",
+)
+
+#: spec §4.1 反例列写 `—` 的那 7 行 —— 它们**不许**有 `COUNTER` 条目。
+COUNTERLESS = ("发票", "支付", "库存补货", "账号", "会员积分", "评价", "其他")
 
 
 def test_labels_are_exactly_the_seventeen():
@@ -107,6 +125,27 @@ def test_non_topical_intents_land_on_other():
         )
 
 
+def test_counter_key_set_is_exactly_the_rows_spec_gives_a_counter():
+    """**反例表的键集本身是契约** —— 删掉一条(如 `COUNTER["价保"]`)不会红任何别的断言,
+    而它删的是**用户刚签字的那份内容**。这里把两个方向都钉住:
+
+    - 10 行有反例的必须有条目(不许少);
+    - 7 行反例列写 `—` 的必须没有条目(不许多 —— 凭空加一条反例,
+      等于在没有设计依据的情况下给某个类目划边界)。
+    """
+    assert set(COUNTER) == set(COUNTER_KEYS), (
+        f"COUNTER 的键集与 spec §4.1 不符:多了 {set(COUNTER) - set(COUNTER_KEYS)}、"
+        f"少了 {set(COUNTER_KEYS) - set(COUNTER)}"
+    )
+    assert not (set(COUNTER) & set(COUNTERLESS)), (
+        f"spec §4.1 的反例列写的是 `—`:{set(COUNTER) & set(COUNTERLESS)}"
+    )
+    assert len(COUNTER_KEYS) == 10 and len(COUNTERLESS) == 7
+    assert set(COUNTER_KEYS) | set(COUNTERLESS) == set(LABELS), (
+        "17 类必须被「有反例 / 无反例」完整划分 —— 新增类目时要一并决定它属于哪一侧"
+    )
+
+
 def test_rendered_block_carries_every_label_and_boundary():
     """渲染块是 prompt 的**唯一**类目来源;漏一类,那个类就永远训不出来。"""
     block = render_taxonomy_for_prompt()
@@ -117,6 +156,20 @@ def test_rendered_block_carries_every_label_and_boundary():
     assert block.count("\n") >= len(LABELS)
 
 
+def test_rendered_block_carries_every_counter_pair():
+    """反例必须**逐条进渲染块** —— 只断类目名与边界说明的话,一个「把反例行整段丢掉」
+    的渲染会**通过全部断言**,而 `render_taxonomy_for_prompt` 的 docstring 明说
+    「含边界说明与反例」,近邻类目的裁决内容**就是那些反例**。
+
+    这里断的是整行文本(而不是「两个词都出现过」)—— 指向与归属任一写错都会红。
+    """
+    block = render_taxonomy_for_prompt()
+    for label, pairs in COUNTER.items():
+        for text, target in pairs:
+            line = f"「{text}」归 {target},不归 {label}"
+            assert line in block, f"渲染块里没有反例行:{line}"
+
+
 def test_rendered_block_has_no_curly_braces():
     """`ChatPromptTemplate` 按 f-string 解析,裸花括号会炸(本仓硬约束)。
 
@@ -125,3 +178,40 @@ def test_rendered_block_has_no_curly_braces():
     """
     block = render_taxonomy_for_prompt()
     assert "{" not in block and "}" not in block
+
+
+def test_committed_csv_is_in_sync_with_the_constants():
+    """盘上那份 CSV 必须**逐字节**等于用常量现算出来的那份(含编码与 BOM)。
+
+    它是本章**唯一一份由人签字**的产物(CP-1),而且**与源码同处一地入库** ——
+    改了 `BOUNDARY` / `COUNTER` 而忘了重跑导出脚本的话,用户签过的那张表
+    会**静默地**与代码不一致:没有任何东西会红,而后面所有预标与合成
+    都照那张表走。
+
+    比较走的是**同一条行产出路径**(`render_csv_text`),所以这条断言
+    断的不是「文件存在」,而是「文件 == f(常量)」。
+    """
+    on_disk = CSV_OUT.read_bytes()
+    assert on_disk == render_csv_text().encode("utf-8-sig"), (
+        f"{CSV_OUT} 与 `taxonomy.py` 的常量不一致 —— "
+        "重跑一遍 `.venv/Scripts/python.exe scripts/export_taxonomy_review.py` 再提交"
+    )
+    # BOM 单列一条:这是给中文 Windows 上的 Excel 看的文件,少了它中文全乱码,
+    # 而「乱码」是用户侧的现象,不是任何别的断言能照到的。
+    assert on_disk[:3] == b"\xef\xbb\xbf", "CSV 少了 UTF-8 BOM"
+
+    rows = list(csv.reader(io.StringIO(on_disk.decode("utf-8-sig"))))
+    assert rows[0] == HEADER, "表头被动了"
+    data = [r for r in rows[1:] if r and r[0].isdigit()]
+    assert [r[1] for r in data] == list(LABELS), "17 行数据被动了(条数或顺序)"
+    assert rows[-1] == [FOOTNOTE], "尾注不在最后一行 —— 它不能被读成第 18 类"
+
+
+def test_csv_footnote_answers_cp1_item_three():
+    """spec §4.2 说「必须写进表里」——「表」是**用户真正打开的那份文件**。
+
+    这条单独钉尾注的**内容**(而不只是「有一行尾注」):CP-1 的第 ③ 问
+    就是「17 类里没有投诉/闲聊/转人工你是否认可」,尾注必须自己答得了它。
+    """
+    for token in ("投诉", "闲聊", "转人工", "意图", "主题", "§4.2"):
+        assert token in FOOTNOTE, f"尾注里没有 {token},回答不了 CP-1 的第 ③ 问"
