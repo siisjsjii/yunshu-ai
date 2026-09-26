@@ -35,7 +35,7 @@
 | 检查点 | 在哪 | 用户要做什么 |
 |---|---|---|
 | **CP-1:术语表过目** | 任务 1 Step 6 | 打开 `evals/topic/taxonomy_review.csv`,看 17 类的边界说明与正反例 —— **后面所有预标、合成、裁决都照它走** |
-| **CP-2:标签复核** | 任务 6 Step 3 | 改 `evals/topic/labels/test.csv`(120 行,100% 过)与 `trainval.csv`(85 行,判对错) |
+| **CP-2:标签复核** | 任务 6 **Step 6**(⚠️ **订正 7**:原先写「Step 3」是笔误;且本任务**跨**检查点,已拆成 B6-A / B6-B,见 Task 6 节头) | 改 `evals/topic/labels/trainval.csv`(**实测 84 行**;原先写的「85」是 `17×5` 的**上界** —— 有一条多标签行被两个桶同时抽中、按 id 去重后少 1)与**任务 7 切分之后才导出**的 `test.csv`(120 行,100% 过) |
 
 **CP-1 不通过不许开工任务 3 及以后。CP-2 不回收不许开工任务 7 及以后。**
 
@@ -1723,6 +1723,22 @@ Expected: **PASS**
 
 - [ ] **Step 5: 写导出/回收脚本**
 
+> ⚠️⚠️ **计划订正 7(controller,2026-09-26)—— 下面这个代码块与盘上实现对不上,四处,照抄会静默劣化** ⚠️⚠️
+>
+> 四处都是 B6-A 的评审**逐处核实过、且各有测试与变异钉住**的修复。真在 `scripts/export_label_review.py`。
+>
+> | # | 计划原稿 | 真实现 | 照抄的后果 |
+> |---|---|---|---|
+> | **A** | `def main() -> None:` 直接 `argparse` | 第一行加 `_pin_stdout_encoding()` | ⚠️ **与 T5 在 `prelabel_topics.py` 上修的是同一个 cp936 坑**:`⚠️`(U+26A0)编不进 GBK,而它**只**出现在「某类一条都没抽到」那条 print 里 ⇒ **产物写好了、命令却以退出码 1 结束**,那条唯一的警告被吞掉 |
+> | **B** | `with src.open(encoding="utf-8-sig") as f:` | 加 `newline=""` | 与 `csv` 官方文档不一致;表内的换行/引号解析在特定输入上出错 |
+> | **C** | 直接 `csv.DictReader(f)` 开读 | 先核 `REQUIRED_COLUMNS`;**表头缺列或「判定」值认不出 ⇒ 响亮 `SystemExit`,且在写产物之前** | 计划原稿里**表头少了「判定」列时 `.get()` 回落到 `""` ⇒ 恒不判「改」⇒ 错误率静默为 0**,而 §6.3 拿它做「训 / 不训」的决策 |
+> | **D** | `[x for x in final.replace(",", "\|").split("\|") if x.strip()]`(**保留了未 strip 的 `x`**) | 逐段 `strip()` | 用户填 `尺码, 退换货` ⇒ `" 退换货"` 不是合法类目 ⇒ **响亮报错,但报的是「不合法类目」而不是「你多打了个空格」**,逼人去改他那份 CSV |
+>
+> ⚠️ 另外**一条口径**已由 controller 裁定、plan 里没有:错误率读数
+> (`changed`)必须数「**生效标签 ≠ 预标标签**」的行,**不是**数「判定」列 ——
+> 否则「用户改了标签但忘了填判定」会读成 0%(**静默**,而 §6.3 拿它决定训不训)。
+> 详见 `task-6-report.md` 的 §订正轮 1 与账本里那条设计裁定。
+
 Create `scripts/export_label_review.py`:
 
 ```python
@@ -1848,10 +1864,16 @@ Run: `.venv/Scripts/python.exe scripts/export_label_review.py import`
 - [ ] **Step 8: Commit**
 
 ```bash
+# ⚠️ 订正 7:本任务的 commit **分两次**(Task 6 跨 CP-2,见节头)。
+# B6-A(紧接 Step 6 之后):
 git add app/topic/labeling.py scripts/export_label_review.py \
-        tests/test_topic_labeling.py evals/topic/labels/trainval.csv \
-        evals/topic/reviewed.jsonl
+        tests/test_topic_labeling.py evals/topic/labels/trainval.csv
 git commit -m "ch10-B T6: 人工抽审 CSV(按类分层各 5 条,测错误率而非逐条改)"
+# ⚠️ **原稿在这里还列了 `evals/topic/reviewed.jsonl`** —— 那个文件在 B6-A 阶段
+#    **还不该存在**(用户还没改完 CSV)。照抄会 `git add` 一个不存在的路径而失败。
+# B6-B(用户改完 CSV、跑完 Step 7 的 `import` 之后):
+git add evals/topic/reviewed.jsonl dev-notes/ch10.md
+git commit -m "ch10-B T6-B: 回收人工复核(错误率读数 + reviewed.jsonl)"
 ```
 
 ---
