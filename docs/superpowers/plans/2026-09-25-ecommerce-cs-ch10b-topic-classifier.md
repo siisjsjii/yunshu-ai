@@ -1904,6 +1904,50 @@ git commit -m "ch10-B T6-B: 回收人工复核(错误率读数 + reviewed.jsonl)
 > (完全相同 ⇒ 必须移出训练侧;近重复 ⇒ 报出条数并入账)。
 > **并把这条风险的量写进 spec §8「对外报数的唯一依据」那一段的账里** ——
 > 报测试集分数时要知道其中 8 行与 prompt 里的例句字面重叠。
+>
+> ⚠️ **9-C:上面这条要求目前只是一段话,没有对应的 Step 与测试。** ⇒ 补 **Step 4b**(见下),
+> 它必须是**能红的**那种实现(拿一份人为造出「训练侧含测试侧原句」的输入喂进去,必须报出来)。
+
+> ⚠️⚠️ **计划订正 9(controller,2026-09-26)—— 本任务有四处必须先订正,两处会让它跑不起来或静默不接上** ⚠️⚠️
+>
+> **9-A(结构,与 Task 6 同款):本任务**也**跨了人工检查点,必须拆成两段。**
+> **Step 6 之后是人的时间** —— 用户要把 120 条 `test.csv` **100% 过一遍**。
+> 照原样派,实现者会在 `import-test` 那一步无输入可回收(`test.csv` 还是空的)。
+> - **B7-A(agent 做,做完就停)**:Step 1–5 + **`export-test`**;
+>   commit「代码 + 切分产物(`train.jsonl` / `val.jsonl` / `topic_test.jsonl`)+ **空着两列的 `test.csv`**」,
+>   把 CSV 交给用户,**停**。
+> - **B7-B(用户改完之后才做)**:`import-test` → 回写 `topic_test.jsonl` → 补 dev-notes → commit。
+> - ⚠️ CSV 先以**空着 `判定` / `最终标签` 两列**的状态入库是**刻意的**(与 Task 6 同款):
+>   用户改完后的 `git diff` 就是**他改了什么的逐字记录**。
+>
+> **9-B(会让它静默不接上)**:Step 4 的代码块写 `f"{name}.jsonl"` ⇒ 产出 `test.jsonl`,
+> 而本任务其余**四处**(Interfaces / Step 6 两处 / Step 7 的 `git add`)全按 **`topic_test.jsonl`** 读写。
+> 照原稿抄 ⇒ **用户那 120 条的复核对指标零影响,而报告照常打印**。
+> ⇒ **已在 Step 4 的代码块里就地订正,以 `topic_test.jsonl` 为准。**
+>
+> **9-D(Step 6 欠规定 = 让实现者自己发明)**:原稿只说「加两个动作」,**没给代码、没定产物名**,
+> 而 Step 7 的 `git add` 里又冒出一个**第三个**名字 `reviewed_test.jsonl`。
+> ⇒ **规定如下**:
+> - `import-test` **必须复用** trainval 那条路**同一套校验**(列错位 / id 白名单 / 重复 id /
+>   表头缺列 / 判定认不出 / 空产物 / 重复类目 / 非 UTF-8 的**人话**报错)。
+>   **做法:把 `do_import` 里那段校验抽成一个共用函数,两处调用** ——
+>   本仓那条「不变量要放在唯一写口上,不要靠每个调用方自觉」。
+>   **不许复制一份**:两份各自维护的校验就是本仓记过的漂移形状。
+> - **产物名定死**:`import-test` **写回 `evals/topic/topic_test.jsonl`**(标签列换成复核后的),
+>   **不产出 `reviewed_test.jsonl`** ⇒ Step 7 的 `git add` 里那个名字**去掉**。
+>   `topic_test.jsonl` 是验收 ① 对外报数的**唯一**依据。
+> - ⚠️ **回写这一步不能省**(原稿自己也强调了):用户改完的标签若只落在 `test.csv`,
+>   而评测读的是回写前的 `topic_test.jsonl`,**用户那 120 条的工作对指标零影响**。
+>
+> **9-E(数据,原稿没预见 —— 已实测)**:`prelabeled.jsonl` 里有 **2 行是零标签**
+> (`labels == []`,实测:有 `labels[0]` 的行 **1422** / 1424)。它的**来源不同**:
+> - `r-0049`「你是」是**模型真判了零诉求**(复审指出:≤4 字的 31 行里 30 行判 `其他`,只有它判 `[]`);
+> - `s-0423`「首重多少,超了咋算?」是**证据校验机械拒到空**(`rejected_labels == ['运费']`),
+>   而它的真实主题**几乎肯定是运费**。
+> ⇒ **把这行以空标签喂进训练,是在教模型「这句话没有主题」** —— 而那是个**处理产物,不是判断**。
+> **规定**:`split()` 必须**显式处理并打印**这两行(列 id / 问句 / `rejected_labels` / 落在哪一侧),
+> 且**把「`labels == []` 且 `rejected_labels` 非空」的行排除出 train/val**
+> (排除了就**不许**再进测试集 —— 它靶子不可信)。**这一条要有测试,且变异能红。**
 
 **Files:**
 - Modify: `app/topic/labeling.py`(加 `stratified_split`)
@@ -2079,8 +2123,14 @@ def split() -> None:
     rows = list(pre.values())
 
     parts = stratified_split(rows, test_real=80, test_synth=40)
+    # ⚠️⚠️ 计划订正 9-B(controller,2026-09-26)—— **原稿这里是 `f"{name}.jsonl"`,会写出
+    # `test.jsonl`,而本任务其余四处(Interfaces / Step 6 的两句 / Step 7 的 git add)
+    # 全都按 `topic_test.jsonl` 读写。**照原稿抄的后果不是报错,是**静默不接上**:
+    # `split` 写出 `test.jsonl`,而 `import-test` 与评测脚本读 `topic_test.jsonl`
+    # ⇒ 用户那 120 条的复核**对指标零影响**,而报告照常打印。**以 `topic_test.jsonl` 为准。**
+    TEST_NAME = "topic_test.jsonl"
     for name, items in parts.items():
-        path = ROOT / "evals" / "topic" / f"{name}.jsonl"
+        path = ROOT / "evals" / "topic" / (TEST_NAME if name == "test" else f"{name}.jsonl")
         path.write_text(
             "\n".join(json.dumps({**r, "split": name}, ensure_ascii=False) for r in items) + "\n",
             encoding="utf-8",
@@ -2099,6 +2149,38 @@ def split() -> None:
               f"报告里要标 †(spec §8.3)")
 ```
 
+- [ ] **Step 4b: train-vs-test 重复/近重复检查(计划订正 9-C —— 原稿只有一段话,没有 Step)**
+
+加一个**纯函数**到 `app/topic/labeling.py`:
+
+```python
+def train_test_overlap(train: list[dict], test: list[dict],
+                       near: float = 0.8) -> dict[str, object]:
+    """报出训练侧与测试侧的重复/近重复。**纯函数、零依赖。**
+
+    ⚠️ **为什么要这一步**(T5 复审发现,见 Task 7 节首那段):
+    `POSITIVE` 的 34 句正例进了 **T4 生成器**的 prompt,而 T4 的禁词表
+    **不覆盖这些例句** ⇒ 重跑 T4 可能把「买大了」「175 穿什么码」整句抄进问句。
+    已发生的一半:**冻结测试集里 8 行与渲染块例句字面重叠**(6 行「运费怎么算」自 T1 起、
+    2 行「什么材质」由 T5 的 Step 0 新带入)。
+
+    **判据分两档,处置不同**:
+    - **完全相同**(清洗后文本相等)⇒ **必须移出训练侧**(`split()` 负责移),它在测试侧留着;
+    - **近重复**(字符二元组 Jaccard ≥ `near`)⇒ **只报不删** —— 删了就是拿判据改数据,
+      而这条判据本身是启发式。报出条数与最像的几对,人来看。
+
+    返回 `{"exact_train_ids": [...], "near_pairs": [(train_id, test_id, 相似度), ...]}`。
+    """
+```
+
+`split()` 里接上:① 先按 `exact_train_ids` 把那些行**从 train/val 里摘掉**;
+② 把两个数(`exact` 条数、`near` 对数)与最像的几对**打印出来**;
+③ **不许** `assert` 近重复为 0(它是预期的,不是错误)。
+
+**测试(必须能红)**:造一份「训练侧含一条与测试侧逐字相同的问句 + 一条相似度高的」输入,
+断 `exact_train_ids` 抓到了那一条、`near_pairs` 非空。
+**变异**:把 `clean(q)` 换成原文比较 / 把 `near` 阈值抬到 1.0 ⇒ 对应的断言必须红。
+
 - [ ] **Step 5: 跑切分,拿真实读数**
 
 Run: `.venv/Scripts/python.exe scripts/prepare_topic_data.py split`
@@ -2107,10 +2189,24 @@ Run: `.venv/Scripts/python.exe scripts/prepare_topic_data.py split`
 
 - [ ] **Step 6: 导出测试集复核 CSV 并交给用户(🚧 与 CP-2 同一批)**
 
+⚠️ **订正 9-D:产物名已定死,别自己发明**(原稿只说「加两个动作」,而 Step 7 的 `git add`
+里还冒出一个**第三个**名字 `reviewed_test.jsonl` —— 那是原稿的内部矛盾)。
+
 在 `scripts/export_label_review.py` 里加两个动作:
 
-- `export-test`:把 `evals/topic/test.jsonl` 的**全部 120 条**导成 `evals/topic/labels/test.csv`(同样的表头);
+- `export-test`:读 **`evals/topic/topic_test.jsonl`**(⚠️ **不是 `test.jsonl`**,见订正 9-B),
+  把**全部 120 条**导成 `evals/topic/labels/test.csv`(表头与 `trainval.csv` **同一个**);
 - `import-test`:回收用户改完的 CSV,**把复核后的标签写回 `evals/topic/topic_test.jsonl`**。
+  ⚠️ **不产出 `reviewed_test.jsonl`** —— Step 7 的 `git add` 里那个名字**去掉**。
+
+⚠️ **`import-test` 必须复用 trainval 那条路的同一套校验,不许复制一份**:
+列错位(`row[None]`)/ id 白名单 / 重复 id / 表头缺列 / 判定值认不出 /
+空产物 / 单元格内重复类目 / 非 UTF-8 的**人话**报错 / 「题面以语料为准」。
+**做法**:把 `do_import` 里那段校验抽成一个**共用函数**,两处调用 ——
+本仓那条「不变量要放在唯一写口上,不要靠每个调用方自觉」。
+两份各自维护的校验就是本仓记过的漂移形状(T4 的 `reject_reason` 是同一条纪律的正例)。
+⚠️ **`test.csv` 与 `trainval.csv` 的「预标」基准不同**:前者的基准是 `topic_test.jsonl` 的
+`labels`,后者是 `prelabeled.jsonl` 的 —— 抽出共用函数时**基准要作参数**,别写死。
 
 ⚠️ **回写这一步不能省。** 用户改完的标签如果只落在 `test.csv` 或一个旁路文件里,而评测脚本读的仍是回写前的 `topic_test.jsonl`,那么**用户那 120 条的工作对指标零影响** —— 而报告会照常打印、看起来完全正常。这是一处「看起来做完了、其实没接上」。
 
@@ -2128,11 +2224,18 @@ Run:
 - [ ] **Step 7: Commit**
 
 ```bash
+# ⚠️ 订正 9-A / 9-D:本任务的 commit **分两次**(它跨检查点)。
+# B7-A(Step 1–5 + export-test 之后):
 git add app/topic/labeling.py scripts/prepare_topic_data.py \
         scripts/export_label_review.py tests/test_topic_labeling.py \
         evals/topic/train.jsonl evals/topic/val.jsonl evals/topic/topic_test.jsonl \
-        evals/topic/labels/test.csv evals/topic/reviewed_test.jsonl
-git commit -m "ch10-B T7: 分层抽样 80/10/10 + 测试集冻结(100% 人工复核)"
+        evals/topic/labels/test.csv
+git commit -m "ch10-B T7-A: 分层抽样 80/10/10 + 测试集冻结(等人工 100% 复核)"
+# ⚠️ **原稿在这里多列了 `evals/topic/reviewed_test.jsonl`** —— 那个文件**不该存在**
+#    (订正 9-D:`import-test` 只回写 `topic_test.jsonl`),照抄会 add 一个不存在的路径。
+# B7-B(用户改完 test.csv、跑完 import-test 之后):
+git add evals/topic/topic_test.jsonl dev-notes/ch10.md
+git commit -m "ch10-B T7-B: 回写人工复核后的测试集标签(冻结)"
 ```
 
 ---
