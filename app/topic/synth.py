@@ -10,7 +10,7 @@
 **零 IO、零 LLM、零 DB**:打网络的那一半在 `scripts/gen_topic_data.py` 里。
 """
 
-from app.topic.taxonomy import HEAD_LABELS, LABELS, OTHER
+from app.topic.taxonomy import COUNTER, HEAD_LABELS, LABELS, OTHER
 
 #: 每类配额。头四类加倍。
 #: 逐项加起来是 **945**(4×90 + 13×45);而脚本逐 (类, 形态) 拆成
@@ -37,8 +37,24 @@ FORMS: dict[str, float] = {"single": 0.55, "multi": 0.30, "boundary": 0.15}
 _BOUNDARY_PHRASES = frozenset({"管钱", "管货", "补差价", "券和满减"})
 
 
+def confusable(label: str) -> str | None:
+    """这个类目**最容易混的那个类目** —— 有声明就用声明,没有返回 `None`。
+
+    ⚠️ 订正轮 I1 加的。原来自合成 prompt 里只写「与它最容易混的那个类目同时出现」,
+    **让模型自由联想**,实测(2026-09-26)联出来的不是易混而是**共现**:
+    `物流` 的边界批次去撞 账号 / 评价 / 会员积分。`COUNTER` 是**全章唯一**的
+    「谁跟谁易混」权威源(它逐条写着「这句话归 X,不归 Y」),所以这里只用它。
+
+    `COUNTER` 只声明了**一部分**类目(就是它的那些键,别在这里写死个数 ——
+    那是又一处会与 taxonomy 漂移的手写清单);没声明的返回 `None`,那一支回退成
+    「让模型自己挑」的说法(实测哪几类走了回退、回退后产出了什么,记在 T4 订正报告里)。
+    """
+    pairs = COUNTER.get(label, ())
+    return pairs[0][1] if pairs else None
+
+
 def forbidden_words() -> set[str]:
-    """**从 taxonomy 派生**类目名,外加三个近邻边界的核心词。
+    """**从 taxonomy 派生**类目名,外加近邻边界的核心词(`_BOUNDARY_PHRASES`)。
 
     刻意手写一份类目名的话,加了类目就会漏 —— 而漏了不会报错,
     只会让某几类悄悄带上「术语表腔」,在真机上失效。
