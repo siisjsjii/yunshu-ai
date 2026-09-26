@@ -36,14 +36,21 @@ T = "tests/test_topic_labeling.py"
 
 LAB = ROOT / "app" / "topic" / "labeling.py"
 PREP = ROOT / "scripts" / "prepare_topic_data.py"
+PRE = ROOT / "scripts" / "prelabel_topics.py"
 EXP = ROOT / "scripts" / "export_label_review.py"
 TEST = ROOT / "tests" / "test_topic_labeling.py"
 
 TRAINVAL = ROOT / "evals" / "topic" / "labels" / "trainval.csv"
 TESTCSV = ROOT / "evals" / "topic" / "labels" / "test.csv"
+#: ⚠️ **本轮新增这一份**(订正轮 1 的 I4):`prelabel_topics` 的桩失效时,真跑会
+#: **追加**进它 —— 而它是 `split` 的输入。`I4` 那个变异正是要证明它没被动过。
+PRELABELED = ROOT / "evals" / "topic" / "prelabeled.jsonl"
 
-#: 树洁癖盯的四份源码。
-SRC = (LAB, PREP, EXP, TEST)
+#: 探针盯的三份**真产物**(开工与收工各量一次)。
+ARTIFACTS = (TRAINVAL, TESTCSV, PRELABELED)
+
+#: 树洁癖盯的五份源码(订正轮 1 起含 `prelabel_topics.py` —— I4 的变异要动它)。
+SRC = (LAB, PREP, PRE, EXP, TEST)
 
 #: 复用同一条测试名,免得每处都抄一长串
 T_COMPOSITION = f"{T}::test_test_set_has_the_prescribed_composition"
@@ -61,6 +68,8 @@ T_NEAR = f"{T}::test_train_test_overlap_honours_the_near_threshold"
 T_SPLIT = f"{T}::test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal"
 T_DISPATCH_SPLIT = f"{T}::test_main_dispatches_split"
 T_CONSTS = f"{T}::test_the_frozen_test_set_path_points_at_topic_test_jsonl"
+T_RATIOS = f"{T}::test_the_train_val_boundary_comes_from_the_ratios_argument"
+T_PRELABEL_PIN = f"{T}::test_main_pins_stdout_encoding"
 T_DISPATCH_EXPORT = f"{T}::test_main_dispatches_export_test"
 T_EXPORT_BLANK = f"{T}::test_export_writes_the_stratified_sample_with_the_judgement_columns_blank"
 T_EXPORT_TEST = f"{T}::test_export_test_writes_every_row_with_the_judgement_columns_blank"
@@ -240,6 +249,75 @@ MUTATIONS = [
         "    else:\n        do_import()\n",
         [(T_DISPATCH_EXPORT, "failed")],
     ),
+    # ==== 订正轮 1(复审:1 Important 是「读数会撒谎」+ 三条覆盖洞)====
+    (
+        "I1-a ★复审:摘除失效(`usable = list(rows)`)—— 打印**必须不再**说「已排除」",
+        LAB,
+        "    usable = [r for r in rows if not is_unusable_target(r)]\n",
+        "    usable = list(rows)\n",
+        # 复审实测:改回**硬编码**那版时,`s-0423` 落在 `train` 而打印照旧说「已排除」。
+        [(T_SPLIT, "failed")],
+    ),
+    (
+        "I1-b ★复审:把去向那一格写回**硬编码**的「已排除」(它不查 `parts`)",
+        PREP,
+        '                 f" → {actual}({reason})")\n',
+        '                 f" → {\'**已排除**\' if is_unusable_target(r) else actual}({reason})")\n',
+        [(T_SPLIT, "failed")],
+    ),
+    (
+        "I2-a ★复审:检测那一步**只喂 train**(漏掉 val)",
+        PREP,
+        '    over = train_test_overlap(parts["train"] + parts["val"], parts["test"])\n',
+        '    over = train_test_overlap(parts["train"], parts["test"])\n',
+        # ⚠️ **一致性那两句抓不住它**(检出与摘除用的是同一个小集合,两边一起变小)。
+        #    红在 ③a(逐份自检:val 摘 0 条)。
+        [(T_SPLIT, "failed")],
+    ),
+    (
+        "I2-b 摘除循环只走 train(`for name in (\"train\",)`)",
+        PREP,
+        '        for name in ("train", "val"):\n',
+        '        for name in ("train",):\n',
+        [(T_SPLIT, "failed")],
+    ),
+    (
+        "I2-c ★复审:检测只喂 **val**(I2-a 的对称错法)—— 专门探 ③b 的独立判别力",
+        PREP,
+        '    over = train_test_overlap(parts["train"] + parts["val"], parts["test"])\n',
+        '    over = train_test_overlap(parts["val"], parts["test"])\n',
+        # ⚠️ 这一条**过了 ③a**(val 侧照旧摘得到)⇒ 只有 ③b 的**独立复算**能红。
+        [(T_SPLIT, "failed")],
+    ),
+    (
+        "I3-a ★复审:公式换成写死的 `* 8 // 9`(ratios 被忽略)",
+        LAB,
+        "    n_train = round(len(rest_sorted) * ratios[0] / (ratios[0] + ratios[1]))\n",
+        "    n_train = round(len(rest_sorted) * 8 / 9)\n",
+        [(T_RATIOS, "failed")],
+    ),
+    (
+        "I3-b `ratios[2]` 被偷偷读进分母(`/ sum(ratios)`)",
+        LAB,
+        "    n_train = round(len(rest_sorted) * ratios[0] / (ratios[0] + ratios[1]))\n",
+        "    n_train = round(len(rest_sorted) * ratios[0] / sum(ratios))\n",
+        [(T_RATIOS, "failed")],
+    ),
+    (
+        "I4 ★复审:`prelabel_topics` 的桩静默失效(导入时把 `run` 绑成别名)",
+        PRE,
+        [
+            ("    asyncio.run(run(args.limit or None))\n",
+             "    asyncio.run(_REAL_RUN(args.limit or None))\n"),
+            ("if __name__ == \"__main__\":\n    main()\n",
+             "_REAL_RUN = run      # 变异:导入时绑死(桩从此拦不住它)\n\n\n"
+             "if __name__ == \"__main__\":\n    main()\n"),
+        ],
+        None,
+        # 红在哪句:桩失效 ⇒ 子进程跑**真的** prelabel ⇒ 它去读 CORPUS(已被测试改到 tmp)
+        # ⇒ `FileNotFoundError` ⇒ returncode != 0。**真产物一行不动**(OUT 同样被改过)。
+        [(T_PRELABEL_PIN, "failed")],
+    ),
 ]
 
 SUMMARY_RE = re.compile(r"(\d+) (passed|failed)")
@@ -291,9 +369,9 @@ def _run(test_id):
 
 def main() -> None:
     snapshot = {p: p.read_bytes() for p in SRC}
-    art_before = {p: (p.read_bytes() if p.exists() else None) for p in (TRAINVAL, TESTCSV)}
+    art_before = {p: (p.read_bytes() if p.exists() else None) for p in ARTIFACTS}
     _revision_report(snapshot)
-    for p in (TRAINVAL, TESTCSV):
+    for p in ARTIFACTS:
         print(f"  · 真产物 {p.name}  sha256={_sha256(p)[:16]}(开工前)")
 
     problems = 0
@@ -335,6 +413,11 @@ def main() -> None:
                 mark = "✅ 红" if got == "failed" else "绿灯"
                 flag = "" if got == want else "   !!! 与期望不符"
                 print(f"  {mark}  {test_id.split('::')[-1]}  (期望 {want}){flag}   [{counts}]")
+                # ⚠️ **红在哪一句**也要进转录(只报「红」说不清判别力落在哪条断言上)。
+                if got == "failed":
+                    exc = [l for l in proc.stdout.splitlines() if l.startswith("E ")]
+                    for line in exc[:4]:
+                        print(f"        {line}")
                 if got != want:
                     problems += 1
         finally:
@@ -345,7 +428,7 @@ def main() -> None:
             else:
                 print(f"  · 已逐字节还原 {path.name}")
 
-    for p in (TRAINVAL, TESTCSV):
+    for p in ARTIFACTS:
         same = (p.read_bytes() if p.exists() else None) == art_before[p]
         print(f"\n真产物 {p.name}:"
               f" {'未被动过 ✅' if same else '!!! 被改动了 —— 立刻停下'}"

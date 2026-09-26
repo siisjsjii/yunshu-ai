@@ -163,14 +163,28 @@ def split() -> None:
     over = train_test_overlap(parts["train"] + parts["val"], parts["test"])
     exact_ids = set(over["exact_train_ids"])
     near_pairs = over["near_pairs"]
-    removed = 0
+    # ⚠️ **逐份计数**(不是只记总数):「val 那一侧到底摘了几条」是**验收集自检**要读的
+    #    读数 —— 它若恒为 0,就说明这份语料再也分不出「摘除只走 train」那种错法
+    #    (订正轮 1 的 I2;tests 里 ③a 读它)。
+    dropped = {name: 0 for name in ("train", "val")}
     if exact_ids:
         for name in ("train", "val"):
             before = len(parts[name])
             parts[name] = [r for r in parts[name] if r["id"] not in exact_ids]
-            removed += before - len(parts[name])
-    _out(f"  train-vs-test:完全相同 {len(exact_ids)} 条(其中 {removed} 条在训练侧,已移出)、"
+            dropped[name] = before - len(parts[name])
+    removed = sum(dropped.values())
+    # ⚠️ **订正轮 1 的 M2**:原来写「完全相同 N 条(**其中** M 条在训练侧,已移出)」——
+    #    「其中」是**空的**:`train_test_overlap` 收到的就是训练侧,所以被检出的每一条
+    #    都在 train/val 里,M 恒等于 N。两个数并排只会让人以为「有些不在训练侧」。
+    #    现在改成 `assert`:它若**不等**,说明摘除只走过一侧(见上面那个 for),那才是真问题。
+    assert removed == len(exact_ids), (
+        f"摘除数 {removed} 与检出数 {len(exact_ids)} 对不上 —— 训练侧有一半没被摘"
+        f"(`for name in (…)` 少了哪一侧?)"
+    )
+    _out(f"  train-vs-test:完全相同 {len(exact_ids)} 条(**全部在训练侧**,已移出)、"
          f"近重复 {len(near_pairs)} 对(只报不删 —— 那是启发式判据,删了就是拿判据改数据)")
+    _out(f"    train 摘 {dropped['train']} 条、val 摘 {dropped['val']} 条"
+         f"(⚠️ **val 那一侧不许恒为 0** —— 恒 0 说明语料分不出「摘除只走 train」那种错法)")
     # ⚠️ **不许** `assert` 近重复为 0:它是**预期的**(T4 的 prompt 里就有那些例句),
     #    而这条判据是启发式 ⇒ 「报出来给人看」才是它的全部用途。
     for tid, xid, score in near_pairs[:10]:
@@ -180,20 +194,26 @@ def split() -> None:
 
     # ---- 【第 1 条】零标签行的去向(9-E)----
     # ⚠️ 放在**摘除之后**:要报的是「落在哪一侧」,**摘除也会改这个答案**。
-    # ⚠️ 处置靠**与 `stratified_split` 里那次摘除同一个谓词**(`is_unusable_target`),
-    #    不在这里再写一遍 `labels == [] and rejected_labels` ——
-    #    两处各自维护的判据就是本仓记过的漂移形状。
+    # ⚠️ **「落到哪儿」是读数,「为什么」才是谓词** —— 两者**不许共用一个变量**
+    #    (订正轮 1 的 **I1**,复审实测):原来 `is_unusable_target(r)` 为真时,
+    #    `where` 被赋成**硬编码**的「已排除」、**从不查 `side`** ⇒ 摘除失效时
+    #    (`usable = list(rows)`)打印**照旧**说「已排除」,而那行实际上在 `train`。
+    #    这一行打印是 dev-notes / 报告里「零标签两行去向」那个读数的**唯一来源**
+    #    ⇒ 它属于本仓「读数看着完全正常」那一族。
+    # ⚠️ 判据仍**只有一处实现**(`is_unusable_target`),但这里只用它给**理由**;
+    #    落位一律从 `parts` 里查 —— 两边分开,谁也盖不住谁。
     zero = [r for r in rows if not (r.get("labels") or [])]
     if zero:
         side = {r["id"]: name for name, items in parts.items() for r in items}
         _out(f"零标签行 {len(zero)} 条 —— **来源不同 ⇒ 处置不同**,逐条列去向:")
         for r in zero:
-            if is_unusable_target(r):
-                where = "**已排除**(靶子不可信:零标签 + rejected_labels 非空)"
-            else:
-                where = side.get(r["id"], "**不在任何一份里**(不该发生,去查 split)")
+            # ⚠️ 这一句**只读落位**,一个字的谓词成分都没有 —— 它才是读数。
+            actual = side.get(r["id"], "**不在任何一份里**")
+            # ⚠️ 谓词只给**理由**,不给落位 —— 两者分开,谁也盖不住谁(I1)。
+            reason = ("靶子不可信:零标签 + rejected_labels 非空,被 stratified_split 排除"
+                      if is_unusable_target(r) else "模型真判了零诉求(不是处理产物)")
             _out(f"  {r['id']} 「{r['question']}」 rejected_labels={r.get('rejected_labels')}"
-                 f" → {where}")
+                 f" → {actual}({reason})")
 
     # ---- 【第 4 条】写出三份(测试集的名字见订正 9-B)----
     for name, items in parts.items():
@@ -207,12 +227,23 @@ def split() -> None:
     # 三层报告的构成核对(spec §8.4)—— 数不对说明硬条件没满足,响亮地报。
     c = Counter(r["provenance"] for r in parts["test"])
     assert c["real"] == 80 and c["synthetic"] == 40, f"测试集构成不对:{dict(c)}"
-    from app.topic.taxonomy import HEAD_LABELS
-    per = Counter(lb for r in parts["test"] for lb in r["labels"])
-    thin = [lb for lb in HEAD_LABELS if per[lb] < 15]
-    if thin:
-        _out(f"  ⚠️ 头四类里这些在测试集不到 15 条:{thin} —— 它们的 F1 **不成结论**,"
-             f"报告里要标 †(spec §8.3)")
+    # ⚠️ **`†` 是按层、对全部 17 类算的**(订正轮 1 的 **M3**,controller 裁定):
+    #    spec §8.3 的判据是「**每类** support < 15」,不是「头四类 < 15」;
+    #    而 §8.4 的三列各有**自己的一套** `†`(只看真实那 80 条与只看合成那 40 条
+    #    的分母差一倍)。这里三个层都算,Task 8/9 生成报告时**照这个来**。
+    from app.topic.taxonomy import LABELS
+    for layer, subset in (
+        ("全体 120", parts["test"]),
+        ("只看真实 80", [r for r in parts["test"] if r["provenance"] == "real"]),
+        ("只看合成 40", [r for r in parts["test"] if r["provenance"] == "synthetic"]),
+    ):
+        per = Counter(lb for r in subset for lb in r["labels"])
+        thin = [lb for lb in LABELS if per[lb] < 15]
+        ok = [f"{lb} {per[lb]}" for lb in LABELS if per[lb] >= 15]
+        _out(f"  † {layer}:17 类里 **{len(thin)} 类 support < 15**(那一行 F1 不成结论);"
+             f"够 15 的只有 {ok or '—'}")
+        if thin:
+            _out(f"      标 † 的:{thin}")
     # ⚠️ 三个数**分开打**:`human_reviewed` 的条数(人工劳动的覆盖面)与
     #    测试集构成(报数依据)是两件事,合起来报会让人以为「测试集也审过了」。
     _out(f"  ⚠️ 以上是**训练侧**的读数;测试集 {len(parts['test'])} 条要 100% 人工过"

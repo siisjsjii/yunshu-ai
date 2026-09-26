@@ -406,7 +406,7 @@ def test_prelabel_wiring_writes_the_three_readings_and_resumes(monkeypatch, tmp_
     assert "本批无读数" in resume_out
 
 
-def test_main_pins_stdout_encoding():
+def test_main_pins_stdout_encoding(tmp_path):
     """`main()` **自己**必须把 stdout 钉成 UTF-8 —— **本机 locale 是 cp936**。
 
     `⚠️`(U+26A0)与 `⇒`(U+21D2)编不进 GBK,而它们只出现在「解析失败不为 0」那条
@@ -424,16 +424,37 @@ def test_main_pins_stdout_encoding():
     测的是**函数体**,不是它命名的那件事(「`main()` **必须**把 stdout 钉住」)——
     评审 M8 实测:把 `main()` 里那一行调用**删掉**(函数留着)照样全绿。
     ⇒ 现在在子进程里直接跑 `main()`,只把 `run` 换成 no-op 桩(不联网、不碰产物)。
+
+    ⚠️⭐ **订正轮 1 的 I4(与 `export_label_review` 那条 F1 完全同构,而且是**先于**本轮
+    就存在的)**:上面那个桩只盖住了**网络那一半**,`main()` 里面还有一句
+    `asyncio.run(run(args.limit or None))` —— `run` 是**模块全局、调用时求值** ⇒
+    **桩一旦静默失效**(有人把 `main()` 换个封装 / 改名 / 把 `run` 提前绑成局部),
+    子进程会跑到**真的** prelabel:它**打网络**、并**追加**进仓库里的
+    `evals/topic/prelabeled.jsonl`(我的 `split` 的输入!)——
+    而这条测试只断 stdout 与 returncode,**产物被改它照样绿**。
+    ⇒ 照 F1 的做法:**先把 `OUT` / `CORPUS` / `SYNTH` 指到 `tmp_path`、再调 `main()`**,
+    并在父进程里补一句**不依赖 print 措辞**的断言:真产物前后**逐字节相同**。
     """
     import subprocess
     import sys
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
+    # 真产物:断「它没被这次子进程动过」。⚠️ 它可能**还不存在**(全新 checkout 上没跑过
+    # prelabel)—— 那就断「跑完之后仍然不存在」,同样是「没被动过」。
+    artifact = root / "evals" / "topic" / "prelabeled.jsonl"
+    before = artifact.read_bytes() if artifact.exists() else None
+    tmp = tmp_path / "topic"
     code = "\n".join([
+        "import sys",
+        "from pathlib import Path",
         "from scripts import prelabel_topics as p",
         "async def _noop(_limit):",
         "    return None",
+        # ⚠️ **先改路径,再调 main()** —— 顺序反了就白改:真 run 会先落在真目录里。
+        f"p.OUT = Path({str(tmp / 'prelabeled.jsonl')!r})",
+        f"p.CORPUS = Path({str(tmp / 'corpus.jsonl')!r})",
+        f"p.SYNTH = Path({str(tmp / 'synthetic.jsonl')!r})",
         "p.run = _noop",              # 只桩掉网络那一半;`main()` 的其余部分照跑
         "p.main()",
         "print('⚠️ 解析失败不为 0 ⇒ 先停下看产物')",
@@ -444,6 +465,13 @@ def test_main_pins_stdout_encoding():
     )
     assert proc.returncode == 0, f"钉编码没生效(main() 里那一行被删了?):\n{proc.stderr}"
     assert "解析失败不为 0" in proc.stdout
+    # ---- I4 的两句:「桩真的拦住了」与「真产物真的没被动」----
+    # ⚠️ 第二句**不依赖 print 措辞**(措辞会变,而「有没有真的跑 prelabel」不会)。
+    after = artifact.read_bytes() if artifact.exists() else None
+    assert after == before, (
+        f"{artifact} 在这次子进程里**被改动了** —— 桩失效时真的跑了 prelabel"
+        f"(它打网络并**追加**进这份语料;而它正是 `split` 的输入)"
+    )
 
 
 # ---- 人工抽审的分层抽样(ch10 spec §6.3)—— 纯函数,零 IO ----
@@ -1114,6 +1142,44 @@ def test_head_labels_are_oversampled_into_the_test_set():
         assert c[label] >= 8, f"头四类里的 {label} 在测试集只有 {c[label]} 条"
 
 
+def test_the_train_val_boundary_comes_from_the_ratios_argument():
+    """★ 订正轮 1 的 **I3**:train/val 的边界必须**真的**由 `ratios` 决定。
+
+    ⚠️ **原来这条完全没有**:把公式换成写死的 `len(rest_sorted) * 8 // 9`,
+    另外两条测试**全绿**(复审复算过:公式本身是对的 —— `rest = 1303`、
+    `round(1303 × 0.8/0.9) = 1158`,与真产物一致 —— **错的是「没有人钉住那个参数」**)。
+
+    两句各钉一半:
+    - **`ratios` 影响边界**:`(0.6, 0.2, 0.2)` 与默认下 train 的长度必须不同,
+      且**短的那个是长的那个的前缀**(边界挪在同一条序列上,不是重新打乱);
+    - **`ratios[2]` 不影响任何东西**:两组的**测试集必须逐条相同**
+      —— 测试集是**先按固定条数取走**的(spec §5.3 的硬条件:真实 80 + 合成 40),
+      它若跟着 `ratios[2]` 变,§8.4 那三层报告就凑不出来。
+      ⇒ 「签名里写着三元组、docstring 说按 8:1:1、而第三个元素一次都没被读」这件事
+      **从注释变成了断言**(`stratified_split` 的 docstring 也写明了它不参与计算)。
+    """
+    default = stratified_split(_mixed(), test_real=80, test_synth=40, seed=0)
+    other = stratified_split(_mixed(), test_real=80, test_synth=40,
+                             ratios=(0.6, 0.2, 0.2), seed=0)
+    n = len(other["train"])
+    assert len(default["train"]) != n, "改了 ratios,train/val 的边界一动不动"
+    # ⚠️ **这两句钉的是分母**:`ratios[0] / (ratios[0] + ratios[1])`,**不是** `/ sum(ratios)`。
+    #    后者会把 `ratios[2]` 偷偷读进分母 —— 而上面那句「边界跟着动」**抓不住它**
+    #    (两组一起缩小,相对关系不变;变异 **I3-b** 实测:只有这两句能红)。
+    rest = 300 - 120          # `_mixed()` 300 条,测试集先按固定条数取走 120
+    assert len(default["train"]) == round(rest * 0.8 / 0.9)
+    assert n == round(rest * 0.6 / 0.8)
+    assert [r["id"] for r in other["train"]] == [r["id"] for r in default["train"]][:n], (
+        "边界不是在同一条序列上挪的 —— 那说明 ratios 顺带把抽样顺序也改了"
+    )
+    assert {r["id"] for r in other["val"]} == {
+        r["id"] for r in default["train"][n:] + default["val"]
+    }
+    assert [r["id"] for r in other["test"]] == [r["id"] for r in default["test"]], (
+        "ratios[2] 被读进去了 —— 测试集必须由 test_real/test_synth 定死(spec §5.3)"
+    )
+
+
 def test_rare_labels_are_not_squeezed_out_of_the_test_set():
     """★ 小类必须**露面** —— 这一条才是「分层」区别于「按比例」的判据。
 
@@ -1281,22 +1347,32 @@ def _bind_split(monkeypatch, tmp_path):
 
 
 def _split_corpus(tmp_path):
-    """给接线用例造语料。⚠️ **`exact_train_ids` 非空是有论证的,不是靠运气**:
+    """给接线用例造语料。⚠️ **两件事都有论证,不是靠运气**(本仓规矩:
+    构造输入前先算一遍它会不会走到那条分支)。
 
-    真实池 **122** 条,其中 **61** 条是**同一个文本**;切走 80 条后训练侧(含验证)
-    剩 **42** 条 ⇒ 那 61 份**不可能全落在训练侧**(42 < 61)⇒ **至少有一份在测试侧**
-    ⇒ 那个文本两侧都有 ⇒ 必然报出「完全相同」。
-    (本仓规矩:构造输入前先算一遍它会不会走到那条分支。)
+    **① `exact_train_ids` 非空**:真实池 **122** 条 = 文本甲 ×**61** + 文本乙 ×**60**
+    + 一条零标签;切走 80 条后训练侧(含验证)剩 **42** 条 ⇒ 两个文本的份数(61 / 60)
+    **都大于 42** ⇒ 哪个文本都不可能**整组**落在训练侧 ⇒ 两个文本**两侧都有**
+    ⇒ 训练侧的**每一条真实行**都是「完全相同」,`exact = 42`。
+
+    **② 验证侧**也**必须**有该被摘的行(订正轮 1 的 **I2**)——
+    这一条以前**没有**,而它正是漏洞所在:检测那一步的**入参**写成
+    `parts["train"]`(漏掉 val)时,**48 条全绿**(复审实测)。
+    论证:`rest` = 42 条真实 + **4** 条合成(合成池 44 − 测试集 40);
+    `n_train = round(46 × 8/9) = 41` ⇒ **val 只有 5 条**,而合成的只有 4 条
+    ⇒ **val 里至少有 1 条真实行**(≥1 条该被摘的)⇒ 「检测漏喂 val」与
+    「摘除只走 train」两种错法都会**少摘**,可被下面第 ③b 条的**独立复算**抓住。
     """
     rows = [{"id": f"r-{i:04d}", "provenance": "real", "source": "chat",
-             "labels": ["尺码"], "question": "重复句"} for i in range(61)]
+             "labels": ["尺码"], "question": "重复句甲"} for i in range(61)]
     rows += [{"id": f"r-1{i:03d}", "provenance": "real", "source": "chat",
-              "labels": ["尺码"], "question": f"独有问题{i}"} for i in range(60)]
+              "labels": ["尺码"], "question": "重复句乙"} for i in range(60)]
     # 9-E 的两行形状:模型真判零诉求 / 证据校验机械拒到空
     rows.append({"id": "r-9001", "provenance": "real", "source": "chat",
                  "labels": [], "rejected_labels": [], "question": "你是"})
+    # ⚠️ 合成只留 **4** 条进 rest(44 − 40)—— 上面论证 ② 靠的就是这个数(`< val 的 5 条`)。
     rows += [{"id": f"s-{i:04d}", "provenance": "synthetic", "source": "gen",
-              "labels": ["运费"], "question": f"合成问题{i}"} for i in range(80)]
+              "labels": ["运费"], "question": f"合成问题{i}"} for i in range(44)]
     rows.append({"id": "s-9002", "provenance": "synthetic", "source": "gen",
                  "labels": [], "rejected_labels": ["运费"], "question": "首重多少,超了咋算?"})
     tmp_path.joinpath("prelabeled.jsonl").write_text(
@@ -1341,6 +1417,18 @@ def test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal(
     for rid in ("r-9001", "s-9002"):
         assert f"{rid} " in out, f"{rid} 没被列出去向"
     assert "'运费'" in out, "不可信那行必须把 `rejected_labels` 打出来(否则与真判零诉求分不开)"
+    # ⭐ **订正轮 1 的 I1**:那一行的**落位必须是从 `parts` 里读出来的**。
+    # 原来谓词为真时 `where` 是**硬编码**的「已排除」,从不查实际落位 ⇒ 摘除失效时
+    # 打印**照旧**说「已排除」,而那行其实在 `train`(复审实测)。这一行打印是
+    # dev-notes / 报告里「零标签两行去向」那个读数的**唯一来源** ⇒ 它撒谎就是读数撒谎。
+    bad = [l for l in out.splitlines() if "s-9002" in l]
+    assert len(bad) == 1, bad
+    assert "**不在任何一份里**" in bad[0], (
+        f"零标签行的去向必须**读实际落位**(它是读数),谓词只许给「为什么」:\n{bad[0]}"
+    )
+    assert "已排除" not in bad[0].split("(")[0], (
+        f"去向那一格又被写成硬编码的「已排除」了(它没查 `parts`):\n{bad[0]}"
+    )
     assert "s-9002" not in ids, "靶子不可信的行还是进了某一份"
     assert ids.count("r-9001") == 1, (
         "模型真判零诉求的行被一起丢了 —— 过度处置(它该留在某一份里)"
@@ -1358,8 +1446,44 @@ def test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal(
         f"(实际 {len(ids)})⇒ 摘除那一步没接上"
     )
     masked = set(r["id"] for r in rows) - set(ids) - {"s-9002"}
-    assert len(masked) == exact
     assert not (masked & {r["id"] for r in files["train"] + files["val"] + files["test"]})
+
+    # ---- ③a **用例自检**:验证侧真的有该被摘的行(见 `_split_corpus` 的论证 ②)----
+    # ⚠️ 这一句防的是「这条用例**悄悄失去判别力**」:语料若哪天不再保证 val 侧有重复,
+    #    下面 ③b 的复算会变得**恒真**,而**不会有任何东西红**。
+    m2 = re.search(r"train 摘 (\d+) 条、val 摘 (\d+) 条", out)
+    assert m2, f"没有打印逐份摘除数(自检要读它):\n{out}"
+    # ⚠️ **这条读数的两种成因必须分开说**(它自己没法分辨,别让它替读者下结论):
+    #    (a) 语料漂移:val 里不再有该被摘的行 ⇒ 这条用例对「检测漏喂 val」失去判别力;
+    #    (b) **代码漏了 val**(检测只喂 `parts["train"]`,或摘除循环只走 `train`)。
+    #    (b) 是复审在 I2 里指的那个洞,而它**正是在这里现形**的(变异 I2-a 实测)。
+    assert int(m2.group(2)) >= 1, (
+        f"val 那一侧摘了 0 条 —— 两种成因,先分清再修:\n"
+        f"  (a) **语料漂移**:val 里不再有该被摘的行(见 `_split_corpus` 的论证 ②)"
+        f" ⇒ 这条用例已对「检测漏喂 val」失去判别力;\n"
+        f"  (b) **代码漏了 val**:检测那一步只喂了 `parts['train']`,或摘除循环只走 `train`。\n"
+        f"train {m2.group(1)} / val {m2.group(2)}"
+    )
+
+    # ---- ③b **独立复算**该被摘掉的全集(订正轮 1 的 I2)----
+    # ⚠️ 上面那句一致性(`len(ids) == … − exact`)**抓不住**下面这个缺陷:
+    #    检测只喂 `parts["train"]`(漏掉 val)时,「检出的」与「摘掉的」用的是**同一个
+    #    小集合** ⇒ 两边一起变小,**一致性照样成立**(复审实测:48 条全绿)。
+    #    ⇒ 必须在这儿**另算一遍**:训练侧里凡是文本与某个测试侧行逐字相同的,都该被摘。
+    #    (这里是**原文**比较,不是 `clean` 后比较 —— 这份语料的重复句本来就连原文都相同,
+    #     所以这一句不依赖被测的那条清洗口径。)
+    test_texts = {r["question"] for r in files["test"]}
+    test_ids = {r["id"] for r in files["test"]}
+    pre_trainval = [r for r in rows if r["id"] not in test_ids and r["id"] != "s-9002"]
+    expect_drop = {r["id"] for r in pre_trainval if r["question"] in test_texts}
+    assert len(expect_drop) == exact, (
+        f"独立复算出该摘 {len(expect_drop)} 条、打印说 {exact} 条 —— 检测那一步的"
+        f"**入参**漏了训练侧的一半?(`parts['train'] + parts['val']` 里少了哪一半)"
+    )
+    assert masked == expect_drop, (
+        f"实际摘掉的和该摘的对不上:少了 {sorted(expect_drop - masked)}、"
+        f"多了 {sorted(masked - expect_drop)}"
+    )
 
     # ---- ④ 测试集构成(与 `split()` 里那条 assert 同源,这里独立复算一遍)----
     from collections import Counter

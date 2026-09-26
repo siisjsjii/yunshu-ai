@@ -1,115 +1,241 @@
 树洁癖复查(开跑那一刻的版本;要跟报告的其余读数对上):
-  · app/topic/labeling.py  11945 B  sha256=d783529d0f878a14  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
-  · scripts/prepare_topic_data.py  11507 B  sha256=0735a0deef5b6d8a  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
-  · scripts/export_label_review.py  21893 B  sha256=b6ee3740cd454631  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
-  · tests/test_topic_labeling.py  77499 B  sha256=0d8f12512f6c2583  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · app/topic/labeling.py  13725 B  sha256=03fa14a5cf8813c4  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · scripts/prepare_topic_data.py  14221 B  sha256=6c06e59de5758da6  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · scripts/prelabel_topics.py  12315 B  sha256=8afe8f46fc9f388a  == HEAD(逐字节)
+  · scripts/export_label_review.py  21893 B  sha256=b6ee3740cd454631  == HEAD(逐字节)
+  · tests/test_topic_labeling.py  86475 B  sha256=3bb3e07dcbcdc720  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
   · 真产物 trainval.csv  sha256=201f1c77daad862c(开工前)
   · 真产物 test.csv  sha256=30542ad40718b349(开工前)
+  · 真产物 prelabeled.jsonl  sha256=6947f2bc2a57bd34(开工前)
 
 === M1 ★必查:删掉 take() 里的 `rng.shuffle(b)`  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_different_seeds_give_different_test_sets  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert ['r99', 'r98', 'r97', 'r96', 'r95', 'r94', ...] != ['r99', 'r98', 'r97', 'r96', 'r95', 'r94', ...]
   绿灯  test_split_is_reproducible  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M2 `random.Random(seed)` → `random.Random()`(种子被丢掉)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_is_reproducible  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert ['r5', 'r69',...4', 'r4', ...] == ['r15', 'r25'...1', 'r3', ...]
+        E         
+        E         At index 0 diff: 'r5' != 'r15'
+        E         Use -v to get more diff
   · 已逐字节还原 labeling.py
 
 === M3 去掉「靶子不可信先摘掉」(`usable = list(rows)`)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_rows_with_an_untrusted_target_are_dropped_out_of_the_split  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���Ӳ����ŵ��л��ǽ���ĳһ��
+        E       assert 's-bad' not in ['r15', 's0', 's8', 'r7', 'r13', 's14', ...]
   · 已逐字节还原 labeling.py
 
 === M4 谓词过度处置:零标签就排除(不看 rejected_labels)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_unusable_target_predicate  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert True is False
+        E        +  where True = is_unusable_target({'labels': [], 'rejected_labels': []})
   ✅ 红  test_rows_with_an_untrusted_target_are_dropped_out_of_the_split  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ģ��������������б�һ���ų��� ���� ���ȴ���
+        E       assert 'r-judged' in ['r17', 's1', 'r18', 'r8', 'r15', 's14', ...]
   · 已逐字节还原 labeling.py
 
 === M5 轮转取 → 每次从**最大的桶**取(小类被挤没)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_rare_labels_are_not_squeezed_out_of_the_test_set  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ��ЩС���ڲ��Լ���һ����û��:['��Ʊ', '�۱�', '֧��', '�˺�', '��Ա����', '����', '��Ʒ��Ϣ', '����ά��', '��油��', '�����޸�']
+        E       assert ['��Ʊ', '�۱�', ...��', '����', ...] == []
+        E         
+        E         Left contains 10 more items, first extra item: '��Ʊ'
   绿灯  test_head_labels_are_oversampled_into_the_test_set  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M6 train_test_overlap 用**原文**比较(不过 clean)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert [] == ['r-exact']
+        E         
+        E         Right contains one more item: 'r-exact'
+        E         Use -v to get more diff
   · 已逐字节还原 labeling.py
 
 === M7 `near` 默认值 0.8 → 1.0(近重复只剩「完全相同」)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: []
+        E       assert [] == [('r-near', 't-near')]
+        E         
+        E         Right contains one more item: ('r-near', 't-near')
   绿灯  test_train_test_overlap_honours_the_near_threshold  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M7b 阈值写死 `0.8`(参数被忽略)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_train_test_overlap_honours_the_near_threshold  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: []
+        E       assert (0 == 1)
+        E        +  where 0 = len([])
   绿灯  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 labeling.py
 
 === M8 完全相同的那对**也**计入 near_pairs(读数虚高)  [app\topic\labeling.py]
   · 树洁癖复查 ✅
   ✅ 红  test_train_test_overlap_reports_exact_duplicates_and_near_pairs  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: [('r-exact', 't-exact', 1.0), ('r-near', 't-near', 0.8333333333333334)]
+        E       assert [('r-exact', ...r', 't-near')] == [('r-near', 't-near')]
+        E         
+        E         At index 0 diff: ('r-exact', 't-exact') != ('r-near', 't-near')
   · 已逐字节还原 labeling.py
 
 === M9 ★订正 9-B:产物名写成 `test.jsonl`  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\mike\\AppData\\Local\\Temp\\pytest-of-mike\\pytest-972\\test_split_wires_the_overlay_t0\\topic_test.jsonl'
   · 已逐字节还原 prepare_topic_data.py
 
 === M10 ★订正 9-C:完全相同的不摘除(数据泄漏)  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ժ���� 0 ������ 42 �Բ��� ���� ѵ������һ��û��ժ(`for name in (��)` ������һ��?)
   · 已逐字节还原 prepare_topic_data.py
 
 === M11 `reviewed.jsonl` 的覆盖不生效(人工复核成果进不了语料)  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: \u4eba\u5de5\u6539\u8fc7\u7684\u6807\u7b7e\u6ca1\u8986\u76d6\u8fdb\u8bed\u6599 \u21d2 \u7528\u6237\u90a3 84 \u6761\u7684\u590d\u6838\u6210\u679c\u53ea\u5f71\u54cd\u62a5\u8868\u3001\u4e0d\u8fdb\u8bad\u7ec3
+        E       assert (1 == 1 and ['�˷�'] == ['��Ʊ']
+        E        +  where 1 = len([{'id': 's-0000', 'provenance': 'synthetic', 'source': 'gen', 'labels': ['�˷�'], ...}])
+        E         
   · 已逐字节还原 prepare_topic_data.py
 
 === M12 ★订正 9-E:零标签行的去向不打印  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: û����ʽ�г����ǩ�е�ȥ��
+        E       assert '\u96f6\u6807\u7b7e\u884c' in "\u8bfb\u5165 167 \u6761;\u5176\u4e2d 1 \u6761\u7528\u7684\u662f**\u4eba\u5de5\u590d\u6838\u8fc7\u7684**\u6807\u7b7e(reviewed.jsonl \u7684\u8986\u76d6\u751f\u6548)\\n  train-vs-test:\u5b8c\u5168\u76f8\u540c 42 \u6761(**\u5168\u90e8\u5728\u8bad\u7ec3\u4fa7**,\u5df2\u79fb\u51fa)\u3001\u8fd1\u91cd\u590d 3 \u5bf9(\u53ea\u62a5\u4e0d\u5220 \u2014\u2014 \u90a3\u662f\u542f\u53d1\u5f0f...', '\u4f1a\u5458\u79ef\u5206', '\u8bc4\u4ef7', '\u5176\u4ed6']\\n  \u26a0\ufe0f \u4ee5\u4e0a\u662f**\u8bad\u7ec3\u4fa7**\u7684\u8bfb\u6570;\u6d4b\u8bd5\u96c6 120 \u6761\u8981 100% \u4eba\u5de5\u8fc7(`export-test` \u2192 \u7528\u6237\u6539 \u2192 `import-test`),\u90a3\u4e4b\u524d\u5b83**\u8fd8\u4e0d\u80fd\u7528\u6765\u62a5\u6570**\u3002\\n"
   · 已逐字节还原 prepare_topic_data.py
 
 === M13 测试集构成那条 assert 不再拦(synth 41 也照写)  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���Լ����ɲ���:{'real': 80, 'synthetic': 41}
   · 已逐字节还原 prepare_topic_data.py
 
 === M14 ★命令行分派:删掉 `elif args.step == "split"`  [scripts\prepare_topic_data.py]
   · 树洁癖复查 ✅
   ✅ 红  test_main_dispatches_split  (期望 failed)   [{'failed': 1}]
+        E           SystemExit: split ��ûʵ��(�ɺ���������)
   · 已逐字节还原 prepare_topic_data.py
 
 === M15 ★订正 9-B:export-test 读 `test.jsonl`  [scripts\export_label_review.py]
   · 树洁癖复查 ✅
   ✅ 红  test_the_frozen_test_set_path_points_at_topic_test_jsonl  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert WindowsPath('D:/agent/MewHelp-develop/evals/topic/test.jsonl') == (((WindowsPath('D:/agent/MewHelp-develop') / 'evals') / 'topic') / 'topic_test.jsonl')
+        E        +  where WindowsPath('D:/agent/MewHelp-develop/evals/topic/test.jsonl') = <module 'scripts.export_label_review' from 'D:\\agent\\MewHelp-develop\\scripts\\export_label_review.py'>.TOPIC_TEST
+        E        +  and   WindowsPath('D:/agent/MewHelp-develop') = <module 'scripts.export_label_review' from 'D:\\agent\\MewHelp-develop\\scripts\\export_label_review.py'>.ROOT
   绿灯  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 passed)   [{'passed': 1}]
   · 已逐字节还原 export_label_review.py
 
 === M16 export-test 写成**抽样**(照抄 export 的 per_label=5)  [scripts\export_label_review.py]
   · 树洁癖复查 ✅
   ✅ 红  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ����ȫ������(Ӧ�� 8 ��,ʵ�� 5)
+        E       assert 5 == 8
+        E        +  where 5 = len([['t000', '��������0', '����', '', '', ''], ['t002', '��������2', '����', '', '', ''], ['t003', '��������3', '����', '', '', ''], ['t006', '��������6', '����', '', '', ''], ['t007', '���ǩ��', '����|�˻���', '', '', '']])
   · 已逐字节还原 export_label_review.py
 
 === M17 导出时把预标标签写进「最终标签」列  [scripts\export_label_review.py]
   · 树洁癖复查 ✅
   ✅ 红  test_export_test_writes_every_row_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���ж���/�����ձ�ǩ��/����ע��������**��**�� ���� ���˾Ͱ��û�����ʲô��ǰ�ٵ�
+        E       assert {('', '����', '...'����|�˻���', '')} == {('', '', '')}
+        E         
+        E         Extra items in the left set:
   ✅ 红  test_export_writes_the_stratified_sample_with_the_judgement_columns_blank  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���ж���/�����ձ�ǩ��/����ע��������**��**�� ���� ���˾Ͱ��û�����ʲô�������ǰ�ٵ�
+        E       assert {('', '����', '...', '�˻���', '')} == {('', '', '')}
+        E         
+        E         Extra items in the left set:
   · 已逐字节还原 export_label_review.py
 
 === M18 ★命令行分派:删掉 `elif args.action == "export-test"`  [scripts\export_label_review.py]
   · 树洁癖复查 ✅
   ✅ 红  test_main_dispatches_export_test  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert ['import'] == ['export-test']
+        E         
+        E         At index 0 diff: 'import' != 'export-test'
+        E         Use -v to get more diff
   · 已逐字节还原 export_label_review.py
+
+=== I1-a ★复审:摘除失效(`usable = list(rows)`)—— 打印**必须不再**说「已排除」  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���ǩ�е�ȥ�����**��ʵ����λ**(���Ƕ���),ν��ֻ������Ϊʲô��:
+        E           s-9002 �����ض���,����զ��?�� rejected_labels=['�˷�'] �� test(���Ӳ�����:���ǩ + rejected_labels �ǿ�,�� stratified_split �ų�)
+        E       assert '**�����κ�һ����**' in "  s-9002 �����ض���,����զ��?�� rejected_labels=['�˷�'] �� test(���Ӳ�����:���ǩ + rejected_labels �ǿ�,�� stratified_split �ų�)"
+  · 已逐字节还原 labeling.py
+
+=== I1-b ★复审:把去向那一格写回**硬编码**的「已排除」(它不查 `parts`)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���ǩ�е�ȥ�����**��ʵ����λ**(���Ƕ���),ν��ֻ������Ϊʲô��:
+        E           s-9002 �����ض���,����զ��?�� rejected_labels=['�˷�'] �� **���ų�**(���Ӳ�����:���ǩ + rejected_labels �ǿ�,�� stratified_split �ų�)
+        E       assert '**�����κ�һ����**' in "  s-9002 �����ض���,����զ��?�� rejected_labels=['�˷�'] �� **���ų�**(���Ӳ�����:���ǩ + rejected_labels �ǿ�,�� stratified_split �ų�)"
+  · 已逐字节还原 prepare_topic_data.py
+
+=== I2-a ★复审:检测那一步**只喂 train**(漏掉 val)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: val ��һ��ժ�� 0 �� ���� ���ֳ���,�ȷ�������:
+        E           (a) **\u8bed\u6599\u6f02\u79fb**:val \u91cc\u4e0d\u518d\u6709\u8be5\u88ab\u6458\u7684\u884c(\u89c1 `_split_corpus` \u7684\u8bba\u8bc1 \u2461) \u21d2 \u8fd9\u6761\u7528\u4f8b\u5df2\u5bf9\u300c\u68c0\u6d4b\u6f0f\u5582 val\u300d\u5931\u53bb\u5224\u522b\u529b;
+        E           (b) **����©�� val**:�����һ��ֻι�� `parts['train']`,��ժ��ѭ��ֻ�� `train`��
+        E         train 37 / val 0
+  · 已逐字节还原 prepare_topic_data.py
+
+=== I2-b 摘除循环只走 train(`for name in ("train",)`)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ժ���� 37 ������ 42 �Բ��� ���� ѵ������һ��û��ժ(`for name in (��)` ������һ��?)
+  · 已逐字节还原 prepare_topic_data.py
+
+=== I2-c ★复审:检测只喂 **val**(I2-a 的对称错法)—— 专门探 ③b 的独立判别力  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_split_wires_the_overlay_the_zero_label_rows_and_the_overlap_removal  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: �����������ժ 42 ������ӡ˵ 5 �� ���� �����һ����**���**©��ѵ�����һ��?(`parts['train'] + parts['val']` ��������һ��)
+        E       assert 42 == 5
+        E        +  where 42 = len({'r-0004', 'r-0005', 'r-0006', 'r-0008', 'r-0012', 'r-0013', ...})
+  · 已逐字节还原 prepare_topic_data.py
+
+=== I3-a ★复审:公式换成写死的 `* 8 // 9`(ratios 被忽略)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_the_train_val_boundary_comes_from_the_ratios_argument  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ���� ratios,train/val �ı߽�һ������
+        E       assert 160 != 160
+        E        +  where 160 = len([{'id': 's140', 'provenance': 'synthetic', 'labels': ['�˷�'], 'question': '�ϳ�����140'}, {'id': 's137', 'provenance': 'syn... ['�˷�'], 'question': '�ϳ�����138'}, {'id': 's26', 'provenance': 'synthetic', 'labels': ['�˷�'], 'question': '�ϳ�����26'}, ...])
+  · 已逐字节还原 labeling.py
+
+=== I3-b `ratios[2]` 被偷偷读进分母(`/ sum(ratios)`)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_the_train_val_boundary_comes_from_the_ratios_argument  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: assert 144 == 160
+        E        +  where 144 = len([{'id': 's140', 'provenance': 'synthetic', 'labels': ['�˷�'], 'question': '�ϳ�����140'}, {'id': 's137', 'provenance': 'syn... ['�˷�'], 'question': '�ϳ�����138'}, {'id': 's26', 'provenance': 'synthetic', 'labels': ['�˷�'], 'question': '�ϳ�����26'}, ...])
+        E        +  and   160 = round(((180 * 0.8) / 0.9))
+  · 已逐字节还原 labeling.py
+
+=== I4 ★复审:`prelabel_topics` 的桩静默失效(导入时把 `run` 绑成别名)  [scripts\prelabel_topics.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_main_pins_stdout_encoding  (期望 failed)   [{'failed': 1}]
+        E       AssertionError: ������û��Ч(main() ����һ�б�ɾ��?):
+        E         Traceback (most recent call last):
+        E           File "<string>", line 10, in <module>
+        E             p.main()
+  · 已逐字节还原 prelabel_topics.py
 
 真产物 trainval.csv: 未被动过 ✅(sha256=201f1c77daad862c)
 
 真产物 test.csv: 未被动过 ✅(sha256=30542ad40718b349)
+
+真产物 prelabeled.jsonl: 未被动过 ✅(sha256=6947f2bc2a57bd34)
 ============================================================
 问题数:0

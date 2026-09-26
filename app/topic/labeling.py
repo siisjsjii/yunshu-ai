@@ -146,6 +146,14 @@ def stratified_split(
     把「模型对了」记成「模型错了」。排除掉的行不在返回值里 —— 调用方要报它们的
     去向,得自己按 `labels == []` 把零标签行找出来,再用**同一个谓词**分辨
     「靶子不可信」与「模型真判零诉求」(`split()` 就是这么做的)。
+
+    ⚠️⚠️ **`ratios[2]` 不参与任何计算**(订正轮 1 的 I3,controller 2026-09-26 裁定):
+    测试集是**先按 `test_real` / `test_synth` 固定条数取走**的,剩下的只按
+    `ratios[0] : ratios[1]` 分训练与验证。三元组留着是为了让签名与 spec 的「8:1:1」对得上,
+    **但它既不读第三个元素、也不该读** —— 用它定测试集条数的话,§8.4 那三层报告的
+    「真实 80 / 合成 40」就再也凑不出来(那正是这个方法存在的前提)。
+    ⚠️ 这句以前写的是「按 8:1:1 切」—— 一句**看起来会生效、其实什么都没做**的话,
+    本仓那条「静默无效」家族的注释版。
     """
     usable = [r for r in rows if not is_unusable_target(r)]
     rng = random.Random(seed)
@@ -153,8 +161,13 @@ def stratified_split(
     for r in usable:
         by_prov[r["provenance"]].append(r)
 
-    def take(pool: list[dict], n: int) -> tuple[list[dict], list[dict]]:
-        """按主标签分层取 n 条,返回 (取出, 剩下)。"""
+    def take(pool: list[dict], n: int) -> list[dict]:
+        """按主标签分层取 n 条。
+
+        ⚠️ 它**只返回取出的那些**(订正轮 1 的 M1):原版还返回一个「剩下」的列表,
+        而两处调用都写 `take(...)[0]`、「剩下」谁也没用 —— 而且那个局部变量**也叫
+        `rest`**,与外层真正被用的 `rest` 同名,读起来像「剩余」却被丢弃。
+        """
         buckets: dict[str, list[dict]] = defaultdict(list)
         for r in pool:
             buckets[(r.get("labels") or ["其他"])[0]].append(r)
@@ -170,12 +183,10 @@ def stratified_split(
             if buckets[k]:
                 picked.append(buckets[k].pop())
             i += 1
-        picked_ids = {r["id"] for r in picked}
-        rest = [r for r in pool if r["id"] not in picked_ids]
-        return picked, rest
+        return picked
 
-    test = take(by_prov.get("real", []), test_real)[0] + \
-        take(by_prov.get("synthetic", []), test_synth)[0]
+    test = take(by_prov.get("real", []), test_real) + \
+        take(by_prov.get("synthetic", []), test_synth)
     test_ids = {r["id"] for r in test}
     rest = [r for r in usable if r["id"] not in test_ids]
 
@@ -221,6 +232,15 @@ def train_test_overlap(train: list[dict], test: list[dict],
       会让「近重复 N 对」这个读数虚高,而 `exact` 那一档谁也不会漏看;
     - `train` 是**训练侧**(调用方把 `train + val` 一起传进来)—— 验证集参与早停与
       阈值选择 ⇒ 它泄漏的后果与训练集同级。
+
+    ⚠️ **`near=0.8` 是默认值,不是标定值**(订正轮 1 如实记账)。已知的偏差方向是
+    **偏松**(会把不该算的一对算进来),成因有一处是本章自己的清洗:
+    `clean()` 把订单号/手机号**脱敏**成同一个占位符 ⇒
+    「查一下订单号为100086的订单」与「查一下订单号为10086的订单」在**清洗后**只差一个字符
+    (真实语料上实测 **0.867**,就是这么来的 —— 见 `dev-notes/ch10.md` 阶段 8)。
+    两句话在**语义上**都只是「查订单」,所以报出来不算错;但**换一批语料会有别的形态**。
+    ⇒ 要动这个阈值,**先标定再改**(把 `near` 从 0.5 扫到 0.95 看对数怎么变 ——
+    本函数是纯函数、零 IO,一行就能跑),不要凭感觉调。
     """
     by_text: dict[str, list[str]] = defaultdict(list)
     for row in test:
