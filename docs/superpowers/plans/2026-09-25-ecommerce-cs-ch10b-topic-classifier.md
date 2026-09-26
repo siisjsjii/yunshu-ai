@@ -1829,6 +1829,12 @@ def do_import() -> None:
         "\n".join(json.dumps(r, ensure_ascii=False) for r in out_rows) + "\n",
         encoding="utf-8",
     )
+    # ⚠️ 订正 8(controller,2026-09-26):**这一句在盘上已经不这么写了。**
+    # 真实现是「其中**标签与预标不同**的 {changed} 条」 —— 因为 `changed` 的**语义**
+    # 已由订正 7 改成「生效标签 ≠ 预标标签」(那才是 spec §6.3 的错误率分子),
+    # 而「用户判『改』的」是**判定列**的口径,**两者会在合法输入上分歧**
+    # (用户改了标签但没写判定 ⇒ 按标签数是 N、按判定数是 0)。
+    # 措辞不改的话,谁把这一行抄进 spec §6.3 就会写错名 —— 本仓「名字与语义不符」那条形状。
     print(f"回收 {len(out_rows)} 条 → {REVIEWED};其中用户判「改」的 {changed} 条")
     # ⚠️ 「judged 改」的比例就是**预标错误率的观测值**(只覆盖被抽到的那些),
     #    它要进报告,与 F1 并排(spec §6.3)。
@@ -1851,7 +1857,8 @@ Run: `.venv/Scripts/python.exe scripts/export_label_review.py export`
 
 **停下来,把 `evals/topic/labels/trainval.csv` 交给用户。** 明确说清:
 ① 他只需填 **「判定(ok/改)」** 与 **「最终标签」** 两列;② 没填的按预标算;
-③ 这一份是**测错误率**的(不是逐条改),所以「改」的条数本身就是产物。
+③ 这一份是**测错误率**的(不是逐条改),所以**「标签与预标不同」的条数**本身就是产物
+(⚠️ 订正 8:**不是**「用户判『改』的条数」—— 后者是判定列口径,见 Step 5 块首的注记)。
 
 > ⚠️ 测试集那份 CSV(120 条,100% 过)由任务 7 在切分之后导出 —— **切分要用到用户改过的标签,所以本任务必须先回收**。
 
@@ -1859,7 +1866,9 @@ Run: `.venv/Scripts/python.exe scripts/export_label_review.py export`
 
 Run: `.venv/Scripts/python.exe scripts/export_label_review.py import`
 
-**把打印的两个数(总条数、「改」的条数)抄进 `dev-notes/ch10.md`。**
+**把打印的两个数(总条数、**「标签与预标不同」的条数**)抄进 `dev-notes/ch10.md`。**
+⚠️ 订正 8:第二个数的**名字**必须照实现打印的那个用 —— 它**不是**「用户判『改』的条数」。
+若打印里同时给了「警告:有 N 行标签变了但没写判定」,**那个数也要抄**(它说明用户漏填了判定列)。
 
 - [ ] **Step 8: Commit**
 
