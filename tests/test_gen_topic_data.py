@@ -192,13 +192,31 @@ def test_plan_realises_the_quota_and_the_global_form_shares():
         assert got >= QUOTA[lb], f"{lb} 计划只要 {got} 条,少于配额 {QUOTA[lb]}"
     assert multi / total >= 0.30 - 1e-9, f"计划里 multi 只占 {multi / total:.1%}"
     assert boundary / total >= 0.15 - 1e-9, f"计划里 boundary 只占 {boundary / total:.1%}"
+    # ⚠️ 上面两条是**单向**的(≥ 门槛),所以「每批固定 30 条」这种**无视 `FORMS`** 的计划
+    #    能让它们**全绿**(30/90 = 33.3% ≥ 30%)。下面两条才是那个变异体真正的判别式:
+    #    计划拆分出来的**比例必须就是 `FORMS` 要的比例**(取整允许 1 个百分点的偏移)。
+    #    —— 顺带把那条取整 pin 的失败文案钉住方向:红在**这里**说明 `plan()` 没读 `FORMS`,
+    #       而不是「裁定变了」(F7)。
+    assert abs(multi / total - FORMS["multi"]) <= 0.01, (
+        f"计划里 multi 占 {multi / total:.1%},与 `FORMS[\"multi\"]` 要的 {FORMS['multi']:.0%} "
+        f"差出 1 个百分点以上 —— **先去看 `plan()` / `batch_size()` 有没有真读 `FORMS`**,"
+        f"别去改下面那条取整 pin(它记的是取整效应,不是这个错因)"
+    )
+    assert abs(boundary / total - FORMS["boundary"]) <= 0.01, (
+        f"计划里 boundary 占 {boundary / total:.1%},与 `FORMS[\"boundary\"]` 要的 "
+        f"{FORMS['boundary']:.0%} 差出 1 个百分点以上 —— **先去看 `plan()` 有没有真读 `FORMS`**"
+    )
     # 头四类的**逐类** multi 占比确实在 30% 线下 —— 这是**已知且被裁定接受**的取整效应,
     # 写成断言是为了让「以后有人把它当 bug 改」这件事被看见(要改先看 §6 那段裁定)。
     head = [lb for lb in HEAD_LABELS]
     head_share = sum(n for l, form, n in batches if l in head and form == "multi") / sum(
         n for l, _, n in batches if l in head
     )
-    assert 0.29 < head_share < 0.30, f"头四类的 multi 占比 {head_share:.1%} 变了,去看裁定"
+    assert 0.29 < head_share < 0.30, (
+        f"头四类的 multi 占比 {head_share:.1%} 变了 —— ⚠️ **先看 `plan()` / `batch_size()` "
+        f"有没有真读 `FORMS`**(这是最常见的错因),再看取整与 §6 那段裁定;"
+        f"本条只记「按 FORMS 拆分 + 取整」必然落在这里这个事实"
+    )
 
 
 def test_plan_realises_every_quota():
@@ -278,50 +296,62 @@ def test_boundary_prompt_names_the_declared_neighbour_and_demands_two_labels():
 def test_accept_takes_a_good_item():
     from scripts.gen_topic_data import accept
 
-    assert accept({"question": "买大了想退", "labels": ["退换货"]}, "退换货")
-    # 多标签(边界形态的样子)也收
-    assert accept({"question": "买大了想换小一号", "labels": ["退换货", "尺码"]}, "退换货")
+    assert accept({"question": "买大了想退", "labels": ["退换货"]}, "退换货", "single")
+    # 多标签(multi / 边界形态的样子)也收
+    assert accept({"question": "买大了想换小一号", "labels": ["退换货", "尺码"]}, "退换货", "multi")
+    assert accept({"question": "买大了想换小一号", "labels": ["退换货", "尺码"]}, "退换货", "boundary")
 
 
 @pytest.mark.parametrize(
-    "item,seed,why",
+    "item,seed,form,why",
     [
-        ({"question": "买大了想退", "labels": []}, "退换货", "① 空标签"),
-        ({"question": "买大了想退", "labels": ["尺码", "尺码"]}, "尺码", "① 重复标签"),
-        ({"question": "买大了想退", "labels": ["a", "b", "c", "d"]}, "退换货", "① 超长(4 个)"),
-        ({"question": "买大了想退", "labels": ["不存在的类目"]}, "退换货", "① 表外标签"),
+        # ⚠️ 第 ④ 条(形态基数,F2)与前三道是**并列**的失败面,别把它们合成一条:
+        #    这一条正是 I1 那个缺陷换门进来的样子 —— 边界批退回单标签,
+        #    而「boundary 应当是 2 个」原本**只活在提示词里**。
+        ({"question": "买大了想换小一号", "labels": ["退换货"]}, "退换货", "boundary",
+         "④ boundary 形态只有 1 个标签"),
+        ({"question": "买大了想退", "labels": ["退换货"]}, "退换货", "multi",
+         "④ multi 形态只有 1 个标签"),
+        # ⚠️ 下面这些一律给 `single`(或 `boundary`)形态,是为了让**每一条只死于它要钉的那一道**:
+        #    形态给错会让第 ④ 道抢先开火,那条用例就变成在测别的东西了。
+        ({"question": "买大了想退", "labels": []}, "退换货", "single", "① 空标签"),
+        ({"question": "买大了想退", "labels": ["尺码", "尺码"]}, "尺码", "single", "① 重复标签"),
+        ({"question": "买大了想退", "labels": ["a", "b", "c", "d"]}, "退换货", "single", "① 超长(4 个)"),
+        ({"question": "买大了想退", "labels": ["不存在的类目"]}, "退换货", "single", "① 表外标签"),
         # ⚠️ 这两条的标签都是**合法**的(过得了第 ① 道),所以它们只可能死于第 ② 道 ——
         #    用「满多少包邮」会自相矛盾:`forbidden_words` 里没有「包邮」,而它正是
         #    反向用例里那条「真实问句必须放行」。
-        ({"question": "我想问退换货的事", "labels": ["退换货"]}, "退换货", "② 含类目名(禁词)"),
-        ({"question": "什么时候补差价", "labels": ["价保"]}, "价保", "② 含边界说明原词(禁词)"),
-        ({"question": "买大了想退", "labels": ["尺码"]}, "退换货", "③ 主诉求不是这一类"),
-        ({"question": "买大了想退"}, "退换货", "缺 labels 键"),
-        ({"labels": ["退换货"]}, "退换货", "缺 question 键(会写出一行没有问句的训练数据)"),
-        ({"question": "", "labels": ["退换货"]}, "退换货", "空问句"),
-        ({"question": "   ", "labels": ["退换货"]}, "退换货", "纯空白问句"),
-        ({"question": 123, "labels": ["退换货"]}, "退换货", "question 不是字符串"),
-        ("买大了想退", "退换货", "条目整个不是 dict(模型偶尔直接吐字符串数组)"),
-        ({"question": "买大了想退", "labels": "退换货"}, "退换货", "labels 不是数组"),
+        ({"question": "我想问退换货的事", "labels": ["退换货"]}, "退换货", "single",
+         "② 含类目名(禁词)"),
+        ({"question": "什么时候补差价", "labels": ["价保"]}, "价保", "single",
+         "② 含边界说明原词(禁词)"),
+        ({"question": "买大了想退", "labels": ["尺码"]}, "退换货", "single", "③ 主诉求不是这一类"),
+        ({"question": "买大了想退"}, "退换货", "single", "缺 labels 键"),
+        ({"labels": ["退换货"]}, "退换货", "single", "缺 question 键(会写出一行没有问句的训练数据)"),
+        ({"question": "", "labels": ["退换货"]}, "退换货", "single", "空问句"),
+        ({"question": "   ", "labels": ["退换货"]}, "退换货", "single", "纯空白问句"),
+        ({"question": 123, "labels": ["退换货"]}, "退换货", "single", "question 不是字符串"),
+        ("买大了想退", "退换货", "single", "条目整个不是 dict(模型偶尔直接吐字符串数组)"),
+        ({"question": "买大了想退", "labels": "退换货"}, "退换货", "single", "labels 不是数组"),
     ],
 )
-def test_accept_rejects_each_failure_mode(item, seed, why):
-    """**三道门逐道钉住** —— 真跑 962 条 `dropped = 0` ⇒ 这三道生产上**一次没开火**。
+def test_accept_rejects_each_failure_mode(item, seed, form, why):
+    """**三道门 + 形态基数逐条钉住** —— 真跑 962 条 `dropped = 0` ⇒ 这几道生产上**一次没开火**。
 
     不抽出来单测,「禁词表写坏了」与「模型没写禁词」在读数上**逐位相同**(都是
     `dropped = 0`);而禁词纪律的执行点原本只是一个没人测过的 `if`。
     """
     from scripts.gen_topic_data import accept
 
-    assert not accept(item, seed), f"应当被拒:{why}"
+    assert not accept(item, seed, form), f"应当被拒:{why}"
 
 
 def test_accept_lets_the_other_class_through_with_any_labels():
     """「其他」是**共用落点**(转人工 / 投诉 / 闲聊都落它),所以第 ③ 道门对它放行。"""
     from scripts.gen_topic_data import accept
 
-    assert accept({"question": "帮我写首诗", "labels": ["其他"]}, "其他")
-    assert accept({"question": "怎么转人工", "labels": ["其他", "退换货"]}, "其他")
+    assert accept({"question": "帮我写首诗", "labels": ["其他"]}, "其他", "single")
+    assert accept({"question": "怎么转人工", "labels": ["其他", "退换货"]}, "其他", "multi")
 
 
 # ─────────────────────── 订正轮 I4:产物带 id,前缀与真实语料分得开 ───────────────────────
@@ -410,6 +440,92 @@ def test_check_rows_flags_a_boundary_share_below_the_line():
     assert "全局边界形态占比 0.0% < 15%" in report
 
 
+def test_check_rows_flags_boundary_rows_that_lost_their_second_label():
+    """**F1:把订正轮 1 之前那个缺陷原样重放,两道占比门都判通过,这道必须开火。**
+
+    这个夹具是**照着复审的实测做的**(复审把订正前的产物形状喂进订正后的 `--check`):
+    把 147 条 boundary 行各退化成只留主标签 ⇒ 多标签落到 290/962 = **30.15%**、
+    边界 147/962 = **15.28%**,两道门槛都过。所以这条用例同时断言**两件事**:
+    ① 占比门**确实**绿(否则这条用例就变成了在测占比门);
+    ② 形态基数那道门**必须**红。
+    """
+    from scripts.gen_topic_data import check_rows
+
+    rows = [{**r, "labels": r["labels"][:1]} if r["form"] == "boundary" else r
+            for r in _conforming_rows()]
+    ok, report = check_rows(rows)
+    # ① 占比门绿:报告里那两行仍是「门槛之内」的读数(30.1% / 15.3% 那一档),没有出问题行
+    assert "全局多标签占比" not in report, "这道夹具下**不该**是全局占比门开火"
+    assert "全局边界形态占比" not in report, "这道夹具下**不该**是全局占比门开火"
+    # ② 形态基数门红,且**指名**是哪个形态、多少行、举一行 id
+    assert not ok
+    assert "147 行没过" in report and "boundary 形态只有 1 个标签" in report
+    assert "例如 s-0078" in report, "报问题时要**指名到行**(id)"
+    # ③ 这道门与生成侧读的是**同一处**(`reject_reason`)—— 摘掉那一行两边同时红,
+    #    所以这里顺带钉住「判据只有一份」这件事:同一句话在生成侧的拒因里也是它。
+    from scripts.gen_topic_data import reject_reason
+
+    assert reject_reason({"question": "买大了想换小一号", "labels": ["退换货"]},
+                         "退换货", "boundary") == "boundary 形态只有 1 个标签(这两种形态的定义就是 2–3 个诉求)"
+
+
+def test_check_rows_flags_forbidden_words():
+    """**F3**:一份**没经过生成**的产物(手改过、或将来另一条写入口)含类目名 ⇒ 必须红。
+
+    禁词是本仓自称「本章最贵的一条数据纪律」的那条,而 `violates_forbidden` 是纯函数、
+    成本为零 —— `--check` 不核它等于把纪律的执行点全押在生成那一次。
+    """
+    from scripts.gen_topic_data import check_rows
+
+    rows = [dict(r) for r in _conforming_rows()]
+    rows[3] = {**rows[3], "question": "保修维修怎么办"}
+    ok, report = check_rows(rows)
+    assert not ok and "含禁词" in report
+    assert rows[3]["id"] in report, "报问题时要**指名到行**(id)"
+
+    # 反向:正常问句不该被这条拦(否则就是禁词表写宽了,表现是「产物全红」)
+    ok2, report2 = check_rows(_conforming_rows())
+    assert ok2, report2
+
+
+def test_check_rows_flags_bad_shape_and_off_label_rows():
+    """**F3 的另外两样**:`shape_ok` 与 `seed_label ∈ labels`。"""
+    from scripts.gen_topic_data import check_rows
+
+    bad_shape = [dict(r) for r in _conforming_rows()]
+    # 重复标签 + seed 仍在标签里 ⇒ **只有**形态那道门该开火(单变量)
+    bad_shape[10] = {**bad_shape[10], "labels": ["退换货", "退换货"]}
+    ok, report = check_rows(bad_shape)
+    assert not ok and "形态不合法" in report
+
+    off = [dict(r) for r in _conforming_rows()]
+    # 「物流」是**合法**类目 ⇒ 过得了形态门,只死于「seed 不在自己标签里」(单变量)
+    off[10] = {**off[10], "labels": ["物流"], "seed_label": "退换货"}
+    ok, report = check_rows(off)
+    assert not ok and "不在自己的 labels 里" in report
+
+
+def test_check_rows_prints_the_boundary_split_and_the_other_cooccurrence():
+    """**I-3 的交付**:边界那 15.3% 必须**拆成两截**打印,「其他」+ 真类目单独计数。
+
+    一个合计数会把「91 条声明过的真近邻对」与「56 条回退支的共现对」混成一件 ——
+    而 controller 2026-09-26 的裁定正是:前者可信、后者是**共现不是易混**
+    (根因是 spec §4.1 在那 7 行写了 `—`),**两批不是一个强度**。
+    """
+    from scripts.gen_topic_data import check_rows
+
+    rows = _conforming_rows()          # 夹具里 boundary 行覆盖 17 类(含没声明的那些)
+    _, report = check_rows(rows)
+    n_declared = sum(1 for r in rows if r["form"] == "boundary" and confusable(r["seed_label"]))
+    n_fallback = sum(1 for r in rows if r["form"] == "boundary" and not confusable(r["seed_label"]))
+    assert n_declared > 0 and n_fallback > 0, "夹具本身要两边都有,否则这条用例证明不了拆分"
+    assert f"{n_declared} 条声明过的真近邻对" in report, report
+    assert f"{n_fallback} 条回退支的共现对" in report, report
+    # 「其他」+ 真类目那一列单独计数(夹具里 boundary 行的第二标签取自 confusable,
+    # 而「其他」的邻居是回退出来的 → 夹具里含「其他」的行至少那些)
+    assert "「其他」+ 真类目的行:" in report
+
+
 def test_check_rows_flags_missing_and_duplicate_ids():
     """`id` 是 T5 的索引键 ⇒ 自检必须自己看住它(缺一个 = T5 当场 `KeyError`)。"""
     from scripts.gen_topic_data import check_rows
@@ -425,6 +541,22 @@ def test_check_rows_flags_missing_and_duplicate_ids():
     dup[1]["id"] = dup[0]["id"]
     ok, report = check_rows(dup)
     assert not ok and "id 有重复" in report
+
+
+def test_counter_declares_at_most_one_counterexample_per_class():
+    """**F5**:`confusable` 只认 `COUNTER[label][0]` 那一条 —— 所以「有没有第二条」要被钉住。
+
+    今天 17 类里每个声明的类目恰好一条反例 ⇒ 无影响;但哪天某个类写下**两条**且目标不同,
+    第二条会被**静默忽略**,而 `confusable` 里的 `assert` 会让这件事**响亮地**炸在源头。
+    这条用例先一步在生产代码之外把它挡住(而且不必去调用 `confusable` 才触发)。
+    """
+    from app.topic.taxonomy import COUNTER as _C
+
+    multi = {lb: len(pairs) for lb, pairs in _C.items() if len(pairs) != 1}
+    assert not multi, (
+        f"这些类目的 COUNTER 反例条数不是 1:{multi} —— `confusable` 只认第一条,"
+        f"多出来的会被静默忽略,要么收窄成一条、要么把 `confusable` 改成能表达多邻居"
+    )
 
 
 def test_check_rows_reports_the_head_class_rounding_effect():

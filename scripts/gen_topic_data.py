@@ -11,8 +11,12 @@
 `evals/topic/synthetic.jsonl`**,否则同一批问题会进两遍(而 `id` 会从文件行数接着编,
 不会撞号,但问题会重复)。脚本不替调用方做这件事 —— 删文件是不可逆的,交给人来决定。
 
-**三类东西被刻意抽成了纯函数**(`plan` / `accept` / `check_rows`),因为真跑里
-`dropped = 0` ⇒ 三道门在生产上**一次都没开过火**,不抽出来就**无从测量**。
+**四个纯函数把「值得测的那一半」从 IO 里摘出来**(各自的理由不同,不是一个理由):
+- `plan()` —— 批次清单,`run` 的唯一循环来源;它是「`FORMS` 有没有被真读」的**接线点**。
+- `accept()` —— 三道门 + 形态基数;真跑 `dropped = 0` ⇒ **这三道门在生产上一次都没开过火**,
+  不抽出来就无从测量(禁词纪律的执行点原本只是一个没人测过的 `if`)。
+- `make_row()` —— 行的形状(`id` 与七个键),下游按 `id` 索引。
+- `check_rows()` —— 对**产物**的复核(`--check`);测试断的是常量,交付物长什么样得另有人看。
 """
 
 import argparse
@@ -80,33 +84,59 @@ def plan() -> list[tuple[str, str, int]]:
     return [(label, form, batch_size(label, form)) for label in QUOTA for form in FORMS]
 
 
-def accept(item: object, seed_label: str) -> bool:
-    """**三道门** —— 唯一的过滤点。纯函数(订正轮 I3 抽出来的)。
+def reject_reason(item: object, seed_label: str, form: str) -> str | None:
+    """**唯一的那张判据表**:`None` = 收下;否则返回一句「为什么不要它」。
 
     ① 形态合法(非空、不重复、≤3、都是真类目);
-    ② 不含禁词(否则模型学成关键词匹配);
-    ③ 主诉求真的是这一类(模型经常跑偏;「其他」是共用的落点,不做这一判)。
+    ② **形态自身的基数**:`multi` / `boundary` 的定义就是「带 2–3 个诉求」⇒ 必须 ≥2 个标签;
+    ③ 问句存在且非空;
+    ④ 不含禁词(否则模型学成关键词匹配);
+    ⑤ 主诉求真的是这一类(模型经常跑偏;「其他」是共用的落点,不做这一判)。
 
-    ⚠️ **为什么非要抽出来**:真跑 962 条 `dropped = 0` ⇒ 这三道门在生产上**一次都没
-    开过火**。禁词纪律这一章最贵的一条,而它的执行点原本只是一个没人测过的 `if` ——
-    「禁词表写坏了」与「模型没写禁词」在读数上长得一模一样(both `dropped = 0`)。
-    ⚠️ 顺带把**非 dict 条目**挡在门外:模型偶尔直接返回字符串数组,
-    原实现会在 `item.get` 上 `AttributeError` 把整轮生成打断。
+    ⚠️ **一处实现、两处调用**(本仓那条「不变量要放在唯一写口上,不要靠每个调用方自觉」):
+    生成时由 `accept` 读它拦输入,核产物时由 `check_rows` 读它复核交付物。
+    两处**不是两套各自维护的谓词** —— 否则「形态基数」这种规则一旦只在一边改,
+    两道防线就会互相对不上,而那正是本仓记过的漂移形状。
+    (实测:把 ② 那一行摘掉,生成侧与产物侧的用例**同时**变红 —— 因为它们读的是同一处。)
+
+    ⚠️ **为什么值得把它从 `run` 里抠出来**:真跑 962 条 `dropped = 0` ⇒ 这几道门
+    在生产上**一次都没开过火**。禁词纪律是这一章最贵的一条,而它的执行点原本只是一个
+    没人测过的 `if` —— 「禁词表写坏了」与「模型没写禁词」在读数上长得一模一样。
+    ⚠️ **空问句也算不过**:`item.get("question", "")` 的默认值让「缺 question 键」与
+    「question 是空串」都能走到写库那一步 —— 前者写出一行没有问句的训练数据,后者写出一行
+    **空问句**。本仓 ch07 那条道理(「有个占位的坏值」比「缺值」更坏)在这里同样成立。
+    ⚠️ **非 dict 条目**也挡在门外:模型偶尔直接返回字符串数组,原实现会在 `item.get` 上
+    `AttributeError` 把整轮生成打断。
+
+    ⚠️ **② 是订正轮 2 补的(F2),而它补的正是 I1 那个缺陷的第二条来路**:上一版的签名里
+    **没有 `form`**,所以「boundary 批应当是 2 个标签」这条要求**只活在提示词里** ——
+    模型下次把边界批退回单标签 ⇒ 147 行**全被接受**、`dropped = 0`、脚本照打
+    「保留 962 条,丢弃 0 条」,而那时 `check_rows` 的两道占比门也判通过(F1)。
     """
     if not isinstance(item, dict):
-        return False
+        return "条目整个不是对象(模型偶尔直接吐字符串数组)"
     labels = item.get("labels")
     if not isinstance(labels, list) or not shape_ok(labels):
-        return False
+        return "形态不合法(shape_ok:空 / 重复 / 超 3 个 / 表外标签)"
+    if form in ("multi", "boundary") and len(labels) < 2:
+        return f"{form} 形态只有 1 个标签(这两种形态的定义就是 2–3 个诉求)"
     question = item.get("question", "")
-    # ⚠️ **空问句也算不过**:`item.get("question", "")` 的默认值让「缺 question 键」
-    #    与「question 是空串」都能走到写库那一步 —— 前者写出一行没有问句的训练数据,
-    #    后者写出一行**空问句**。本仓 ch07 那条道理(「有个占位的坏值」比「缺值」更坏,
-    #    因为它看起来是正常的一行)在这里同样成立。抽出来单测才看见这个洞:
-    #    原来那版三道门里**没有一道**看问句本身(禁词检查对空串恒过)。
-    if not isinstance(question, str) or not question.strip() or violates_forbidden(question):
-        return False
-    return seed_label in labels or seed_label == OTHER
+    if not isinstance(question, str) or not question.strip():
+        return "问句缺失或为空"
+    hits = violates_forbidden(question)
+    if hits:
+        return f"含禁词 {hits}"
+    if seed_label not in labels and seed_label != OTHER:
+        return "seed_label 不在自己的 labels 里"
+    return None
+
+
+def accept(item: object, seed_label: str, form: str) -> bool:
+    """**三道门 + 形态基数** —— 生成时的过滤点。纯函数(订正轮 I3 抽出,订正轮 2 补 `form`)。
+
+    判据全在 `reject_reason` 那一处;核产物时读的是**同一张表**(不是另写一份)。
+    """
+    return reject_reason(item, seed_label, form) is None
 
 
 def _boundary_desc(label: str) -> str:
@@ -197,7 +227,7 @@ def load_rows(path: Path) -> list[dict]:
 
 
 def check_rows(rows: list[dict]) -> tuple[bool, str]:
-    """核**产物**的三条纪律:`(是否通过, 给人看的报表)`。纯函数(订正轮 I2)。
+    """核**产物**的纪律:`(是否通过, 给人看的报表)`。纯函数(订正轮 I2,I2-2 扩过)。
 
     ⚠️ **为什么非要这一层**:测试里 `FORMS["multi"] >= 0.30` 断的是**常量**,而
     `plan` 按 `FORMS` 拆分出来的比例**按代数就等于 0.30** —— 「多标签 ≥30%」这条纪律
@@ -206,6 +236,17 @@ def check_rows(rows: list[dict]) -> tuple[bool, str]:
     判据(controller 2026-09-26 裁定):**按全局判**,逐类只打印 ——
     头四类**永远**到不了 30%(见下面 `_plan_note`),那是取整效应,
     把 `FORMS["multi"]` 抬上去凑一个逐类读数才是真的错。
+
+    **核哪些**(订正轮 2 补了后四条):
+    ① `id` 齐全且唯一;② 逐类行数 ≥ `QUOTA`;③ 全局多标签 ≥ 30%;④ 全局边界 ≥ 15%;
+    ⑤ 形态基数、⑥ 形态合法、⑦ 禁词、⑧ `seed_label ∈ labels` —— **这四条不在本函数里另写**,
+    逐行读的是 `reject_reason` 那张**唯一**的判据表(与生成侧的 `accept` 同一处)。
+
+    ⚠️ **⑤ 与 ③④ 是两件事,别互相代偿**(F1):③④ 判的是**占比**,而 `form` 列由
+    `plan()` 写死、模型摸不到 ⇒ ④ 实际是个**掉行探测器**(掉够 4 条才开火);
+    ③ 今天有 15pp 余量**只是因为 I1 修好了**。把 147 条边界行各自退化成单标签
+    (I1 那个缺陷原样重放)⇒ 多标签 290/962 = 30.15%、边界 147/962 = 15.28%,
+    **③④ 两道门都判通过**。所以基数必须按**形态**单独判。
     """
     problems: list[str] = []
 
@@ -219,6 +260,24 @@ def check_rows(rows: list[dict]) -> tuple[bool, str]:
     total = len(rows)
     if not total:
         return False, "产物是空的 —— 没有任何东西可核\n"
+
+    # ── F1 + F3:读**同一张判据表**(`reject_reason`),在产物上把生成时那几道门再核一遍 ──
+    # ⚠️ 为什么不在这里另写一遍谓词:那样「形态基数」这类规则一旦只在一边改,两道防线
+    #    就会互相对不上 —— 本仓记过的漂移形状。读同一处 ⇒ 摘掉那一行,两边**同时**红。
+    # ⚠️ 其中 **F1 那条**(形态基数)是复审实测出来补的:订正轮 1 的两道**占比**门对
+    #    I1 那个缺陷**零判别力** —— 把 147 条 boundary 行各自退化成只留主标签,
+    #    多标签落到 290/962 = 30.15%、边界 147/962 = 15.28%,**两道门都判通过**。
+    #    为什么:boundary 那道判的是**边界行的占比**,而 `form` 列完全由 `plan()` 写死
+    #    (模型摸不到)⇒ 它其实是个**掉行探测器**(掉够 4 条才开火);而多标签那道今天
+    #    有 15pp 余量,**纯粹是因为 I1 修好了** —— I1 一退,余量就没了。
+    #    ⇒ 形态自身的基数必须**按形态单独判**,不能靠占比代偿。
+    rejected: dict[str, list[str]] = {}
+    for r in rows:
+        why = reject_reason(r, r.get("seed_label"), r.get("form"))
+        if why:
+            rejected.setdefault(why, []).append(str(r.get("id")))
+    for why, bad_ids in rejected.items():
+        problems.append(f"{len(bad_ids)} 行没过「{why}」,例如 {bad_ids[0]}")
 
     lines = [f"总行数 {total}", "逐类(每类都打印:行数 / 配额 / 这一类的多标签占比 / 边界形态占比)"]
     for lb in LABELS:
@@ -240,10 +299,42 @@ def check_rows(rows: list[dict]) -> tuple[bool, str]:
         problems.append(f"全局多标签占比 {share_multi:.1%} < {MIN_MULTI_SHARE:.0%}")
     if share_bound < MIN_BOUNDARY_SHARE:
         problems.append(f"全局边界形态占比 {share_bound:.1%} < {MIN_BOUNDARY_SHARE:.0%}")
+    lines.extend(_boundary_note(rows))
     lines.append(_plan_note())
     lines.append("结论:**通过**" if not problems
                  else "结论:**不通过**\n" + "\n".join(f"  - {p}" for p in problems))
     return not problems, "\n".join(lines) + "\n"
+
+
+def _boundary_note(rows: list[dict]) -> list[str]:
+    """把边界那 15.3% **拆开**打出来 —— 一个合计数会把两件事混成一件(订正轮 2,I-3)。
+
+    - **声明支**:`COUNTER` 点过名的真近邻对(91 条);
+    - **回退支**:`COUNTER` 没声明的 7 类,模型**自己挑**的邻居 —— 复审逐行核过全部 147 条,
+      判定那是**共现**而不是易混(发票 / 支付 / 其他 三类甚至逐行换邻居)。根因是
+      spec §4.1 自己在那 7 行写了 `—`。**controller 2026-09-26 裁定:接受并记账,
+      不在本任务里补 `COUNTER`**(改 taxonomy 超出本任务);⇒ 两批**不是一个强度**,
+      合计数不能拿来当「147 条边界对都学得开」的证据。
+    - 「其他」+ 真类目那一列**单独计数**:它在 `INTENT_TO_TOPICS` 下是**合法标注**
+      (`其他` 就是转人工/投诉/闲聊的落点),而在 `BOUNDARY` 的释义(「以上都不是」)下读起来像矛盾。
+      决策点在 T5 的预标口径(T5 会整列覆盖 `labels`),不在这里。
+    """
+    b = [r for r in rows if r.get("form") == "boundary"]
+    declared = [r for r in b if confusable(r.get("seed_label"))]
+    fallback = [r for r in b if not confusable(r.get("seed_label"))]
+    lines = [
+        f"边界形态拆分:{len(b)} 条 = **{len(declared)} 条声明过的真近邻对**"
+        f"(`COUNTER` 点名的那些)+ **{len(fallback)} 条回退支的共现对**"
+        f"(邻居由模型自选,共现≠易混;类目 = {sorted({r.get('seed_label') for r in fallback})})",
+    ]
+    other_rows = [r for r in rows
+                  if OTHER in (r.get("labels") or []) and len(r.get("labels") or []) > 1]
+    by_form: dict[str, int] = {}
+    for r in other_rows:
+        by_form[str(r.get("form"))] = by_form.get(str(r.get("form")), 0) + 1
+    lines.append(f"「其他」+ 真类目的行:{len(other_rows)} 条 {by_form}"
+                 f"(「合法标注 / 矛盾释义」两种读法见 T4 报告 §6.2 与 §9.7,决策点在 T5 口径)")
+    return lines
 
 
 def _plan_note() -> str:
@@ -281,8 +372,8 @@ async def run(dry_run: bool, check_only: bool = False) -> int:
                 continue
             raw = await _call(model, prompt)
             for item in raw:
-                # ⚠️ 三道门全在 `accept` 里(纯函数、有测试)。真跑里这三道没开过火。
-                if not accept(item, label):
+                # ⚠️ 三道门 + 形态基数全在 `accept` 里(纯函数、有测试)。真跑里这三道没开过火。
+                if not accept(item, label, form):
                     dropped += 1
                     continue
                 f.write(json.dumps(make_row(item, label, form, next_id),
