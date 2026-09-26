@@ -5,6 +5,8 @@
 
 用法:
     .venv/Scripts/python.exe scripts/prepare_topic_data.py collect
+    .venv/Scripts/python.exe scripts/prepare_topic_data.py augment --limit 20   # 小样:看漂移率
+    .venv/Scripts/python.exe scripts/prepare_topic_data.py augment               # 全量(约 75 分钟)
 """
 
 import argparse
@@ -19,12 +21,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text
 
+from app.config import get_settings
 from app.db.base import get_engine
+# ⚠️ 与 `scripts/prelabel_topics.py` **同款**:`_rewrite` 要用同一个抽取模型工厂
+#    (temperature=0),不许在这里另建一个 `ChatOpenAI`。
+from app.llm import create_extract_model
 # ⚠️ 这一行是**同源守卫**要求的(tests/test_topic_clean.py::test_both_sides_use_the_same_clean):
 #    训练侧必须与推理侧用**同一份** `clean`。它在本文件里也被真的用到(数「洗后为空」那几行),
 #    不是一条只为过守卫而存在的 import。
 from app.topic.clean import clean
-from app.topic.labeling import dedupe_questions, is_unusable_target, stratified_split, train_test_overlap
+from app.topic.labeling import (
+    dedupe_questions,
+    inject_typo,
+    is_unusable_target,
+    label_drift,
+    stratified_split,
+    train_test_overlap,
+    typo_seed,
+)
+from app.topic.taxonomy import render_taxonomy_for_prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 TOPIC_DIR = ROOT / "evals" / "topic"
@@ -42,6 +57,15 @@ REVIEWED = TOPIC_DIR / "reviewed.jsonl"
 #: 名字写错**不报错**,只是评测读到一个空的/不存在的文件 ⇒
 #: **用户那 120 条的复核对指标零影响,而报告照常打印**。做成常量,别在循环里拼字符串。
 TEST_NAME = "topic_test.jsonl"
+
+#: 增强的**唯一**输入(spec §5.4)。⚠️ 它同时是**冻结产物** —— Task 9 拿它训练,
+#: 所以 `augment` **只读**它,而且**就地改它**是本任务明令避开的那把脚枪(订正 11-A)。
+TRAIN_NAME = "train.jsonl"
+TRAIN = TOPIC_DIR / TRAIN_NAME
+#: 增强的产物 —— **新文件,不是就地改 `TRAIN`**。
+#: 名字与输入逐字不同,也**不是**那两份冻结产物(`val.jsonl` / `topic_test.jsonl`)。
+AUGMENTED_NAME = "train_augmented.jsonl"
+TRAIN_AUGMENTED = TOPIC_DIR / AUGMENTED_NAME
 
 
 def _out(message: str) -> None:
@@ -250,16 +274,176 @@ def split() -> None:
          f"(`export-test` → 用户改 → `import-test`),那之前它**还不能用来报数**。")
 
 
+REWRITE_PROMPT = """下面是一句电商客服场景里的买家提问,以及它**已经标注好**的标签。
+
+原句:{question}
+标签:{labels}
+这些标签的含义(权威类目表):
+
+{taxonomy}
+
+请把这句话**换一种说法**,要求:
+1. **诉求的个数与类别一个都不许变** —— 原来是 2 个诉求,改写后还是那 2 个;
+   原来有「尺码」,改写后这句话里「买大了」这层意思必须还在。
+2. 同义词替换、句式调整(比如把陈述句改成疑问句),不要只改了标点。
+3. 不要引入新的诉求,也不要删掉任何一个。
+4. 像真人在客服窗口打出来的。
+
+输出一个 JSON 对象,两个字段:
+- question:改写后的句子
+- labels:改写后这句话应当打上的标签数组(**必须与原标签集合完全相同**)
+
+只输出 JSON,不要别的内容。"""
+
+
+async def _rewrite(model, row: dict) -> tuple[str, list[str], bool]:
+    """返回 `(改写后的句子, 它自己报的标签, 这一条是不是**没解析出来**)`。
+
+    ⚠️ 调用方会用 `label_drift` 比对原标签与它报的标签 —— **不一致就整条丢弃**。
+    不在这里悄悄「修正」成原标签:那样会把「模型觉得该改标签」这个信号抹掉,
+    而那个信号正是我们要观测的东西(它的比例就是 spec §5.4 的语料质量读数)。
+
+    ⚠️ **「没解析出来」一律原样返回**,并把第三个值置位(照
+    `scripts/prelabel_topics.py::_label` 的先例:`parse_failed` 是一列**读数**,
+    不是异常)。若在这里返回**空标签**,`label_drift` 会把一条本来没问题的样本
+    判成漂移而丢掉 ⇒ 「网络/解析抖动」与「标签真的漂了」两个读数**混在一起分不开**。
+
+    ⚠️ **形状闸**(原稿只挡了 JSON 语法):`labels` 吐成字符串时
+    `list("退换货")` 会按**字符**迭代,每个字符都查无此类目 ⇒ 同样被算成漂移;
+    吐成 int 时 `list(5)` 直接 `TypeError` ⇒ **打断整跑**(那是 75 分钟)。
+    两种都不是「JSON 没解出来」,但都不是正常结果 ⇒ 归同一档。
+
+    ⚠️ 改写后的句子要过一遍 `clean()`(spec §5.1:训练侧与推理侧**同源**)——
+    训练语料里其余每一行都是清洗过的,而 `encode_rows` **不再洗**
+    (`app/topic/model.py` 直接读 `row["question"]`)⇒ 不洗这里,增强行进训练时
+    就是另一种口径。`clean()` **不修错别字**(§5.1),所以它不抵消增强。
+    """
+    from langchain_core.messages import HumanMessage
+
+    prompt = REWRITE_PROMPT.format(
+        question=row["question"],
+        labels=" / ".join(row["labels"]),
+        taxonomy=render_taxonomy_for_prompt(),
+    )
+    resp = await model.ainvoke([HumanMessage(content=prompt)])
+    text = (resp.text or "").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        text = text[4:] if text.lower().startswith("json") else text
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return row["question"], row["labels"], True
+    if not isinstance(data, dict):
+        return row["question"], row["labels"], True
+    new_q, new_labels = data.get("question"), data.get("labels")
+    if (not isinstance(new_q, str) or not isinstance(new_labels, list)
+            or not all(isinstance(x, str) for x in new_labels)):
+        return row["question"], row["labels"], True
+    cleaned = clean(new_q)
+    if not cleaned:                      # 模型吐了一句纯空白 ⇒ 回落原句,不算漂移
+        return row["question"], row["labels"], True
+    return cleaned, (new_labels or row["labels"]), False
+
+
+async def augment(limit: int | None = None) -> None:
+    """增强**只扩训练集**。验证集与测试集一条都不许动。
+
+    扩了测试集,§8 那套指标就不再有意义 —— 而那是个**静默**的破坏:
+    指标会变好看,没人会去查测试集是不是被动过。
+
+    ⚠️ **订正 11-B:上面那句话在订正之前只是散文**(本仓已编目:一句看起来成立的
+    注释不是守卫)。现在它由三样东西守着 —— 开头那两条 `assert`(输入只许叫
+    `train.jsonl`、产物只许叫 `train_augmented.jsonl`)、那条断言**至少一条**的
+    用例(把 `TRAIN` 指到 `val.jsonl` ⇒ 必须红)、以及跑前跑后
+    `val.jsonl` / `topic_test.jsonl` **逐字节相同**的用例。
+
+    ⚠️ `limit` **只**决定「这次改写几行」(订正 11-A)。**不裁 `train.jsonl`** ——
+    那是冻结的训练集(Task 9 的输入),裁它就是就地改掉它,而 `git status` 里
+    只会安静地多一行 ` M train.jsonl`。原件**照旧全部写出**,小样只让产物
+    少掉那几条增强行 —— 这件事会**响亮地打出来**(别让它冒充全量产物)。
+    """
+    train_path, out_path = TRAIN, TRAIN_AUGMENTED
+    # ---- 11-B 的两条守卫。⚠️ 位置承重:写在**打开任何文件之前** ----
+    # 断言若落在 `open(..., "w")` 之后,一次失败的运行会先留下一个**空的**产物文件,
+    # 而「拦住了」与「拦住了但先写了一份错的」是两回事。
+    assert train_path.name == TRAIN_NAME, (
+        f"增强的输入只许是 {TRAIN_NAME},而现在是 {train_path.name} —— "
+        f"验证集参与早停与阈值选择,把它加强进产物与测试集被动过同级"
+    )
+    assert out_path.name == AUGMENTED_NAME, (
+        f"增强产物只许叫 {AUGMENTED_NAME},而现在是 {out_path.name} —— "
+        f"写进冻结产物是个**静默**的破坏:指标会变好看,没人会去查"
+    )
+
+    rows = [json.loads(l) for l in train_path.read_text(encoding="utf-8").splitlines()
+            if l.strip()]
+    todo = rows[:limit] if limit else rows
+    _out(f"训练集 {len(rows)} 行({train_path.name},只读);本次改写 {len(todo)} 行"
+         + (f" —— ⚠️ **小样**(--limit {limit}),这个产物**不是**全量!"
+            if limit else ""))
+
+    settings = get_settings()
+    model = create_extract_model(settings)
+    kept, drifted, parse_failed = 0, 0, 0
+    with out_path.open("w", encoding="utf-8") as f:
+        # 原件照写 —— 增强是**追加**,不是替换。
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for i, r in enumerate(todo, 1):
+            new_text, new_labels, bad = await _rewrite(model, r)
+            if bad:
+                parse_failed += 1
+            if label_drift(r["labels"], new_labels):
+                # ⚠️ **静默的标签漂移** —— 整条丢弃,不修。
+                #    修的话要判断「是它漂了还是原标错了」,而那需要人。
+                drifted += 1
+                continue
+            f.write(json.dumps(
+                # ⚠️ 种子从**行 id** 派生,不用循环下标(订正 11-C):
+                #    下标会让可复现性依赖行序,而 `train.jsonl` 是会被重排的。
+                {**r, "question": inject_typo(new_text, typo_seed(r["id"])),
+                 "labels": new_labels, "augmented": True}, ensure_ascii=False) + "\n")
+            kept += 1
+            # 逐行 flush:整跑约 75 分钟(1158 × 逐条打网络),崩在中途时
+            # 盘上那份至少是**可读的**半成品(断点续跑本章没做,如实记在报告里)。
+            f.flush()
+            if i % 25 == 0:
+                _out(f"  … {i}/{len(todo)}(追加 {kept}、漂移 {drifted}、解析失败 {parse_failed})")
+
+    # ⚠️ **三个读数都要打,别只打一个**:
+    #    `kept`         = 追加了几条;
+    #    `drifted`      = **语料质量的读数** —— 它高说明预标不稳(或 prompt 里
+    #                     「保持诉求个数与类别不变」没被遵守);
+    #    `parse_failed` = **故障读数,它是 0 才正常**(那些行按**原句**写回)。
+    #    三者混起来报会把「网络抖动」记成「标签漂移」,而两个读数都救不回来。
+    _out(f"增强追加 {kept} 条;因标签漂移丢弃 {drifted} 条;"
+         f"解析失败 {parse_failed} 条(这些行按**原句**写回)")
+    _out(f"产物 {out_path.name}:{len(rows) + kept} 行(原件 {len(rows)} + 增强 {kept})")
+    if parse_failed:
+        _out("⚠️ 解析失败不为 0 ⇒ 先停下看产物:那些行的题面是**原句**"
+             "(不是改写的),标签是原标签 —— 它们不是「漂移」,别混着读。")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("step", choices=["collect", "split", "augment"])
+    # ⚠️ **订正 11-A**:小样跑必须走这个参数,不许「先把 `train.jsonl` 截成 20 条」。
+    ap.add_argument("--limit", type=int, default=0,
+                    help="只对 augment 有意义:只改写前 N 行(0/缺省 = 全量)")
     args = ap.parse_args()
+    # 「参数被静默忽略」是本仓最不喜欢的一族:有人打 `split --limit 20` 想看小样,
+    # 脚本照跑全量(而 `split` 会**覆盖那三份冻结产物**)—— 必须响亮地停。
+    if args.limit < 0:
+        raise SystemExit("--limit 不许为负(0 表示全量)")
+    if args.limit and args.step != "augment":
+        raise SystemExit(f"--limit 只对 augment 有意义(`{args.step}` 不支持它)")
     if args.step == "collect":
         asyncio.run(collect())
     elif args.step == "split":
         split()
     else:
-        raise SystemExit(f"{args.step} 还没实现(由后续任务补上)")
+        asyncio.run(augment(args.limit or None))
 
 
 if __name__ == "__main__":

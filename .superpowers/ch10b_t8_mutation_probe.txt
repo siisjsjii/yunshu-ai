@@ -1,0 +1,120 @@
+树洁癖复查(开跑那一刻的版本;要跟报告的其余读数对上):
+  · app/topic/labeling.py  17487 B  sha256=6786e6d09015fd2c  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · scripts/prepare_topic_data.py  24438 B  sha256=4582efa96398bcd3  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+  · tests/test_topic_labeling.py  116274 B  sha256=001eb8f74de8ef6c  与 HEAD **不同** —— 本轮有未提交改动(报告里要写明)
+三份**冻结产物**(本轮一个字节都不许动):
+  · train.jsonl  32051bf5f17ad670
+  · val.jsonl  d9118eaf0f5ab6c3
+  · topic_test.jsonl  1b78c2d8c7dd2664
+
+=== 11-D 的直接读数(原稿那条断言 vs 加固后那条)
+  · 原稿断言 `assert inject_typo('退货', s).strip()` 在恒等实现下:**仍然通过**(判别力 0)
+  · 加固后那句 `out != '退货'`:恒等实现下 0/50 个种子「变了」⇒ 断言**红**
+
+=== M1 ★11-B 输入守卫拆掉(有人改成「train + val 一起增强」)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_refuses_to_read_a_frozen_artifact  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 passed)   [{'passed': 1}]
+  绿灯  test_augment_refuses_to_write_a_frozen_artifact  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M2 ★11-B 输出守卫拆掉(产物可以写成 val/topic_test)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_refuses_to_write_a_frozen_artifact  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 passed)   [{'passed': 1}]
+  绿灯  test_augment_refuses_to_read_a_frozen_artifact  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M3 ★11-B **绕过两条名字守卫**偷写 val.jsonl(spec 里那句「静默的破坏」)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_limit_only_samples_the_rewriting  (期望 passed)   [{'passed': 1}]
+  绿灯  test_augment_drops_the_rows_whose_labels_drifted  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M4 ★11-C 种子换成**循环下标**(本任务原稿的写法)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_gives_the_same_typo_no_matter_the_row_order  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 passed)   [{'passed': 1}]
+  绿灯  test_typo_seed_comes_from_the_row_id  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M5 ★11-C 换回内置 `hash()`(本仓硬约束)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_typo_seed_is_stable_across_processes  (期望 failed)   [{'failed': 1}]
+  绿灯  test_typo_seed_comes_from_the_row_id  (期望 passed)   [{'passed': 1}]
+  绿灯  test_augment_gives_the_same_typo_no_matter_the_row_order  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M6 ★11-D `inject_typo` 改成恒等函数(一条错别字都不注入)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_inject_typo_never_empties_the_text  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_inject_typo_actually_changes_something  (期望 failed)   [{'failed': 1}]
+  绿灯  test_inject_typo_is_deterministic  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M7 `label_drift` 恒判漂移(把合法增强全丢光)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_label_drift_detects_changed_count  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_label_drift_is_set_semantics_on_the_other_two_faces  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_augment_drops_the_rows_whose_labels_drifted  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M8 `label_drift` 改成**比长度**(重复被算成漂移)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_label_drift_is_set_semantics_on_the_other_two_faces  (期望 failed)   [{'failed': 1}]
+  绿灯  test_label_drift_detects_changed_count  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+=== M9 改写后的句子**不过清洗**(训练语料两种口径并存)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_reports_a_malformed_answer_without_counting_it_as_drift  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M10 形状闸失效后**返回空标签**(原稿那种错法:把故障记成漂移)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_reports_a_malformed_answer_without_counting_it_as_drift  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M11 `main()` 不转发 `--limit`(小样变成 75 分钟全量)  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_main_dispatches_augment_and_forwards_the_limit  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_limit_only_samples_the_rewriting  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M12 `--limit` 给了别的步骤时**静默忽略**  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_main_refuses_limit_on_the_other_steps  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M13 ★11-A 那把脚枪:**就地裁掉 train.jsonl**  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_limit_only_samples_the_rewriting  (期望 failed)   [{'failed': 1}]
+  绿灯  test_main_dispatches_augment_and_forwards_the_limit  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M14 ★夹具截回四行(判别力归零)—— 用例自检必须自己红  [tests\test_topic_labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_gives_the_same_typo_no_matter_the_row_order  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 test_topic_labeling.py
+
+=== M15 `_rewrite` 不把这一行的**原标签**喂进 prompt  [scripts\prepare_topic_data.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical  (期望 failed)   [{'failed': 1}]
+  ✅ 红  test_augment_limit_only_samples_the_rewriting  (期望 failed)   [{'failed': 1}]
+  · 已逐字节还原 prepare_topic_data.py
+
+=== M16 `typo_seed` 返回常数(id 被丢掉)  [app\topic\labeling.py]
+  · 树洁癖复查 ✅
+  ✅ 红  test_typo_seed_comes_from_the_row_id  (期望 failed)   [{'failed': 1}]
+  绿灯  test_augment_gives_the_same_typo_no_matter_the_row_order  (期望 passed)   [{'passed': 1}]
+  · 已逐字节还原 labeling.py
+
+三份冻结产物:
+  · train.jsonl  未被动过 ✅  sha256=32051bf5f17ad670
+  · val.jsonl  未被动过 ✅  sha256=d9118eaf0f5ab6c3
+  · topic_test.jsonl  未被动过 ✅  sha256=1b78c2d8c7dd2664
+============================================================
+问题数:0

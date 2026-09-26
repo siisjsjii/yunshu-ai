@@ -4,6 +4,7 @@
 去重与分层抽样既在离线造数据时跑,也在评测脚本里跑(测试集冻结后的再切分)。
 """
 
+import hashlib
 import random
 from collections import defaultdict
 
@@ -194,6 +195,78 @@ def stratified_split(
     rng.shuffle(rest_sorted)
     n_train = round(len(rest_sorted) * ratios[0] / (ratios[0] + ratios[1]))
     return {"train": rest_sorted[:n_train], "val": rest_sorted[n_train:], "test": test}
+
+
+# ---- 数据增强(只扩训练集,ch10 spec §5.4)----
+#
+# 两个纯函数,零 IO、零依赖:`label_drift` 是增强的**自检判据**;
+# `typo_seed` / `inject_typo` 是「保留错别字 + 主动注入」那一半(spec §5.1 第 3 条)。
+
+
+def label_drift(before: list[str], after: list[str]) -> bool:
+    """增强后标签集合变了没有。**顺序不算变化**(标签是集合语义,spec §6.5)。
+
+    这是增强阶段最要紧的一条自检:把「买大了想退」改成「不喜欢这个想退」,
+    标签就从 `尺码+退换货` 变成 `退换货` —— 而它看起来只是一次正常增强,
+    **没有任何东西会报错**,训练分布却悄悄偏了。
+
+    ⚠️ 三个面各自对应一种错法(两条用例分别钉住,见
+    `tests/test_topic_labeling.py` 里 `test_label_drift_is_set_semantics_…`):
+    列表比较 ⇒ **顺序**被算成变化;`len()` 比较 ⇒ **重复**被算成变化;
+    只看向量长度那一侧 ⇒ **零标签**被判成漂移 —— 而零标签是**合法**结果
+    (`r-0049`「你是」,模型真判零诉求)。
+    """
+    return set(before) != set(after)
+
+
+#: 同音/形近替换对。**保守**:只收在电商语境下几乎不会改变语义的字。
+#: ⚠️ `dst` 一律**非空**、且与 `src` 逐字不同 —— `inject_typo` 那两条
+#: **结构性**性质(必定变、不可能变空)全靠这两点成立。加新对时别破坏它们。
+_TYPO_MAP: tuple[tuple[str, str], ...] = (
+    ("退货", "退或"), ("尺码", "尺马"), ("运费", "云费"), ("发票", "发飘"),
+    ("快递", "快第"), ("订单", "定单"), ("颜色", "艳色"), ("保修", "报修"),
+)
+
+
+def typo_seed(row_id: str) -> int:
+    """从**行 id** 派生一个稳定种子。
+
+    ⚠️ **不许用内置 `hash()`**(本仓硬约束):它对 str **每进程随机化**
+    (PYTHONHASHSEED)⇒「同一 id 永远同样处理」在脚本重启之后就没了,
+    而**同进程内的任何测试都测不出来**(本仓在 `app/tools/mock_data.py` 上栽过;
+    钉子见 `tests/test_topic_labeling.py::test_typo_seed_is_stable_across_processes`)。
+
+    ⚠️ **不许用循环下标**(本任务原稿的写法):可复现性于是**依赖输入行序** ——
+    `train.jsonl` 一旦重排(重跑 `split`、按 id 重排、手工挪几行),
+    **每一行**注的错别字都变,而产物**看起来照常合理**、没有任何东西会报错,
+    「这份语料是哪来的」随之说不清。⇒ 种子要表示「这一行**是谁**」,
+    不是「它排第几」。
+
+    取 sha256 的**整条** digest(不截前 8 位):没有截断带来的碰撞面,
+    也与 `app/tools/mock_data.py::rng` 的写法一致。
+    """
+    return int.from_bytes(hashlib.sha256(row_id.encode("utf-8")).digest(), "big")
+
+
+def inject_typo(text: str, seed: int) -> str:
+    """确定性地注入一个错别字(同音/形近)。**只用于训练集**。
+
+    为什么这么做:部署时用户就是会打错字,而清洗阶段**刻意不修错别字**
+    (spec §5.1)。如果不注入,训练语料比真实输入干净 ⇒ 真机掉分,
+    而**测试集也是干净的,测不出来**。
+
+    找不到可替换的字时返回原文(不算失败)—— 一句话里没有那些词很正常。
+
+    ⚠️ 候选的**顺序**来自 `_TYPO_MAP`(元组、写死的顺序)⇒ 同一段文本 +
+    同一个种子,`rng.choice` 抽到的永远是同一个。这是可复现性的另一半,
+    别把它换成 `set` / `dict`(那会让候选顺序随进程变)。
+    """
+    rng = random.Random(seed)
+    candidates = [(a, b) for a, b in _TYPO_MAP if a in text]
+    if not candidates:
+        return text
+    src, dst = rng.choice(candidates)
+    return text.replace(src, dst, 1)
 
 
 def _char_bigrams(text: str) -> set[str]:

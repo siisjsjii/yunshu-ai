@@ -6,16 +6,20 @@
 也在 `not db` 套件里。
 """
 
+import asyncio
 import json
 
 import pytest
 
 from app.topic.labeling import (
     dedupe_questions,
+    inject_typo,
     is_unusable_target,
+    label_drift,
     pick_review_sample,
     stratified_split,
     train_test_overlap,
+    typo_seed,
     validate_evidence,
 )
 
@@ -1605,3 +1609,542 @@ def test_main_dispatches_export_test(monkeypatch):
     exp.main()
 
     assert called == ["export-test"]
+
+
+# ---- 数据增强:标签漂移自检 + 注入错别字(ch10 spec §5.4;计划订正 11)----
+#
+# ⚠️ 本节两条线,别混:
+#   ① **纯函数**(`label_drift` / `inject_typo` / `typo_seed`)—— 零 IO,可密集断言;
+#   ② `scripts/prepare_topic_data.py` 的 `augment` **接线** —— ① 全对了,
+#      把它接到 `val.jsonl` 上(**或者干脆接到 `topic_test.jsonl` 上当产物**)
+#      **照样全绿**,而那正是 spec §5.4 唯一一条硬约束的反面。
+#      ⚠️ 后者是**静默**的破坏:§8 那套指标会变好看,没人会去查测试集被动过。
+
+
+def test_label_drift_detects_changed_count():
+    """标签集合变了就是漂移(「买大了想退」→「不喜欢这个想退」少了一个诉求那种)。"""
+    assert label_drift(["尺码", "退换货"], ["退换货"])          # 少了一个
+    assert label_drift(["退换货"], ["尺码", "退换货"])          # 多了一个
+    assert not label_drift(["尺码", "退换货"], ["退换货", "尺码"])  # **顺序不算变化**
+
+
+def test_label_drift_is_set_semantics_on_the_other_two_faces():
+    """上面那条只钉了「顺序」这一个面 —— 集合语义还有「重复」与「空」两个面,各自对应一种错法。
+
+    - 写成列表比较 ⇒ 上面那条红;
+    - 写成 `len(before) != len(after)` ⇒ **重复**那一句把它误判成漂移:
+      模型吐 `["尺码","尺码"]` 时丢掉一条**本来没问题**的样本,而 `drifted` 读数虚高;
+    - 写成 `bool(after)`(或任何只看向量长度那一侧的东西)⇒ **空**那两句错:
+      零标签是一个**合法**结果(`r-0049`「你是」,模型真判零诉求)。
+    """
+    assert label_drift([], []) is False
+    assert label_drift([], ["其他"]) is True
+    assert label_drift(["尺码", "尺码"], ["尺码"]) is False, "重复不该被算成漂移"
+
+
+def test_inject_typo_is_deterministic():
+    """同种子同输入 → 同输出。增强产物要**可复现**,否则「这份语料是哪来的」说不清。"""
+    assert inject_typo("买大了想退", 1) == inject_typo("买大了想退", 1)
+
+
+def test_inject_typo_uses_the_seed_to_choose_among_the_candidates():
+    """★ **反向断言**:不同种子**能**给出不同结果。
+
+    ⚠️ 只有上面那条时,「seed 被用上了」是**同义反复** —— 一个**完全忽略 seed**
+    的实现(每次取 `candidates[0]`、或干脆原样返回)同样满足「同种子同结果」。
+    本仓已在 `pick_review_sample` / `stratified_split` 上记过同一个形状
+    (`test_different_seeds_pick_different_samples`)。
+    """
+    text = "退货 尺码 运费 发票 快递 订单 颜色 保修"          # 八个候选**全在**
+    seen = {inject_typo(text, s) for s in range(64)}
+    assert len(seen) >= 2, f"64 个种子只注出 {len(seen)} 种结果 ⇒ seed 没被用上:{seen}"
+
+
+def test_inject_typo_actually_changes_something():
+    """不是恒等函数 —— 否则「注入了错别字」这句话是空的。"""
+    changed = [inject_typo("我要退货", s) for s in range(20)]
+    assert any(c != "我要退货" for c in changed)
+
+
+def test_inject_typo_never_empties_the_text():
+    """**11-D:这条原稿零判别力,现在钉两件真的事。**
+
+    ⚠️ 原稿只有 `assert inject_typo("退货", s).strip()`。而实现是
+    `text.replace(src, dst, 1)`(dst 非空、src ≠ dst)⇒ 输入非空就**结构上不可能**
+    返回空 —— 连「原样返回 `text`」那种错实现**也照样绿**。
+    本仓那条判据在此成立:**「注入的错别字不许为空」这句话,没有任何东西守着。**
+
+    ⇒ 现在断的是:① 有可替换词 ⇒ **必定变了**;② 没有可替换词 ⇒ **原样返回**。
+    """
+    for s in range(50):
+        out = inject_typo("退货", s)
+        assert out.strip(), "注成空串了 —— 空样本会进训练集而看不出来"
+        assert out != "退货", "原样返回了 —— 那等于一条错别字都没注入"
+    # ② 反过来那一半:这句话里一个可替换词都没有 ⇒ 原样返回,**不是**「随便塞一个错别字」。
+    #    少了这一句,「无脑 append 一个错字」那种错实现照样能过上面那两句。
+    assert {inject_typo("在吗", s) for s in range(20)} == {"在吗"}
+
+
+def test_typo_seed_comes_from_the_row_id():
+    """★ **11-C**:种子从**行 id** 派生 —— 同 id 同种子、不同 id 不同种子。
+
+    ⚠️ 「不同 id 不同种子」这一半承重:一个**把 id 丢掉**的实现(返回常数)
+    在这里当场红。它在下游的后果是「同一行在不同的跑里注出不同的错别字」——
+    产物看起来照常合理,而「这份语料是哪来的」再也说不清。
+    """
+    ids = [f"r-{i:04d}" for i in range(1, 200)] + [f"s-{i:04d}" for i in range(1, 200)]
+    assert typo_seed("r-0001") == typo_seed("r-0001")
+    seeds = [typo_seed(i) for i in ids]
+    assert len(set(seeds)) == len(ids), "400 个真实 id 撞出了重复种子(id 被丢掉了?)"
+
+
+def test_typo_seed_is_stable_across_processes():
+    """跨进程确定性 —— **这一条只能这么测**。
+
+    ⚠️ 内置 `hash()` 对 str **每进程随机化**(PYTHONHASHSEED)。用上它的后果是
+    「同一 id 两次增强得到同一个错别字」在脚本重启之后就没了,而
+    **同进程内的任何断言都测不出来**(本仓在 `app/tools/mock_data.py` 上栽过,
+    照 `tests/test_tools_random.py::test_seed_is_stable_across_processes` 的先例)。
+    另起两个进程:它们默认拿到**不同**的 PYTHONHASHSEED ⇒ 用 `hash()` 的实现两个数不同。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    code = (
+        "import sys; sys.path.insert(0, r'.');"
+        "from app.topic.labeling import typo_seed;"
+        "sys.stdout.buffer.write(' '.join("
+        "str(typo_seed(i)) for i in ('r-0056', 's-0282', 'r-0001')).encode('utf-8'))"
+    )
+    outs = []
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", "-c", code], cwd=str(root),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        assert proc.returncode == 0, proc.stderr
+        outs.append(proc.stdout.strip())
+    assert outs[0] == outs[1], (
+        f"两个进程算出的种子不同:{outs} —— 用上内置 `hash()` 了?(它对 str 每进程随机化)"
+    )
+    # 非退化:三个 id 不许算成同一个数(常数也「跨进程稳定」,但那不是 id 派生)
+    assert len(set(outs[0].split())) == 3, f"三个不同的 id 算成了同一个种子:{outs[0]!r}"
+
+
+# ---- `augment` 的接线(ch10 spec §5.4;计划订正 11-A / 11-B / 11-C)----
+
+#: `augment` 的迷你语料。**每行文本里都有两个可替换的同音词对**
+#: ⇒ `inject_typo` 的候选不止一个(「行序无关」那条才有判别力,见它的用例自检)。
+_AUG_TRAIN = [
+    {"id": "r-0001", "question": "买大了要退货,运费谁出", "source": "chat",
+     "provenance": "real", "labels": ["尺码", "退换货", "运费"], "split": "train"},
+    {"id": "s-0002", "question": "订单里颜色选错了想换货", "source": "gen",
+     "provenance": "synthetic", "labels": ["订单修改", "退换货"], "split": "train"},
+    {"id": "r-0003", "question": "发票能改成公司抬头吗,保修几年", "source": "pool",
+     "provenance": "real", "labels": ["发票", "保修维修"], "split": "train"},
+    {"id": "s-0004", "question": "快递太慢了,尺码也不对", "source": "gen",
+     "provenance": "synthetic", "labels": ["物流", "尺码"], "split": "train"},
+    {"id": "r-0005", "question": "颜色发错了,能换货吗", "source": "chat",
+     "provenance": "real", "labels": ["质量问题", "退换货"], "split": "train"},
+    {"id": "s-0006", "question": "保修期内坏了,运费谁出", "source": "gen",
+     "provenance": "synthetic", "labels": ["保修维修", "运费"], "split": "train"},
+    # ⚠️ 后两行是**为了判别力**加的,不是凑数:只有前四行时,
+    #    「把种子换成循环下标」那个变异**测不出来**(实测:两跑的产物逐字相同)——
+    #    证据是 `.superpowers/ch10b_t8_mutation_probe.py` 的变异 **M4** 与 **M14**
+    #    以及它的 `.txt` 转录(两份都已入库);判定判别力的那段断言见
+    #    `test_augment_gives_the_same_typo_…` 末尾的用例自检。
+    #    ⚠️ 这一行 `r-0005` 的**候选只有一个**(「颜色」) —— 它顺带覆盖
+    #    「候选唯一 ⇒ 下标怎么变都不影响它」那条路。
+]
+
+#: 替身的回复表:原句 → (改写后的句子, 它自己报的标签)。
+#: ⚠️ **改写后的句子也各带两个可替换词** —— 否则「行序无关」那条的用例自检过不去。
+_AUG_REPLIES = {
+    "买大了要退货,运费谁出": ("我买大了一码想退货,运费得我自己出吗", ["尺码", "退换货", "运费"]),
+    "订单里颜色选错了想换货": ("订单里颜色我选错了,能换一个吗", ["订单修改", "退换货"]),
+    # ⚠️ 后两条**故意带全角标点**(？ ，):它们让「增强行也过了清洗」这条断言
+    #    真的走得通 —— 全是半角标点时,加不加 `clean()` 读数**逐字相同**(假绿)。
+    "发票能改成公司抬头吗,保修几年": ("能不能把发票开成公司抬头？保修是几年", ["发票", "保修维修"]),
+    "快递太慢了,尺码也不对": ("快递怎么这么慢啊，而且尺码也不合适", ["物流", "尺码"]),
+    "颜色发错了,能换货吗": ("收到的颜色不对,能给我换一个吗", ["质量问题", "退换货"]),
+    "保修期内坏了,运费谁出": ("还在保修期内就坏了,运费得我自己掏吗", ["保修维修", "运费"]),
+}
+
+
+class _Msg:
+    def __init__(self, text):
+        self.text = text
+
+
+class _RewriteStub:
+    """改写模型的替身 —— **回复由行内容决定,与调用顺序无关**。
+
+    ⚠️ 这一点是「行序无关」(11-C)那条的**前提**。照 `prelabel` 那份测试的写法
+    (**按调用顺序出队**),行序一反过来回复也跟着变 —— 那条断言就只是在测
+    「队列按顺序出队」,种子那件事一点也测不到。
+    """
+
+    def __init__(self, *, drift_for=(), malformed=None):
+        self.replies = dict(_AUG_REPLIES)
+        self.drift_for = set(drift_for)
+        #: {原句: 那个**坏形状**的 `labels` 值} —— 造「不是 JSON 语法错,而是形状不对」那一档
+        self.malformed = dict(malformed or {})
+        self.asked: list[str] = []      # 每行的**原句**,按被问到的顺序
+
+    async def ainvoke(self, messages):
+        prompt = messages[0].content
+        for q, (new_q, labels) in self.replies.items():
+            if q in prompt:
+                self.asked.append(q)
+                if q in self.malformed:
+                    return _Msg(json.dumps({"question": new_q, "labels": self.malformed[q]},
+                                           ensure_ascii=False))
+                # 顺带钉住「prompt 逐条带了原标签」(spec §5.4 的第二条硬约束)——
+                # 它的唯一执行点就是 prompt 里那一行字。
+                # ⚠️ **不能**写成 `all(lb in prompt)`:`render_taxonomy_for_prompt()`
+                #    把 17 个类名全列了一遍 ⇒ 那条断言**恒真**(本仓的假绿形态)。
+                joined = " / ".join(labels)
+                assert joined in prompt, (
+                    f"prompt 里没有这一行的原标签 {joined!r} —— `_rewrite` 没把 "
+                    f"`row['labels']` 喂进去(spec §5.4 要求逐条带原标签)"
+                )
+                if q in self.drift_for:
+                    labels = [*labels, "评价"]          # 它自己报的标签多了一个 ⇒ 漂移
+                return _Msg(json.dumps({"question": new_q, "labels": labels},
+                                       ensure_ascii=False))
+        raise AssertionError(
+            f"prompt 里没有任何已知原句 —— `_rewrite` 没把这一行的题面喂进去:\n{prompt}"
+        )
+
+
+def _bind_augment(monkeypatch, tmp_path, *, drift_for=(), malformed=None, rows=None):
+    """把 `augment` 的路径指到 `tmp_path`,并写出**冻结的** val / topic_test。
+
+    ⚠️ val / topic_test 是**真的写到盘上**的(不是留空、也不是不建):
+    11-B 要断的是「跑 `augment` 前后**逐字节相同**」,而对着不存在的文件
+    那句恒真 —— 那正是这条守卫最容易变成假绿的地方。
+
+    ⚠️ `TOPIC_DIR` 也一起指过去:凡是用 `TOPIC_DIR` 拼路径的写法(被改变的实现、
+    或变异探针)都落在 `tmp_path` 里,**够不到真产物**。
+    """
+    from scripts import prepare_topic_data as p
+
+    from app.topic.taxonomy import LABELS
+
+    rows = list(_AUG_TRAIN if rows is None else rows)
+    bad = {lb for r in rows for lb in r["labels"]} - set(LABELS)
+    assert not bad, f"夹具用了不存在的类目 {bad} —— 夹具自己先错了"
+
+    def _write(name, items):
+        (tmp_path / name).write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in items) + "\n",
+            encoding="utf-8")
+
+    _write("train.jsonl", rows)
+    _write("val.jsonl", rows[:2])
+    _write("topic_test.jsonl", rows[2:])
+
+    stub = _RewriteStub(drift_for=drift_for, malformed=malformed)
+    monkeypatch.setattr(p, "TOPIC_DIR", tmp_path)
+    monkeypatch.setattr(p, "TRAIN", tmp_path / "train.jsonl")
+    monkeypatch.setattr(p, "TRAIN_AUGMENTED", tmp_path / "train_augmented.jsonl")
+    monkeypatch.setattr(p, "get_settings", lambda: object())
+    monkeypatch.setattr(p, "create_extract_model", lambda _settings: stub)
+    return p, rows, stub
+
+
+def _augmented_rows(tmp_path):
+    return [r for r in _read_jsonl(tmp_path / "train_augmented.jsonl") if r.get("augmented")]
+
+
+def test_augment_appends_augmented_rows_and_leaves_the_frozen_artifacts_byte_identical(
+    monkeypatch, tmp_path, capsys
+):
+    """★ `augment` 的正题:原件照写 + 追加增强行 + **冻结产物一个字节都没动**(11-B)。
+
+    ⚠️ **为什么必须有这条**:`augment()` 的 docstring 写着「验证集与测试集一条都不许动」,
+    而那句话此前**只是散文** —— 没有任何东西守着它(本仓已编目:一句看起来成立的
+    注释不是守卫)。它一旦被违反,§8 那套指标就不再有任何意义,**而且是静默的**:
+    指标会变好看,没人会去查测试集被动过。
+    """
+    p, rows, stub = _bind_augment(monkeypatch, tmp_path)
+    frozen = {name: (tmp_path / name).read_bytes() for name in ("val.jsonl", "topic_test.jsonl")}
+
+    asyncio.run(p.augment())
+
+    out = _read_jsonl(tmp_path / "train_augmented.jsonl")
+    n = len(rows)
+    # ① 原件照写 —— 增强是**追加**,不是替换
+    assert [r["id"] for r in out[:n]] == [r["id"] for r in rows]
+    assert [r["question"] for r in out[:n]] == [r["question"] for r in rows]
+    # ② 每条原件后面跟着**它自己**的增强版(同序、同 id、题面变了、标签没变)
+    aug = out[n:]
+    assert [r["id"] for r in aug] == [r["id"] for r in rows]
+    assert all(r["augmented"] is True for r in aug)
+    assert [r["labels"] for r in aug] == [r["labels"] for r in rows]
+    assert all(a["question"] != o["question"] for a, o in zip(aug, rows)), "题面一个字都没改"
+    assert stub.asked == [r["question"] for r in rows], "改写次数/顺序与训练集对不上"
+    # ③ ⭐ **冻结产物逐字节相同**(11-B 的正题)
+    for name, before in frozen.items():
+        assert (tmp_path / name).read_bytes() == before, (
+            f"{name} 在跑 `augment` 的过程中**被改动了** —— 扩了测试集,"
+            f"§8 那套指标就不再有任何意义,而且没人会去查"
+        )
+    # ④ 增强行的题面**也过了清洗**(spec §5.1:训练侧与推理侧同源)。
+    #    ⚠️ 判别力依赖夹具:替身那两条回复里带了**全角标点**(？ ，)——
+    #    全是半角时,加不加 `clean()` 读数**逐字相同**(那又是一条假绿)。
+    #    而这一条的后果不小:训练语料里两种口径并存,而 `encode_rows` **不再洗**
+    #    (`app/topic/model.py` 直接读 `row["question"]`)。
+    from app.topic.clean import clean
+    for a in aug:
+        assert clean(a["question"]) == a["question"], (
+            f"增强行的题面没过清洗 ⇒ 训练语料两种口径并存:{a['question']!r}"
+        )
+    # ⑤ 读数打出来(交付要求的一部分:`kept` / `drifted` / 产物行数)
+    printed = capsys.readouterr().out
+    assert "增强追加 6 条" in printed, printed
+    assert "因标签漂移丢弃 0 条" in printed, printed
+    assert "产物 train_augmented.jsonl:12 行(原件 6 + 增强 6)" in printed, printed
+
+
+def test_augment_refuses_to_read_a_frozen_artifact(monkeypatch, tmp_path):
+    """★ 11-B 的另一半:**把 `train_path` 指向 `val.jsonl` ⇒ 那条断言必须红。**
+
+    真正会把验证集吃掉的那种改法(有人决定「train + val 一起增强,验证集样本太少」)
+    在这里当场停住,而不是安静地增强一份验证集 —— 而验证集参与早停与阈值选择,
+    它被改动与测试集被动过同级。
+
+    ⚠️ 最后那句断的是「产物**不存在**」:「拦住了」与「拦住了但先写了一份错的」
+    是两回事 —— 断言若写在打开产物之后,一份空产物已经落在盘上了。
+    """
+    p, _, _ = _bind_augment(monkeypatch, tmp_path)
+    monkeypatch.setattr(p, "TRAIN", tmp_path / "val.jsonl")
+
+    with pytest.raises(AssertionError):
+        asyncio.run(p.augment())
+
+    assert not (tmp_path / "train_augmented.jsonl").exists(), (
+        "断言写在**打开产物之后** ⇒ 先留了一份空产物再报错"
+    )
+
+
+def test_augment_refuses_to_write_a_frozen_artifact(monkeypatch, tmp_path):
+    """★ 11-B:**产物也不许写进冻结产物** —— 这才是**真正**会毁掉测试集的方向。
+
+    ⚠️ 两条断言分得开,不许互相顶替:输入那条守的是「验证集被加强进产物」,
+    输出那条守的是「测试集被覆盖」。它们对应两种**不同的**改法。
+    """
+    p, _, _ = _bind_augment(monkeypatch, tmp_path)
+    frozen = (tmp_path / "topic_test.jsonl").read_bytes()
+    monkeypatch.setattr(p, "TRAIN_AUGMENTED", tmp_path / "topic_test.jsonl")
+
+    with pytest.raises(AssertionError):
+        asyncio.run(p.augment())
+
+    assert (tmp_path / "topic_test.jsonl").read_bytes() == frozen, (
+        "冻结的测试集被覆盖了 —— 而那是个静默的破坏(指标会变好看)"
+    )
+
+
+def test_augment_gives_the_same_typo_no_matter_the_row_order(monkeypatch, tmp_path):
+    """★ **11-C**:种子从**行 id** 派生 ⇒ 语料重排后每一行注的还是同一个错别字。
+
+    ⚠️ 用**循环下标**当种子时,`train.jsonl` 一旦重排(重跑 `split`、按 id 重排、
+    有人手工挪了几行),**每一行**的错别字都变 —— 产物看起来照常合理,
+    没有任何东西会报错。这里跑两遍(正序 / 倒序),断**同一 id 的题面逐字相同**。
+    """
+    seen: dict[str, dict[str, str]] = {}
+    for order, rows in (("正序", _AUG_TRAIN), ("倒序", list(reversed(_AUG_TRAIN)))):
+        p, _, _ = _bind_augment(monkeypatch, tmp_path, rows=rows)
+        asyncio.run(p.augment())
+        seen[order] = {r["id"]: r["question"] for r in _augmented_rows(tmp_path)}
+    assert set(seen["正序"]) == set(seen["倒序"]), "两跑增强出的 id 集合就不一样"
+    assert seen["正序"] == seen["倒序"], (
+        "同一行在两份行序里注出了**不同**的错别字 ⇒ 种子跟着行序变了(11-C 那个错法)"
+    )
+
+    # ---- 用例自检:这个夹具**真的**能分辨「下标当种子」----
+    # ⚠️ 判据是本仓那句「构造输入前先算一遍它会不会走到那条分支」:把两跑的
+    #    **循环下标**(实现里是 `enumerate(todo, 1)`,**从 1 起**)当种子算一遍 ——
+    #    若两跑的产物**逐字相同**,那上面那条断言对 11-C 那个错法就**零判别力**
+    #    (那时该换几个 id / 加几行,不是删掉它)。
+    # ⚠️ 两点都吃过亏,别再写回去:
+    #    ① 这一段**不引用 `typo_seed`** —— 引用它就成了「用被测的那件事去证明
+    #       被测的那件事」;
+    #    ② 下标必须**从 1 起**(与实现一致)。第一版写的是 0 起的 `enumerate(…)`
+    #       ⇒ 自检报「有判别力」而**变异实测全绿** —— 一段**看起来在守什么、
+    #       其实什么都没守**的自检(与本仓那条「一句看起来成立的注释不是守卫」同族)。
+    #       `ch10b_t8_mutation_probe.py` 的变异 **M14** 现在钉住这段自检本身:
+    #       把夹具截回四行 ⇒ 自检**先红**(而不是悄悄变成绿灯)。
+    rewritten = {q: new_q for q, (new_q, _) in _AUG_REPLIES.items()}
+    by_index = {
+        "正序": {r["id"]: inject_typo(rewritten[r["question"]], i)
+                 for i, r in enumerate(_AUG_TRAIN, 1)},
+        "倒序": {r["id"]: inject_typo(rewritten[r["question"]], i)
+                 for i, r in enumerate(reversed(_AUG_TRAIN), 1)},
+    }
+    assert by_index["正序"] != by_index["倒序"], (
+        "夹具没有判别力:把种子换成**循环下标**时,正序与倒序的产物**逐字相同**"
+        " ⇒ 上面那条断言抓不住 11-C 那个错法(换几个 id / 加几行,不是删掉它)"
+    )
+
+
+def test_augment_drops_the_rows_whose_labels_drifted(monkeypatch, tmp_path, capsys):
+    """标签漂移的行**整条丢弃**,并如实计数(spec §5.4 的第一条硬约束)。
+
+    ⚠️ **两个方向都要钉**:
+    - **该丢的丢了**:漂的那一条**不在**产物里;
+    - **不该丢的没丢**:其余三条**在**产物里 —— 把判据写成恒真
+      (`label_drift` 直接 `return True`)的实现会在这里红;
+    - 原件**照样全写**(丢弃只作用于增强行,不许连原件一起丢)。
+    """
+    p, rows, _ = _bind_augment(monkeypatch, tmp_path,
+                               drift_for=("订单里颜色选错了想换货",))
+
+    asyncio.run(p.augment())
+
+    written = _read_jsonl(tmp_path / "train_augmented.jsonl")
+    aug = [r for r in written if r.get("augmented")]
+    assert {r["id"] for r in aug} == {r["id"] for r in rows} - {"s-0002"}, (
+        "漂移的行还是写进产物了,或者**没漂的行被一起丢了**"
+    )
+    assert len(written) == len(rows) * 2 - 1, "原件被连带丢了"
+    printed = capsys.readouterr().out
+    assert "因标签漂移丢弃 1 条" in printed, printed
+    assert "增强追加 5 条" in printed, printed
+
+
+def test_augment_limit_only_samples_the_rewriting(monkeypatch, tmp_path, capsys):
+    """★ **11-A**:`--limit N` **只**决定这次改写几行,并且**不许碰冻结的 `train.jsonl`**。
+
+    ⚠️ 本任务原稿写的是「先把 `train.jsonl` 截成 20 条试跑」—— 那是**就地改掉训练集**:
+    一份 20 行的训练集会出现在 `git status` 里(` M train.jsonl`),谁在收尾时一
+    `git add -A` 就把它提交了,而 Task 9 拿它训练。这条把那个脚枪钉住:
+    跑完 `train.jsonl` **逐字节相同**。
+    """
+    p, rows, stub = _bind_augment(monkeypatch, tmp_path)
+    before = (tmp_path / "train.jsonl").read_bytes()
+
+    asyncio.run(p.augment(limit=2))
+
+    assert stub.asked == [r["question"] for r in rows[:2]], "`limit` 取的不是**前 N 行**"
+    assert [r["id"] for r in _augmented_rows(tmp_path)] == [r["id"] for r in rows[:2]]
+    # 原件仍然**全部**照写(小样只影响「改写几行」,不影响产物的原件那一半)
+    assert len(_read_jsonl(tmp_path / "train_augmented.jsonl")) == len(rows) + 2
+    assert (tmp_path / "train.jsonl").read_bytes() == before, (
+        "`train.jsonl` 被就地改了 —— 那是 11-A 的脚枪(冻结的训练集是 Task 9 的输入)"
+    )
+    # ⚠️ 小样跑出来的产物**不是**全量 —— 这件事必须打出来,否则一份只增强了 20 条的
+    #    产物会安静地冒充全量产物,而 Task 9 照它训练。
+    assert "小样" in capsys.readouterr().out
+
+
+def test_augment_reports_a_malformed_answer_without_counting_it_as_drift(
+    monkeypatch, tmp_path, capsys
+):
+    """改写端没解析出来 ⇒ **按原句写回**,而且**不**记进「漂移」。
+
+    ⚠️ 两个读数混起来的后果(原稿只挡了 JSON 语法那一档,这里钉的是**形状**那一档):
+    `drifted` 是**语料质量的读数**(它高说明预标不稳 / prompt 的「诉求个数与类别不变」
+    没被遵守),而「模型吐了怪东西」是**故障**。混起来之后,一个「网络抖动 + 标签全对」
+    的批次会被读成「标签大面积漂移 ⇒ 回去改 prompt」。
+
+    ⚠️ 两种形状都要造,因为后果不同:
+    - `labels` 吐成**字符串** ⇒ `list("退换货")` 按**字符**迭代,每个字符都查无此类目
+      ⇒ 原稿照样落进 drift(看起来像模型判错了标签,其实是形状不对);
+    - `labels` 吐成 **int** ⇒ `list(5)` 直接 `TypeError` ⇒ **打断整跑**(那是 75 分钟)。
+    """
+    p, rows, _ = _bind_augment(monkeypatch, tmp_path, malformed={
+        "订单里颜色选错了想换货": "退换货",
+        "快递太慢了,尺码也不对": 5,
+    })
+
+    asyncio.run(p.augment())
+
+    aug = {r["id"]: r for r in _augmented_rows(tmp_path)}
+    assert set(aug) == {r["id"] for r in rows}, "解析失败的行被丢了(该按原句写回)"
+    for rid, question in (("s-0002", "订单里颜色选错了想换货"), ("s-0004", "快递太慢了,尺码也不对")):
+        orig = next(r for r in rows if r["id"] == rid)
+        assert aug[rid]["labels"] == orig["labels"], f"{rid} 落回的不是原标签"
+        assert aug[rid]["question"] == inject_typo(question, typo_seed(rid)), (
+            f"{rid} 的题面该按**原句**写回(那个没解析出来的改写不许进语料)"
+        )
+    printed = capsys.readouterr().out
+    assert "因标签漂移丢弃 0 条" in printed, printed
+    assert "解析失败 2 条" in printed, printed
+
+
+def test_the_augment_paths_point_at_the_right_files():
+    """★ 名字要有一条**直接**断言 —— 与订正 9-B(`topic_test.jsonl`)同一个理由。
+
+    ⚠️ 上面那些接线用例全都 `monkeypatch` 掉了 `TRAIN` / `TRAIN_AUGMENTED`
+    ⇒ **常量指错文件它们照样绿**(订正 9-B 的 M15 实测过同一形状)。
+    指错的后果分两种:`val.jsonl`(验证集被当成训练集加强)最重 ——
+    验证集参与早停与阈值选择,它被改动与测试集被动过同级。
+    """
+    from scripts import export_label_review as exp
+    from scripts import prepare_topic_data as p
+
+    assert p.TRAIN == p.TOPIC_DIR / "train.jsonl"
+    assert p.TRAIN_AUGMENTED == p.TOPIC_DIR / "train_augmented.jsonl"
+    assert p.TRAIN != p.TRAIN_AUGMENTED, "产物指回了输入 —— 那是就地改掉冻结的训练集"
+    for frozen in (p.TOPIC_DIR / "val.jsonl", exp.TOPIC_TEST):
+        assert p.TRAIN != frozen, "冻结产物被当成增强的输入了"
+        assert p.TRAIN_AUGMENTED != frozen, "增强会写进冻结产物 —— 静默的破坏"
+
+
+def test_main_dispatches_augment_and_forwards_the_limit(monkeypatch):
+    """`main()` 的分派:`augment` 必须走到 `augment()`,而且 `--limit` 要**真的传进去**。
+
+    ⚠️ 守的是**命令行那一半**:上面几条直接调 `p.augment(...)`,所以把 `main()`
+    里 `elif args.step == "augment"` 那一支删掉、或忘了转发 `--limit` 时它们**照样绿** ——
+    而 `bash` 里那一行 `augment --limit 20` 会变成一次**全量**跑
+    (1158 条 × 逐条打网络,约 75 分钟)。
+    """
+    import sys
+
+    from scripts import prepare_topic_data as p
+
+    called: list[tuple[str, int | None]] = []
+
+    async def fake(limit=None):
+        called.append(("augment", limit))
+
+    monkeypatch.setattr(p, "augment", fake)
+
+    monkeypatch.setattr(sys, "argv", ["prepare_topic_data.py", "augment", "--limit", "3"])
+    p.main()
+    assert called == [("augment", 3)]
+
+    monkeypatch.setattr(sys, "argv", ["prepare_topic_data.py", "augment"])
+    p.main()
+    assert called[-1] == ("augment", None), "不带 `--limit` 时必须传 `None`(= 全量)"
+
+
+def test_main_refuses_limit_on_the_other_steps(monkeypatch):
+    """`--limit` 只对 `augment` 有意义 —— 给 `split` / `collect` 加它必须**响亮地停**。
+
+    ⚠️ 静默忽略是这里唯一危险的走法:有人打 `split --limit 20` 想看小样,
+    脚本照跑全量,而**没有任何东西告诉他这个参数被吞了**。
+
+    ⚠️ `split` / `collect` 在这里**被替成计数器**(不是让它真跑):
+    真跑 `split()` 会**覆盖 `evals/topic/` 里那三份冻结产物** —— 这条测试自己
+    绝不能带那种风险。写成计数器顺带多钉一句:**分派前就停了**(两个都没被调用)。
+    """
+    import sys
+
+    from scripts import prepare_topic_data as p
+
+    called: list[str] = []
+    monkeypatch.setattr(p, "split", lambda: called.append("split"))
+    monkeypatch.setattr(p, "collect", lambda: called.append("collect"))
+
+    for step in ("split", "collect"):
+        monkeypatch.setattr(sys, "argv", ["prepare_topic_data.py", step, "--limit", "20"])
+        with pytest.raises(SystemExit) as e:
+            p.main()
+        assert "--limit" in str(e.value), str(e.value)
+
+    assert called == [], "`--limit` 没拦住,真跑了别的一步"
