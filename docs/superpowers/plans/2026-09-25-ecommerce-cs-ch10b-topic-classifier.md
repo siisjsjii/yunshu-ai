@@ -1068,6 +1068,22 @@ def build_prompt(label: str, form: str, n: int) -> str:
 
     ⚠️ 本仓硬约束:提示词里必须出现字面 `JSON` 字样,且**不得有裸花括号**。
     """
+    # ⚠️⚠️ **计划订正 A(controller,2026-09-26)—— 下面这段是计划原稿,已实现取代** ⚠️⚠️
+    # 真在 `scripts/gen_topic_data.py`。**照抄下面这一版会原样复发 I1**:
+    #
+    # 旧 `boundary` 只写「与它最容易混的那个类目同时出现,让人必须读完才分得清」——
+    # **一个字都没提标签基数**,读起来像一道**单选辨析题**。实测后果:边界形式产出
+    # **147/147 全单标签**(而 `multi` 对解剖学上一样的双诉求句打 2–3 个),于是
+    # 「≥15% 近邻边界对」这项覆盖**名不副实**。
+    #
+    # 现在的实现(订正轮 1 + 2):
+    #   ① **明写基数** —— 边界批两个诉求**都要打标**;
+    #   ② 把 `taxonomy.COUNTER[label]` **声明的那个易混类目**直接交给模型,**不让它自己挑**;
+    #   ③ `COUNTER` **没声明**的 7 类(§4.1 反例列写 `—` 的那 7 行)退回共现措辞 ——
+    #      ⚠️ **这 56 条是「共现对」,不是「真近邻对」**:复审逐行核过 147 条,
+    #      其中真近邻对只有 **91 条**;`发票`/`支付`/`其他` 三类甚至**逐行换邻居**。
+    #      裁定是**接受并记账**(理由见 `check_rows` 报表里的拆分与 SDD 账本),
+    #      **不在这里补 `COUNTER`** —— 那是改 taxonomy,是全章唯一的类目来源。
     form_desc = {
         "single": f"只涉及「{label}」**一个**诉求",
         "multi": f"涉及「{label}」**以及另外 1–2 个**不同的诉求(共 2–3 个)",
@@ -1109,11 +1125,24 @@ async def run(dry_run: bool) -> None:
                     continue
                 raw = await _call(model, prompt)
                 for item in raw:
+                    # ⚠️⚠️ **计划订正 B(controller,2026-09-26)—— 这段也是计划原稿,已实现取代** ⚠️⚠️
+                    # 两处会直接坑到下一个执行者,**别照抄**:
+                    #
+                    # ① **行形状少了 `"id"`。** 下面写的是六个键,而**同一份计划的 Task 5**
+                    #    (本文档 `todo = [r for r in rows if r["id"] not in done]`)按 `r["id"]` 索引
+                    #    ⇒ 照这段抄,Task 5 读到第一条合成数据就 `KeyError: 'id'`。
+                    #    实现里发的是 `"id": f"s-{n:04d}"`(`s-0001`…`s-0962`)。
+                    #    ⚠️ **`s-` 前缀是必要的**:真实语料那边是 `r-0001`…`r-0462`,
+                    #    两个文件被 Task 5 合流进**同一个列表**,前缀撞了就会互相顶掉。
+                    #
+                    # ② **三道门是内联的 `if`,不是那张唯一判据表。** 现在是
+                    #    `reject_reason(item, seed_label, form) -> str | None`(**一处实现、两处调用**:
+                    #    生成侧 `accept` 读它拦输入,核产物时 `check_rows` 读**同一张表**复核)。
+                    #    为什么非要抽出来:真跑 962 条 `dropped = 0` ⇒ 这几道门在生产上
+                    #    **一次都没开过火** —— 「禁词表写坏了」与「模型没写禁词」在读数上长得一样。
+                    #    ⚠️ 抽出来之后又补了**形态基数**(`multi`/`boundary` 必须 ≥2 个标签):
+                    #    「boundary 应当是 2 个」这条要求原先**只活在提示词里**(见订正 A)。
                     q, labels = item.get("question", ""), item.get("labels", [])
-                    # ⚠️ **三道门,任何一道不过就丢弃**:
-                    #   ① 形态合法(非空、不重复、≤3、都是真类目)
-                    #   ② 不含禁词(否则学成关键词匹配)
-                    #   ③ 主诉求真的是这一类(模型经常跑偏)
                     if not shape_ok(labels):
                         dropped += 1
                         continue
@@ -1198,6 +1227,36 @@ git commit -m "ch10-B T4: 配额合成 + 形态强制 + 禁词自检(三条数�
 - Produces:
   - `app.topic.labeling.validate_evidence(question: str, labels: list[str], evidence: dict[str,str]) -> tuple[list[str], list[str]]` —— 返回 `(accepted_labels, rejected_labels)`
   - `scripts/prelabel_topics.py` → `evals/topic/prelabeled.jsonl`(append-only,可断点续跑)
+
+- [ ] **Step 0: 把 `POSITIVE` 接进渲染块(计划订正 D,controller 2026-09-26)**
+
+**先读背景再动手。** `app/topic/taxonomy.py` 的 `POSITIVE` 是 B1 按 spec §4.1 的「正例」列
+**逐类**收的(17 类每类 ≥1 条,`tests/test_topic_taxonomy.py:70` 有断言守着),
+**但它一个 prompt 都没进过** —— `render_taxonomy_for_prompt()` 只渲染 `BOUNDARY` + `COUNTER`。
+(`scripts/export_taxonomy_review.py` 把它写进了给用户过目的 CSV,所以它不是死数据;
+**死的是「从没进过任何 prompt」这一半**。)
+
+而 `POSITIVE` 自己的 docstring 逐字写着:
+
+> 「其他」也有正例(§4.1 第 17 行):它的边界是「以上都不是」,
+> 但**边界说明不足以让模型学会认它**,给一句原话比给一句否定式更有效。
+
+⇒ **作者论证过它该进 prompt,而渲染函数从来没输出它。** 这是本仓那条
+「代码里一句**看起来会生效**的话,其实什么都没做」的形状(家族里已有四个成员)。
+
+**改法**:让 `render_taxonomy_for_prompt()` 在每类的边界说明**下面**渲染它的正例
+(形如 `    · 例:「{text}」`,与现行反例行的缩进对齐),**`COUNTER` 没声明的 7 类照样有正例**。
+`tests/test_topic_taxonomy.py` 里照
+`test_rendered_block_carries_every_counter_pair` 的体例**补一条同款**(断言**整行文本**在块里,
+而不是「两个词都出现过」),并确认 `test_rendered_block_has_no_curly_braces` 仍然绿。
+
+⚠️ **必须一并记账的两条**(写进报告与 commit message):
+1. **这是一处对已复审代码(`app/topic/taxonomy.py`,Task 1 的交付物)的改动** ——
+   改的是渲染**函数**,不是 `POSITIVE` 常量本身(那张常量表与 CP-1 用户签过字的 CSV 一字未动)。
+2. **连带影响**:`render_taxonomy_for_prompt()` **也被 Task 4 的生成器用** ⇒
+   **下一次重跑 Task 4 会得到不同的问题**。现存那 962 条是在**没有正例**的渲染块下生成的。
+   对训练**无影响**(Task 5 用 `{**row, "labels": accepted}` **整列覆盖** `labels`),
+   但这条漂移要如实写下来,不要装作没有。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1377,24 +1436,56 @@ async def run(limit: int | None) -> None:
 
     settings = get_settings()
     model = create_extract_model(settings)
-    flagged = 0
+    flagged = 0        # 有标签被证据校验拒掉
+    parse_failed = 0   # JSON 根本没解出来 —— **与上面那个是两回事,必须分开数**
+    zero_label = 0     # 解出来了,但一个标签都没落下(含上面那种,也含模型真判了零诉求)
     with OUT.open("a", encoding="utf-8") as f:
         for row in todo:
-            labels, evidence = await _label(model, row["question"])
+            labels, evidence, bad = await _label(model, row["question"])
+            if bad:
+                parse_failed += 1
             accepted, rejected = validate_evidence(row["question"], labels, evidence)
             if rejected:
                 flagged += 1
+            if not accepted:
+                zero_label += 1
             f.write(json.dumps(
                 {**row, "labels": accepted, "rejected_labels": rejected,
+                 # ⚠️ 「分得开」的**唯一**保证就是这一列(见 `_label` 的 docstring)
+                 "parse_failed": bad,
                  "evidence": {k: v for k, v in evidence.items() if k in accepted}},
                 ensure_ascii=False) + "\n")
             f.flush()
-    # ⚠️ 「被校验拒掉标签」的条数是个**质量读数**,不是错误 —— 它会直接进
-    #    训练集标签错误率那一段(spec §6.3)。打出来。
-    print(f"完成。其中 {flagged} 条有标签被证据校验拒掉(占 {flagged / max(1, len(todo)):.1%})")
+    # ⚠️ **三个读数都要打,别只打一个**:
+    #    `flagged`      = 有标签被证据校验拒掉 —— **质量读数**,直接进 spec §6.3
+    #    `parse_failed` = JSON 没解出来 —— **故障读数,它是 0 才正常**
+    #    `zero_label`   = 一个标签都没落下(含上面那种,也含「模型真的判了零诉求」)
+    print(f"完成。被证据校验拒掉标签的 {flagged} 条({flagged / max(1, len(todo)):.1%});"
+          f"**JSON 解析失败 {parse_failed} 条**;空标签 {zero_label} 条")
+    if parse_failed:
+        print("⚠️ 解析失败不为 0 ⇒ **先停下看产物,别直接进 Task 6** ——"
+              "这些行的标签是空的,而不是「判定了没有主题」。")
 
 
-async def _label(model, question: str) -> tuple[list[str], dict[str, str]]:
+async def _label(model, question: str) -> tuple[list[str], dict[str, str], bool]:
+    """返回 `(labels, evidence, parse_failed)`。
+
+    ⚠️ **`parse_failed` 必须一路传出去**(计划订正 C,controller 2026-09-26)。
+    本节原稿在 `JSONDecodeError` 时 `return [], {}`,调用方写出的行是
+    `{"labels": [], "rejected_labels": [], "evidence": {}}` —— 与「模型**真的**返回零标签」
+    (合法,例如闲聊)写出来的行**逐字节相同**。而原稿那行注释写的是
+    「它与「有标签但被拒」是两回事,**分开记**才能在人审时看出是哪一种」—— **那句是假的**。
+
+    后果不是「少个字段」:① 空标签行进 Task 6 人审、进 Task 7 分层抽样时**看起来是正常行**,
+    而它可能是「模型吐了散文、JSON 没解出来」;② `flagged` 那个「质量读数」
+    (要进 spec §6.3 的训练标签错误率)会**系统性偏小**。
+
+    ⚠️ **可选但优先**:若 `with_structured_output({...}, method="json_mode")` 在本网关可用,
+    优先用它 —— 它能**结构性**消掉这条失败路径(本仓 `app/services/extract.py` 走的就是
+    `json_mode`;`function_calling` / `json_schema` 在本网关返回 400)。
+    **先查 Context7 或实测再决定**,并在报告里说明用了哪个、为什么。
+    无论用哪个,`parse_failed` 这个读数与那一列**都要在**。
+    """
     from langchain_core.messages import HumanMessage
 
     prompt = PROMPT.format(taxonomy=render_taxonomy_for_prompt(), question=question)
@@ -1406,10 +1497,10 @@ async def _label(model, question: str) -> tuple[list[str], dict[str, str]]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # 解析失败落一条**空标签**记录 —— 它与「有标签但被拒」是两回事,
-        # 分开记才能在人审时看出是哪一种。
-        return [], {}
-    return list(data.get("labels") or []), dict(data.get("evidence") or {})
+        return [], {}, True
+    if not isinstance(data, dict):
+        return [], {}, True
+    return list(data.get("labels") or []), dict(data.get("evidence") or {}), False
 
 
 def _already_done() -> set[str]:
@@ -1437,7 +1528,11 @@ if __name__ == "__main__":
 Run: `.venv/Scripts/python.exe scripts/prelabel_topics.py --limit 10`
 
 **打开 `evals/topic/prelabeled.jsonl` 肉眼读这 10 条。** 检查:
-① `evidence` 里的每个值**真的是原句的连续片段**(不是改写的);② 被拒的标签是**真的错**还是清洗口径问题。
+① `evidence` 里的每个值**真的是原句的连续片段**(不是改写的);② 被拒的标签是**真的错**还是清洗口径问题;
+③ **`parse_failed` 列必须全是 `false`** —— 不是 0 就先别往下跑,那是**故障**不是质量(计划订正 C)。
+另外**抽 2 条核 `evidence` 是不是逐字子串**:拿产物里的 `evidence` 值去 `clean()` 后的问句里 `in` 一遍,
+**自己算一次**,别只看脚本说「被拒 0 条」——「被拒 0」在**标签本来就都对**与
+**校验器根本没跑**两种实现下**读数相同**。
 
 > ⚠️ 如果「被拒标签」的比例很高(比如 >30%),**先别往下跑** —— 那通常说明 prompt 里的「照抄、不要改写」没被遵守,改 prompt 重来比标完全部再返工便宜得多。已写出的 10 条可以用 `rm evals/topic/prelabeled.jsonl` 清掉重来(append-only 的代价)。
 
@@ -1448,8 +1543,9 @@ Run: `.venv/Scripts/python.exe scripts/prelabel_topics.py`
 - [ ] **Step 8: Commit**
 
 ```bash
-git add app/topic/labeling.py scripts/prelabel_topics.py tests/test_topic_labeling.py
-git commit -m "ch10-B T5: 大模型预标(证据串校验 + 断点续跑)"
+git add app/topic/taxonomy.py app/topic/labeling.py scripts/prelabel_topics.py \
+        tests/test_topic_labeling.py tests/test_topic_taxonomy.py
+git commit -m "ch10-B T5: 大模型预标(证据串校验 + 解析失败可见 + 断点续跑;正例接进渲染块)"
 ```
 
 ---
