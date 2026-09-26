@@ -2284,6 +2284,31 @@ git commit -m "ch10-B T7-B: 回写人工复核后的测试集标签(冻结)"
 
 ## Task 8: 数据增强(**只扩训练集**)
 
+> ⚠️⚠️ **计划订正 11(controller,2026-09-26)—— 五处,一处是脚枪(11-A,已就地改)、
+> 一处是「文档里的承诺没有装置守」(11-B)** ⚠️⚠️
+>
+> **11-B(最要紧的一条)**:`augment()` 的 docstring 写着「验证集与测试集一条都不许动」,
+> 以及「扩了测试集…是个**静默**的破坏」—— **但这些只是散文,没有任何东西守着它**。
+> ⇒ **补一个 Step 与一条测试**:跑 `augment` 的**前后**,`val.jsonl` 与 `topic_test.jsonl`
+> 必须**逐字节相同**(`sha256` 对比),并且在 `augment()` 里**显式 `assert`** 它只读 `train.jsonl`。
+> **要能红**:把 `train_path` 指向 `val.jsonl` ⇒ 那条断言必须红。
+> (本仓已编目过:一句**看起来成立**的注释不是守卫。)
+>
+> **11-C**:`inject_typo(new_text, i)` 用**循环下标**当种子 ⇒ 可复现性依赖**输入行序**,
+> `train.jsonl` 一旦重排,错别字就变。⇒ **改成从行 id 派生一个稳定种子**
+> (例如 `int(hashlib.sha256(r["id"].encode()).hexdigest()[:8], 16)`)。
+> ⚠️ 仍要 `random.Random(seed)`(本仓硬约束:**不许用内置 `hash()`**,它对 str 每进程随机化)。
+>
+> **11-D**:`test_inject_typo_never_empties_the_text` **零判别力** ——
+> `inject_typo` 的实现是 `text.replace(src, dst, 1)`,只要输入非空就**结构上不可能**返回空,
+> 而「原样返回 `text`」的错实现**照样绿**。
+> ⇒ 要么**加强**它(例如断言「有可替换词时**必定**变了」),要么在注释里**标成不承重**。
+> 别留着一条看起来在守什么、其实什么都没守的断言。
+>
+> **11-E**:全量约 **75 分钟**(1158 条 × T5 实测 3.9 秒/条)。
+>
+> ⚠️ 另**不要**让实现者写 `dev-notes`(见 11-F 的流程约定,写 `task-8-report.md`)。
+
 **Files:**
 - Modify: `app/topic/labeling.py`(加 `label_drift`、`inject_typo`)
 - Modify: `tests/test_topic_labeling.py`
@@ -2457,8 +2482,22 @@ async def _rewrite(model, row: dict) -> tuple[str, list[str]]:
 
 - [ ] **Step 5: 小样试跑,看漂移率**
 
-Run: 先把 `train.jsonl` 截成 20 条试跑,看 `drifted` 比例。
-若 >20%,**先改 `_rewrite` 的 prompt 再全量跑** —— 全量跑完再发现就得重来。
+> ⚠️⚠️ **计划订正 11-A(controller,2026-09-26)—— 原稿这里是个脚枪** ⚠️⚠️
+> 原稿写「**先把 `train.jsonl` 截成 20 条试跑**」—— **`train.jsonl` 是已入库的冻结产物**,
+> 是 Task 9 的训练输入。照它做就是**就地改掉训练集**,而 `git status` 会显示 ` M`,
+> 谁在收尾时一 `git add -A` 就把一份 20 行的训练集提交了。
+> ⇒ **给 `augment` 加一个 `--limit N` 参数**,小样跑 `--limit 20`。
+> **任何情况下都不许改 `train.jsonl` / `val.jsonl` / `topic_test.jsonl` 的**内容。
+
+Run:
+```bash
+.venv/Scripts/python.exe scripts/prepare_topic_data.py augment --limit 20
+```
+看 `drifted` 比例。若 >20%,**先改 `_rewrite` 的 prompt 再全量跑** —— 全量跑完再发现就得重来。
+(⚠️ **20% 这个阈值是拍的,没有标定** —— 它只是个「先停下来看看」的提示,不是判据。)
+
+> ⚠️ **订正 11-E(耗时)**:全量是 **1158 条 × 逐条调模型**。按 T5 实测的 **3.9 秒/条**,
+> 大约是 **75 分钟**量级。**派活时按这个估。**
 
 - [ ] **Step 6: 跑纯函数测试**
 
