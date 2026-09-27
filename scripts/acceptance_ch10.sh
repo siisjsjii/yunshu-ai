@@ -509,8 +509,48 @@ wait_port_free() {   # $1=端口 $2=秒数
   done
   return 1
 }
+
+# ── 认证(认证章 T7):三行接入,让下面每一处裸 `curl` 一个字都不用改 ──────────
+#   ① 登录一次拿 token(`cinfly` 是 admin ⇒ 一个 token 同时覆盖用户面与工作台);
+#   ② 用**同名函数遮蔽 `curl`** —— 此后每一处 `curl` 自动带上 Authorization 头。
+# ⚠️ 登录走 python 的 `urllib` 而不是 `curl`:此刻 curl 还没被遮蔽,而「请求体不走
+#    argv」是本仓的规矩(顺带不依赖 jq)。
+# ⚠️ 遮蔽只在**当前 shell** 生效。七个验收脚本里 `bash -c` / `sh -c` / `command curl`
+#    / 绝对路径 curl **各 0 处**(实测),而 `$(curl …)` 那类调用是**子 shell、会继承
+#    函数** ⇒ 全覆盖,没有一处漏网。
+# ⚠️ **登录放在 `wait_ready` 里,不放在脚本开头**:本脚本自己起服务,脚本开头那一刻
+#    服务还没起 ⇒ 只会拿到空 token;而 `wait_ready` 那条 200 判据现在也要 token。
+#    登录成败因此顺带就是「服务起没起」的另一半判据(拿不到 token 时它自己会打印
+#    原因,而不是让下面所有断言悄悄变成 401)。
+TOKEN=""
+login_token() {   # $1=base ⇒ 成功时填 TOKEN 并返回 0;失败打一行原因、返回 1
+  TOKEN=$(BASE="$1" "$PYTHON" - <<'PYEOF'
+import json, os, sys, time, urllib.request
+base, deadline, last = os.environ["BASE"], time.monotonic() + 60, None
+while time.monotonic() < deadline:
+    try:
+        req = urllib.request.Request(
+            base + "/api/auth/login",
+            data=json.dumps({"username": "cinfly", "password": "123456"}).encode(),
+            headers={"Content-Type": "application/json"})
+        print(json.load(urllib.request.urlopen(req, timeout=10))["token"])
+        sys.exit(0)
+    except Exception as exc:      # 服务还没起来 ⇒ 重试;真出错也就重试这 60 秒
+        last = exc
+        time.sleep(1)
+sys.stderr.write("登录没成(%s):%s\n" % (base, last))
+sys.exit(1)
+PYEOF
+)
+  [ -n "$TOKEN" ]
+}
+curl() { command curl -H "Authorization: Bearer $TOKEN" "$@"; }
+
 wait_ready() {   # $1=秒数
   local deadline=$((SECONDS + $1))
+  # 认证(见上面那段):token 只在**服务起来之后**才拿得到 ⇒ 在第一次轮询时补。
+  # 放在脚本开头必然拿到空 token,而下面那条 200 判据现在也要 token。
+  [ -n "$TOKEN" ] || login_token "$BASE"
   while [ "$SECONDS" -lt "$deadline" ]; do
     [ "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/api/conversations")" = "200" ] && return 0
     sleep 1

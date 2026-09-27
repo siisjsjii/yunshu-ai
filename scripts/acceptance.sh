@@ -335,13 +335,20 @@ fi
 
 # 轮询后台任务直到终态,输出最终任务 JSON;超时(600s)输出 running 并返回 1。
 poll_job() {
-  BASE="$BASE" JOBID="$1" "$PYTHON" -c '
+  # ⚠️ 认证:**这一处不是 curl,是 python 的 urllib** —— 遮蔽 curl 的三行够不着它,
+  # 所以要**就地把 token 传进来**(用 env,不走 argv:本仓规矩)。
+  # 漏掉它的后果实测过(2026-09-28 第一次带认证跑):`/api/kb/jobs/{id}` 回 **401**,
+  # 轮询函数当场抛 `HTTPError` ⇒ 验收 6/7 报成「向量化任务超时」「挖知识失败」——
+  # 而红出现在**别的名字**上,读起来像 ch04 的后台任务坏了。
+  BASE="$BASE" TOKEN="$TOKEN" JOBID="$1" "$PYTHON" -c '
 import json, os, sys, time, urllib.request
 
 base = os.environ["BASE"]
 jid = os.environ["JOBID"]
+auth = {"Authorization": "Bearer " + os.environ["TOKEN"]}
 for _ in range(600):
-    with urllib.request.urlopen(f"{base}/api/kb/jobs/{jid}") as r:
+    with urllib.request.urlopen(
+            urllib.request.Request(f"{base}/api/kb/jobs/{jid}", headers=auth)) as r:
         j = json.loads(r.read().decode("utf-8"))
     if j["status"] != "running":
         sys.stdout.buffer.write(json.dumps(j, ensure_ascii=False).encode("utf-8"))
@@ -411,6 +418,36 @@ if ! curl -s -m 5 -o /dev/null "$BASE/"; then
   exit 2
 fi
 pass "$BASE 可达"
+
+# ── 认证(认证章 T7):三行接入,让下面每一处裸 `curl` 一个字都不用改 ──────────
+#   ① 登录一次拿 token(`cinfly` 是 admin ⇒ 一个 token 同时覆盖用户面与工作台);
+#   ② 用**同名函数遮蔽 `curl`** —— 此后每一处 `curl` 自动带上 Authorization 头。
+# ⚠️ 登录走 python 的 `urllib` 而不是 `curl`:此刻 curl 还没被遮蔽,而「请求体不走
+#    argv」是本仓的规矩(顺带不依赖 jq)。
+# ⚠️ 遮蔽只在**当前 shell** 生效。七个验收脚本里 `bash -c` / `sh -c` / `command curl`
+#    / 绝对路径 curl **各 0 处**(实测),而 `$(curl …)` 那类调用是**子 shell、会继承
+#    函数** ⇒ 全覆盖,没有一处漏网。
+# ⚠️ 登录失败必须**响亮地停**:没有 token 时下面每一处请求都回 401,而本脚本的预检
+#    读的正是状态码 ⇒ 会把「服务没起」误诊成「旧进程」或「新代码坏了」(本仓最贵的
+#    那一类假红)。所以判空后直接 exit,别带着空 token 往下跑。
+TOKEN=$(BASE="$BASE" "$PYTHON" - <<'PYEOF'
+import json, os, urllib.request
+req = urllib.request.Request(
+    os.environ["BASE"] + "/api/auth/login",
+    data=json.dumps({"username": "cinfly", "password": "123456"}).encode(),
+    headers={"Content-Type": "application/json"})
+print(json.load(urllib.request.urlopen(req, timeout=10))["token"])
+PYEOF
+)
+if [ -z "$TOKEN" ]; then
+  echo "预检失败:$BASE 的 /api/auth/login 登录不了。先分清两种可能:" >&2
+  echo "  * 服务没起 ⇒ 起它:$PYTHON -m uvicorn app.main:app --port 8000" >&2
+  echo "  * 8000 上是**没有认证端点**的旧进程(该路由回 404)⇒ kill 掉再起" >&2
+  echo "  (账号由 $PYTHON scripts/seed_users.py 预置;上面那行 traceback 就是错因)" >&2
+  exit 1
+fi
+curl() { command curl -H "Authorization: Bearer $TOKEN" "$@"; }
+
 echo
 
 echo "=== 验收 1:流式回复 ==="
