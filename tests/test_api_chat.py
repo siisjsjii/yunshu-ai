@@ -1116,20 +1116,26 @@ def test_session_id_wider_than_the_column_is_rejected_as_422(client_factory):
     assert at_limit.status_code == 200
 
 
-def test_user_id_wider_than_the_column_is_rejected_as_422(client_factory):
-    """128 是 conversations.user 的列宽,理由同上。"""
-    client, _ = client_factory(batches=[])
-    with client as c:
-        resp = c.post(
-            "/api/chat/stream", json={"message": "你好", "user_id": "u" * 129}
-        )
-    assert resp.status_code == 422
+def test_token_user_wins_over_a_smuggled_user_id(client_factory):
+    """**客户端不能自称是谁** —— 归属只认 token 里的用户名(认证,2026-09-27)。
 
+    本用例是改写来的:此前它叫 `test_chat_stream_accepts_optional_user_id`,
+    断的是「请求体里的 `user_id` 真的落到 `conversations.user`」。认证之后
+    那句话正是缺陷本身,于是**断言方向整个反过来**(现在钉的就是「它**不**生效」)。
 
-def test_chat_stream_accepts_optional_user_id(client_factory):
-    """user_id 必须真的落到 conversations.user。
+    两条容易读错的观测,都不是 bug:
 
-    只断 200 的话,这个字段被整条丢掉(永远用缺省值)也一样通过。
+    · **请求体里多带一个 `user_id` 不会 422**。`ChatRequest` 没有
+      `extra="forbid"`(实测 `grep -n 'extra=' app/schemas.py` 为空)⇒ pydantic
+      **静默忽略**未知键,请求照旧 200。此前有一条「`user_id` 超 128 字应当 422」
+      的用例,**字段删掉之后那条 422 不可能再出现**,留着它只会红在一个不是缺陷的
+      位置上 —— 它随本次一起删了(理由也写进了提交信息)。
+    · **`tests-default-user` 这个名字**来自 `tests/conftest.py` 的 `_default_login`
+      装置(每条用例默认已登录;本文件不显式请求它)。写成别的用户名就等于在测
+      另一份装置,而不是在测端点的归属来源。
+
+    只断 200 的话,「归属被整条丢掉、一律写成空串」也一样通过 —— 所以这里必须
+    读回落库那一行。**`alice` 一个字都不许出现**:它是请求体里那个自称。
     """
     client, _ = client_factory(batches=[[FakeChunk("您好")]])
     with client as c:
@@ -1139,17 +1145,9 @@ def test_chat_stream_accepts_optional_user_id(client_factory):
         session_id = _parse_sse(resp.text)[0][1]["session_id"]
 
     assert resp.status_code == 200
-    assert client.db.conversations[session_id].user == "alice"
-
-
-def test_user_id_defaults_to_demo_user(client_factory):
-    client, _ = client_factory(batches=[[FakeChunk("您好")]])
-    with client as c:
-        resp = c.post("/api/chat/stream", json={"message": "你好"})
-        session_id = _parse_sse(resp.text)[0][1]["session_id"]
-
-    assert resp.status_code == 200
-    assert client.db.conversations[session_id].user == "demo-user"
+    assert client.db.conversations[session_id].user == "tests-default-user", (
+        "归属必须来自 token;拿到 alice 说明请求体里那个自称又生效了"
+    )
 
 
 # ---------- 工具事件(ch02 新增) ----------

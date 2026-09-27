@@ -67,8 +67,16 @@ class ChatRequest(BaseModel):
     INSERT 才抛 DataError,按错误分类算**不可恢复 → 502** —— 一个参数
     问题被报成服务端故障。收窄后它以 422 被拒,语义诚实。
 
-    `user_id` 的上限 128 与 `conversations.user` 的列宽一致,同理 ——
-    否则宽度不一致会以同一个 DataError 形态复现。
+    ---- ch10 跟进(认证,2026-09-27)----
+
+    `user_id` **已删除**:身份从 token 来(`app/auth.py` 的 `require_user`),
+    客户端再也不能自称是谁。「上限 128 与 `conversations.user` 的列宽一致」
+    那条事实随字段一起挪进了 `app/db/models.py` 的 `User` docstring
+    (那边的 `username` 同样是 128)。
+
+    ⚠️ **本模型没有 `extra="forbid"`** ⇒ 请求体里多带一个 `user_id` 会被
+    pydantic **静默忽略**、请求照旧 200(`tests/test_schemas.py` 里那条用例
+    记着这件事)。这不是漏洞,但**别以为它还会 422**。
 
     ---- ch06:`resume` ----
 
@@ -91,7 +99,6 @@ class ChatRequest(BaseModel):
 
     session_id: str | None = Field(default=None, min_length=1, max_length=32)
     message: str | None = Field(default=None, min_length=1)
-    user_id: str | None = Field(default=None, min_length=1, max_length=128)
     #: 从挂起点续跑(点订单卡片)。给订单号即 resume;不给则开新一轮(见 spec F4)。
     resume: dict | None = None
 

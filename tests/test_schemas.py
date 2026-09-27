@@ -93,15 +93,18 @@ def test_chat_request_rejects_oversized_session_id():
     assert ChatRequest(session_id="s" * 32, message="你好").session_id == "s" * 32
 
 
-def test_chat_request_user_id_is_optional_and_bounded():
-    """user_id 上限 128 = conversations.user 的列宽,宽度不一致会复现同一个 DataError。"""
-    assert ChatRequest(message="你好").user_id is None
-    assert ChatRequest(message="你好", user_id="alice").user_id == "alice"
-    with pytest.raises(ValidationError):
-        ChatRequest(message="你好", user_id="")
-    with pytest.raises(ValidationError):
-        ChatRequest(message="你好", user_id="u" * 129)
-    assert ChatRequest(message="你好", user_id="u" * 128).user_id == "u" * 128
+def test_chat_request_no_longer_has_a_user_id():
+    """`user_id` **已删除**(认证,2026-09-27)—— 身份只从 token 来。
+
+    本条替掉的是原 `test_chat_request_user_id_is_optional_and_bounded`(断上限
+    128 / 空串 422):字段没了,那三条断言**不可能再成立**,而它们红的原因
+    不是缺陷。这里留一个**正向**守卫,免得日后有人又把这个字段加回来。
+
+    ⚠️ **别把它读成「多带一个 `user_id` 会 422」**:`ChatRequest` 没有
+    `extra="forbid"` ⇒ 未知键被 pydantic **静默忽略**、请求照发。归属那一侧
+    由 `tests/test_api_chat.py::test_token_user_wins_over_a_smuggled_user_id` 钉。
+    """
+    assert "user_id" not in ChatRequest.model_fields
 
 
 def test_extract_result_allows_null_order_id():

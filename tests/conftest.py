@@ -108,3 +108,45 @@ def _no_default_login():
     ⇒ **本任务不许改它的形状**(名字即契约),那个装置才加它的逻辑。
     """
     return None
+
+
+@pytest.fixture(autouse=True)
+def _default_login(request):
+    """**每条用例**默认带一个已登录的 admin。
+
+    ## 为什么要有它
+
+    认证一挂,`app/api/` 下 25 个操作全部要 token ⇒ 16 个既有测试文件里
+    **约 79 处**端点调用会集体变红,而它们**测的都不是认证**。
+    在**一处**注入默认身份,那 79 处一个字都不用改。
+
+    ## 它与「假绿」的关系(必须配套 `tests/test_auth_wiring.py`)
+
+    它让「这个端点受不受保护」在测试里**恒真** —— 少挂一个守卫照样全绿。
+    那件事由 `tests/test_auth_wiring.py` **不经过本装置**地钉住。
+    **两条必须同时在**,少一条就是本仓编目过的形态 ⑦。
+
+    ## 为什么是 admin 而不是 user
+
+    默认给 `user` 的话,工作台那 18 个端点在既有测试里会**集体 403**;
+    而 admin 是**超集**(能打用户面也能打工作台)—— 与 spec §6.4 的语义一致。
+
+    ## ⚠️ 开关为什么用 `request.fixturenames` 而**不是参数**
+
+    写成 `def _default_login(_no_default_login)` 的话,那个名字**永远**在
+    `fixturenames` 里 ⇒ 默认登录**永远**被跳过 ⇒ 那 79 处调用**集体 401**。
+    (实测过:临时 conftest + 两条用例,只有这一版对。)
+    """
+    if "_no_default_login" in request.fixturenames:
+        yield None
+        return
+
+    from app.auth import ADMIN, AuthenticatedUser, require_admin, require_user
+    from app.main import app as fastapi_app
+
+    fake = AuthenticatedUser(username="tests-default-user", role=ADMIN)
+    fastapi_app.dependency_overrides[require_user] = lambda: fake
+    fastapi_app.dependency_overrides[require_admin] = lambda: fake
+    yield
+    fastapi_app.dependency_overrides.pop(require_user, None)
+    fastapi_app.dependency_overrides.pop(require_admin, None)

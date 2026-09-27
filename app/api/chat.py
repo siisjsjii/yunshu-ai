@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, format_sse_event
@@ -9,6 +10,7 @@ from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import observability
+from app.auth import AuthenticatedUser, require_user
 from app.agent.emit import make_emitter
 from app.agent.graph import build_graph, get_checkpointer
 from app.config import Settings, get_settings
@@ -93,6 +95,9 @@ def _frame(event: str, payload: dict) -> bytes:
 @router.post("/api/chat/stream")
 async def chat_stream(
     request: ChatRequest,
+    # ⚠️ 位置在 `settings` **之前**是 Python 的硬约束(无默认值的形参不能跟在
+    # 有默认值的后面),不是风格偏好。
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
     settings: Settings = Depends(get_settings),
     store: SessionStore = Depends(get_store),
     model=Depends(get_chat_model),
@@ -100,7 +105,15 @@ async def chat_stream(
     session: AsyncSession = Depends(get_session),
 ) -> EventSourceResponse:
     session_id = request.session_id or uuid.uuid4().hex
-    user_id = request.user_id or "demo-user"
+
+    # 身份**只从 token 来**(认证,2026-09-27)。此前是
+    # `request.user_id or "demo-user"` —— 客户端自称是谁就是谁,而
+    # `user_id` 那个字段本身已经删掉了(`app/schemas.py`)。
+    #
+    # ⚠️ 依赖写在**函数签名**上就已经生效,不必等 router 级守卫:缺 token /
+    # token 坏了在这里抛 **401**,而那发生在**流开始之前** —— 与「预算校验必须
+    # 在流开始前」同一条规矩(SSE 一旦 yield 过首帧,状态码再也改不了)。
+    user_id = user.username
 
     # `lock_for` 与 `acquire` 之间**不得插入 await**:lock_for 返回的锁可能
     # 被紧随其后的容量淘汰摘掉,而这中间一旦让出控制权,那个窗口就可达了
@@ -591,6 +604,7 @@ async def chat_stream(
 @router.post("/api/ticket")
 async def create_ticket_endpoint(
     request: TicketRequest,
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
     settings: Settings = Depends(get_settings),
     store: SessionStore = Depends(get_store),
     session: AsyncSession = Depends(get_session),
@@ -617,8 +631,9 @@ async def create_ticket_endpoint(
         raise HTTPException(status_code=409, detail="该会话正在处理另一条消息,请稍后重试") from exc
 
     try:
+        # 归属取 token 里的用户名(认证,2026-09-27);此前写死 `"demo-user"`。
         await ensure_conversation(
-            session=session, session_id=request.session_id, user_id="demo-user"
+            session=session, session_id=request.session_id, user_id=user.username
         )
         registry = build_registry(
             session=session, conversation_id=request.session_id, settings=settings

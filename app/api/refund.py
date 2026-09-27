@@ -8,12 +8,14 @@
 
 import asyncio
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.chat import get_store          # 复用同一把会话锁的单例依赖
+from app.auth import AuthenticatedUser, require_user
 from app.config import Settings, get_settings
 from app.db.models import RefundRequest
 from app.db.session import get_session
@@ -65,6 +67,9 @@ async def _persist(session, request: RefundRequestIn) -> RefundRequest:
 @router.post("/api/refund")
 async def create_refund(
     request: RefundRequestIn,
+    # ⚠️ 位置在带默认值的形参**之前**(无默认值的形参不能跟在其后,
+    # 那是 Python 的硬约束,不是风格)。
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_session),
     store: SessionStore = Depends(get_store),
@@ -101,8 +106,9 @@ async def create_refund(
         ) from exc
 
     try:
+        # 归属取 token 里的用户名(认证,2026-09-27);此前写死 `"demo-user"`。
         await ensure_conversation(
-            session=session, session_id=request.session_id, user_id="demo-user"
+            session=session, session_id=request.session_id, user_id=user.username
         )
         row = await _persist(session, request)
         return {
