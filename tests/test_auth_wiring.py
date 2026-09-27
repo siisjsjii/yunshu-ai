@@ -17,15 +17,63 @@
 
 from fastapi.routing import APIRoute
 
-from app.auth import require_admin, require_user
 from app.main import app
 
 #: 唯一允许不带守卫的端点。**加一条都要在这里写明理由。**
+#: ⚠️ 它是 `EXPECTED_GUARDS` 里值为 `None` 那一条的**同一件事的第二处写法**。
+#: 没有并进来是**刻意**的:漂移不会静默 —— 这里多一条会在
+#: `test_the_guard_matrix_matches_spec_64_exactly` 上红(端点集合不等),少一条会在
+#: `test_every_api_route_is_guarded_or_whitelisted` 上红。
+#: (它另有一个读者:`tests/test_api_auth.py` 的运行时 401 扫描按它跳过公开端点。)
 PUBLIC = {("POST", "/api/auth/login")}
 
 #: 守卫的词汇表(本仓只有这两个,`app/auth.py` 是**唯一**的鉴权边界)。
-#: 两条用例都读它 —— 不是死代码。
 GUARDS = {"require_user", "require_admin"}
+
+#: spec §6.4 的权限矩阵 —— **逐行**照抄(27 行,一行都不许抽样)。
+#:
+#: ⚠️ **为什么非得是这张表,而不是「至少挂了某一个守卫」那种粗断言**:
+#: 复审给过反例 —— 把 `app/api/extract.py` 的守卫换成 `require_admin`,
+#: 「有没有守卫」那类断言**全绿**(`require_admin` 在守卫词表里、
+#: `test_workbench_routes_require_admin` 按前缀跳过它、运行时无 token 照样 401,
+#: 而 `conftest.py` 把两个守卫**都**替成同一个 admin 假用户)
+#: ⇒ `/api/extract` 悄悄变成「只有管理员能用」,而**没有一条测试红**。
+#: 判据必须细到「**挂的是哪一个**」—— 那正是 spec §6.4 那句话的内容。
+#: (同一个形状的第二个例子:`me` 挂成 `require_admin`,见
+#: `test_login_is_public_and_me_is_user_only`。)
+#:
+#: `None` = 公开(只有 login 一处)。`{conversation_id}` / `{name}` / `{job_id}` /
+#: `{review_id}` 这几个占位符名是**从 `r.path` 读出来的**(不是照文档手抄的)。
+EXPECTED_GUARDS = {
+    ("POST", "/api/auth/login"): None,                 # 公开:拿 token 的地方
+    ("GET", "/api/auth/me"): "require_user",
+    ("POST", "/api/chat/stream"): "require_user",
+    ("POST", "/api/ticket"): "require_user",
+    ("GET", "/api/conversations"): "require_user",
+    ("GET", "/api/conversations/{conversation_id}/messages"): "require_user",
+    ("POST", "/api/extract"): "require_user",
+    ("POST", "/api/feedback"): "require_user",
+    ("POST", "/api/refund"): "require_user",
+    # ---- 工作台 18 个:require_admin ----
+    ("GET", "/api/kb/stats"): "require_admin",
+    ("GET", "/api/kb/documents"): "require_admin",
+    ("GET", "/api/kb/documents/{name}"): "require_admin",
+    ("POST", "/api/kb/documents"): "require_admin",
+    ("GET", "/api/kb/search"): "require_admin",
+    ("GET", "/api/kb/eval"): "require_admin",
+    ("POST", "/api/kb/jobs/vectorize"): "require_admin",
+    ("POST", "/api/kb/jobs/mine"): "require_admin",
+    ("POST", "/api/kb/jobs/flywheel"): "require_admin",
+    ("POST", "/api/kb/jobs/eval"): "require_admin",
+    ("GET", "/api/kb/jobs"): "require_admin",
+    ("GET", "/api/kb/jobs/{job_id}"): "require_admin",
+    ("GET", "/api/review/queue"): "require_admin",
+    ("GET", "/api/review/{review_id}"): "require_admin",
+    ("POST", "/api/review/{review_id}/approve"): "require_admin",
+    ("POST", "/api/review/{review_id}/reject"): "require_admin",
+    ("GET", "/api/topics/distribution"): "require_admin",
+    ("GET", "/api/traces/recent"): "require_admin",
+}
 
 # ⚠️ 这里**不要**再留一个「只要求 require_user」的集合:plan 初稿写过 `USER_ONLY`,
 # 而它是**死代码**(下面那条用例自己就把 `me` 点名了)。定义一个没人读的常量
@@ -62,6 +110,15 @@ def _iter_api_routes():
                     yield from walk(inner.routes)
 
     for r in walk(app.routes):
+        # 只收 `/api/*`:spec §6.4 那张矩阵说的就是这个前缀下的操作,
+        # 而这个 App 另外还有「不是 API」的几页 —— `mount("/")` 的静态 catch-all
+        # 与 FastAPI 自带的 `/docs` / `/redoc` / `/openapi.json`
+        # (⚠️ 实测:今天这一行**一条都没挡掉** —— 那几页是
+        #  `starlette.routing.Route` 与 `Mount`,**不是** `APIRoute`,
+        #  上面的 `walk` 本来就遍历不到它们。留着是因为扫描器哪天改成
+        #  「凡是带 path 的都收」时,得有个地方把非 API 的挡在外面。)
+        # ⚠️ 下面那条非空性护栏(`>= 27`)数的是**过滤之后**这个列表 ——
+        # 别把「扫描器没塌」读成「App 里每一条路由都被检查过了」。
         if r.path.startswith("/api/"):
             yield r
 
@@ -88,7 +145,7 @@ def test_every_api_route_is_guarded_or_whitelisted():
         key = (sorted(r.methods)[0], r.path)
         if key in PUBLIC:
             continue
-        if not (_guard_names(r) & {"require_user", "require_admin"}):
+        if not (_guard_names(r) & GUARDS):
             unguarded.append(key)
     assert not unguarded, (
         f"这些端点**没有**挂守卫:{unguarded}\n"
@@ -107,6 +164,40 @@ def test_workbench_routes_require_admin():
         if "require_admin" not in _guard_names(r):
             wrong.append((sorted(r.methods)[0], r.path, _guard_names(r)))
     assert not wrong, f"这些工作台端点不是 require_admin:{wrong}"
+
+
+def test_the_guard_matrix_matches_spec_64_exactly():
+    """**逐行**钉住 spec §6.4 —— 27 行,**类型也要对**。
+
+    这条与上面那几条的分工:上面问的是「**有没有**挂守卫」(粗),
+    这条问的是「挂的**是哪一个**」(细)。两者都要 —— 粗的那条在「整行被删掉」时
+    给的信息更直白,细的那条才管得住「挂错了类型」那一类(见 `EXPECTED_GUARDS`
+    的说明:换成 `require_admin` 时上面几条**全绿**)。
+
+    **两端都断**:端点集合相等(**多一条、少一条都红**)+ 每一行的守卫集合相等。
+    只断「期望的每一行都对」的话,一个**新加进来却没写进矩阵**的端点会漏过去;
+    只断集合的话,类型挂错了看不出来。
+
+    `me` 那一行是**有意重复**的:它在上面的
+    `test_login_is_public_and_me_is_user_only` 里被点过一次名 —— 那条留下来是因为
+    它把「为什么 `me` 必须是 `require_user`」写在了断言旁边(前端启动时验 token,
+    普通用户也要能过)。这一条是**整张表**的机器可读版本。两条不冲突。
+    """
+    actual = {
+        (sorted(r.methods)[0], r.path): (_guard_names(r) & GUARDS)
+        for r in _iter_api_routes()
+    }
+    assert set(actual) == set(EXPECTED_GUARDS), (
+        "端点集合与 spec §6.4 不一致:"
+        f"多出 {sorted(set(actual) - set(EXPECTED_GUARDS))},"
+        f"缺少 {sorted(set(EXPECTED_GUARDS) - set(actual))}"
+    )
+    wrong = {
+        k: (sorted(v), [EXPECTED_GUARDS[k]] if EXPECTED_GUARDS[k] else [])
+        for k, v in actual.items()
+        if v != ({EXPECTED_GUARDS[k]} if EXPECTED_GUARDS[k] else set())
+    }
+    assert not wrong, f"守卫挂错(实际 vs 期望):{wrong}"
 
 
 def test_login_is_public_and_me_is_user_only():
