@@ -1,0 +1,29 @@
+开工 sha256[:16] = 41d339c9e54d8f43  (admin.html)
+
+=== W1 字面量 id ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_static_wiring.py::test_every_referenced_id_exists[admin.html]
+   1 failed, 1 passed in 3.19s
+   OK 按预期变红(退出码 1)
+
+=== W2 TAB_NAMES 少一个 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_static_wiring.py::test_tabs_and_panels_match - AssertionErr...
+   1 failed in 3.26s
+   OK 按预期变红(退出码 1)
+
+=== W3 data-goto 打错 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_static_wiring.py::test_home_goto_buttons_point_at_real_tabs
+   1 failed in 3.20s
+   OK 按预期变红(退出码 1)
+
+=== W4 首页卡的 id 拼错 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_static_wiring.py::test_home_cards_wire_up_to_existing_elements
+   1 failed in 3.38s
+   OK 按预期变红(退出码 1)
+
+收工 sha256[:16] = 41d339c9e54d8f43  (admin.html)
+源码字节还原:一致
+四条变异全部按预期变红。

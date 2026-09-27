@@ -1,8 +1,13 @@
-"""知识库管理台(ch04)端点:文档查看/上传、后台任务(vectorize / mine)。
+"""知识库端点(ch04):工作台「入库」页的文档查看/上传与统计,外加四条后台任务的起停。
 
 纯函数 helper(文档列表/读取)与薄端点分离 —— helper 可整体单测。
-上传只落盘 + 切分入库(pending),**不向量化**;向量化/挖知识是单独的后台
-任务(见 `app/kb/orchestrate.py`),前端轮询 `JobStore`。
+上传只落盘 + 切分入库(pending),**不向量化**;向量化 / 挖知识 / 飞轮 / 评测
+都是单独的后台任务,前端轮询 `JobStore` 看它们的进度。
+
+四条后台任务**共用同一个运行槽**(`JobStore` 只有一个),但它们**不都住在这个
+文件指向的同一个模块里**:前三条在 `app/kb/orchestrate.py` 与
+`app/flywheel/tasks.py`(线程 + 自建 engine),评测在 `app/kb/eval_job.py`
+(**子进程** —— 理由写在那份 docstring 里)。这个文件只做四件事:`start_*` + 409。
 """
 
 import re
@@ -15,6 +20,7 @@ from app.config import Settings, get_settings
 from app.db.models import KnowledgeChunk
 from app.db.session import get_session
 from app.flywheel.tasks import start_flywheel_job
+from app.kb.eval_job import start_eval_job
 from app.kb.ingest import parse_corpus_file
 from app.kb.jobs import Job, get_job_store
 from app.kb.orchestrate import start_job
@@ -224,6 +230,27 @@ async def start_flywheel(settings: Settings = Depends(get_settings)):
     只会互相抢行。
     """
     job_id = start_flywheel_job(settings=settings)
+    if job_id is None:
+        raise HTTPException(status_code=409, detail="已有任务在跑")
+    return {"job_id": job_id}
+
+
+@router.post("/api/kb/jobs/eval", status_code=201)
+async def start_eval(settings: Settings = Depends(get_settings)):
+    """**手动**跑一轮检索评测(工作台「评测」页的那个按钮)。
+
+    形状与上面三条逐字一致(同一个 `JobStore`、同一条 409)。跑的是
+    `scripts/run_eval.py` 的**子进程** —— 为什么不是「线程 + 自建 engine」、
+    以及为什么它与那条命令逐字相同,见 `app/kb/eval_job.py` 的模块 docstring。
+
+    ⚠️ **它不接 `--limit`(刻意的,不是没做)**:`eval_trend.py` 把「条数与上一轮
+    不同」的两轮标成**不可比并整行不打箭头**,而一个能点出 20 条那种轮次的按钮
+    = 每点一下就往趋势表里插一行不可比 ⇒ 趋势表会被按钮自己污染。要跑小样本
+    仍走命令行(`--limit N`),那是**有意**跑一轮小样本的人才会做的动作。
+    ⚠️ 跑成一轮就**多一行** `eval_runs`(不可撤销)——与向量化那种「重跑 = 覆盖」
+    不同。`trigger_by` 取 `manual`(与命令行一致,不新增第三种取值)。
+    """
+    job_id = start_eval_job(settings)
     if job_id is None:
         raise HTTPException(status_code=409, detail="已有任务在跑")
     return {"job_id": job_id}

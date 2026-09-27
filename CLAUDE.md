@@ -72,6 +72,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   只读分布接口(`GET /api/topics/distribution`,标签在 SQL 里用 `JSON_TABLE` 展开)+
   管理台「主题分布」页。设计源见 ch10 spec(§15 现有 15.1–15.4 四条实现订正)。
 
+- **ch10 跟进(2026-09-27,不在任何一章的范围内)三件事**:① `admin.html` 从
+  **「知识库管理」改名为「工作台」**(`index.html` 顶栏那个入口同步改;
+  ch04 spec §6 那一行加了后记 —— 它描述的是 ch04 交付时的样子);② 工作台加了
+  **「首页」**(第一个目录),给入库 / 待审 / 评测 / 主题分布 / 链路各一张卡:
+  **一行摘要 + 一个入口**,六个目录 `flex:1` **等宽铺满**;③ 评测页加了
+  **「运行评测」按钮** ⇒ `POST /api/kb/jobs/eval` → `app/kb/eval_job.py`
+  (**子进程**,跑的就是 `scripts/run_eval.py --trigger manual`;
+  实测一轮全量 **52 秒**,写 `latest.json` + 追加一行 `eval_runs`;**不接 `--limit`**,
+  理由见那个端点的 docstring)。
+  另:三条前端缺陷(#113 引用弹层 × 关不掉 / #114 历史回载丢齿轮与文档链接 /
+  #115 工作台加「链路」页)也已修完,全过程见 `dev-notes/ch10.md` 的「阶段 9」。
+
 - **ch10-B 的五条命门**(每条都对应一次「报错指向别处」或「静默出错」):
   1. **`problem_type` 不是配置项,是从 `labels.dtype` 猜出来的**(transformers 5.17,
      spec §2.3)。单标签(dtype=long)与多标签(dtype=float + `BCEWithLogitsLoss`)走**两条
@@ -111,7 +123,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000    # 起服务;浏览器开 http://localhost:8000
 .venv/Scripts/python.exe evals/run_tool_selection_eval.py       # 工具选择评估集,需真实 key + MySQL
 bash scripts/acceptance.sh                                      # 端到端验收 1–9,需服务已启动 + 真实 key
-# ch04 管理台:浏览器开 http://localhost:8000/admin.html(文档查看/上传、向量化/挖知识按钮)
+# 工作台(ch04 起叫「管理台」,ch10 跟进改名):浏览器开 http://localhost:8000/admin.html
+# 六个目录:首页 / 入库 / 待审 / 评测 / 主题分布 / 链路。首页五张卡是各页的摘要 + 入口;
+# 「评测」页的「运行评测」按钮跑的是与命令行逐字相同的那条命令(见下面的 ch10 一段)。
 
 # ch07(前置:MySQL + Milvus + 真实 key)
 .venv/Scripts/python.exe scripts/run_summary_eval.py            # 摘要标注样例评估(11 条,打网络)
@@ -188,6 +202,10 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 .venv/Scripts/python.exe scripts/classify_topics.py --dry-run    # 先看会写哪些行
 .venv/Scripts/python.exe scripts/classify_topics.py --limit 20   # 跑批(写 topic_classifications)
 bash scripts/acceptance_ch10.sh                                  # ch10 验收 ①–④
+# ↑ 检索评测那一轮也可以**从工作台点**(「评测」页的「运行评测」):它跑的是与
+#   `.venv/Scripts/python.exe scripts/run_eval.py --trigger manual` 逐字相同的命令,
+#   只是包在一个**子进程**里(`app/kb/eval_job.py`)。⚠️ 它**需要 Milvus**,
+#   而且**每跑成一**轮就往 `eval_runs` **多写一行**(撤不掉)。
 # ↑ **它自己起四样东西**:客服服务(8000)+ 两个 MCP Server(尽力而为)+ **旁路服务(8103)**
 #   ⇒ 跑之前先清掉 8000/8101/8102/8103 的残留进程(否则 curl 到旧代码 —— 本仓记过的那种假红)。
 #   ⚠️ **一次实测 100–110 秒**:① 会把评测脚本**跑两遍**(比两次运行的产物是否逐字节相同)。
@@ -306,11 +324,15 @@ app/memory/       ch01-06:store.py(锁注册表)、trim.py(token 计数与按整
 app/services/     chat.py(纯校验的 prepare_turn)、extract.py(抽取)、history.py(会话历史读写)
 app/api/          chat.py、extract.py、conversations.py(ch07 两个只读端点)、
                   feedback.py(ch09 飞轮入口 ③:`POST /api/feedback`)、
-                  review.py(ch09 待审队列的四个端点)
-app/static/       聊天页 + 管理台 admin.html(单页,无构建工具链)
+                  review.py(ch09 待审队列的四个端点)、
+                  topics.py(ch10-B 只读分布)、traces.py(ch10 跟进:Langfuse 只读代理)
+app/static/       聊天页 + **工作台** admin.html(单页,无构建工具链;
+                  ch10 跟进起有**六个目录**:首页 / 入库 / 待审 / 评测 / 主题分布 / 链路)
 app/retrieval/    ch03 在线检索:embedder.py(BGE-M3 懒加载)、milvus.py、search.py(KnowledgeRetriever)
 app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining;
                   ch04 的 jobs.py(JobStore)与 orchestrate.py(后台任务);
+                  ch10 跟进增 **eval_job.py**:评测**子进程**任务(工作台的「运行评测」
+                  按钮;四条后台任务共用同一个 JobStore 槽);
                   ch09 增 **evidence.py**(三信号置信度 `evidence_confidence`,纯函数);
                   ch09 改 **assess.py**(落池写口 `record_low_confidence` 多收一个
                   `evidence_snapshot=`;`None` 与 `[]` 是**两个不同的值**)

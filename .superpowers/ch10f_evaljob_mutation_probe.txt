@@ -1,0 +1,29 @@
+开工 sha256[:16] = faa0ccd4758b519b  (D:\agent\MewHelp-develop\app\kb\eval_job.py)
+
+=== M1 编码 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_eval_job.py::test_chinese_output_round_trips - AssertionErr...
+   1 failed in 4.13s
+   OK 按预期变红(退出码 1)
+
+=== M2 stderr ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_eval_job.py::test_stderr_is_merged_into_message - Assertion...
+   1 failed in 3.74s
+   OK 按预期变红(退出码 1)
+
+=== M3 杀进程 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_eval_job.py::test_timeout_kills_the_child_and_releases_the_slot
+   1 failed in 23.51s
+   OK 按预期变红(退出码 1)
+
+=== M4 脱敏 ===  锚点命中 1 次
+   =========================== short test summary info ===========================
+   FAILED tests/test_eval_job.py::test_redacts_api_key_from_child_output - Asser...
+   1 failed in 3.64s
+   OK 按预期变红(退出码 1)
+
+收工 sha256[:16] = faa0ccd4758b519b
+源码字节还原:一致
+四条变异全部按预期变红。

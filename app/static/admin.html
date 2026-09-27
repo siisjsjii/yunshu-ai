@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>知识库管理 · 小喵</title>
+<title>工作台 · 小喵</title>
 <style>
   :root {
     --bg:        #e8f2fb;
@@ -29,7 +29,7 @@
       linear-gradient(90deg, var(--bg-line) 1px, transparent 1px);
     background-size: 22px 22px;
   }
-  .wrap { max-width: 860px; margin: 0 auto; }
+  .wrap { max-width: 1000px; margin: 0 auto; }
   header {
     display: flex; align-items: center; gap: 12px;
     padding: 12px 16px; background: var(--brand); color: #fff;
@@ -38,7 +38,7 @@
   }
   header .avatar { width: 40px; height: 40px; display: grid; place-items: center;
     font-size: 22px; background: #fff; border-radius: 4px; }
-  header h1 { font-size: 17px; margin: 0; letter-spacing: .5px; }
+  header h1 { font-size: 19px; margin: 0; letter-spacing: .5px; }
   header .spacer { flex: 1; }
   header a { font-size: 13px; color: #fff; text-decoration: none;
     border: 2px solid #fff; border-radius: 3px; padding: 7px 14px; }
@@ -130,10 +130,36 @@
     border-bottom: 1px dashed var(--brand); cursor: pointer; }
   .src-link:hover { color: var(--brand-dim); }
   .src-none { font-size: 11.5px; color: #9aa7b4; }
-  .tabs { display: flex; gap: 8px; margin: 16px 0; }
-  .tab { font: inherit; font-size: 14px; padding: 8px 18px; color: var(--brand);
-    background: #fff; border: 2px solid var(--ink); border-radius: 3px; cursor: pointer; }
+  /* 六个目录(首页 + 五个页)把整行**等宽铺满** —— `flex: 1` 让它们按容器分,
+     而不是各自按字数长短(「首页」两个字与「主题分布」四个字一样宽才齐)。 */
+  .tabs { display: flex; gap: 10px; margin: 18px 0; }
+  .tab { flex: 1 1 0; min-width: 0; font: inherit; font-size: 15px; padding: 11px 8px;
+    color: var(--brand); background: #fff; border: 2px solid var(--ink);
+    border-radius: 3px; cursor: pointer; white-space: nowrap; }
   .tab.active { background: var(--brand); color: #fff; border-color: var(--brand-dim); }
+
+  /* ── 首页(工作台的入口页)─────────────────────────────
+     五张卡只做两件事:**给一眼能看的状态**,和**一个进去的按钮**。
+     卡片本身不带任何算术 —— 数字一律是服务端原样给的(见 `renderHome`)。 */
+  .home-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .home-card { background: var(--bubble); border: 2px solid var(--ink);
+    border-radius: 4px; padding: 14px 16px; display: flex; flex-direction: column;
+    gap: 8px; box-shadow: 4px 4px 0 rgba(28,43,57,.10); }
+  .home-card.wide { grid-column: 1 / -1; }
+  .home-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .home-title { font-size: 15px; font-weight: 700; }
+  .home-badge { font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    color: var(--badge); border: 1.5px dashed var(--badge); white-space: nowrap; }
+  .home-badge.ok { color: var(--ok); border-color: var(--ok); }
+  .home-badge.warn { color: var(--warn); border-color: var(--warn);
+    background: #fff8e8; }
+  .home-badge.bad { color: #b23b3b; border-color: #b23b3b; background: #fdf0f0; }
+  /* ⚠️ 这一行**只有 `textContent`** —— `homeSay` 一律不拼 HTML(服务端文本
+     直接进 DOM),所以这里没有给 `<b>` / `<span>` 留样式:留了也不会有人用,
+     而「长得像有用的死 CSS」正是本仓最烦的那种东西。要强调就用徽标的颜色。 */
+  .home-line { font-size: 13px; color: #40586e; line-height: 1.7; flex: 1;
+    word-break: break-word; }
+  .home-go { align-self: flex-start; font-size: 13px; padding: 7px 18px; }
   table.eval { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.eval th, table.eval td { border: 1px solid #cdd9e4; padding: 6px 8px; text-align: center; }
   table.eval th { background: #f0f7fd; }
@@ -198,20 +224,73 @@
 <div class="wrap">
   <header>
     <div class="avatar">📚</div>
-    <h1>知识库管理</h1>
+    <h1>工作台</h1>
     <div class="spacer"></div>
     <a href="/">← 回聊天</a>
   </header>
 
   <nav class="tabs" id="tabs">
-    <button class="tab active" data-tab="入库" type="button">入库</button>
+    <button class="tab active" data-tab="首页" type="button">首页</button>
+    <button class="tab" data-tab="入库" type="button">入库</button>
     <button class="tab" data-tab="待审" type="button">待审</button>
     <button class="tab" data-tab="评测" type="button">评测</button>
     <button class="tab" data-tab="主题分布" type="button">主题分布</button>
     <button class="tab" data-tab="链路" type="button">链路</button>
   </nav>
 
-  <div id="tab-入库">
+  <div id="tab-首页">
+    <div class="home-grid" id="home-grid">
+      <!-- 每张卡的**状态行由 JS 填**(`renderHome`),这里只有骨架与入口。
+           ⚠️ 五张卡的一行摘要**各自独立取数、各自兜错** —— 一张卡读不到
+           (比如 Langfuse 连不上)不许把另外四张也弄成「加载中」。 -->
+      <div class="home-card wide">
+        <div class="home-head">
+          <span class="home-title">📥 入库</span>
+          <span class="home-badge" id="home-kb-badge">读取中…</span>
+        </div>
+        <div class="home-line" id="home-kb-line">读取中…</div>
+        <button class="home-go" data-goto="入库" type="button">进入入库</button>
+      </div>
+
+      <div class="home-card">
+        <div class="home-head">
+          <span class="home-title">📝 待审</span>
+          <span class="home-badge" id="home-rv-badge">读取中…</span>
+        </div>
+        <div class="home-line" id="home-rv-line">读取中…</div>
+        <button class="home-go" data-goto="待审" type="button">进入待审</button>
+      </div>
+
+      <div class="home-card">
+        <div class="home-head">
+          <span class="home-title">📊 评测</span>
+          <span class="home-badge" id="home-ev-badge">读取中…</span>
+        </div>
+        <div class="home-line" id="home-ev-line">读取中…</div>
+        <button class="home-go" data-goto="评测" type="button">进入评测</button>
+      </div>
+
+      <div class="home-card">
+        <div class="home-head">
+          <span class="home-title">🏷 主题分布</span>
+          <span class="home-badge" id="home-tp-badge">读取中…</span>
+        </div>
+        <div class="home-line" id="home-tp-line">读取中…</div>
+        <button class="home-go" data-goto="主题分布" type="button">进入主题分布</button>
+      </div>
+
+      <div class="home-card">
+        <div class="home-head">
+          <span class="home-title">🔗 链路</span>
+          <span class="home-badge" id="home-tr-badge">读取中…</span>
+        </div>
+        <div class="home-line" id="home-tr-line">读取中…</div>
+        <button class="home-go" data-goto="链路" type="button">进入链路</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-入库" style="display:none">
   <div class="stats" id="stats">
     <div class="stat"><div class="n" id="st-total">–</div><div class="l">总块数</div></div>
     <div class="stat"><div class="n" id="st-done">–</div><div class="l">已向量化</div></div>
@@ -290,10 +369,27 @@
   <div id="tab-评测" style="display:none">
     <div class="card">
       <h2>检索评测(四策略对比)</h2>
-      <div style="display:flex;gap:10px;align-items:center">
-        <button id="eval-refresh">刷新结果</button>
-        <span class="muted">评测由 <code>scripts/run_eval.py</code> 跑出,这里读取最近一次结果</span>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="eval-run">运行评测</button>
+        <button id="eval-refresh" class="secondary">刷新结果</button>
+        <span class="muted">
+          下面读的是最近一次结果(<code>evals/results/latest.json</code>);
+          「运行评测」跑的是<strong>与命令行逐字相同的那条命令</strong>
+          (<code>scripts/run_eval.py --trigger manual</code>),跑完自动刷新。
+        </span>
       </div>
+      <div class="muted" style="margin-top:6px">
+        ⚠️ 跑一轮是<strong>全量 300 条 × 四策略</strong>(本机实测一轮 <strong>52 秒</strong>,
+        含重排权重冷加载),它
+        <strong>不接 <code>--limit</code></strong>:条数与上一轮不同的两轮在
+        <code>eval_trend.py</code> 里被标成<strong>不可比</strong>,一个能点出
+        20 条那种轮次的按钮等于每点一下就往趋势表里插一行不可比。
+        每跑成一轮还会往 <code>eval_runs</code> <strong>多写一行</strong>
+        (与「向量化」那种重跑即覆盖不同,<strong>这一行撤不掉</strong>)。
+        它跑在<strong>后台子进程</strong>里,与向量化 / 挖知识 / 飞轮
+        <strong>共用同一个运行槽</strong> —— 有任务在跑时会回 409。
+      </div>
+      <div class="job-status" id="eval-status" style="display:none"></div>
       <div id="eval-results" style="margin-top:10px"></div>
     </div>
   </div>
@@ -360,6 +456,11 @@
   }
 
   // ── 统计与文档列表 ──
+  //
+  // 返回**拿到的那个对象**(读不到时 `null`)。返回值只有一个用处:首页那张
+  // 「入库」卡拿它拼那一行摘要 —— 于是 `/api/kb/stats` 每加载一次页面只问一次,
+  // 而不是「入库页一遍 + 首页一遍」(两处各取一次的话,两个数字还可能不同帧)。
+  // 只管填 DOM 的那一半没变(失败仍然**静默**:管理页不因 stats 失败崩掉)。
   async function refreshStats() {
     try {
       const s = await api("/api/kb/stats");
@@ -367,7 +468,8 @@
       $("st-done").textContent = s.done;
       $("st-pending").textContent = s.pending;
       $("st-milvus").textContent = s.milvus_count == null ? "不可用" : s.milvus_count;
-    } catch (e) { /* 静默:管理页不因 stats 失败崩掉 */ }
+      return s;
+    } catch (e) { return null; }
   }
 
   async function refreshDocs() {
@@ -576,7 +678,10 @@
   const STATUS_LABEL = { pending: "待审", approved: "已通过", rejected: "已驳回" };
 
   let rvBusy = false;            // 有审核请求在飞
-  let flywheelTimer = null;      // 飞轮任务的轮询句柄
+  //: 后台任务状态轮询的句柄。飞轮与评测**共用这一个** —— 两者都只能在这条
+  //: 唯一的运行槽空着时才能起,所以两条轮询链在时间上不可能真的重叠
+  //: (要起第二条,第一条那个任务得已经结束)。见下面 `pollJob`。
+  let jobPollTimer = null;
 
   function el(tag, cls, text) {
     const e = document.createElement(tag);
@@ -1003,7 +1108,6 @@
   // 状态必须**看得见**:`[running]` = 还没跑完;`[done] 处理 N 行:归并 x、
   // 新建 y、失败 z` = 跑完了 —— 新建 0 就是「跑完了但没进来」,一眼分得开。
   async function startFlywheel() {
-    clearTimeout(flywheelTimer);       // 起新的一轮之前先掐掉上一个轮询链
     const st = $("q-fly-status");
     st.style.display = "block";
     st.className = "job-status";
@@ -1011,7 +1115,7 @@
     try {
       const r = await req("/api/kb/jobs/flywheel", { method: "POST" });
       if (r.status === 409) {
-        // 单槽:飞轮 / 向量化 / 挖知识**共用同一个运行槽**。这不是错误 ——
+        // 单槽:飞轮 / 向量化 / 挖知识 / **评测**共用同一个运行槽。这不是错误 ——
         // 顺手把**正在跑的那个**接上,免得操作员对着 409 干等。
         const all = await req("/api/kb/jobs");
         const jobs = Array.isArray(all.body) ? all.body : [];
@@ -1019,10 +1123,11 @@
         if (running) {
           st.className = "job-status";
           st.textContent = `已有任务在跑(${running.type} ${running.id}),接着看它的状态…`;
-          pollFlywheel(running.id);
+          clearTimeout(jobPollTimer);   // 要接上另一条链了,先掐掉旧的
+          pollJob(running.id, st, refreshQueue);
         } else {
           st.className = "job-status failed";
-          st.textContent = "⚠ 已有任务在跑(飞轮 / 向量化 / 挖知识共用一个运行槽),等它结束再点。";
+          st.textContent = "⚠ 已有任务在跑(飞轮 / 向量化 / 挖知识 / 评测共用一个运行槽),等它结束再点。";
         }
         return;
       }
@@ -1031,7 +1136,11 @@
         st.textContent = `⚠ 启动失败(${(r.body && r.body.detail) || `HTTP ${r.status}`})`;
         return;
       }
-      pollFlywheel(r.body.job_id);
+      // ⚠️ `clearTimeout` **只能放在这里**(确认要起/接一条新链之后),
+      // 不能放在函数开头:那样的话,一次 409(比如评测正在跑)会把**评测那条**
+      // 正在轮询的链掐掉,而屏幕上还停在上一次的进度行上。
+      clearTimeout(jobPollTimer);
+      pollJob(r.body.job_id, st, refreshQueue);
     } catch (e) {
       st.className = "job-status failed";
       st.textContent = `⚠ 启动失败(${e.message})`;
@@ -1047,20 +1156,35 @@
     return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
   }
 
-  //: 轮询上限与退避。**不许无界轮询**(复审 Minor 5):这个按钮存在的理由之一就是
+  //: 轮询上限与退避。**不许无界轮询**(复审 Minor 5):这些按钮存在的理由之一就是
   //: 「任务会卡住」,而无界轮询会让页面一直打下去,直到关标签页。
-  //: 300 秒与服务端那条任务级死线对齐(`e5afbdd` 起飞轮有 300s 死线),
-  //: 到点没进终态就停下并**说清楚**「它可能还在跑,可以手动看」。
+  //: 两个上限各自与服务端那条**任务级死线**对齐,到点没进终态就停下并**说清楚**
+  //: 「它可能还在跑,可以手动看」。⚠️ 改服务端那两处设置就要**一起**动这两个数
+  //: (`flywheel_job_timeout_seconds` / `eval_job_timeout_seconds`)——
+  //: 前端拿不到设置,只能写死;写死的代价由这两行注释记账。
   const FLYWHEEL_POLL_MAX_MS = 300 * 1000;
-  const FLYWHEEL_POLL_BASE_MS = 1000;
-  const FLYWHEEL_POLL_MAX_GAP_MS = 5000;
+  const EVAL_POLL_MAX_MS = 1800 * 1000;   // = eval_job_timeout_seconds(1800s)
+  const POLL_BASE_MS = 1000;
+  const POLL_MAX_GAP_MS = 5000;
 
-  function pollFlywheel(jobId) {
-    const st = $("q-fly-status");
+  //: 盯一个后台任务直到终态(或到上限),把状态画进 `st`。
+  //:
+  //: `onDone` **每一条停止路径上都恰好被调一次**(终态 / 到上限 / 读不到状态 /
+  //: 轮询中断)—— 调用方拿它做「跑完之后的收尾」(刷列表、把按钮放开)。
+  //: 只挂在「终态」那一条路上的话,一次轮询上限或一次网络抖动会让按钮**永久**
+  //: 停在禁用态,而屏幕上写着「提交中…」。
+  function pollJob(jobId, st, onDone, maxMs) {
     const startedAt = Date.now();
-    let gap = FLYWHEEL_POLL_BASE_MS;
+    let gap = POLL_BASE_MS;
+    let finished = false;
 
-    const schedule = (ms) => { flywheelTimer = setTimeout(tick, ms); };
+    function finish() {
+      if (finished) return;              // 恰好一次
+      finished = true;
+      Promise.resolve(onDone ? onDone() : null).catch(() => {});
+    }
+
+    const schedule = (ms) => { jobPollTimer = setTimeout(tick, ms); };
 
     async function tick() {
       try {
@@ -1068,6 +1192,7 @@
         if (!r.ok || !r.body) {
           st.className = "job-status failed";
           st.textContent = `⚠ 任务状态读取失败(HTTP ${r.status})`;
+          finish();
           return;                       // 不排下一次 = 停
         }
         const j = r.body;
@@ -1078,31 +1203,36 @@
         // **`message` 与 `result` 说的是同一件事,只打印一次**(复审 Minor 1):
         // 飞轮任务跑完时 `message` 里已经写着「处理 N 行:归并 x、新建 y、失败 z」,
         // 再拿 `result` 拼一遍就是同一句出现两次(原始走查记录里逐字可见)。
-        // `result` 只在 `message` 为空时兜底(别的任务类型可能只填 result)。
-        if (!j.message && j.result) {
+        // `result` 只在 `message` 为空时兜底 —— ⚠️ 那个兜底**只对飞轮那个形状成立**
+        // (`result` 里是 processed/merged/created/failed);评测的 `result` 是
+        // `{exit_code, tail}`,拼出来会是一句「处理 undefined 行」。按字段在不在分支。
+        if (!j.message && j.result && "processed" in j.result) {
           line += ` · 处理 ${j.result.processed} 行:归并 ${j.result.merged}、` +
                   `新建 ${j.result.created}、失败 ${j.result.failed}`;
         }
         st.className = "job-status " + j.status;
         st.textContent = line;
         if (j.status !== "running") {
-          // 跑完才刷队列:新归并 / 新建出来的待审行是这一刻才有的。
-          await refreshQueue();
+          // 跑完才刷列表 / 结果:新归并出来的待审行、刚写出来的 latest.json
+          // 都是这一刻才有的。
+          finish();
           return;                       // 终态 = 停
         }
-        if (Date.now() - startedAt >= FLYWHEEL_POLL_MAX_MS) {
+        if (Date.now() - startedAt >= maxMs) {
           st.className = "job-status failed";
           st.textContent = line +
             `\n⚠ 轮询已停:盯了 ${fmtDur((Date.now() - startedAt) / 1000)}还是 running。` +
-            `任务**可能仍在跑**(也可能卡住了)—— 点「刷新」看队列有没有新行,` +
+            `任务**可能仍在跑**(也可能卡住了)—— 点「刷新」看结果有没有变,` +
             `或过一会儿重开本页看它是否已经结束。`;
+          finish();
           return;                       // 到点 = 停
         }
-        gap = Math.min(gap * 2, FLYWHEEL_POLL_MAX_GAP_MS);
+        gap = Math.min(gap * 2, POLL_MAX_GAP_MS);
         schedule(gap);
       } catch (e) {
         st.className = "job-status failed";
         st.textContent = `⚠ 任务状态轮询中断(${e.message})`;
+        finish();
       }
     }
 
@@ -1112,8 +1242,143 @@
   $("q-refresh").addEventListener("click", refreshQueue);
   $("q-flywheel").addEventListener("click", startFlywheel);
 
+  // ── 首页(工作台的入口页)──────────────────────────
+  //
+  // 五张卡各写一行摘要 + 一个徽标。它们**只做投影,不做算术**:
+  // 每个数字都是服务端原样给的(唯一一处「挑最大」在主题分布那张卡上,
+  // 用的是服务端已经算好的 `count`)。
+  //
+  // ⚠️ 三处**必须保持三种读法**的地方不许被抹平(与它们各自那一页同款):
+  //   · 链路 —— 「观测没启用」/「连不上」/「通了没数据」三个徽标各不相同;
+  //   · 主题分布 —— `total < 100` 时那句「样本量还很少」**跟着卡片走**
+  //     (spec §9.5:不写这句,这张图就会被当成分布结论读);
+  //   · 评测 —— 404(还没跑过)不是错误,它是一条状态。
+  function homeSay(id, text, badge, cls) {
+    $("home-" + id + "-line").textContent = text;
+    const b = $("home-" + id + "-badge");
+    b.textContent = badge;
+    b.className = "home-badge" + (cls ? " " + cls : "");
+  }
+
+  async function homeKb() {
+    // 与「入库」页共用同一次请求(`refreshStats` 把对象回给我们)。
+    const s = await refreshStats();
+    if (!s) {
+      homeSay("kb", "读不到 /api/kb/stats —— 检查服务是否起在 8000。", "读取失败", "bad");
+      return;
+    }
+    const milvusDown = s.milvus_count == null;
+    const pending = s.pending > 0;
+    homeSay("kb",
+      `总块数 ${s.total} · 已向量化 ${s.done} · 待向量化 ${s.pending} · ` +
+      (milvusDown ? "Milvus 条数:**不可用**" : `Milvus ${s.milvus_count} 条`),
+      milvusDown ? "Milvus 不可用" : (pending ? `待向量化 ${s.pending}` : "已就绪"),
+      (milvusDown || pending) ? "warn" : "ok");
+  }
+
+  async function homeReview() {
+    const r = await req("/api/review/queue");
+    if (!r.ok || !Array.isArray(r.body)) {
+      homeSay("rv", `读不到待审队列(HTTP ${r.status})。`, "读取失败", "bad");
+      return;
+    }
+    const rows = r.body;
+    homeSay("rv", rows.length
+        ? `待审 ${rows.length} 条。第一条:${rows[0].standard_question || "(空)"}`
+        : "队列为空 —— 去聊天页对一条答得不好的回复点 👎,或在「待审」页点「跑一轮飞轮」。",
+      rows.length ? `待办 ${rows.length}` : "队列为空",
+      rows.length ? "warn" : "");
+  }
+
+  async function homeEval() {
+    const r = await req("/api/kb/eval");
+    if (r.status === 404) {
+      // ⚠️ 404 在这里**不是错误**:没跑过评测就是这样(`latest.json` 还没生成)。
+      homeSay("ev", "还没有跑过评测。点进去按「运行评测」跑一轮(全量,分钟级)。",
+        "未跑过", "warn");
+      return;
+    }
+    if (!r.ok || !r.body) {
+      homeSay("ev", `读不到评测结果(HTTP ${r.status})。`, "读取失败", "bad");
+      return;
+    }
+    const d = r.body;
+    const names = Object.keys(d.strategies || {});
+    const buckets = new Set();
+    for (const s of names) for (const b of Object.keys(d.strategies[s] || {})) buckets.add(b);
+    // ⚠️ 只报**结果的形状**,不报质量:这里没有任何 F1/MRR 的汇总数
+    //    (那要按桶加权,是 `eval_trend.py` 的活 —— 在前端再实现一遍就是
+    //     同一套口径两处实现)。
+    homeSay("ev",
+      `当前这份结果:top_k=${d.top_k} · ${names.length} 种策略 × ${buckets.size} 个桶` +
+      (names.length ? `(${names.join(" / ")})` : "") +
+      " —— 点进去看按桶的 Recall@10 / MRR / 应答正确。",
+      names.length ? "有结果" : "结果为空", names.length ? "ok" : "warn");
+  }
+
+  async function homeTopics() {
+    const r = await req("/api/topics/distribution");
+    if (!r.ok || !r.body) {
+      homeSay("tp", `读不到分布数据(HTTP ${r.status})。`, "读取失败", "bad");
+      return;
+    }
+    const d = r.body;
+    const buckets = d.buckets || [];
+    if (!d.total || !buckets.length) {
+      homeSay("tp", "还没有归类结果。先跑 scripts/classify_topics.py。", "空", "warn");
+      return;
+    }
+    const top = buckets.reduce((a, b) => (b.count > a.count ? b : a), buckets[0]);
+    const few = d.total < 100;
+    homeSay("tp",
+      `${d.total} 行分类结果 / ${d.distinct_questions} 个不同题面 · 最多:${top.label}(${top.count} 条)` +
+      (few ? "。⚠ 样本量还很少,这张图不足以支撑「先补哪块知识」。" : ""),
+      few ? `样本量少(${d.total})` : "有数据", few ? "warn" : "ok");
+  }
+
+  async function homeTraces() {
+    // 只要 5 条:这张卡是「有没有、连不连得上」,不是那一页的表。
+    const r = await req("/api/traces/recent?limit=5");
+    if (!r.ok || !r.body) {
+      homeSay("tr", `读不到链路数据(HTTP ${r.status})。`, "读取失败", "bad");
+      return;
+    }
+    const d = r.body;
+    if (!d.available) {
+      // 两个原因**两种颜色**(与「链路」页同款):没启用是**去配 .env**,
+      // 连不上是**去看服务** —— 处置完全不同,画成同一个样子就丢了信息。
+      const notEnabled = d.reason === "观测未启用";
+      homeSay("tr",
+        (d.reason || "链路数据不可用(服务端没给原因)") +
+        (notEnabled ? " —— 在 .env 里配齐 LANGFUSE_* 再重启服务。" : ""),
+        notEnabled ? "观测未启用" : "连不上", notEnabled ? "warn" : "bad");
+      return;
+    }
+    const n = (d.items || []).length;
+    homeSay("tr", n
+        ? `最近 5 条观测里拿到 ${n} 条,点进去看时间 / 会话 / 名称 / 耗时 / 等级。`
+        : "观测已启用、也连得上 Langfuse,但那边一条都还没有 —— 先去聊天页聊一轮。",
+      n ? `${n} 条` : "无数据", n ? "ok" : "");
+  }
+
+  // 进「首页」时全刷一遍。⚠️ 五张卡**各自兜错**(一张读不到不许把另外四张
+  // 留在「读取中…」)—— 每张卡自己 try/catch,这里的 `allSettled` 是第二道。
+  const HOME_LOADERS = [
+    ["kb", homeKb], ["rv", homeReview], ["ev", homeEval],
+    ["tp", homeTopics], ["tr", homeTraces],
+  ];
+  async function renderHome() {
+    await Promise.allSettled(HOME_LOADERS.map(async ([id, fn]) => {
+      try {
+        await fn();
+      } catch (e) {
+        homeSay(id, `⚠ 读取失败(${e.message})`, "读取失败", "bad");
+      }
+    }));
+  }
+
   // ── 标签页切换 ──
-  const TAB_NAMES = ["入库", "待审", "评测", "主题分布", "链路"];
+  const TAB_NAMES = ["首页", "入库", "待审", "评测", "主题分布", "链路"];
   function switchTab(name) {
     for (const b of document.querySelectorAll(".tab")) {
       b.classList.toggle("active", b.dataset.tab === name);
@@ -1121,6 +1386,13 @@
     for (const t of TAB_NAMES) {
       $("tab-" + t).style.display = (t === name) ? "block" : "none";
     }
+    // 「首页」：每次切回来都重取一遍 —— 它就是「现在的状态」那一页,
+    // 缓存过的数字在这页上等于错的。
+    if (name === "首页") renderHome();
+    // 「入库」：文档列表与统计(页面打开时它在后台、拉到的东西没人看)。
+    if (name === "入库") { refreshStats(); refreshDocs().catch(() => {}); }
+    // 「评测」：读的是本地那份 latest.json,便宜;刚跑完一轮再切回来就能看到。
+    if (name === "评测") refreshEval();
     // 进「待审」才拉队列(页面打开时它在后台、拉到的东西没人看)。
     if (name === "待审") refreshQueue();
     // 「主题分布」同理 —— 而且**每次切进来都重拉**:跑批写完表之后,
@@ -1451,9 +1723,71 @@
   }
   $("eval-refresh").addEventListener("click", refreshEval);
 
+  // ── 跑一轮评测(后台子进程)────────────────────────
+  //
+  // 它与「跑一轮飞轮」是同一个形状,差别只有三处,都是刻意的:
+  //   ① **409 不接上别的任务**(与飞轮相反):飞轮的 409 多半就是落池那个
+  //      fire-and-forget 起的、同一件事的任务,接上去是顺手的;而评测的 409
+  //      几乎一定是别的类型(向量化 / 挖知识 / 飞轮)—— 把它们的进度画在
+  //      「评测」这一页上只会让人以为评测在跑。这里**只报是谁占着槽**。
+  //   ② 状态行在**跑完之前一直禁用按钮** —— 一次全量评测是分钟级,
+  //      一个还能再点的按钮会让人以为没点上(点了也只是拿 409)。
+  //   ③ 跑完刷新的是**评测结果表**,不是待审队列。
+  async function runEval() {
+    const st = $("eval-status");
+    const btn = $("eval-run");
+    st.style.display = "block";
+    st.className = "job-status";
+    st.textContent = "提交中…";
+    btn.disabled = true;
+    const release = () => { btn.disabled = false; };
+    try {
+      const r = await req("/api/kb/jobs/eval", { method: "POST" });
+      if (r.status === 409) {
+        const all = await req("/api/kb/jobs");
+        const jobs = Array.isArray(all.body) ? all.body : [];
+        const running = jobs.find((j) => j.status === "running");
+        st.className = "job-status failed";
+        st.textContent = running
+          ? `⚠ 已有任务在跑(${running.type} ${running.id})—— 向量化 / 挖知识 / 飞轮 / ` +
+            `评测共用同一个运行槽,等它结束再点。`
+          : "⚠ 已有任务在跑(四条后台任务共用一个运行槽),等它结束再点。";
+        release();
+        return;
+      }
+      if (!r.ok || !r.body || !r.body.job_id) {
+        st.className = "job-status failed";
+        st.textContent = `⚠ 启动失败(${(r.body && r.body.detail) || `HTTP ${r.status}`})`;
+        release();
+        return;
+      }
+      clearTimeout(jobPollTimer);
+      pollJob(r.body.job_id, st, async () => {
+        // 成功与失败**都要刷一次**:失败的一轮不写 latest.json(结果表不会变),
+        // 但成功的那一轮会 —— 而前端从任务状态上分不出是哪一种(它只知道
+        // 子进程退出了),所以无脑刷一次,由 `refreshEval` 自己兜错。
+        await refreshEval();
+        release();
+      }, EVAL_POLL_MAX_MS);
+    } catch (e) {
+      st.className = "job-status failed";
+      st.textContent = `⚠ 启动失败(${e.message})`;
+      release();
+    }
+  }
+  $("eval-run").addEventListener("click", runEval);
+
+  // 首页那五张卡上的「进入 X」。这里的按钮是**静态**的(HTML 里就那五个,
+  // `data-goto` 不会变),所以直接绑;动态生成的列表才需要委托。
+  for (const b of document.querySelectorAll("[data-goto]")) {
+    b.addEventListener("click", () => switchTab(b.dataset.goto));
+  }
+
   // ── 初始 ──
-  refreshStats();
-  refreshDocs();
+  // 初始标签页**由 `switchTab` 一处决定**(首页),它顺带把六个页的 display 与
+  // 目录的 active 一次摆对 —— HTML 里那份初值只是「JS 挂了还能看」的兜底,
+  // 不是第二处真源。文档列表与统计跟着「入库」走(切进去才拉)。
+  switchTab("首页");
 })();
 </script>
 </body>

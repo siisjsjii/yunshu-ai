@@ -146,6 +146,25 @@ class Settings(BaseSettings):
     #   它保的是「槽**永远**能被下一次拿到」。
     flywheel_job_timeout_seconds: float = Field(default=300.0, gt=0)
     #
+    # `eval_job_timeout_seconds`:**整条评测任务**的上界(ch10 跟进:工作台上的
+    #   「运行评测」按钮)。它跑的是**子进程**,不是线程 —— 理由见
+    #   `app/kb/eval_job.py` 的模块 docstring(那个文件还解释了为什么另立这个旋钮
+    #   而不是复用 `flywheel_job_timeout_seconds`)。
+    #   ⚠️ 它保的与上面那条**是同一条命门**:`JobStore` 只有**一个**运行槽
+    #   (向量化 / 挖知识 / 飞轮 / 评测**共用**),而「挂起不是异常」⇒ 没有这个界,
+    #   一次卡死的评测会把那个槽**永久**占死,此后每一次触发都是 409。
+    #   实测(2026-09-27,本机,含重排权重的**冷加载**):一次全量 300 条 × 四策略
+    #   **52 秒**(21:53 那一轮,`eval_runs` id=154)。⇒ `1800s` 是它的 **≈35 倍**,
+    #   与 `flywheel_job_timeout_seconds` 那 10 倍余量同一种算法(不是同一个数:
+    #   评测这次的耗时**大头是冷加载权重**,与本机当时的载荷关系更大)。
+    #   ⚠️ 这个数只保「槽不会被永久占死」,**不保「跑得完」** —— 语料/用例长大了
+    #   要一起看它。一句话回退:`EVAL_JOB_TIMEOUT_SECONDS=86400`(≈不设上界)。
+    #   ⚠️ 与另外三条超时一样:**它只圈得住「子进程活着」这件事**。子进程被杀之后
+    #   那一轮评测**不会写 `latest.json`、也不会往 `eval_runs` 落行**
+    #   (`run_round` 先算完才落,而落库是子进程里最后一步)⇒ 半途而废的一轮
+    #   结构上不可能被记成一条完整的评估。
+    eval_job_timeout_seconds: float = Field(default=1800.0, gt=0)
+    #
     # `retrieval_timeout_seconds`:**请求路径上两处直接调用检索/向量化组件**的墙钟上界
     #   (ch09 最终修复轮复审 D5)。那两处**不经 `execute_tool`**,所以
     #   `tool_timeout_seconds` 够不着它们 —— 收窄成「工具超时」那一个旋钮,
