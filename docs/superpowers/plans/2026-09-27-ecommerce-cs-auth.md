@@ -823,6 +823,18 @@ git commit -m "认证 T2:users 表(db/auth.sql)+ 幂等种子脚本 + db 测试"
 
 - [ ] **Step 1: 写失败测试 `tests/test_api_auth.py`**
 
+> ⚠️⚠️ **传输必须用 `httpx.ASGITransport`,不能用 `TestClient`**(计划初稿写的是
+> `TestClient`,**实现者实测推翻**)。本仓**记过这条账**:`tests/test_api_feedback.py:12-14`
+> 逐字写着「`TestClient` 自建 portal 事件循环,会把 `get_engine()` 那个 **lru_cache 单例**
+> 绑到**它的**循环上,污染同进程里排在后面的 db 测试」;`tests/test_api_ticket.py:4-5`
+> 同款。实测三组:`TestClient` 单独 → 200;`TestClient` + 先 `await _seed_now()`
+> (**brief 原本的写法**)→ `RuntimeError: got Future … attached to a different loop`;
+> `ASGITransport` + 同样的播种 → 200。`with TestClient(...)` **救不了**(实测)。
+> ⇒ 测试体是 `async def` + `await client.post(...)`(不是同步的),
+> 客户端在用例里用 `httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+> base_url="http://test")` 现开,**照 `tests/test_api_feedback.py` 的既有形状写**。
+> (后面那几段测试代码的**断言**照用,只有「怎么发请求」这一层变。)
+
 ```python
 """登录端点的行为面。**要 MySQL**(它要读 users 表)。
 
@@ -1020,9 +1032,43 @@ app.include_router(auth_router)
 - [ ] **Step 6: 跑测试**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_api_auth.py -p no:cacheprovider`
-Expected: **6 passed**(需要 MySQL)。⚠️ 计划初稿在这里写过「5」—— **那是错的**
-(Step 1 里一共 **6** 个 `def test_…`;我后来加了「坏 token」那条却没改这个数)。
-**以实际为准**并把真实数字写进报告。
+Expected: **7 passed**(需要 MySQL)。⚠️ 这个数**改过三次**,过程记在这里:
+初稿写 5(错,那时有 6 条)→ 改成 6 → **现在 7**:实现者的变异探针 **M-C**
+(把「查无此人」那条路提前 `return`,跳过 `verify_password`)**活过了全部 6 条**,
+因为**计划断言了那个性质却没有测试守它**(注释里写着「查无此人时也要跑一次
+`verify_password`」,而没有任何断言能区分)。⇒ 第 7 条:
+**用一个调用记录器钉住「两条失败路径都真的调了 `verify_password`」**
+(替身替的是 `app.auth.verify_password`,断「被调过」而不是「返回什么」——
+**行为断言在这条路上分不开**,因为两种实现的返回值逐字相同)。
+
+```python
+@pytest.mark.anyio
+async def test_both_failure_paths_still_run_verify_password(monkeypatch, client, _no_default_login):
+    """**查无此人也要跑一次密码校验** —— 防的是**时序侧信道**。
+
+    ⚠️ 这条**必须存在**:没有它的话,把「用户不存在」改成提前 `return`
+    (省掉那次 scrypt)的实现**六条测试全绿**,而那正是要防的
+    —— 两次失败的**耗时差一个数量级**,响应时间就成了枚举用户名的信道。
+    ⚠️ 断的是**被调用过**,不是返回值(两种实现的返回值逐字相同 ⇒ 断返回值零判别力)。
+    ⚠️ `monkeypatch` 打在 `app.api.auth.verify_password` 上:`login` 里是
+    `from app.auth import verify_password` 之后按**局部名**调用 ⇒ 换命名空间的绑定即生效。
+    """
+    calls = []
+    real = auth_api.verify_password
+    monkeypatch.setattr(auth_api, "verify_password",
+                        lambda pw, stored: (calls.append(stored), real(pw, stored))[1])
+    await _seed_now()
+    await client.post("/api/auth/login", json={"username": "cinfly", "password": "nope"})
+    await client.post("/api/auth/login", json={"username": "nobody", "password": "nope"})
+    assert len(calls) == 2, (
+        f"两条失败路径都该跑一次 verify_password(实际 {len(calls)} 次)"
+        " —— 少了的那次就是时序侧信道")
+    assert calls[1] == "", "查无此人时传给 verify_password 的应当是空串(坏串回 False)"
+```
+
+> **以实际为准**并把真实数字写进报告。⚠️ 并且:**我给的计数不是约束** ——
+> 若你发现**必须**多一条才能守住某个声明过的性质(这条就是这么来的),
+> **就加上它并在报告里说清**;反过来才不许(改测试去凑我写的数)。
 
 ⚠️ **`_no_default_login` 由本任务定义**(裁定 R1):Step 1 的测试**请求**它,
 不定义的话整个文件在 collection 阶段就 error。在 `tests/conftest.py` 里加:
