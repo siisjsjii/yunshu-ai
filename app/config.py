@@ -186,6 +186,21 @@ class Settings(BaseSettings):
     #   一句话回退:.env 里 `RETRIEVAL_TIMEOUT_SECONDS=86400`(等价于「基本不设上界」)。
     retrieval_timeout_seconds: float = Field(default=10.0, gt=0)
 
+    # 认证(2026-09-27 用户点名要求;见 docs/superpowers/specs/2026-09-27-ecommerce-cs-auth-design.md)。
+    #
+    # `jwt_secret`:HS256 的签名密钥。
+    #   ⚠️ **代码里不给真值** —— 空串 ⇒ `app/auth.py` 在**首次用到时**随机生成一个
+    #   并打一条 WARNING(代价:重启后所有旧 token 失效)。这样「clone 下来不配也能跑」,
+    #   而**密钥不进源码**。本机 `.env` 与入库的 `.env.example` 里都是 `itcinfly`
+    #   (用户 2026-09-27 拍板的值)—— ⚠️ **`.env.example` 是入库的**,
+    #   所以那个值是**公开的**,只能本机演示用。
+    jwt_secret: str = ""
+    #
+    # `jwt_expire_minutes`:token 有效期。720 = 12 小时,一次登录够一个工作日。
+    #   没有刷新机制(spec §2 明确不做)⇒ 到点就重新登录。
+    #   一句话回退:`.env` 里调这个数。
+    jwt_expire_minutes: int = Field(default=720, gt=0)
+
     # ch05 编排。两个数都加了界:写错要在启动时炸,不能等运行时变成
     # 「ReAct 循环一次都不跑」或「预算恒超 → 第一步就强制收敛」这种静默故障。
     max_agent_steps: int = Field(default=5, ge=1)

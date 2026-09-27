@@ -6,6 +6,9 @@ langchain==1.4.0
 langchain-openai==1.6.2
 tiktoken==0.14.0
 httpx==0.28.1
+# PyJWT 今天只是 mcp 的传递依赖(pip show PyJWT ⇒ Required by: mcp),
+# 显式钉住它:mcp 哪天不带它了,登录会在 import 处突然崩,而报错指向 import。
+PyJWT==2.14.0
 pytest==9.1.1
 anyio==4.15.1
 sqlalchemy==2.0.53
