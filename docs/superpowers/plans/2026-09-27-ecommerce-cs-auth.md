@@ -213,8 +213,13 @@ def test_token_without_sub_or_role_is_rejected():
 
 
 def test_empty_secret_generates_a_random_one_and_still_round_trips():
-    """`.env` 没配时:同一个进程内签发/校验仍然自洽(重启后失效是**设计**)。"""
-    s = Settings(_env_file=None, **_REQUIRED)      # jwt_secret 默认 = ""
+    """`.env` 没配时:同一个进程内签发/校验仍然自洽(重启后失效是**设计**)。
+
+    ⚠️ `jwt_secret=""` **必须显式传**:`_env_file=None` 只关掉 `.env` 这个**文件**,
+    pydantic-settings **照读 `os.environ`** —— 跑测试的 shell 里一旦 export 过
+    `JWT_SECRET`,这条就会拿到那个值,而它断的正是「空配置」那条路。
+    """
+    s = Settings(_env_file=None, jwt_secret="", **_REQUIRED)
     assert s.jwt_secret == ""
     u = decode_token(create_token(username="demo-user", role=ADMIN, settings=s), s)
     assert u.username == "demo-user"
@@ -473,7 +478,9 @@ def require_admin(
 - [ ] **Step 5: 跑测试,确认全绿**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_auth.py -p no:cacheprovider`
-Expected: **13 passed**
+Expected: **12 passed**(⚠️ 计划初稿在这里写过「13」—— **那是错的**,Step 2 里一共
+12 个 `def test_…`。**以实际为准**,并把真实数字写进你的报告;数量对不上时**别改测试去凑数**,
+先数一遍是不是自己漏写了一整条。)
 
 - [ ] **Step 6: 跑一条真机(`alg:none` 那条依赖 PyJWT 的行为)**
 
@@ -555,50 +562,76 @@ Expected: 出现 `uk_users_username` 唯一键与上面四列。
 ```python
 """种子账号(db)。**要 MySQL 起着**。
 
-断三件事:两个账号真的能建出来 / **重跑是覆盖不是追加** /
+断三件事:两个账号真的能建出来 / **重跑不追加行** /
 建出来的哈希**真的能验过 123456**(否则「账号建了但登不上」)。
+
+⚠️ **本仓没有 `session` fixture** —— db 测试的既有形状是**直接
+`get_sessionmaker()()`**,照 `tests/test_api_conversations_db.py` 那份写。
+⚠️ **这两个账号是「生产数据」,不是探针**:所以**不删它们**
+(删了本机就登不上了,而 re-run 一次 `seed_users.py` 才是正确的恢复动作)。
+断言也因此**不写 `len(rows) == 2`**(将来多一个账号就假红),改成「两次 seed 之间
+总数不变」。
 """
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from app.auth import ADMIN, verify_password
-from app.db.models import User                      # Task 2 Step 4 里新增的 ORM 模型
+from app.db.base import get_engine, get_sessionmaker
+from app.db.models import User
 from scripts.seed_users import ACCOUNTS, seed
 
 pytestmark = pytest.mark.db
 
+NAMES = [u for u, _, _ in ACCOUNTS]
+
+
+async def _seed_now() -> int:
+    async with get_sessionmaker()() as session:
+        return await seed(session)
+
+
+async def _rows() -> dict[str, User]:
+    """**新 session** 读:身份映射里的旧对象会让断言变成「靠 refcount 走运」。"""
+    async with get_sessionmaker()() as session:
+        return {
+            r.username: r
+            for r in (await session.execute(select(User))).scalars().all()
+        }
+
 
 @pytest.mark.anyio
-async def test_seed_creates_both_accounts_and_is_idempotent(session):
-    await seed(session)
-    rows = (await session.execute(select(User))).scalars().all()
-    names = sorted(r.username for r in rows)
-    assert names == ["cinfly", "demo-user"], f"实际 {names}"
+async def test_seed_creates_both_accounts_and_does_not_append_on_rerun():
+    await _seed_now()
+    first = await _rows()
+    assert set(NAMES) <= set(first), f"两个账号都该在,实际 {sorted(first)}"
 
-    first = {r.username: r.password_hash for r in rows}
-    await seed(session)                                  # 再跑一遍
-    again = (await session.execute(select(User))).scalars().all()
-    assert len(again) == 2, "重跑**追加**了行 ⇒ 不是幂等(唯一键应当拦住)"
-    second = {r.username: r.password_hash for r in again}
-    assert second.keys() == first.keys()
-    assert all(second[u] != first[u] for u in first), (
-        "两次哈希相同 ⇒ 种子脚本没重算盐(覆盖没真的发生)")
+    await _seed_now()                       # 再跑一遍
+    second = await _rows()
+    assert len(second) == len(first), (
+        f"重跑让行数从 {len(first)} 变成 {len(second)} ⇒ 不是幂等"
+    )
+    assert all(second[u].password_hash != first[u].password_hash for u in NAMES), (
+        "两次哈希相同 ⇒ 种子脚本没重算盐(覆盖没真的发生)"
+    )
 
 
 @pytest.mark.anyio
-async def test_seeded_passwords_verify(session):
-    await seed(session)
+async def test_seeded_passwords_verify_and_roles_are_admin():
+    await _seed_now()
+    rows = await _rows()
     for username, password, role in ACCOUNTS:
-        row = (await session.execute(
-            select(User).where(User.username == username))).scalar_one()
-        assert verify_password(password, row.password_hash), f"{username} 的密码验不过"
-        assert row.role == role
-```
+        assert verify_password(password, rows[username].password_hash), (
+            f"{username} 的密码验不过 ⇒ 账号建了但登不上"
+        )
+        assert rows[username].role == role == ADMIN
 
-> ⚠️ `session` 装置与 `pytest.mark.anyio` 的用法**照抄** `tests/test_api_conversations_db.py`
-> 那份现有文件(本仓 db 测试的既有形状);`_REQUIRED` 之类的 settings 构造照抄
-> `tests/test_flywheel_task.py`(那边有现成的 `_settings` 样板)。
+
+@pytest.mark.anyio
+async def test_engine_disposes_cleanly():
+    """收尾:`get_engine()` 是 lru_cache 单例,别的 db 文件都这么收。"""
+    await get_engine().dispose()
+```
 
 - [ ] **Step 4: 加 ORM 模型 `User`(`app/db/models.py`)**
 
@@ -735,17 +768,19 @@ git commit -m "认证 T2:users 表(db/auth.sql)+ 幂等种子脚本 + db 测试"
 ```python
 """登录端点的行为面。**要 MySQL**(它要读 users 表)。
 
-⚠️ 这一份**刻意不请求** conftest 那个「默认已登录」装置 —— 它测的就是
-「没登录时会怎样」。用 `_no_default_login` 关掉那个 autouse(Task 5 加)。
+⚠️ 这一份**刻意请求** `_no_default_login`(Task 5 定义的 autouse 开关)——
+它测的就是「没登录时会怎样」,而那个全局装置默认替每条用例装一个已登录用户。
+⚠️ **本仓没有 `session` fixture**:种账号用**直接 engine**,照
+`tests/test_api_conversations_db.py` 既有形状写。
 """
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
-from app.auth import ADMIN
-from app.db.models import User
+from app.auth import ADMIN, create_token
+from app.config import Settings
 from app.main import app
+from app.db.base import get_engine, get_sessionmaker
 from scripts.seed_users import seed
 
 pytestmark = pytest.mark.db
@@ -758,9 +793,14 @@ def client():
     return TestClient(app)
 
 
+async def _seed_now() -> None:
+    async with get_sessionmaker()() as session:
+        await seed(session)
+
+
 @pytest.mark.anyio
-async def test_login_returns_a_token_that_me_accepts(session, client, _no_default_login):
-    await seed(session)
+async def test_login_returns_a_token_that_me_accepts(client, _no_default_login):
+    await _seed_now()
     r = client.post("/api/auth/login", json=GOOD)
     assert r.status_code == 200, r.text
     body = r.json()
@@ -770,19 +810,22 @@ async def test_login_returns_a_token_that_me_accepts(session, client, _no_defaul
     me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {body['token']}"})
     assert me.status_code == 200, me.text
     assert me.json() == {"username": "cinfly", "role": ADMIN}
+    await get_engine().dispose()
 
 
 @pytest.mark.anyio
-async def test_wrong_password_and_unknown_user_are_indistinguishable(session, client, _no_default_login):
+async def test_wrong_password_and_unknown_user_are_indistinguishable(client, _no_default_login):
     """两种失败必须**逐字相同** —— 否则响应文案成了「用户名枚举」的接口。"""
-    await seed(session)
+    await _seed_now()
     a = client.post("/api/auth/login", json={"username": "cinfly", "password": "nope"})
     b = client.post("/api/auth/login", json={"username": "nobody", "password": "nope"})
     assert a.status_code == b.status_code == 401
     assert a.json() == b.json(), f"{a.json()} != {b.json()}"
+    await get_engine().dispose()
 
 
 def test_login_body_is_validated(client, _no_default_login):
+    """缺 password ⇒ 422(pydantic 在碰库**之前**就拒了)。"""
     assert client.post("/api/auth/login", json={"username": "x"}).status_code == 422
 
 
@@ -791,15 +834,29 @@ def test_me_without_token_is_401_and_not_403(client, _no_default_login):
     assert r.status_code == 401, f"缺 header 必须 401(不是 403),实际 {r.status_code}"
 
 
+def test_me_with_a_garbage_token_is_401(client, _no_default_login):
+    """坏 token 与缺 header 必须是**同一个** 401(前端只认这一条去弹登录)。"""
+    a = client.get("/api/auth/me", headers={"Authorization": "Bearer not-a-jwt"})
+    b = client.get("/api/auth/me")
+    assert a.status_code == b.status_code == 401
+    assert a.json() == b.json()
+
+
 @pytest.mark.anyio
-async def test_expired_token_is_401(session, client, _no_default_login):
-    from app.auth import create_token
-    from app.config import Settings
-    await seed(session)
-    expired = create_token(username="cinfly", role=ADMIN,
-                           settings=Settings(jwt_expire_minutes=-1))
+async def test_expired_token_is_401(client, _no_default_login):
+    """**过期**必须被拒 —— 而且红的理由得是「过期」,不是「签名不匹配」。
+
+    ⚠️ 所以密钥要**与 App 用的那一份相同**,只把有效期调成负数:
+    `get_settings()` 是 App 依赖的同一个对象(lru_cache),`model_copy` 换掉一个字段。
+    自己另造一份 `Settings(...)` 的话密钥很可能不同 ⇒ 这条**照样绿**,
+    而它测的东西变成了「签名不匹配」—— 那是 `require_user` 的另一条分支。
+    """
+    from app.config import get_settings
+    expired_settings = get_settings().model_copy(update={"jwt_expire_minutes": -1})
+    expired = create_token(username="cinfly", role=ADMIN, settings=expired_settings)
     r = client.get("/api/auth/me", headers={"Authorization": f"Bearer {expired}"})
     assert r.status_code == 401
+    await get_engine().dispose()
 ```
 
 - [ ] **Step 2: 跑测试,确认全红**
@@ -1140,8 +1197,9 @@ from app.main import app
 #: 唯一允许不带守卫的端点。**加一条都要在这里写明理由。**
 PUBLIC = {("POST", "/api/auth/login")}
 
-#: 只要求 `require_user`(不要求 admin)的端点。
-USER_ONLY = {("GET", "/api/auth/me")}
+# ⚠️ 这里**不要**再留一个「只要求 require_user」的集合:plan 初稿写过 `USER_ONLY`,
+# 而它是**死代码**(下面那条用例自己就把 `me` 点名了)。定义一个没人读的常量
+# 正是复审要拦的那类东西。
 
 
 def _guard_names(route: APIRoute) -> set[str]:
