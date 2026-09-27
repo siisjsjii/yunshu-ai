@@ -108,9 +108,23 @@ def test_alg_none_token_is_rejected():
         decode_token(forged, _settings())
 
 
-def test_token_without_sub_or_role_is_rejected():
-    """缺 claim 的 token 不许当成匿名用户放过去。"""
-    bare = jwt.encode({"exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+def test_token_without_sub_is_rejected():
+    """**缺 `sub`** 的 token 不许当成匿名用户放过去。
+
+    ⚠️ **两条 claim 必须分开测**(计划初稿把 `sub` 与 `role` **一起省掉** ——
+    那样**删掉任何一条守卫它都照样绿**,本仓「假绿形态」里最经典的一种)。
+    这里只**少给 `sub`**,`role` 给对的。
+    """
+    bare = jwt.encode({"role": ADMIN, "exp": int(time.time()) + 3600},
+                      SECRET, algorithm="HS256")
+    with pytest.raises(AuthError):
+        decode_token(bare, _settings())
+
+
+def test_token_with_an_unknown_role_is_rejected():
+    """**角色不认识**的 token 也不许放过去(只少给 `role` 那一半)。"""
+    bare = jwt.encode({"sub": "cinfly", "role": "root", "exp": int(time.time()) + 3600},
+                      SECRET, algorithm="HS256")
     with pytest.raises(AuthError):
         decode_token(bare, _settings())
 
