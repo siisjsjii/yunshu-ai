@@ -962,8 +962,27 @@ app.include_router(auth_router)
 - [ ] **Step 6: 跑测试**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_api_auth.py -p no:cacheprovider`
-Expected: **5 passed**(需要 MySQL;`_no_default_login` 此时还不存在 ⇒ 会在 Task 5 之前一直红 ——
-**如果此刻红在 fixture 上,就先在 `tests/conftest.py` 里加一个临时的空 fixture**,Task 5 再补实)。
+Expected: **6 passed**(需要 MySQL)。⚠️ 计划初稿在这里写过「5」—— **那是错的**
+(Step 1 里一共 **6** 个 `def test_…`;我后来加了「坏 token」那条却没改这个数)。
+**以实际为准**并把真实数字写进报告。
+
+⚠️ **`_no_default_login` 由本任务定义**(裁定 R1):Step 1 的测试**请求**它,
+不定义的话整个文件在 collection 阶段就 error。在 `tests/conftest.py` 里加:
+
+```python
+@pytest.fixture
+def _no_default_login():
+    """**关掉**「默认已登录」装置的开关。
+
+    只有认证自己的测试请求它 —— 那几条测的就是「没登录时会怎样」,
+    被默认装置一盖,断言的「401」会变成 200 而**红得莫名其妙**。
+
+    ⚠️ 这里只是**占个名字**:真正的开关在 Task 5 加的 autouse 装置里,
+    它靠 `"_no_default_login" in request.fixturenames` 认这个名字。
+    ⇒ **本任务不许改它的形状**(名字即契约),Task 5 才加那个装置。
+    """
+    return None
+```
 
 - [ ] **Step 7: 真机冒烟(服务重启 + curl)**
 
@@ -1326,7 +1345,7 @@ def _no_default_login():
 
 
 @pytest.fixture(autouse=True)
-def _default_login(_no_default_login):
+def _default_login(request):
     """**每条用例**默认带一个已登录的 admin。
 
     ## 为什么要有它
@@ -1345,7 +1364,17 @@ def _default_login(_no_default_login):
 
     默认给 `user` 的话,工作台那 18 个端点在既有测试里会**集体 403**;
     而 admin 是**超集**(能打用户面也能打工作台)—— 与 spec §6.4 的语义一致。
+
+    ## ⚠️ 开关为什么用 `request.fixturenames` 而**不是参数**
+
+    写成 `def _default_login(_no_default_login)` 的话,那个名字**永远**在
+    `fixturenames` 里 ⇒ 默认登录**永远**被跳过 ⇒ 那 79 处调用**集体 401**。
+    (实测过:临时 conftest + 两条用例,只有下面这一版对。)
     """
+    if "_no_default_login" in request.fixturenames:
+        yield None
+        return
+
     from app.auth import ADMIN, AuthenticatedUser, require_admin, require_user
     from app.main import app as fastapi_app
 
@@ -1357,17 +1386,8 @@ def _default_login(_no_default_login):
     fastapi_app.dependency_overrides.pop(require_admin, None)
 ```
 
-⚠️ **`_no_default_login` 必须让 `_default_login` 跳过**——把 `_default_login`
-写成:
-
-```python
-@pytest.fixture(autouse=True)
-def _default_login(request):
-    if "_no_default_login" in request.fixturenames:
-        yield
-        return
-    ...  # 上面的注入
-```
+⚠️ **`_no_default_login` 由 Task 3 先定义**(`return None` 就够 —— 上面那个开关
+只认**名字在不在**),本任务**保留**它、不要改它的形状。
 
 - [ ] **Step 5: 跑两个方向都验一遍**
 
