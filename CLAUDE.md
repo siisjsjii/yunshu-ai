@@ -60,6 +60,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `scripts/acceptance_ch10.sh` 把它测成一个**比例读数**(三层:意图 / 工具被调 / 回复含工号或等待)
   并把读数如实写进 `dev-notes/ch10.md`(见 ch10 spec §11.4)。
 
+- **ch10-B(微调 17 类多标签主题分类器)** 交付(分支 `ch10-b-topic-classifier`,ch10 的第二半;
+  **ch10-A 合并到 `main` 之后**做的)。它把「低置信度池里那堆问题该先补哪块知识」变成
+  一个**能算的数**:17 类权威类目表(`app/topic/taxonomy.py`;9→17 是**有损投影**)+
+  语料合流 / 配额合成 / 大模型预标 / 分层切分(`scripts/prepare_topic_data.py`)+
+  **本地全参微调**(`scripts/train_topic_clf.py`,基座 hfl/chinese-roberta-wwm-ext,
+  产物 `models/topic-clf` —— 409MB,**不入库**)+ 冻结测试集评测
+  (`scripts/eval_topic_clf.py` → `evals/topic/report.md` + report.json + 两张矩阵 + misjudged.csv,
+  **都入库**)+ **旁路推理服务**(`topic_service/`,独立进程 **8103**,**不在对话链路上**)+
+  离线跑批(`scripts/classify_topics.py` → 表 `topic_classifications`)+
+  只读分布接口(`GET /api/topics/distribution`,标签在 SQL 里用 `JSON_TABLE` 展开)+
+  管理台「主题分布」页。设计源见 ch10 spec(§15 现有 15.1–15.4 四条实现订正)。
+
+- **ch10-B 的五条命门**(每条都对应一次「报错指向别处」或「静默出错」):
+  1. **`problem_type` 不是配置项,是从 `labels.dtype` 猜出来的**(transformers 5.17,
+     spec §2.3)。单标签(dtype=long)与多标签(dtype=float + `BCEWithLogitsLoss`)走**两条
+     不同的头**,猜错时报错指向别处 ⇒ 训练侧**显式设** `problem_type` 并当场核对。
+  2. **标签顺序是契约**(spec §2.7)。模型第 N 个 logit 对应哪个类目**靠产物里那张表的下标**;
+     服务若自己硬编码一份顺序 ⇒ **分布图整张错位,而每一个组件都工作正常**(scores 全在
+     0–1、写库成功、页面画得出来、没有任何东西报错)。三道防线**全落在产物上**
+     (`labels.json` / `inference_config.json` / `train_meta.json`),服务与评测脚本
+     **只走 `app.topic.model.load_artifacts` 这一个读侧**;`/healthz` 把 `labels` **整张表**
+     印出来(`num_labels` 对**重排**是瞎的 —— 反序之后它还是 17)。
+  3. **train / serve 同源**:清洗(`app/topic/clean.py`)与类目表(`app/topic/taxonomy.py`)
+     两侧**import 同一份**,不是各写一遍 —— 写成测试守着(spec §5.1 / §9.1)。
+  4. **跑批整批原子**:`classify_topics.py` 一次运行**一个事务**,服务故障 ⇒ **什么都不写**。
+     绝不写空标签:`labels=[]` 会被分布页读成「这些问题没有主题」—— **故障被读成业务结果**。
+  5. **`labels` 是 JSON 列,读它要用 `JSON_TYPE` 而不是 `IS NULL`**:ORM 的 `JSON` 类型
+     (`none_as_null=False`)把 Python 的 `None` 落成**字面 JSON `null`**,它在 SQL 上
+     **不是 NULL** ⇒ `WHERE labels IS NULL` 一行都筛不出来。同一族的账 ch09 在
+     `evidence_snapshot` 上已经付过一次(见下面「已知问题与未达成项」)。
+
 **ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop、认证。
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
@@ -143,6 +174,26 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 #   就判红** —— 让「装置自己喷错误行」不再可能与「6/6 通过」共存(踩过:收尾文案里的反引号
 #   被 bash 当命令替换执行,喷了一屏错误而脚本照样报 6/6)。失败时那份转录会被复制进证据目录。
 
+# ch10(前置:MySQL + 真实 key;**不需要 Milvus** —— 分类器这条线不检索)
+#   起服务之前**先起旁路推理服务**(8103):②③ 两类验收全靠它,`classify_topics.py` 也要它。
+.venv/Scripts/python.exe -m topic_service --model models/topic-clf --port 8103
+.venv/Scripts/python.exe scripts/prepare_topic_data.py collect   # 语料合流(三源 → corpus.jsonl)
+.venv/Scripts/python.exe scripts/train_topic_clf.py              # 训练(约十几分钟;产物不入库)
+.venv/Scripts/python.exe scripts/eval_topic_clf.py --report evals/topic/report.md  # 验收 ① 的落点
+.venv/Scripts/python.exe scripts/classify_topics.py --dry-run    # 先看会写哪些行
+.venv/Scripts/python.exe scripts/classify_topics.py --limit 20   # 跑批(写 topic_classifications)
+bash scripts/acceptance_ch10.sh                                  # ch10 验收 ①–④
+# ↑ **它自己起四样东西**:客服服务(8000)+ 两个 MCP Server(尽力而为)+ **旁路服务(8103)**
+#   ⇒ 跑之前先清掉 8000/8101/8102/8103 的残留进程(否则 curl 到旧代码 —— 本仓记过的那种假红)。
+#   ⚠️ **一次约 2–4 分钟**:① 会把评测脚本**跑两遍**(比两次运行的产物是否逐字节相同)。
+#   ⚠️ **必须在 Git Bash 里跑**:从 cmd/PowerShell/Python 的 `subprocess` 直接调 `bash` 会解析到
+#   **WSL 的 bash**(CreateProcess 把 System32 排在 PATH 之前),那里 `localhost` 与 `/tmp`
+#   都不是 Windows 这边的 ⇒ 一屏假红。脚本自己有一道 `OSTYPE` 自检把这种情况拦在开头。
+#   ⚠️ 它**会写库**:② 那一节跑 `classify_topics.py --limit 20`(upsert,幂等:唯一键
+#   `uk_pool_question` 保证「重跑 = 覆盖,不是追加」)。① 的两次运行产物落在 `$TEMP` 下
+#   (**不写 `/tmp`**:bash 的 `/tmp` 是 MSYS 的,Python 的 `/tmp` 是 `D:\tmp`,不是同一个地方)。
+#   ⚠️ ① 有一条硬断言是「**入库的五份报告 == 本次运行的那五份**」⇒ 换了权重必须重生成报告。
+
 # 建库 / 升级(Milvus 另需 docker start milvus-standalone;BGE-M3 等权重由 main.py 预热)
 .venv/Scripts/python.exe scripts/init_db.py                     # 建表:create_all,只建**不存在的表**
 # ⚠️ **`init_db.py` 永不加列。** `create_all` 对已存在的表是**空操作** —— 它不会
@@ -152,7 +203,17 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 #    `db/ch07.sql`(新表 conversation_summaries + conversations 的两个锚点列)、
 #    **`db/ch08.sql`(新表 tool_audit_logs)**、
 #    **`db/ch09.sql`(新表 `review_queue` + `eval_runs`,外加
-#    `low_confidence_questions` 的两列 `evidence_snapshot` / `matched_review_id`)**。
+#    `low_confidence_questions` 的两列 `evidence_snapshot` / `matched_review_id`)**、
+#    **`db/ch10.sql`(新表 `topic_classifications`,ch10-B 的归类结果)**。
+#    ⚠️ `db/ch10.sql` 与 `db/ch08.sql` **同款**:它只有 `CREATE TABLE`,而 ORM 侧有同名模型
+#    (`TopicClassification`)⇒ `init_db.py` 的 create_all **已经把它建出来了** ⇒
+#    **在全新库上跑它会在那条 CREATE 上响亮地报 `ERROR 1050`(表已存在)。
+#    那是刻意的、不是脏库** —— 与 `db/ch06.sql` 的 refund_requests、`db/ch08.sql` 的
+#    tool_audit_logs 是同一个已知取舍。**想让 DDL 成为权威形状**才需要
+#    `DROP TABLE topic_classifications;` 再跑一遍(头部的注释写着这条,T12 就是这么核的);
+#    两条路径的形状差异逐条记在 `app/db/models.py` 的 `TopicClassification` docstring 里。
+#    漏掉它的后果是**功能性的**:`/api/topics/distribution` 与 `classify_topics.py` 直接
+#    `Unknown table`(这张表**没有别的写方**,批处理是唯一入口)。
 #    漏掉 ch09 那份的后果**不是「少个功能」**:飞轮每条 `WHERE matched_review_id IS NULL`
 #    的选择谓词、审核页的每一行、趋势表的每一轮都读那两列/两张表 ⇒ 一进 `/api/review/*`
 #    或 `eval_trend.py` 就是 `Unknown column`。⚠️ 走法与其余几份**相反**(DDL 头部写着,
@@ -183,7 +244,9 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 #    所以新库上仍然应当**让 DDL 建表**:要么先跑
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
-#    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`。
+#    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`
+#    (**`db/ch09.sql` 与 `db/ch10.sql` 不在此列** —— 前者第一句是 ALTER(空库上 1146)、
+#    后者只有 CREATE(会 1050);那两份的走法各自写在上面与它们自己的文件头里)。
 
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)
@@ -241,6 +304,18 @@ app/flywheel/     ch09 数据飞轮(**池子的下游**):normalize.py(口语 →
 knowledge/        知识语料(3 份 Markdown,首行带 <!--type: ...--> 类型标记)
 scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)、calibrate_evidence.py、
                   intent_cost.py、eval_trend.py、run_flywheel_eval.py
+app/topic/        ch10-B 分类器的**纯函数内核**(零 torch、零 IO):taxonomy.py(17 类权威表 +
+                  BOUNDARY + 9→17 投影)、clean.py(脱敏/格式,训练与推理**同源**)、
+                  labeling.py(分层切分 + 证据校验 + `is_unusable_target` + 错别字注入)、
+                  metrics.py(四个指标 + 两张矩阵,**零第三方依赖**)、model.py(产物的**唯一读侧**
+                  `load_artifacts`)、synth.py(配额合成的形态约束)
+topic_service/    ch10-B 的**旁路推理进程**(8103,`python -m topic_service`):model.py(**产物 → logits
+                  → sigmoid → 阈值 → 标签**,标签顺序/阈值/长度一律读产物)+ server.py(`/predict` 与
+                  `/healthz`)。**不在对话链路上** —— 主链路零调用分类器(源码扫描测试守着)
+app/api/topics.py ch10-B:只读分布接口(标签在 SQL 里用 `JSON_TABLE` 展开;**回池子按题面**数
+                  「不同问题数」,不是按池子行 id —— 那一列有唯一键,数与行数恒等)
+scripts/          ch10-B 加:prepare_topic_data.py(合流/切分)、train_topic_clf.py(微调)、
+                  eval_topic_clf.py(冻结测试集评测,验收 ① 的落点)、classify_topics.py(批量归类)
 ```
 
 ch03 把依赖方向扩展为 `tools → retrieval → db` 与 `kb → {db, llm, retrieval}`,仍是单向。
@@ -747,6 +822,29 @@ T19 补了 `#9–#16`(8 条);三次跑又消耗 `#9` / `#10`
 打出来指认错因 —— 别把它读成「代码坏了」。连带:`sum_totalCost` **恒为 0**(没配模型价格),
 `scripts/intent_cost.py` **只报 token、不报钱**。
 
+**ch10-B · 本章测不出**结论性的 per-class 指标 —— 能引用的只有汇总数,而权威列上一条都没有。**
+根因是**真实语料按类稀薄**,不是模型不行、也不是阈值没调好:
+
+- `†` 的判据是 spec §8.3 的 `support < 15`,而 **17 类 × 15 = 255 个标签槽 > 全表 169 个槽**
+  ⇒ **算术上装不下**「17 类各 ≥15」。
+- 实测(`evals/topic/report.json`,`scripts/acceptance_ch10.sh` 验收 ① 会把这三个数断成判词):
+  **全体 120 → 够 15 的 3/17**(退换货 18 / 运费 15 / 保修维修 15);
+  **只看真实 80(§8.4 指定的权威列)→ 1/17**;**只看合成 40 → 0/17**。
+  ⚠️ `†` 是**每一层各自**重判的 ⇒ **权威列挂的 † 比全体更多**(16/17 vs 14/17),
+  别把它读成「那一列更差」(见 ch10 spec §15.3)。
+- ⇒ **本章没有任何一条可以按类下的结论**;能引用的只有全体/分层那几个汇总数
+  (micro-F1 0.8285 / macro-F1 0.7866 / 整条一致率 0.675 @ t=0.5,三口径见 report.md)。
+- **解救办法只有一个:补真实语料**(真实池里 `尺码` 只有 4 条 ⇒ 它在权威列上的上限**永远是 4**)。
+  **不是**调低阈值 15(那是拿判据迁就数据)、**不是**把测试集做大(做大只改善合并列)、
+  **也不是**给头四类配额(真实 80 里要为 4 个类抽掉 ≈48 个名额,其余 13 类各剩 ~2.5 条 ——
+  拿一个更差的仪器换一个被合成数据污染的列)。三条裁定与其理由见 ch10 spec §15.2 与
+  `dev-notes/ch10.md` 阶段 8 补。
+- ⚠️ **报告里那个 F1 是在「预标标签」上测的,不是在人工标注的黄金集上**:120 行里只有
+  **12 行**带 `human_reviewed`(用户 2026-09-26 拍板跳过测试集人工复核;那 12 行是从 CP-2
+  复核过的 84 条流过去的:`train 60 + val 12 + test 12`)。**`import-test` 刻意没有执行** ——
+  跑了它会给 120 行**全部**打上「人核过」,而其中 **108 行没有人看过**。
+  验收 ① 因此**把它断成判词**:`test_human_reviewed_rows` 一旦变成 120,那一节就红。
+
 ## 平台陷阱(Windows + Git Bash)
 
 本机 locale 是 **cp936**,这个陷阱在 ch02 咬过**三次**,属**复发型**:
@@ -757,6 +855,7 @@ T19 补了 `#9–#16`(8 条);三次跑又消耗 `#9` / `#10`
 - **验收断言不能直接 grep 原始 SSE 流**。回复逐 token 推送,`20240915` 会被切成三个独立帧。用 `join_tokens` 拼回后再比对。
 - **不要用 `grep '[一-龥]'` 检查中文完好性**:C locale 下 bracket expression 退化成字节区间,对真实 UTF-8 和 mojibake 全部匹配,是个恒真的假断言。脚本里的 `has_cjk` 按 Python 码点判断。
 - **起服务前先查端口**:8000 上残留的僵尸进程会让你 curl 到旧代码,从而得出「新代码坏了」的**假红**。ch02 的最终验证就差点栽在这上面。ch05 又遇到一次,且**一次开了两个 uvicorn** —— 见到多个就全部清掉再起,别猜哪个是新的。
+- **⚠️ 从 Python(或 cmd / PowerShell)调 `bash` 拿到的是 WSL 的 bash,不是 Git Bash(ch10-B 实测,2026-09-27)**。`CreateProcess` 的搜索顺序把 **System32 排在 PATH 之前** ⇒ `subprocess.run(["bash", …])` 解析到 `C:\Windows\System32\bash.exe`(**哪怕 `shutil.which("bash")` 明明返回的是 Git 那一份** —— 两者查的不是同一张表)。后果是**一屏假红**:WSL 里 `curl http://localhost:8000` 到不了 Windows 上跑的服务(WSL2 有自己的网络命名空间)⇒ 起来像是「客服服务起不来」;`/tmp` 也是 Linux 的 /tmp,而 **Python 的 `/tmp` 是 `D:\tmp`**。**判据:`bash -c 'uname -s'` 必须是 `MINGW*`/`MSYS*`(Git Bash 的 `OSTYPE` 实测是 `cygwin`,WSL 是 `linux-gnu`)**;固定走绝对路径(`D:\kit\Git\usr\bin\bash.exe`),别让 PATH 决定。`scripts/acceptance_ch10.sh` 开头有一道 `OSTYPE` 自检把这种情况**拦在跑之前**。
 - **LangGraph 的两条实测硬约束(ch06,都是「报错指向别处」的类型)**:
   - **`astream(stream_mode="custom")` 会把 `interrupt()` 整个吞掉** —— 一个帧都不吐、run 直接结束、`state.next` 停在待续节点、**不报任何错**。interrupt 只从 **`updates`** 模式浮出(`{'__interrupt__': (Interrupt(value=…),)}`)。ch06 的订单卡片差点因此「永远不出现且不报错」;端点的流模式因此是 `["custom","updates"]`。
   - **`resume` 时节点会从头重跑**(`interrupt()` 之前的代码再执行一遍)。所以**放 `interrupt()` 的节点里不能有别的事** —— 取订单那类有副作用的活必须在它**之后**的节点。ch06 有一条「取订单恰好一次」的用例,计数器放在 **tool 的 `ainvoke` 边界**上(那正是本项目栽过的边界)。

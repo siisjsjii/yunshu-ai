@@ -1,0 +1,22 @@
+########## J1 ##########
+FAIL 两次运行**不是**逐字节相同:report.md(spec §8.6 的「不参与任何随机」不成立 —— 先查 device 是不是 cuda,再查 model.eval() 与 torch.no_grad())
+FAIL 入库的 evals/topic/report.md 与本次运行不同 ⇒ 盘上那份报告已经不描述当前权重
+==> ✅ 判红在「两次运行逐字节相同:report.md」
+########## J2 ##########
+FAIL report.md 印的 micro-F1 [0.8285, 0.8252, 0.835] 与 report.json 的全体/真实/合成 [0.9999, 0.8252, 0.835] 对不上
+FAIL report.md §2 的 micro-F1 0.8285 != report.json 的 0.9999
+FAIL 两次运行**不是**逐字节相同:report.json(spec §8.6 的「不参与任何随机」不成立 —— 先查 device 是不是 cuda,再查 model.eval() 与 torch.no_grad())
+FAIL 入库的 evals/topic/report.json 与本次运行不同(差异字段:grid)—— 要么权重换过而报告没重生成,要么那份报告被手改过
+==> ✅ 判红在「报告里印的 micro-F1 与 report.json 对不上」
+########## J3 ##########
+FAIL 测试集变过:报告记的是 1b78c2d8c7dd2664,盘上是 19bf270f20e86b60 ⇒ 这份报告描述的已经不是这份数据
+FAIL 测试集文件的 provenance 计数 {"real": 81, "synthetic": 40} != 报告里的 {"real": 80, "synthetic": 40}
+==> ✅ 判红在「测试集 sha256 与报告记录的不符」
+########## J4 ##########
+FAIL 各 bucket 条数合计 0 < total 65 ⇒ 有行的标签没被展开
+FAIL 不同问题数接口给 65,回池子按题面数是 33 ⇒ 接口很可能退回了按 low_confidence_question_id 去重(那一列有唯一键 ⇒ 它会与行数恒等,是个没意义的数)
+FAIL bucket 与独立复算对不上的:退换货: 接口 0/0 vs 复算 11/3 ; 发票: 接口 0/0 vs 复算 1/1 ; 运费: 接口 0/0 vs 复算 1/1(最多列 3 个)
+==> ✅ 判红在「不同问题数退回按 low_confidence_question_id 去重」
+########## J5 ##########
+FAIL 多诉求句「买大了想退」只命中 1 个类目(期望 >= 2):退换货 ⇒ 多标签退化了
+==> ✅ 判红在「多诉求句只命中 1 个类目(期望 >= 2)」(且只有这一条红)
