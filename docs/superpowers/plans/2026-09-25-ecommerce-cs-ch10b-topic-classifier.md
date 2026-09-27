@@ -3180,13 +3180,19 @@ class _FakeModel:
         return type("Out", (), {"logits": torch.tensor(self.logits)})()
 
 
-def _classifier(tmp_path, logits):
+def _classifier(tmp_path, logits, *, labels=None, threshold=0.5, max_length=64):
     import json
 
-    (tmp_path / "labels.json").write_text(json.dumps(list(LABELS)), encoding="utf-8")
+    # ⚠️⚠️ **计划订正 14(controller,2026-09-27)—— 这里的三个参数是刻意的** ⚠️⚠️
+    # 原稿把 `labels` / `threshold` 写死成 `LABELS` / `0.5`(**也就是实现的默认期望值**),
+    # 于是那三条「来自产物」的断言变成了**同义反复**:
+    # **一个把 `LABELS`、`0.5` 写死在服务里的实现照样绿** ——
+    # 而它们的 docstring 说的正是「服务不许自己写一份」。
+    # ⇒ 现在**可以传进被打乱 / 非默认的值**,断言读出来的必须是**那个值**。
+    (tmp_path / "labels.json").write_text(
+        json.dumps(list(labels if labels is not None else LABELS)), encoding="utf-8")
     (tmp_path / "inference_config.json").write_text(
-        json.dumps({"max_length": 64, "threshold": 0.5}), encoding="utf-8"
-    )
+        json.dumps({"max_length": max_length, "threshold": threshold}), encoding="utf-8")
     return TopicClassifier(tmp_path, model=_FakeModel(logits), tokenizer=None)
 
 
@@ -3195,14 +3201,38 @@ def test_label_order_comes_from_the_artifact(tmp_path):
 
     两侧顺序不一致会产出一张**完全错的分布图,而每个组件都工作正常**:
     模型有输出、scores 在 0–1、写库成功、页面画得出来。
+
+    ⚠️ **订正 14-A**:原稿写进去的就是 `LABELS`、再断言等于 `LABELS` ⇒ **同义反复**,
+    写死 `LABELS` 的实现照样绿。⇒ 现在写一份**打乱的**,断言读出的是**打乱的那个顺序**。
     """
-    c = _classifier(tmp_path, [[0.0] * len(LABELS)])
-    assert c.labels == list(LABELS)
+    scrambled = list(reversed(LABELS))          # 顺序**被打乱**(内容仍是同样 17 个)
+    c = _classifier(tmp_path, [[0.0] * len(LABELS)], labels=scrambled)
+    assert c.labels == scrambled                # ← 必须是**产物里那个顺序**
+    assert c.labels != list(LABELS)             # ← 且**不是**代码里那份(判别力在这一句)
+
+
+def test_the_label_set_is_the_same_either_way(tmp_path):
+    """顺序来自产物,**类目集合**仍必须等于 `taxonomy.LABELS`(spec §9.1 那条断言)。
+
+    ⚠️ 这两件事要**分开**断:顺序错了是「分布图整张错」,集合错了是「类目表两处漂移」。
+    合在一句里时,打乱顺序的正确实现会**误红**,而漏一个类目的实现可能**误绿**。
+    """
+    scrambled = list(reversed(LABELS))
+    c = _classifier(tmp_path, [[0.0] * len(LABELS)], labels=scrambled)
+    assert sorted(c.labels) == sorted(LABELS)
 
 
 def test_threshold_comes_from_the_artifact(tmp_path):
-    c = _classifier(tmp_path, [[0.0] * len(LABELS)])
-    assert c.threshold == 0.5
+    """⚠️ **订正 14-B**:原稿写 `0.5`、断 `0.5` ⇒ 写死 0.5 的实现照样绿。用**非默认值**。"""
+    c = _classifier(tmp_path, [[0.0] * len(LABELS)], threshold=0.7)
+    assert c.threshold == 0.7
+
+
+def test_max_length_comes_from_the_artifact(tmp_path):
+    """⚠️ **订正 14-D**(spec §9.1):`max_length` 也在产物里,**不许在服务里写死** ——
+    「两侧截断长度不一致」与标签顺序是**同一族的静默失效**。同样用**非默认值**。"""
+    c = _classifier(tmp_path, [[0.0] * len(LABELS)], max_length=48)
+    assert c.max_length == 48
 
 
 def test_sigmoid_decoding_picks_every_label_above_threshold(tmp_path):
@@ -3237,8 +3267,26 @@ def test_predict_handles_a_batch(tmp_path):
     assert len(out) == 3
 
 
+class _ExplodingModel:
+    """**被调用就抛** —— 用来把「没调用模型」从一句声称变成一个可断言的事实。
+
+    ⚠️ **订正 14-C**:原稿那条测试叫 `..._without_calling_the_model`,
+    但**只断言了返回值是 `[]`** —— 名字声称的比断的多。
+    一个**真的**把空列表喂进模型的实现(浪费一次前向、还可能因空张量报错)照样绿。
+    """
+
+    def __call__(self, **kwargs):
+        raise AssertionError("空输入不该调用模型")
+
+
 def test_empty_input_returns_empty_without_calling_the_model(tmp_path):
-    assert _classifier(tmp_path, []).predict([]) == []
+    import json
+
+    (tmp_path / "labels.json").write_text(json.dumps(list(LABELS)), encoding="utf-8")
+    (tmp_path / "inference_config.json").write_text(
+        json.dumps({"max_length": 64, "threshold": 0.5}), encoding="utf-8")
+    c = TopicClassifier(tmp_path, model=_ExplodingModel(), tokenizer=None)
+    assert c.predict([]) == []          # ← 若它调了模型,这里会抛
 ```
 
 - [ ] **Step 2: 跑测试,确认失败**
