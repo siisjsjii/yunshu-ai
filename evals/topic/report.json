@@ -690,6 +690,10 @@
   "label_count_match": 0.7666666666666667,
   "wrong_rows": 39,
   "wrong_rows_limit": 60,
+  "misjudged_rows": 39,
+  "misjudged_file": "evals/topic/misjudged.csv",
+  "misjudged_evidence_source": "topic_test.jsonl 每一行自己的 evidence 字段",
+  "misjudged_note": "spec §8.5 —— 给人判「模型错 还是 标签错」用,本脚本不预判、也不产出自动化结论",
   "train_meta": {
     "base": "hfl/chinese-roberta-wwm-ext",
     "seed": 42,

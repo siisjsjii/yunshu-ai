@@ -12,6 +12,7 @@
 | `report.json` | 机器可读、可 diff |
 | `matrix_confusion.csv` | 每类 2×2(TP/FP/FN/TN),§8.2 的第 1 张 |
 | `matrix_flow.csv` | 17×17 **误判流向矩阵**,§8.2 的第 2 张 |
+| `misjudged.csv` | 判错样本(≤60 条),**给人判「谁错了」**(§8.5) |
 
 ## 三条不许动的东西
 
@@ -175,6 +176,21 @@ def f4(value) -> str:
     return f"{value:.4f}"
 
 
+def render_evidence(evidence) -> str:
+    """把一条样本的 `evidence` 渲染成给人读的一行。**取不到就返回空串 —— 不许编。**
+
+    ⚠️ 这里是「**不许编**」那条规矩的落点。缺证据串的行(字段不存在 / 不是 dict /
+    空 dict)一律留空,而不是写 `(无)`、更不是拿题面回填 —— 那份 CSV 是给**人**判
+    「模型错 还是 标签错」用的,一个编出来的证据串会让人**判反**。
+
+    ⚠️ 证据串**只用于人判**,**不许**拿它去反推标签对不对:它是**预标那一步的输入**,
+    不是裁决(`spec §6.2` 那根「字面提到」的结构性保证说的是另一回事)。
+    """
+    if not isinstance(evidence, dict) or not evidence:
+        return ""
+    return " ; ".join(f"{label}:{text}" for label, text in evidence.items())
+
+
 def write_csv(path: Path, headers: list[str], rows: list[list]) -> None:
     """`newline=""` 是 `csv` 模块的硬要求;显式 `encoding="utf-8"` 是本仓的平台纪律。"""
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -191,6 +207,7 @@ def main() -> int:
     ap.add_argument("--json", default=None, help="默认与 --report 同目录")
     ap.add_argument("--matrix-confusion", default=None, help="默认与 --report 同目录")
     ap.add_argument("--matrix-flow", default=None, help="默认与 --report 同目录")
+    ap.add_argument("--misjudged", default=None, help="默认与 --report 同目录")
     ap.add_argument("--alt-threshold", type=float, default=ALT_THRESHOLD,
                     help="订正 13-H 要求的第二行;默认 0.3")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -204,6 +221,7 @@ def main() -> int:
     json_path = Path(cli.json) if cli.json else out_dir / "report.json"
     conf_path = Path(cli.matrix_confusion) if cli.matrix_confusion else out_dir / "matrix_confusion.csv"
     flow_path = Path(cli.matrix_flow) if cli.matrix_flow else out_dir / "matrix_flow.csv"
+    misjudged_path = Path(cli.misjudged) if cli.misjudged else out_dir / "misjudged.csv"
 
     art = load_artifacts(cli.model_dir)
     labels = list(art["labels"])
@@ -263,8 +281,20 @@ def main() -> int:
     flagged = [r["label"] for r in per_class if r["support"] < SUPPORT_MIN]
     unflagged = [r["label"] for r in per_class if r["support"] >= SUPPORT_MIN]
 
-    # spec §8.5 的账:判错**条数**(那份 CSV 归后续任务,这里先把数记下来)
+    # spec §8.5:Misjudged 的行 —— 判错的**条数**与那份给人判的 CSV 的**行**。
+    # ⚠️ **不许在这里自动判「谁错了」** —— 「模型错 还是 标签错」正是**要人来判**的那件事。
+    #    那个区分是本次复核的全部价值:如果判错里多数是**标签错**,那 F1 低不是模型的问题,
+    #    要修的是数据不是训练 —— 而只看一个 F1 数字永远分不出来。
+    #    ⇒ 本脚本只负责**把现场摆好**(原话 / 真实标签 / 预测标签 / 预标的证据串)。
     wrong = [i for i, (t, p) in enumerate(zip(y_true, y_pred)) if set(t) != set(p)]
+    misjudged = [[rows[i]["question"],
+                  "、".join(y_true[i]) or "(无)",
+                  "、".join(y_pred[i]) or "(无)",
+                  # 证据串取自**这一行自己**的 `evidence`。冻结测试集 120 行**全部**带非空
+                  # evidence(实测),所以不必去 join `prelabeled.jsonl` —— 少一个输入就少一处
+                  # 按 id 索引的机会(本仓记过「按 id 建索引会把行静默塌掉」的账)。
+                  render_evidence(rows[i].get("evidence"))]
+                 for i in wrong[:ERROR_SAMPLE_LIMIT]]
 
     # 三个口径上的 support 实况(订正 10 那条「算术上装不下」的依据)
     support_by_def = {}
@@ -306,6 +336,11 @@ def main() -> int:
         "label_count_match": grid[str(threshold)]["all"]["label_count_match"],
         "wrong_rows": len(wrong),
         "wrong_rows_limit": ERROR_SAMPLE_LIMIT,
+        "misjudged_rows": len(misjudged),
+        "misjudged_file": misjudged_path.as_posix(),
+        "misjudged_evidence_source": "topic_test.jsonl 每一行自己的 evidence 字段",
+        "misjudged_note": ("spec §8.5 —— 给人判「模型错 还是 标签错」用,"
+                           "本脚本不预判、也不产出自动化结论"),
         "train_meta": art["meta"],
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -323,6 +358,8 @@ def main() -> int:
         ["真实\\预测", *labels],
         [[i, *[flow[(i, j)] for j in labels]] for i in labels],
     )
+
+    write_csv(misjudged_path, ["原话", "真实标签", "预测标签", "预标的证据串"], misjudged)
 
     # ------------------------------------------------ report.md
     tm = art["meta"]
@@ -430,9 +467,17 @@ def main() -> int:
     add("**两个都要报,不要合并**(§6.5):个数一致率天然高于(或等于)整条一致率,"
         "只报前者会把「认错了类但个数没错」读成「判对了」。")
     add("")
-    add(f"本轮判错的样本共 **{len(wrong)} 条**。"
-        f"spec §8.5 要求把其中最多 {ERROR_SAMPLE_LIMIT} 条导成 CSV 让人判「**谁错了**」"
-        "(模型错 vs 标签错)—— **那份 CSV 不在本任务的产物清单里**,这里先把条数入账。")
+    add(f"本轮判错的样本共 **{len(wrong)} 条**,最多 {ERROR_SAMPLE_LIMIT} 条导进 "
+        f"[`misjudged.csv`](misjudged.csv)(实际导出 **{len(misjudged)} 条**,"
+        f"列:原话 / 真实标签 / 预测标签 / 预标的证据串)。")
+    add("")
+    add("**那份 CSV 是给「人」判 `谁错了` 用的(spec §8.5)** —— 逐条判:"
+        "**模型错**(标签对、模型没学到位)归模型的账;**标签错**(模型对、预标标错)归数据的账。"
+        "**这个区分是本次复核的全部价值**:如果判错里**多数是标签错**,那 F1 低就不是模型的问题,"
+        "要修的是数据不是训练 —— 而只看一个 F1 数字**永远分不出来**。")
+    add("")
+    add("⚠️ 本脚本**不预判**「谁错」:它只把现场摆好(原话 + 两边标签 + 预标当时的证据串)。"
+        "证据串取自**这一行自己**的 `evidence` 字段;取不到的条目**留空**,不编。")
     add("")
 
     add("## 4. 两张矩阵(§8.2)")
@@ -557,7 +602,8 @@ def main() -> int:
     add(f"| 测试集 sha256(盘上字节) | `{test_sha}` |")
     add(f"| 设备 | `{cli.device}`(见模块 docstring:CPU 是为了逐字节可复现) |")
     add("")
-    add("附件:`report.json`(机器可读)、`matrix_confusion.csv`、`matrix_flow.csv`。")
+    add("附件:`report.json`(机器可读)、`matrix_confusion.csv`、`matrix_flow.csv`、"
+        f"`misjudged.csv`(§8.5 的人工复核现场,{len(misjudged)} 条)。")
     add("")
 
     report_path.write_text("\n".join(md), encoding="utf-8")
@@ -570,9 +616,10 @@ def main() -> int:
                   f"macro={c['macro_f1']:.4f} subset={c['subset_accuracy']:.4f} "
                   f"count={c['label_count_match']:.4f}")
     print(f"flagged(support<{SUPPORT_MIN}) {len(flagged)}/{len(labels)}: {'、'.join(flagged)}")
-    print(f"wrong_rows={len(wrong)} flow_nonzero_cells={len(top)}")
+    print(f"wrong_rows={len(wrong)} flow_nonzero_cells={len(top)} "
+          f"misjudged_rows={len(misjudged)}")
     print(f"wrote {report_path.as_posix()} {json_path.as_posix()} "
-          f"{conf_path.as_posix()} {flow_path.as_posix()}")
+          f"{conf_path.as_posix()} {flow_path.as_posix()} {misjudged_path.as_posix()}")
     return 0
 
 

@@ -372,3 +372,23 @@ def test_eval_script_strata_split_the_rows_and_their_label_carries_its_own_count
     assert headers == {"all": "全体 3", "real": "只看真实 2", "synthetic": "只看合成 1"}
     # 切开 —— 与 `main()` 里那条 `SystemExit` 守卫是同一条不变量(守卫在真数据上跑)。
     assert counts["real"] + counts["synthetic"] == counts["all"]
+
+
+def test_misjudged_evidence_rendering_never_invents_anything():
+    """⚠️ **`misjudged.csv` 是给「人」判「模型错 还是 标签错」用的(spec §8.5)。**
+
+    一个人判**判反**的代价很大:如果判错里多数是标签错,那要修的是**数据**不是训练 ——
+    而一个**编出来的**证据串会让人把「模型对、预标标错」看成「模型错」。
+    ⇒ 取不到证据串时**留空**,不写 `(无)`、更不拿题面回填。
+
+    判别力:任何「缺字段就回填题面 / 回填标签 / 写占位符」的实现,前三条断言都会红。
+    """
+    from scripts.eval_topic_clf import render_evidence
+
+    assert render_evidence({"价保": "价格保护几天有效"}) == "价保:价格保护几天有效"
+    assert render_evidence({"价保": "a", "物流": "b"}) == "价保:a ; 物流:b"
+    # 四种「取不到」的形态,一律空串 —— 一个字符都不许补
+    assert render_evidence(None) == ""
+    assert render_evidence({}) == ""
+    assert render_evidence([]) == ""
+    assert render_evidence("价保") == ""
