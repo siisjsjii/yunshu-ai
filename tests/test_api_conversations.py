@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList, Grouping
 from sqlalchemy.sql.functions import Function
 
+from app.auth import ADMIN, AuthenticatedUser, require_user
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
 from app.main import app
@@ -81,21 +82,31 @@ class _StubSession:
         entity = cols[0]["entity"]
         terms = _where_terms(stmt)
         if entity is Conversation:
-            # 两种查询形态,**按比较的是哪一列**区分,不能只看「有没有 where」:
-            #   `Conversation.id == <id>`   → 按 id 查单条(→ 404 那条路)
-            #   `Conversation.user == <u>`  → 列表查询(还可能什么都没有)
-            # **不要把这两种混成一种**:混了之后「列表接口串了另一个用户的会话」
+            # 三种查询形态,**按「有没有 id 条件」分流**(不能只看「有没有 where」):
+            #   `Conversation.id == <id>`                 → 按 id 查单条(→ 404)
+            #   `Conversation.id == <id> AND user == <u>` → **归属**查询
+            #     (`get_owned_conversation`;认证 2026-09-27 起明细端点走它)
+            #   `Conversation.user == <u>`                → 列表查询(还可能什么都没有)
+            # **不要把前两种混成一种**:混了之后「列表接口串了另一个用户的会话」
             # 与「详情接口查不到就 404」两条断言会互相掩盖。
             #
-            # 列表这一支**真按 where 里写的条件筛**:端点漏了 `.where()`、或把条件
-            # 写错列,都会在断言上现形。写成「端点筛不筛都行」的替身,等于让
-            # 那条断言恒真。
+            # 后两种都**真按 where 里写的条件筛**(归属那一支**必须**按 user 筛):
+            # 端点漏了 `.where()`、把条件写错列、或归属查了别人的会话,都会在断言上
+            # 现形。写成「端点筛不筛都行」的替身,等于让那条断言恒真 ——
+            # 那正是本仓记过的「替身替被测对象完成语义」。
             by_id = [t for t in terms if t[0] == "id"]
             if by_id:
-                if len(terms) != 1 or by_id[0][1] != "eq":
-                    raise AssertionError(f"替身不支持复合的 id 查询:{terms}")
+                if by_id[0][1] != "eq":
+                    raise AssertionError(f"替身不支持的 id 比较:{terms}")
                 row = self.conversations.get(by_id[0][2])
-                return _Result([row] if row is not None else [])
+                if row is None:
+                    return _Result([])
+                if len(terms) == 1:
+                    return _Result([row])
+                user_terms = [t for t in terms if t[0] == "user"]
+                if len(terms) == 2 and len(user_terms) == 1 and user_terms[0][1] == "eq":
+                    return _Result([row] if row.user == user_terms[0][2] else [])
+                raise AssertionError(f"替身不支持的复合的 id 查询:{terms}")
             rows = [c for c in self.conversations.values() if _matches(c, terms)]
             # ⚠️ 这一句 `sorted` 让「端点有没有写 ORDER BY」在本文件里**不可观测**
             # (替身替它排好了)—— 顺序改由 db 用例钉,见
@@ -246,14 +257,27 @@ def conv_client():
         async def _override():
             yield session
         app.dependency_overrides[get_session] = _override
+        # 认证(2026-09-27):本文件的探针会话都属于 `demo-user`,而端点现在
+        # **按当前登录用户**过滤/校验归属 ⇒ 这里显式让「当前登录用户」就是
+        # `demo-user`。**刻意不依赖 conftest 那个全局默认装置** ——
+        # 默认给的是 `tests-default-user`,与本文件的探针不是一个用户,
+        # 而那种不一致会以「列表空 / 明细 404」的形式红,读起来像端点坏了。
+        app.dependency_overrides[require_user] = lambda: AuthenticatedUser(
+            username="demo-user", role=ADMIN)
         return TestClient(app)
 
     yield make
     app.dependency_overrides.clear()
 
 
-def test_list_filters_by_demo_user(conv_client):
-    """固定 `user='demo-user'`(无认证,前端从来不传 user_id)。
+def test_list_filters_by_the_logged_in_user(conv_client):
+    """列表按**当前登录用户**过滤(认证,2026-09-27)。
+
+    ⚠️ 过滤值**来自 token**,不再是一个写死的 `demo-user`(那个常量连同
+    `ChatRequest.user_id` 一起删了)。这里之所以仍然是 `demo-user`,是因为
+    **`conv_client` 这个装置显式投了它**(见该装置里那句 override)—— 本文件的
+    探针会话本来就都属于它。**别把 `demo-user` 读成产品常量**:
+    conftest 的全局默认装置给的是 `tests-default-user`,与这里不是一个人。
 
     **必须放一个别的 user 的会话进去** —— 不放的话「有没有 WHERE user」
     在输出上完全一样,这条用例就恒真。
@@ -564,6 +588,32 @@ def test_the_query_only_accepts_the_json_type_predicate(conv_client):
     with client as c:
         # 正常跑通就说明端点用的判据是替身认的那一种(换写法 ⇒ 替身直接抛 ⇒ 红)
         assert c.get(f"/api/conversations/{CONV_A}/messages").json()["items"] == []
+
+
+def test_messages_endpoint_404s_for_someone_elses_conversation(conv_client):
+    """**存在、但不是你的**会话 ⇒ 与「不存在」同一个出口(认证,2026-09-27)。
+
+    与上一条(不存在的 id)是两回事:那条查得到「查无此会话」,这条**查得到、
+    但不属于当前登录用户**。回 403 就等于承认它存在 —— 那是一个可枚举的接口。
+
+    ⚠️ 本用例**同时是替身自检**:`_StubSession` 的复合 id 分支必须**真按 user 筛**
+    (见 `_StubSession.execute` 那段),把那一句删掉它当场变红 —— 这与
+    `tests/test_api_chat.py::test_fake_session_applies_updates_and_still_rejects_unknown_queries`
+    是同一条规矩:替身自己支持了什么,要有东西钉着。
+
+    ⚠️ **真库上的同一性质**由 `tests/test_api_conversations_db.py` 的两个用例钉
+    (那边验的是 SQL 真的带上了 user 条件 —— 替身验不出来)。这里留一条**不依赖
+    MySQL** 的同款断言:`pytest -m "not db"` 那一档也要罩得住这条性质。
+    """
+    convs = {CONV_A: _conv(CONV_A, "someone-else", T0)}
+    msgs = [_msg(1, CONV_A, "user", "别人的一句话")]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        resp = c.get(f"/api/conversations/{CONV_A}/messages")
+    assert resp.status_code == 404, (
+        f"别人的会话必须 404(不是 {resp.status_code} —— 403 等于承认它存在)"
+    )
+    assert resp.json()["detail"] == "会话不存在"
 
 
 def test_messages_endpoint_404s_for_unknown_conversation(conv_client):

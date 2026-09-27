@@ -27,6 +27,21 @@ async def ensure_conversation(*, session, session_id: str, user_id: str) -> Conv
     return conversation
 
 
+async def get_owned_conversation(*, session, conversation_id: str,
+                                 user_id: str) -> Conversation | None:
+    """取会话,**且必须是这个用户的**;不属于他 ⇒ 回 `None`。
+
+    ⚠️ **「别人的会话」与「不存在的会话」必须是同一个答案**(端点都翻成 404):
+    回 403 等于承认「这个 id 存在」,那就给了枚举的口子。它与
+    `ensure_conversation` 那条「已存在时忽略传入的 user_id」的分工是:
+    那边保的是**归属不被改写**,这边保的是**读不到别人的**。
+    """
+    return (await session.execute(
+        select(Conversation)
+        .where(Conversation.id == conversation_id, Conversation.user == user_id)
+    )).scalars().one_or_none()
+
+
 async def load_history(*, session, conversation_id: str) -> list[Message]:
     """按插入序(id)正序读出该会话的全部消息。
 

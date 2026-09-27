@@ -8,17 +8,16 @@
 东西 —— 尤其**不重新渲染**任何内容(见 `list_messages` 的说明)。
 """
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import AuthenticatedUser, require_user
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
-
-#: 无认证(spec §5.1 的产品口径),所以列表**固定**按这个 user 过滤 ——
-#: 与会话端点 `request.user_id or "demo-user"` 的默认值**同一个字面量**:
-#: 两边不一致的话,前端建出来的会话一个都不会出现在列表里,而两边都不报错。
-DEMO_USER = "demo-user"
+from app.services.history import get_owned_conversation
 
 #: `messages` 表里**不进对话回载**的那一类行(spec §5.2)。
 #:
@@ -95,13 +94,20 @@ async def _preview(session: AsyncSession, conversation_id: str) -> str:
 
 
 @router.get("/api/conversations")
-async def list_conversations(session: AsyncSession = Depends(get_session)) -> dict:
+async def list_conversations(
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict:
     """侧栏列表:`{"items": [{id, created_at, preview, summarized}]}`,新在前。
 
-    过滤与排序都在 **SQL** 里(`WHERE user = 'demo-user' ORDER BY created_at DESC`,
-    spec §5.1 的字面)。`DEMO_USER` 与会话端点 `request.user_id or "demo-user"`
-    的默认值**同一个字面量**:两边不一致的话,前端建出来的会话一个都不会出现在
-    列表里,而两边都不报错。
+    过滤与排序都在 **SQL** 里(`WHERE user = <当前登录用户> ORDER BY created_at
+    DESC`,spec §5.1)。
+
+    ⚠️ **过滤值来自 token,不再是一个常量**(认证,2026-09-27)。此前这里写死
+    `DEMO_USER = "demo-user"`,与会话端点 `request.user_id or "demo-user"` 的
+    默认值**同一个字面量**;那个字面量连同 `ChatRequest.user_id` 一起删了 ——
+    留下它的话,「谁建的会话」与「列表查谁」会**各自漂移**,而两边都不报错
+    (表现是所有会话从侧栏消失)。
 
     ⚠️ **「过滤对不对」与「顺序对不对」这两件事,替身验不出来** ——
     `tests/test_api_conversations.py` 的替身自己就会按 `created_at` 倒序排、
@@ -121,7 +127,7 @@ async def list_conversations(session: AsyncSession = Depends(get_session)) -> di
     rows = (
         await session.execute(
             select(Conversation)
-            .where(Conversation.user == DEMO_USER)
+            .where(Conversation.user == user.username)
             .order_by(Conversation.created_at.desc())
         )
     ).scalars().all()
@@ -149,7 +155,9 @@ async def list_conversations(session: AsyncSession = Depends(get_session)) -> di
 
 @router.get("/api/conversations/{conversation_id}/messages")
 async def list_messages(
-    conversation_id: str, session: AsyncSession = Depends(get_session)
+    conversation_id: str,
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
 ) -> dict:
     """某会话**用户看见过的**对话,**按 id 升序**,回的是**原文**(spec §5.2)。
 
@@ -226,23 +234,27 @@ async def list_messages(
     齿轮**画不出失败态** —— 这是已知局限,不是省略(前端也没有去猜,见
     `renderHistory` 那段)。
 
-    **两条过滤都在 SQL 里**,不是读回来再筛 —— 与列表的 user 过滤同一条理由:
-    替身验不出「端点有没有传对 SQL」。
+    **三条过滤都在 SQL 里**(归属 / `role` / `content` 与齿轮),不是读回来再筛
+    —— 与列表的 user 过滤同一条理由:替身验不出「端点有没有传对 SQL」。
 
     ⚠️ **「按 id 升序」由 db 用例钉,单测钉不住** —— 替身的 messages 分支自己就按
     `m.id` 排(端点把 `order_by` 反过来它照样绿)。db 用例里探针消息**一条一 commit
     按内容顺序插入**(自增 id 因此严格递增、与期望顺序同向),端点写成 `.desc()`
     就与断言反向、当场红。
 
-    404 只表示「这个 id 在库里不存在」:前端点的那条会话可能已被删/清库,
-    这时该给一个明确的「会话不存在」,而不是 200 + 空列表(空列表是
-    「这个会话真的没有消息」的语义,两者混在一起,前端分不出要画哪个)。
+    404 表示**两件事之一**:「这个 id 在库里不存在」,或「它**不是你的**」
+    (认证,2026-09-27)。两者**必须共用一个出口** —— 分开回(比如别人的回 403)
+    等于承认「这个 id 存在」,那就是一个可枚举的接口。前端点的那条会话也可能
+    已被删/清库,这时该给一个明确的「会话不存在」,而不是 200 + 空列表
+    (空列表是「这个会话真的没有消息」的语义,两者混在一起,前端分不出要画哪个)。
     """
-    conv = (
-        await session.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
-        )
-    ).scalars().one_or_none()
+    # 归属检查在**读消息之前**:别人的会话连一行消息都不该被查出来
+    # (顺序反了的话,`rows` 那一次查询已经把别人的消息读进了内存,虽然最终
+    #  会被 404 挡住 —— 「读到了再丢掉」与「根本不读」在响应上一样,区别只在
+    #  有没有那次越权读)。
+    conv = await get_owned_conversation(
+        session=session, conversation_id=conversation_id, user_id=user.username
+    )
     if conv is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 

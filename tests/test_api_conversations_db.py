@@ -22,6 +22,9 @@
    (回给侧栏就是空气泡),顺序与过滤一起钉。
 5. **预览取第一条 user 消息** —— 真实表上放「工具行 + 两条 user 消息」,
    「取最后一条」与「取第一条」给出不同答案。
+6. **归属(认证,2026-09-27)** —— 明细端点对「别人的会话」与「不存在的会话」回
+   **同一个 404**(回 403 等于承认它存在);列表按**当前登录用户**过滤,而这件事
+   用**两个身份**各查一次才钉得住(单身份那几条照不到「过滤值写死成某个用户名」)。
 
 ⚠️ **探针行用完即删,且删除必须 `commit`** —— `async with session` 退出是 rollback,
 只 `execute(delete(...))` 不提交的话,下一轮跑就会看到上一轮的残留。
@@ -30,9 +33,11 @@
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import delete, func, select, text
 
 from app.api.conversations import list_conversations, list_messages
+from app.auth import ADMIN, AuthenticatedUser
 from app.db.base import get_engine, get_sessionmaker
 from app.db.models import Conversation, ConversationSummary, MessageRecord
 
@@ -98,17 +103,28 @@ async def _insert(rows) -> None:
         await session.commit()
 
 
-async def _list_items() -> list[dict]:
+#: 本文件所有探针会话都属于这个用户。两个端点自认证(2026-09-27)起按
+#: **当前登录用户**过滤 / 校验归属,所以它们现在各收一个 `user` ——
+#: ⚠️ 这**不是**产品里的常量(`app/api/conversations.py` 那个 `DEMO_USER`
+#: 已经删了),只是探针自己的身份。
+_PROBE_USER = AuthenticatedUser(username="demo-user", role=ADMIN)
+
+
+async def _list_items(user: AuthenticatedUser = _PROBE_USER) -> list[dict]:
     """**新 session** 读(身份映射里的旧对象会让断言变成「靠 refcount 走运」)。"""
     async with get_sessionmaker()() as session:
-        return (await list_conversations(session=session))["items"]
+        return (await list_conversations(session=session, user=user))["items"]
 
 
-async def _messages(conversation_id: str) -> list[dict]:
+async def _messages(
+    conversation_id: str, user: AuthenticatedUser = _PROBE_USER
+) -> list[dict]:
     async with get_sessionmaker()() as session:
-        return (await list_messages(conversation_id=conversation_id, session=session))[
-            "items"
-        ]
+        return (
+            await list_messages(
+                conversation_id=conversation_id, session=session, user=user
+            )
+        )["items"]
 
 
 @pytest.mark.anyio
@@ -141,7 +157,10 @@ async def test_list_orders_newest_first_on_a_real_table():
 
 @pytest.mark.anyio
 async def test_list_excludes_other_users_on_a_real_table():
-    """`WHERE user = 'demo-user'` 真的落到了 SQL 上(替身那一支是替身自己筛的)。
+    """`WHERE user = <当前登录用户>` 真的落到了 SQL 上(替身那一支是替身自己筛的)。
+
+    ⚠️ 过滤值自认证(2026-09-27)起**来自 token**,不再是一个常量 —— 所以下面
+    显式把「当前登录用户」交给端点,而不是指望某个写死的字面量。
 
     **两个断言缺一不可**:只断「别人的不在」的话,一个恒返回空列表的实现照样绿;
     所以同一次请求里自己的会话**必须也在**。别人的那条给**最新**的 `created_at`
@@ -153,12 +172,114 @@ async def test_list_excludes_other_users_on_a_real_table():
             _conv(PROBE_ORDER_NEW, "demo-user", T_NEW),
             _conv(PROBE_FOREIGN, "someone-else", T_FOREIGN),
         ])
-        ids = [i["id"] for i in await _list_items()]
+        mine = AuthenticatedUser(username="demo-user", role=ADMIN)
+        ids = [i["id"] for i in await _list_items(user=mine)]
         assert PROBE_ORDER_NEW in ids, "自己的会话必须在(否则下一条断言恒真)"
         assert PROBE_FOREIGN not in ids, (
             f"别人的会话泄漏进了列表:{PROBE_FOREIGN}(它在结果里的第 "
             f"{ids.index(PROBE_FOREIGN) if PROBE_FOREIGN in ids else -1} 位)"
         )
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_a_foreign_conversation_is_404_on_messages_not_403():
+    """**别人的会话明细必须像不存在一样**(404)。
+
+    ⚠️ 回 403 会把「这个 id 存在」告诉对方 —— 那就成了一个可枚举的接口。
+    这条与 `test_list_excludes_other_users_on_a_real_table`(**列表**那一半)
+    是一对:列表管「看不见」,这条管「点不进去」。
+
+    ⚠️ **正面对照那两行不是装饰**:只有「别人的 ⇒ 404」的话,一个**一律 404**
+    的实现(把归属检查写成「查不到就行」)照样绿。同一个 `user` 手里那条会话
+    必须在**同一次**里真的读得出来,`mine` 这个名字才有意义。
+    """
+    await _cleanup()
+    try:
+        await _insert([
+            _conv(PROBE_FOREIGN, "someone-else", T_FOREIGN),
+            _msg(PROBE_FOREIGN, "user", "别人的一句话"),
+            # 正面对照:同一个 user(`demo-user`)自己的会话
+            _conv(PROBE_MSGS, "demo-user", T_NEW),
+            _msg(PROBE_MSGS, "user", "自己的一句话"),
+        ])
+        mine = AuthenticatedUser(username="demo-user", role=ADMIN)
+        async with get_sessionmaker()() as session:
+            with pytest.raises(HTTPException) as ei:
+                await list_messages(
+                    conversation_id=PROBE_FOREIGN, session=session, user=mine
+                )
+            # 同一次里把自己的那条读出来 —— 它**必须**照常返回(见 docstring)
+            own = await list_messages(
+                conversation_id=PROBE_MSGS, session=session, user=mine
+            )
+        assert ei.value.status_code == 404, (
+            f"别人的会话必须 404(不是 {ei.value.status_code} —— 403 等于承认它存在)")
+        assert [i["content"] for i in own["items"]] == ["自己的一句话"], own
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_two_users_see_only_their_own_conversations():
+    """**两个用户互不可见**(spec §8.4)—— 两个方向各断一次。
+
+    ⚠️ **它比「别人的不在我的列表里」强在哪**:那条只用一个身份查,于是
+    「过滤值写死成某个用户名」这种实现(原来那个 `DEMO_USER = "demo-user"`)
+    **照样绿** —— 探针恰好就叫 `demo-user`。这里两边各拿**自己**的身份去查,
+    写死成任何一个名字都会在**其中一半**上红:
+    「写死 `demo-user`」⇒ `someone-else` 看到空列表(或看到别人的);
+    「写死 `someone-else`」⇒ `demo-user` 那一半同样红。
+
+    ⚠️ **两个方向都要断「自己那条在」+「别人的不在」**,不能只断「别人的不在」:
+    一个恒返回空列表的实现满足后半句,却在这里两次都红。
+
+    ⚠️ **不能用 `== [探针 id]` 那种整表断言**:开发库上 `demo-user` 名下有
+    581 条真实会话(2026-09-27 实测),整表相等会红在一个与本任务无关的地方
+    (本仓那条「断言不要拿真实数据的读数当基线」)。所以按**归属**断,而不是
+    按整张列表断 —— 这与本文件其余用例的形状一致。
+
+    明细端点(`list_messages`)的那一半**同一条里一起断**:归属检查若把用户名
+    写死,`someone-else` 读**自己**的会话就会 404 —— 而 `demo-user` 那半边的
+    正面对照(见 `test_a_foreign_conversation_is_404_on_messages_not_403`)照不到它。
+    """
+    await _cleanup()
+    try:
+        await _insert([
+            _conv(PROBE_ORDER_OLD, "demo-user", T_OLD),
+            _msg(PROBE_ORDER_OLD, "user", "demo 的话"),
+            _conv(PROBE_FOREIGN, "someone-else", T_FOREIGN),
+            _msg(PROBE_FOREIGN, "user", "别人的话"),
+        ])
+        demo = AuthenticatedUser(username="demo-user", role=ADMIN)
+        other = AuthenticatedUser(username="someone-else", role=ADMIN)
+
+        seen_by_demo = [i["id"] for i in await _list_items(user=demo)]
+        seen_by_other = [i["id"] for i in await _list_items(user=other)]
+        assert PROBE_ORDER_OLD in seen_by_demo, "demo-user 必须看得见自己那条"
+        assert PROBE_FOREIGN not in seen_by_demo, (
+            f"别人的会话泄漏进 demo-user 的列表:{PROBE_FOREIGN}")
+        assert PROBE_FOREIGN in seen_by_other, (
+            "someone-else 必须看得见自己那条(否则上一条在「一律返回空」下也恒真)")
+        assert PROBE_ORDER_OLD not in seen_by_other, (
+            f"demo-user 的会话泄漏进 someone-else 的列表:{PROBE_ORDER_OLD}")
+
+        # 明细:各自读得到自己的(正面),读别人的都是 404(反面)
+        assert [i["content"] for i in await _messages(PROBE_ORDER_OLD, user=demo)] == [
+            "demo 的话"
+        ]
+        assert [i["content"] for i in await _messages(PROBE_FOREIGN, user=other)] == [
+            "别人的话"
+        ]
+        for me, not_mine in ((demo, PROBE_FOREIGN), (other, PROBE_ORDER_OLD)):
+            with pytest.raises(HTTPException) as ei:
+                await _messages(not_mine, user=me)
+            assert ei.value.status_code == 404, (
+                f"{me.username} 读 {not_mine} 必须 404,拿到 {ei.value.status_code}"
+            )
     finally:
         await _cleanup()
         await get_engine().dispose()
