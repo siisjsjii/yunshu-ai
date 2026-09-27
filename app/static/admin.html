@@ -54,6 +54,20 @@
     padding: 14px 16px; margin: 16px 0; box-shadow: 4px 4px 0 rgba(28,43,57,.10); }
   .card h2 { margin: 0 0 10px; font-size: 15px; }
 
+  /* ── 主题分布 ── */
+  /* 不引图表库:用 div 宽度画条,与这个页面零依赖的现状一致。 */
+  .topic-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+  .topic-name { flex: 0 0 76px; font-size: 13px; text-align: right; color: #33475b; }
+  .topic-bar { flex: 1; height: 16px; background: #eef4fa; border: 1px solid #cdd9e4;
+    border-radius: 2px; overflow: hidden; }
+  .topic-bar i { display: block; height: 100%; background: #3d7ea6; }
+  .topic-num { flex: 0 0 132px; font-size: 12px; color: #5b7186; }
+  .topic-sum { font-size: 12px; color: #5b7186; margin-bottom: 8px; }
+  /* ⚠️ 那句「样本量还很少」必须**看得见** —— 用醒目的边框而不是灰字,
+     否则它会被当成装饰跳过(spec §9.5:不写这句,这张图就会被当成分布结论读)。 */
+  .topic-caveat { border: 2px solid #c98a00; background: #fff8e8; color: #7a5200;
+    padding: 8px 10px; border-radius: 4px; font-size: 13px; margin-bottom: 10px; }
+
   .doc-list { list-style: none; margin: 0; padding: 0; }
   .doc-list li { display: flex; align-items: center; gap: 10px;
     padding: 8px 6px; border-bottom: 1px dashed #cdd9e4; cursor: pointer; }
@@ -173,6 +187,7 @@
     <button class="tab active" data-tab="入库" type="button">入库</button>
     <button class="tab" data-tab="待审" type="button">待审</button>
     <button class="tab" data-tab="评测" type="button">评测</button>
+    <button class="tab" data-tab="主题分布" type="button">主题分布</button>
   </nav>
 
   <div id="tab-入库">
@@ -259,6 +274,20 @@
         <span class="muted">评测由 <code>scripts/run_eval.py</code> 跑出,这里读取最近一次结果</span>
       </div>
       <div id="eval-results" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div id="tab-主题分布" style="display:none">
+    <div class="card">
+      <h2>主题分布(低置信度池 → 17 类)</h2>
+      <div class="topic-sum" id="topic-asof">加载中…</div>
+      <div class="topic-caveat" id="topic-caveat" style="display:none"></div>
+      <div id="topic-bars"></div>
+      <p class="muted" style="margin-top:10px">
+        分类由 <code>scripts/classify_topics.py</code> 跑批写入
+        <code>topic_classifications</code>,这里只读。
+        <strong>实时对话主链路不经过它</strong>(旁路)。
+      </p>
     </div>
   </div>
 </div>
@@ -1047,7 +1076,7 @@
   $("q-flywheel").addEventListener("click", startFlywheel);
 
   // ── 标签页切换 ──
-  const TAB_NAMES = ["入库", "待审", "评测"];
+  const TAB_NAMES = ["入库", "待审", "评测", "主题分布"];
   function switchTab(name) {
     for (const b of document.querySelectorAll(".tab")) {
       b.classList.toggle("active", b.dataset.tab === name);
@@ -1057,9 +1086,80 @@
     }
     // 进「待审」才拉队列(页面打开时它在后台、拉到的东西没人看)。
     if (name === "待审") refreshQueue();
+    // 「主题分布」同理 —— 而且**每次切进来都重拉**:跑批写完表之后,
+    // 停在这一页上的人应该能靠「切走再切回」看到新数(没有轮询)。
+    if (name === "主题分布") renderTopics();
   }
   for (const b of document.querySelectorAll(".tab")) {
     b.addEventListener("click", () => switchTab(b.dataset.tab));
+  }
+
+  // ── 主题分布 ──
+  //
+  // ⚠️ 这个页面唯一要防的误读是「把它当成分布结论」。
+  //    spec §9.5 的原话:池子今天只有几十行,**页面不写那句提示,它就会被当成
+  //    「先补哪块知识」的依据读**。所以那句提示是**功能的一部分**,不是装饰。
+  //
+  // ⚠️ 两个数的**口径不同**,别让人以为对不上是 bug:
+  //    `total`            = 分类结果的**行数**(一个题面被归过几次就是几行)
+  //    `distinct_questions` = 池子里**不同题面**的条数
+  async function renderTopics() {
+    const box = $("topic-bars");
+    const asof = $("topic-asof");
+    const caveat = $("topic-caveat");
+    box.textContent = "加载中…";
+    asof.textContent = "";
+    caveat.style.display = "none";
+
+    const r = await req("/api/topics/distribution");
+    if (!r.ok || !r.body) {
+      // ⚠️ **说人话** —— 「空白」读起来像「页面坏了」,而这里可能是接口没起、
+      //    也可能是表还没建。把状态码打出来,别让人去猜。
+      box.textContent = `读不到分布数据(HTTP ${r.status})。` +
+        (r.status === 404 ? "接口没挂上?" : "检查服务是否起在 8000。");
+      return;
+    }
+    const d = r.body;
+    asof.textContent = `数据截至 ${d.last_classified_at || "—"}` +
+      ` · ${d.total} 行分类结果 / ${d.distinct_questions} 个不同题面` +
+      (d.model_versions && d.model_versions.length
+        ? ` · 模型 ${d.model_versions.join("、")}` : "");
+
+    const buckets = d.buckets || [];
+    if (!buckets.length) {
+      box.textContent = "还没有归类结果。先跑 scripts/classify_topics.py。";
+      return;
+    }
+
+    // ⚠️ 样本量不足时**额外**追加一句(spec §9.5)。
+    //    阈值 100 是**拍的**(chapter 里没标定过)—— 它只是「先别下结论」的提示线。
+    if (d.total < 100) {
+      caveat.textContent =
+        `样本量还很少(${d.total} 行),这张图不足以支撑「先补哪块知识」的决策。`;
+      caveat.style.display = "block";
+    }
+
+    const max = Math.max(1, ...buckets.map((b) => b.count));
+    box.innerHTML = "";
+    for (const b of buckets) {
+      const row = document.createElement("div");
+      row.className = "topic-row";
+      // 用 textContent 逐段填,不拼 innerHTML —— 类目名来自服务端,
+      // 这个页面别为它开一个转义的口子。
+      const name = document.createElement("span");
+      name.className = "topic-name";
+      name.textContent = b.label;
+      const bar = document.createElement("span");
+      bar.className = "topic-bar";
+      const fill = document.createElement("i");
+      fill.style.width = `${(b.count / max) * 100}%`;
+      bar.appendChild(fill);
+      const num = document.createElement("span");
+      num.className = "topic-num";
+      num.textContent = `${b.count} 条 / ${b.distinct} 个题面`;
+      row.append(name, bar, num);
+      box.appendChild(row);
+    }
   }
 
   // ── 评测结果 ──
