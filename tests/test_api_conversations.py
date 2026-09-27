@@ -18,7 +18,8 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList
+from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList, Grouping
+from sqlalchemy.sql.functions import Function
 
 from app.db.models import Conversation, MessageRecord
 from app.db.session import get_session
@@ -109,25 +110,76 @@ class _StubSession:
         raise AssertionError(f"替身不支持的实体:{entity}")
 
 
-def _where_terms(stmt) -> list[tuple[str, str, object]]:
-    """把 `.where(...)` 拆成 `[(列名, 比较符, 值)]`;没有 where 就是 `[]`。
+def _where_terms(stmt) -> list[tuple]:
+    """把 `.where(...)` 拆成一组**词项**;没有 where 就是 `[]`。词项有三种:
 
-    支持的**形态**只有「列 `==` 值」与「列 `!=` 值」,多个条件按 AND(这也是本仓
-    端点实际用到的全部)。**取不出来时直接抛**,不退化成「返回全部」—— 忽略 where
-    的替身会让「列表读到了别人的会话」「详情读到了不存在的会话」「工具行漏进了
-    回载」这类缺陷统统无从观测。
+    · `(列名, 比较符, 值)` —— 列 `==` / `!=` 值;
+    · `("json_type", 列名, "ARRAY")` —— **只认这一种函数形态**;
+    · `("or", [词项, …])` —— 嵌套的 OR 组。
+
+    多个顶层词项按 AND(这就是本仓端点实际用到的全部)。
+
+    **取不出来时直接抛**,不退化成「返回全部」—— 忽略 where 的替身会让
+    「列表读到了别人的会话」「详情读到了不存在的会话」「齿轮行漏进了回载」
+    这类缺陷统统无从观测。
+
+    ⚠️ **`json_type` 只认 `JSON_TYPE(列) == 'ARRAY'` 这一种写法,别的函数形态
+    当场抛**。这是**有意**的:它把「判据用的是哪个函数」也钉住了 ——
+    换成 `JSON_LENGTH(tool_calls) > 0` 或 `tool_calls IS NOT NULL` 会在这里
+    直接炸(而不是悄悄绿)。⚠️ **必须说明白:这条钉的是判据的「形状」,不是
+    行为** —— 在**真实数据**上那三种写法取到的行**逐位相同**(实测本机
+    2026-09-27:`role <> 'tool' AND (content <> '' OR <判据>)` 三种写法都是
+    **2238** 行),因为「`content=''` 且 tool_calls 不是 ARRAY」的行**一行都没有**。
+    行为上的差别只在**将来**某一行写成那个形状时才会出现,而那种行在归并里
+    也该被丢掉 —— 两个原因叠加,行为断言**今天写不出来**(如实记在
+    `app/api/conversations.py` 的 `JSON_ARRAY` 那段)。
+
+    ⚠️ `json_type` 这一支的语义**由替身自己实现**(`isinstance(v, list)`)——
+    因为替身手里拿到的是**已经从 JSON 反序列化过的** Python 对象,不是
+    MySQL 的列。⇒ 「字面 JSON `null` 不是 SQL NULL」这条**真库语义替身验不了**,
+    它由 `tests/test_api_conversations_db.py` 在真库上钉。
     """
-    clause = stmt.whereclause
+    return _parse_clause(stmt.whereclause)
+
+
+def _parse_clause(clause) -> list[tuple]:
     if clause is None:
         return []
     parts = list(clause.clauses) if isinstance(clause, BooleanClauseList) else [clause]
-    terms: list[tuple[str, str, object]] = []
+    terms: list[tuple] = []
     for part in parts:
+        if isinstance(part, Grouping):
+            # ⚠️ `or_(...)` 在 SQLAlchemy 2.0 里**不是**直接一个
+            # `BooleanClauseList`,而是被包了一层括号组(实测类型
+            # `sqlalchemy.sql.elements.Grouping`,它的 `.element` 才是那个
+            # `BooleanClauseList`)。少了这一步,端点**正确的** OR 条件会被替身
+            # 当成「不支持的查询形态」—— 那是**灯下黑**:它会红在一个正确实现上。
+            part = part.element
+        if isinstance(part, BooleanClauseList):
+            # 嵌套的 OR 组。**只支持这一层** —— 端点用到的就这一层,
+            # 再深就该把替身重写成通用求值器了(而那会让「替身支持什么」
+            # 变得谁也说不清,正是本文件开头那段要避免的)。
+            if getattr(part.operator, "__name__", None) != "or_":
+                raise AssertionError(f"替身只支持 or_ 这一种嵌套组:{part}")
+            terms.append(("or", _parse_clause(part)))
+            continue
         if not isinstance(part, BinaryExpression):
-            raise AssertionError(f"替身不支持的查询形态:{stmt}")
-        key = getattr(getattr(part, "left", None), "key", None)
+            raise AssertionError(f"替身不支持的查询形态:{part}")
         op = getattr(getattr(part, "operator", None), "__name__", None)
-        if key is None or op not in ("eq", "ne"):
+        if op not in ("eq", "ne"):
+            raise AssertionError(f"替身不支持的比较:{part}")
+        # ⚠️ **按类型分流,不按 `.name`** —— `Column` 也有 `.name`(它就是列名),
+        # 按 `.name` 判会把 `messages.tool_calls = :x` 也当成函数调用。
+        if isinstance(part.left, Function):
+            if part.left.name != "JSON_TYPE":
+                raise AssertionError(
+                    f"替身只认 JSON_TYPE(...) 这个判据(实测另两种写法不安全):{part}"
+                )
+            col = list(part.left.clauses)[0]
+            terms.append(("json_type", getattr(col, "key", None), part.right.value))
+            continue
+        key = getattr(getattr(part, "left", None), "key", None)
+        if key is None:
             raise AssertionError(f"替身不支持的比较:{part}")
         terms.append((key, op, part.right.value))
     return terms
@@ -135,11 +187,27 @@ def _where_terms(stmt) -> list[tuple[str, str, object]]:
 
 def _matches(obj, terms) -> bool:
     """按 `_where_terms` 的结果判一行是否命中(列名即 ORM 属性名)。"""
-    for key, op, value in terms:
-        actual = getattr(obj, key)          # 列名写错 ⇒ AttributeError,响亮地炸
-        if (actual == value) is (op == "ne"):
+    for term in terms:
+        if term[0] == "or":
+            if not any(_matches(obj, [sub]) for sub in term[1]):
+                return False
+            continue
+        if not _matches_atom(obj, term):
             return False
     return True
+
+
+def _matches_atom(obj, term) -> bool:
+    """单个词项。列名写错 ⇒ `getattr` 抛 AttributeError,响亮地炸。"""
+    if term[0] == "json_type":
+        _, key, value = term
+        # 替身这边拿到的是**已反序列化**的值:`list` 就是 JSON 的 ARRAY,
+        # 别的一律当「不是 ARRAY」(`None` 就是 JSON 的 `null`,见 `_where_terms`)。
+        return ("ARRAY" if isinstance(getattr(obj, key), list) else "NULL") == value
+    key, op, value = term
+    actual = getattr(obj, key)
+    # 原来的语义:`op == "ne"` 时「相等」要判 False;`eq` 时相反。
+    return (actual == value) is not (op == "ne")
 
 
 class _Result:
@@ -287,18 +355,20 @@ def test_summarized_flag_reflects_the_anchor_not_the_row_count(conv_client):
 
 
 def test_messages_endpoint_hides_tool_rows_and_empty_assistant_bubbles(conv_client):
-    """**用户没看见过的内部机制**都不回载(spec §5.2 裁定):
+    """**用户没看见过的内部机制**里,这两样不回**成一条 item**(spec §5.2 裁定):
 
     ① `role='tool'` 的行 —— 原始工具载荷(`{"order_no": …}`);
-    ② **`content=''` 的 assistant 行** —— 「只申请调用工具、还没产出文字」那一形态
+    ② `content=''` 的 assistant 行 —— 「只申请调用工具、还没产出文字」那一形态
        (`app/agent/nodes.py` 写的是 `content=m.content or ""`,它身上只有
-       `tool_calls`);回给侧栏就是一个**空气泡**。
+       `tool_calls`);**它自己不作为一条气泡出现**。
+
+    ⚠️ **② 的语义在 2026-09-27 改过,别照老话读**:②那一行的 `tool_calls`
+    **会**被归并到本轮的答案项上(那是修「齿轮回不来」的正解,见
+    `test_messages_endpoint_merges_a_turns_gears_into_its_answer`)——
+    「不回载」说的只是**它不作为独立的一条 item**。
 
     同时断言**同一批里 user 与带文字的 assistant 仍然在**:只断「那两条不在」的话,
     一个恒返回空列表的实现也满足它。
-
-    构造上刻意让 ② 那条**带 `tool_calls`**(生产上就是这个形状):去掉
-    `content != ''` 这个条件,它就会作为一条 `content=""` 的气泡出现在结果里。
     """
     convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
     msgs = [
@@ -384,32 +454,116 @@ def test_messages_endpoint_returns_tool_calls_and_citations(conv_client):
     assert items[1]["citations"] == citations
 
 
-def test_messages_endpoint_hides_the_tool_calls_of_filtered_out_rows(conv_client):
-    """被滤掉的那些行**不许把它们的 `tool_calls` 顺带泄漏**进结果。
+def test_messages_endpoint_merges_a_turns_gears_into_its_answer(conv_client):
+    """一轮里的齿轮(在**空 content** 的 assistant 行上)**归并到本轮那条答案**上。
 
-    动机是**一条真实的错法**:为了让「工具齿轮还在」,一个省事的实现会拿
-    「本轮全部 assistant 行(含被 `content != ''` 滤掉的那条空气泡)」去
-    拼 `tool_calls` —— 那样用户会看见一个**他当初没看见过的齿轮**
-    (空气泡那一轮的齿轮在直播时就画过了,而回载把它算了两遍会更糟:
-    同一轮出现两个同名齿轮)。这条用「空气泡带一个不同的工具名」把它钉住:
-    出现 `query_product` ⇒ 有东西从被滤掉的行里漏出来了。
+    这就是 2026-09-27 那次修复的核心:直播时齿轮与正文在**同一个气泡**里
+    (`tool_call` 帧与 `token` 帧都往同一个 ctx 上画),而库里它们在**两行**上
+    ⇒ 回载必须做这层归并,否则「空气泡那一轮」的齿轮永远回不来
+    (实测:336 条带齿轮的 assistant 行里 **303 条** content 为空)。
+
+    **判别力**:不归并 ⇒ 结果里两条 assistant 项(一条空气泡、一条无齿轮的答案)
+    ⇒ 下面的 `len(items) == 2` 与 `items[1]["tool_calls"]` 两条都红。
     """
     convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
     msgs = [
-        _msg(1, CONV_A, "assistant", "",
-             tool_calls=[{"id": "c1", "name": "query_product", "args": {},
+        _msg(1, CONV_A, "user", "订单 1002 到哪了"),
+        _msg(2, CONV_A, "assistant", "",
+             tool_calls=[{"id": "c1", "name": "query_order", "args": {},
                           "type": "tool_call"}]),
-        _msg(2, CONV_A, "assistant", "这一单已取消",
-             tool_calls=[{"id": "c2", "name": "query_order", "args": {},
+        _msg(3, CONV_A, "tool", '{"order_no":"1002","status":"已取消"}'),
+        _msg(4, CONV_A, "assistant", "这一单已取消"),
+    ]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
+
+    assert [i["content"] for i in items] == ["订单 1002 到哪了", "这一单已取消"]
+    names = [tc["name"] for i in items for tc in (i["tool_calls"] or [])]
+    assert names == ["query_order"], names
+    # 项数**少于**行数(4 行 → 2 项):这正是「归并」这件事本身
+    assert len(items) == 2 < len(msgs)
+
+
+def test_messages_endpoint_does_not_merge_two_text_bearing_assistant_rows(conv_client):
+    """**反着断**:归并**不许**把两条**本来就有正文**的 assistant 行并成一条。
+
+    并了就是**凭空抹掉一条用户看见过的回复**(而它不报错:屏幕上只是少了一句话)。
+    归并的判据是「该行有没有正文」,不是「这一轮有几条 assistant 行」——
+    这条用例把两者分开。
+
+    (顺带钉住 `tool_calls` 的另一个来源:「先说了一句开场白、再申请调用工具」
+    那种行**正文与 tool_calls 在同一条行上**,实测真实库里有 33 条 ——
+    它的齿轮必须跟着**自己**那条输出,不能只认累积区。)
+    """
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    msgs = [
+        _msg(1, CONV_A, "user", "订单 1002 到哪了"),
+        _msg(2, CONV_A, "assistant", "这就为您查询。",
+             tool_calls=[{"id": "c1", "name": "query_order", "args": {},
+                          "type": "tool_call"}]),
+        _msg(3, CONV_A, "assistant", "这一单已取消"),
+    ]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
+
+    assert [i["content"] for i in items] == ["订单 1002 到哪了", "这就为您查询。",
+                                             "这一单已取消"]
+    # 齿轮挂在**有它自己那份** tool_calls 的那条上
+    assert [tc["name"] for tc in items[1]["tool_calls"]] == ["query_order"]
+    assert items[2]["tool_calls"] is None, items[2]["tool_calls"]
+
+
+def test_messages_endpoint_emits_the_gears_of_a_turn_with_no_answer(conv_client):
+    """**边界**:某一轮**只有齿轮、没有带正文的 assistant 行** ⇒ 仍然输出一条
+    `content: ""` 带 `tool_calls` 的项。
+
+    这是刻意的(生产形状是「模型申请了工具、那一轮随后报错」):丢掉它 =
+    用户回载时**连齿轮都看不见**,而直播时他明明看见过。
+
+    **判别力**:把这一支删掉(只输出带正文的项)⇒ 下面 `len(items) == 2` 变成 1,当场红。
+    """
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    msgs = [
+        _msg(1, CONV_A, "user", "订单 1002 到哪了"),
+        _msg(2, CONV_A, "assistant", "",
+             tool_calls=[{"id": "c1", "name": "query_logistics", "args": {},
                           "type": "tool_call"}]),
     ]
     client = conv_client(conversations=convs, messages=msgs)
     with client as c:
         items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
 
-    assert [i["content"] for i in items] == ["这一单已取消"]
-    names = [tc["name"] for i in items for tc in (i["tool_calls"] or [])]
-    assert names == ["query_order"], names
+    assert len(items) == 2, items
+    assert items[1]["role"] == "assistant"
+    assert items[1]["content"] == ""
+    assert [tc["name"] for tc in items[1]["tool_calls"]] == ["query_logistics"]
+
+
+def test_the_query_only_accepts_the_json_type_predicate(conv_client):
+    """⚠️ **这条钉的是判据的「形状」,不是行为** —— 先把这件事说白。
+
+    端点的 SQL 里那个「这一行有没有工具调用」的判据**只能**是
+    `JSON_TYPE(tool_calls) = 'ARRAY'`:另两种写法
+    (`IS NOT NULL` / `JSON_LENGTH(...) > 0`)都会把**字面 JSON `null`** 当成
+    「有」(实测整表 `IS NOT NULL` 与 `JSON_LENGTH > 0` 都是 **2721** 行,
+    而真值是 **336**)。
+
+    **为什么行为断言写不出来**(本机 2026-09-27 实测):本查询的形态是
+    `role <> 'tool' AND (content <> '' OR <判据>)`,而那三种判据取到的行数
+    **逐位相同(都是 2238)** —— 因为「`content=''` 且 tool_calls 不是 ARRAY」的
+    行**一行都没有**(所有空 content 的 assistant 行都带 ARRAY)。
+    ⇒ 差别只在**将来**某一行写成那个形状时才出现,而那种行在归并里也该被丢掉。
+    所以这条只能在**替身**上钉形状:替身遇到非 `JSON_TYPE` 的函数形态**当场抛**
+    (见 `_where_terms`),把判据钉死在源码里;那条 SQL 的**真库语义**由
+    `tests/test_api_conversations_db.py` 的用例另行钉住。
+    """
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    client = conv_client(conversations=convs, messages=[])
+    with client as c:
+        # 正常跑通就说明端点用的判据是替身认的那一种(换写法 ⇒ 替身直接抛 ⇒ 红)
+        assert c.get(f"/api/conversations/{CONV_A}/messages").json()["items"] == []
 
 
 def test_messages_endpoint_404s_for_unknown_conversation(conv_client):

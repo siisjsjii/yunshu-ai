@@ -30,7 +30,7 @@
 from datetime import datetime
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 from app.api.conversations import list_conversations, list_messages
 from app.db.base import get_engine, get_sessionmaker
@@ -259,6 +259,183 @@ async def test_list_messages_is_id_ascending_and_hides_tool_rows():
         assert [i["content"] for i in items] == ["第一句", "第二答"]
         assert all("order_no" not in i["content"] for i in items)
         assert all(i["content"] != "" for i in items)
+        # 4 行 → 2 项:空气泡那条(第 2 行)**不作为独立 item 出现**,
+        # 它的齿轮归并到了本轮的答案上(2026-09-27 修复)。
+        assert len(items) == 2, items
+        assert [tc["name"] for tc in items[1]["tool_calls"]] == ["query_order"]
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_a_react_turn_merges_into_one_item_on_a_real_table():
+    """**真实 ReAct 形状的一轮**在真库上:4 行 → **1 条 assistant 项**,
+    且那一条**既有答案、又带两个齿轮**。
+
+    这是这次修复的核心读数(实测 336 条带齿轮的 assistant 行里 303 条
+    `content` 为空 ⇒ 不归并的话那 303 个齿轮**全部**回不来)。
+
+    **判别力**:
+    · 不做归并 ⇒ 出 3 项(空气泡、答案各一条 + user),`len(items) == 2` 红;
+    · 归并时**丢掉**被归并行的 `tool_calls` ⇒ `tool_calls == tool_calls_used` 红;
+    · 归并时**多算**(把答案行自己那份也算两遍)⇒ 长度 3 的断言红。
+
+    ⚠️ 两个齿轮**分别来自两个不同的空 content 行**(生产上确实会:一轮里可以
+    申请调两次工具),这样「只认最后一条」的写法也会红(`query_order` 会丢)。
+    """
+    tool_calls_used = [
+        {"id": "c1", "name": "query_order", "args": {"order_no": "1002"},
+         "type": "tool_call"},
+        {"id": "c2", "name": "query_product", "args": {"product_id": "p1"},
+         "type": "tool_call"},
+    ]
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "user", "订单 1002 能退吗")])
+        await _insert([_msg(PROBE_MSGS, "assistant", "",
+                            tool_calls=tool_calls_used[:1])])
+        await _insert([_msg(PROBE_MSGS, "tool", '{"status":"已取消"}')])
+        await _insert([_msg(PROBE_MSGS, "assistant", "",
+                            tool_calls=tool_calls_used[1:])])
+        await _insert([_msg(PROBE_MSGS, "tool", '{"product_id":"p1"}')])
+        await _insert([_msg(PROBE_MSGS, "assistant", "按政策可以退[1]。")])
+
+        items = await _messages(PROBE_MSGS)
+        assert [i["role"] for i in items] == ["user", "assistant"], (
+            f"6 行应当归并成 2 项,实际 {[(i['role'], i['content']) for i in items]}"
+        )
+        assert items[1]["content"] == "按政策可以退[1]。"
+        assert items[1]["tool_calls"] == tool_calls_used, items[1]["tool_calls"]
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_two_text_bearing_assistant_rows_stay_two_items_on_a_real_table():
+    """**反着断**(真库):归并**不许**把两条**本来就有正文**的 assistant 行并成一条。
+
+    并了 = 凭空抹掉一条用户看见过的回复,而它**不报错** ——
+    屏幕上只是少了一句话。归并的判据是「该行有没有正文」,不是「一轮里有几条」。
+    """
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "user", "订单 1002 到哪了")])
+        await _insert([_msg(PROBE_MSGS, "assistant", "这就为您查询。")])
+        await _insert([_msg(PROBE_MSGS, "assistant", "这一单已取消")])
+
+        items = await _messages(PROBE_MSGS)
+        assert [i["content"] for i in items] == ["订单 1002 到哪了", "这就为您查询。",
+                                                 "这一单已取消"], items
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_a_turn_with_only_gears_emits_one_item_on_a_real_table():
+    """**边界**(真库):一轮只有齿轮、**没有**带正文的 assistant 行 ⇒
+    仍然输出一条 `content: ""` 带 `tool_calls` 的项。
+
+    生产形状 = 「模型申请了工具,那一轮随后报错/没产出正文」
+    (`app/agent/nodes.py` 先落带 `tool_calls` 的空行,收尾那条根本没写出来)。
+    丢掉它 = 用户回载时连齿轮都看不见,而直播时他明明看见过。
+
+    **判别力**:把「孤立项」那一支删掉 ⇒ `len(items)` 从 2 变 1,当场红。
+    """
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "user", "订单 1002 到哪了")])
+        await _insert([_msg(PROBE_MSGS, "assistant", "", tool_calls=[
+            {"id": "c1", "name": "query_logistics", "args": {"order_no": "1002"},
+             "type": "tool_call"}
+        ])])
+
+        items = await _messages(PROBE_MSGS)
+        assert len(items) == 2, items
+        assert items[1]["role"] == "assistant"
+        assert items[1]["content"] == "", items[1]
+        assert [tc["name"] for tc in items[1]["tool_calls"]] == ["query_logistics"]
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_empty_content_without_tool_calls_is_not_fetched_on_a_real_table():
+    """`content=''` 且 `tool_calls` 是**字面 JSON `null`** 的行 ⇒ **不产生任何项**。
+
+    ⚠️ **这条不是「另一种写法的杀手」,别把它读成那样**(如实记):端点把
+    「这一行有没有工具调用」判成 `JSON_TYPE(tool_calls) = 'ARRAY'`,而换成
+    `IS NOT NULL` 或 `JSON_LENGTH(...) > 0` 时,这样一行**会**被 SQL 捞出来 ——
+    可是它在归并里是**空操作**(没有齿轮可累积)⇒ **API 输出逐字相同**。
+    本机实测(2026-09-27)也证实了这件事:本查询那三种判据取到的行数**都是 2238**,
+    因为「`content=''` 且 tool_calls 不是 ARRAY」的行在真实库里**一行都没有**。
+
+    ⇒ 这条用例守的是**归并的边界**(空行不许单独冒出来),**不是**那条判据。
+    判据的形状由 `tests/test_api_conversations.py` 的替身钉(它只认 `JSON_TYPE`),
+    判据的**真库语义**由下面那条用例钉。
+    """
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "user", "在吗")])
+        # 生产形状:`_lc_to_records` 对没有工具调用的行写 `tool_calls=None`
+        # ⇒ JSON 列里是**字面 JSON `null`**,不是 SQL NULL。
+        await _insert([_msg(PROBE_MSGS, "assistant", "", tool_calls=None)])
+
+        items = await _messages(PROBE_MSGS)
+        assert [i["content"] for i in items] == ["在吗"], items
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_json_type_is_the_only_safe_predicate_on_a_real_table():
+    """**真库**上核 `JSON_TYPE` 这条判据为什么唯一安全 —— 三种写法各是多少行。
+
+    这是「库 X 在情况 Y 下表现 Z」那一类断言**必须带可复现证据**的那条规矩:
+    证据就是下面这几条**当场跑出来的**读数(本机 2026-09-27 实测:2721 / 336 / 2721)。
+    它钉住的是**数据库的语义**:JSON 的 `null` 是一个**标量**,
+    `JSON_LENGTH` 对它返回 **1**(所以 `> 0` 恒真),而它在 SQL 上**不是 NULL**
+    (所以 `IS NOT NULL` 为真)。同族陷阱见 ch09 的 `evidence_snapshot`
+    与 `app/db/models.py` 的 `citations` 列注释。
+
+    ⚠️ **这条红了不代表端点坏了** —— 先看 `db/followup_messages_citations.sql`
+    与 `app/api/conversations.py` 的 `JSON_ARRAY` 那段:它断的是**我们对 MySQL 的
+    认识**。真变了(比如升到某个版本 `JSON_TYPE` 对 JSON null 返回别的值)就要
+    重新裁定那个判据。
+    """
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "assistant", "", tool_calls=None)])   # JSON null
+        await _insert([_msg(PROBE_MSGS, "assistant", "有齿轮", tool_calls=[
+            {"id": "c1", "name": "query_order", "args": {}, "type": "tool_call"}
+        ])])
+
+        async with get_sessionmaker()() as session:
+            def count(where: str):
+                return select(func.count()).select_from(MessageRecord).where(
+                    MessageRecord.conversation_id == PROBE_MSGS, text(where)
+                )
+
+            got = {}
+            for label, where in (
+                ("is_not_null", "tool_calls IS NOT NULL"),
+                ("json_type", "JSON_TYPE(tool_calls) = 'ARRAY'"),
+                ("json_length", "JSON_LENGTH(tool_calls) > 0"),
+            ):
+                got[label] = (await session.execute(count(where))).scalar()
+
+        assert got["json_type"] == 1, got          # 只有那一条真的有齿轮
+        assert got["is_not_null"] == 2, got        # JSON null 也算「非 NULL」
+        assert got["json_length"] == 2, got        # JSON 标量的长度是 1 ⇒ > 0 恒真
     finally:
         await _cleanup()
         await get_engine().dispose()
@@ -305,6 +482,10 @@ async def test_tool_calls_and_citations_survive_the_json_columns_on_a_real_table
         assert items[0]["citations"] is None, items[0]["citations"]
         assert items[0]["tool_calls"] is None, items[0]["tool_calls"]
         assert items[1]["citations"] == citations, items[1]["citations"]
+        # `tool_calls` 那一列也走**同一条**往返路径(它在这一版之前就存在,
+        # 但那时是「原样透传某一行」;现在它经过归并 ⇒ 这条同时钉住了
+        # 「归并出来的那个 list 也是从 JSON 列反序列化来的」)。
+        assert items[1]["tool_calls"] == tool_calls, items[1]["tool_calls"]
     finally:
         await _cleanup()
         await get_engine().dispose()
