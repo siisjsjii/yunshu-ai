@@ -218,6 +218,22 @@
   .rv-result .rv-title { font-weight: 700; font-size: 13.5px; margin-bottom: 6px; }
   .rv-result.failed .rv-title { color: var(--warn); }
   .rv-note { font-size: 12px; color: #5b7186; margin-top: 6px; }
+
+  /* ── 登录浮层(认证)── */
+  #auth-overlay { display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(28,43,57,.45); align-items: center; justify-content: center; }
+  .auth-card { background: #fff; border: 3px solid var(--ink); border-radius: 4px;
+    padding: 20px 22px; width: 320px; box-shadow: 6px 6px 0 rgba(28,43,57,.18); }
+  .auth-card h2 { margin: 0 0 12px; font-size: 16px; }
+  .auth-card label { display: block; font-size: 13px; color: #5b7186; margin-bottom: 8px; }
+  .auth-card input { width: 100%; margin-top: 4px; }
+  .auth-card .auth-err { color: var(--warn); font-size: 12.5px; min-height: 18px; }
+  .auth-card .auth-hint { font-size: 11.5px; color: #9aa7b4; margin-top: 8px; line-height: 1.6; }
+  /* 顶栏那个「<用户名>(角色) · 退出」。`退出` 是 `mountUserBadge` 造出来的 `<a>`,
+     不加这条的话它会命中本页的 `header a`(那一条是给「← 回聊天」那个按钮写的)
+     而长成一个按钮框。 */
+  #who { font-size: 12.5px; }
+  #who a { border: none; padding: 0; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -226,6 +242,9 @@
     <div class="avatar">📚</div>
     <h1>工作台</h1>
     <div class="spacer"></div>
+    <!-- 当前用户 / 退出(认证)。**内容由 `auth.js` 的 `mountUserBadge` 填** ——
+         这里只放容器:两页共用同一个函数,各写一遍就会漂移。 -->
+    <span id="who"></span>
     <a href="/">← 回聊天</a>
   </header>
 
@@ -425,6 +444,13 @@
   </div>
 </div>
 
+<!-- 认证(2026-09-27):**必须排在下面那把 IIFE 之前** —— 那个 IIFE 直接
+     用全局的 `authFetch` / `authBoot`(由 auth.js 挂到 `window` 上)。
+     ⚠️ 路径是 `/auth.js`,不是 `/static/auth.js` —— 见 `app/main.py` 那句
+     `mount("/")`(静态目录挂在**根**上)。路径写错的后果是**整页脚本无一生效**。
+     ⚠️ 与 index.html 那条同规矩:注释里不出现真的 script 开标签(会让按正则
+     取代码块的测试与探针把注释和真代码当成一块)。 -->
+<script src="/auth.js"></script>
 <script>
 (() => {
   "use strict";
@@ -437,8 +463,13 @@
   // 404(这一行已经被处理过)、422(答案为空)对操作员是**三件不同的
   // 事**,而「一律抛一句 detail」会把它们压成同一句话。飞轮那个 409
   // (已有任务在跑)同样要指名道姓,不能与「同名文档已存在」共用一句文案。
+  //
+  // 认证(2026-09-27):这一处 `fetch` 换成 `authFetch` ⇒ **本页全部请求**
+  // (上面那些 `req` / `api` 的调用点一个都不用改)都带上了 token,
+  // 401 也统一走 auth.js 那一条路径。本页是**只读 + 后台任务**,没有流式请求,
+  // 所以用不上 `stream: true`。
   async function req(path, opts) {
-    const resp = await fetch(path, opts);
+    const resp = await authFetch(path, opts);
     let body = null;
     try { body = await resp.json(); } catch { /* 非 JSON 响应:body 留 null */ }
     return { status: resp.status, ok: resp.ok, body };
@@ -1787,7 +1818,23 @@
   // 初始标签页**由 `switchTab` 一处决定**(首页),它顺带把六个页的 display 与
   // 目录的 active 一次摆对 —— HTML 里那份初值只是「JS 挂了还能看」的兜底,
   // 不是第二处真源。文档列表与统计跟着「入库」走(切进去才拉)。
-  switchTab("首页");
+  //
+  // 认证(2026-09-27):这两件事**都必须排在登录之后** ——
+  //   ① `mountUserBadge` 要问 `/api/auth/me`;没 token 时问也白问,顶栏会停在
+  //      「未登录」,而用户明明刚刚登录过。
+  //   ② 首页那五张卡**是并发打的**(`renderHome` 下面那句 `HOME_LOADERS.map`
+  //      一把发五条)。**token 过期**(不是「没有」—— 那条被下面的 gate 挡住了)
+  //      时它们会一起 401,而并发 401 撞上 `auth.js` 那个**单例浮层**是会丢
+  //      等待者的:`showLogin` 每调一次都 `go.onclick = submit` 一次,
+  //      只有**最后**一个等待者能被唤醒。
+  //      实测读数(逐次复现,4 次全一样):3 个并发 ⇒ 登录后只回来 **1** 个。
+  //      见 `.superpowers/auth_t6_login_probe.mjs` 的 ⑧ 号观察、以及它转录的
+  //      `.superpowers/auth_t6_login_probe.txt`。
+  //      先登录再放行,这五条从一开始就带着 token,根本不走那条路。
+  authBoot(() => {
+    mountUserBadge($("who"));
+    switchTab("首页");
+  });
 })();
 </script>
 </body>

@@ -353,6 +353,21 @@
     font-size: 11.5px;
     color: #5b7186;
   }
+
+  /* ── 登录浮层(认证)── */
+  #auth-overlay { display: none; position: fixed; inset: 0; z-index: 50;
+    background: rgba(28,43,57,.45); align-items: center; justify-content: center; }
+  .auth-card { background: #fff; border: 3px solid var(--ink); border-radius: 4px;
+    padding: 20px 22px; width: 320px; box-shadow: 6px 6px 0 rgba(28,43,57,.18); }
+  .auth-card h2 { margin: 0 0 12px; font-size: 16px; }
+  .auth-card label { display: block; font-size: 13px; color: #5b7186; margin-bottom: 8px; }
+  .auth-card input { width: 100%; margin-top: 4px; }
+  .auth-card .auth-err { color: var(--warn); font-size: 12.5px; min-height: 18px; }
+  .auth-card .auth-hint { font-size: 11.5px; color: #9aa7b4; margin-top: 8px; line-height: 1.6; }
+  /* 顶栏那个「<用户名>(角色) · 退出」。`退出` 是 `mountUserBadge` 造出来的 `<a>`,
+     不加这条的话它会继承页面里别的 `header a` 规则长成一个按钮框。 */
+  #who { font-size: 12.5px; }
+  #who a { color: #fff; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -371,6 +386,9 @@
         <div class="subtitle">ONLINE · 云枢</div>
       </div>
       <div class="spacer"></div>
+      <!-- 当前用户 / 退出(认证)。**内容由 `auth.js` 的 `mountUserBadge` 填** ——
+           这里只放容器:两页共用同一个函数,各写一遍就会漂移。 -->
+      <span id="who"></span>
       <!-- ⚠️ 这个入口的名字跟的是**对面那一页**:`admin.html` 从 ch10 起叫「工作台」
            (它已经不只有知识库了 —— 待审 / 评测 / 主题分布 / 链路都在那儿),
            两处名字不一致时,人会在两个词之间找同一扇门。 -->
@@ -392,6 +410,16 @@
   </div>
 </div>
 
+<!-- 认证(2026-09-27):**必须排在下面那把 IIFE 之前** —— 那个 IIFE 直接
+     用全局的 `authFetch` / `authBoot`(上面那几个名字由 auth.js 挂到 `window` 上)。
+     ⚠️ 路径是 `/auth.js` 而**不是** `/static/auth.js`:`app/main.py` 把静态目录
+     `mount("/")` 挂在了**根**上(所以 `app/static/admin.html` 的网址是 `/admin.html`),
+     `/static/...` 会 404,而 404 的后果是整页**一行脚本都没生效**:
+     `authFetch is not defined` 只在点下第一个按钮时才炸。
+     ⚠️ 这段注释里**不许出现**真的 script 开标签 —— `tests/test_static_wiring.py`
+     与几个探针脚本都用正则按 script 标签取代码块,注释里混进一个假的开标签,
+     会把「这整段注释 + 后面那段真代码」当成**同一块**取走。 -->
+<script src="/auth.js"></script>
 <script>
 (() => {
   "use strict";
@@ -541,7 +569,7 @@
         st.textContent = "提交中…";
         const value = btn.dataset.v;
         try {
-          const resp = await fetch("/api/feedback", {
+          const resp = await authFetch("/api/feedback", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             // 刻意**不带 `message_id`**:见上面那段(本页拿不到它)。
@@ -688,10 +716,14 @@
     ctx.suspended = false;
 
     try {
-      const resp = await fetch("/api/chat/stream", {
+      // ⚠️ `stream: true` 是**承重的**,不是备忘:这一条 401 时 `authFetch`
+      //    只弹登录、**不重放** —— 重放等于替用户把那条消息再发一遍
+      //    (见 auth.js 里那段注释与 spec §7.3)。
+      const resp = await authFetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        stream: true,
       });
 
       if (!resp.ok || !resp.body) {
@@ -784,7 +816,7 @@
   let docListPromise = null;
   function loadDocList() {
     if (!docListPromise) {
-      docListPromise = fetch("/api/kb/documents")
+      docListPromise = authFetch("/api/kb/documents")
         .then((r) => (r.ok ? r.json() : []))
         .catch(() => []);
     }
@@ -856,7 +888,7 @@
       return;
     }
     try {
-      const r = await fetch(`/api/kb/documents/${encodeURIComponent(hit.name)}`);
+      const r = await authFetch(`/api/kb/documents/${encodeURIComponent(hit.name)}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       const [body, located] = locateInDoc(d.content || "", c);
@@ -996,7 +1028,7 @@
       btn.disabled = true;              // 一次性锁定:这是**非幂等写**,重复提交会出两张单
       st.textContent = "提交中…";
       try {
-        const r = await fetch("/api/refund", {
+        const r = await authFetch("/api/refund", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1066,7 +1098,7 @@
   async function createTicket(btn, bar) {
     btn.textContent = "建单中…";
     try {
-      const resp = await fetch("/api/ticket", {
+      const resp = await authFetch("/api/ticket", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
@@ -1198,7 +1230,7 @@
   // 这里吞掉全部异常(含 JSON 解析),调用方不需要再 catch。
   async function loadSidebar() {
     try {
-      const r = await fetch("/api/conversations");
+      const r = await authFetch("/api/conversations");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       renderSidebar(Array.isArray(d.items) ? d.items : []);
@@ -1293,7 +1325,7 @@
     let items = null;
     let missing = false;
     try {
-      const r = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages`);
+      const r = await authFetch(`/api/conversations/${encodeURIComponent(id)}/messages`);
       if (r.status === 404) missing = true;
       else if (!r.ok) throw new Error(`HTTP ${r.status}`);
       else items = (await r.json()).items || [];
@@ -1371,7 +1403,17 @@
     if (stored && sessionId === stored) await switchTo(stored);  // 404 时内部退回新会话
   }
 
-  boot().catch((e) => console.warn("初始化失败(聊天不受影响):", e));
+  // 认证(2026-09-27):**先登录、再 boot**。
+  // ⚠️ 说清楚它**不是**在修一个坏掉的东西:不 gate 也跑得通 —— boot 那第一发
+  //    `loadSidebar()` 401 之后,`authFetch` 会在登录成功时把它**重放**回来。
+  //    gate 换来的是两件事:
+  //      ① 浮层弹出来的时候,背后没有一串注定 401 的请求在飞(控制台一屏红);
+  //      ② `mountUserBadge` 不会在用户**还没登录**时就抢先往顶栏写「未登录」。
+  //   · 手里**有** token ⇒ `authBoot` 同步放行;token 过期与否交给 authFetch 兜。
+  authBoot(() => {
+    mountUserBadge(document.getElementById("who"));
+    boot().catch((e) => console.warn("初始化失败(聊天不受影响):", e));
+  });
 })();
 </script>
 </body>
