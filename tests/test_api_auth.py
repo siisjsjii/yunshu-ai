@@ -34,6 +34,7 @@ brief 原稿写的是 `TestClient(app)`。本机 2026-09-27 实测三种形状:
 import httpx
 import pytest
 
+import app.api.auth as auth_api
 from app.auth import ADMIN, create_token
 from app.main import app
 from app.db.base import get_engine, get_sessionmaker
@@ -120,4 +121,29 @@ async def test_expired_token_is_401(client, _no_default_login):
     expired = create_token(username="cinfly", role=ADMIN, settings=expired_settings)
     r = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {expired}"})
     assert r.status_code == 401
+    await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_both_failure_paths_still_run_verify_password(monkeypatch, client, _no_default_login):
+    """**查无此人也要跑一次密码校验** —— 防的是**时序侧信道**。
+
+    ⚠️ 这条**必须存在**:没有它的话,把「用户不存在」改成提前 `return`
+    (省掉那次 scrypt)的实现**六条测试全绿**,而那正是要防的
+    —— 两次失败的**耗时差一个数量级**,响应时间就成了枚举用户名的信道。
+    ⚠️ 断的是**被调用过**,不是返回值(两种实现的返回值逐字相同 ⇒ 断返回值零判别力)。
+    ⚠️ `monkeypatch` 打在 `app.api.auth.verify_password` 上:`login` 里是
+    `from app.auth import verify_password` 之后按**局部名**调用 ⇒ 换命名空间的绑定即生效。
+    """
+    calls = []
+    real = auth_api.verify_password
+    monkeypatch.setattr(auth_api, "verify_password",
+                        lambda pw, stored: (calls.append(stored), real(pw, stored))[1])
+    await _seed_now()
+    await client.post("/api/auth/login", json={"username": "cinfly", "password": "nope"})
+    await client.post("/api/auth/login", json={"username": "nobody", "password": "nope"})
+    assert len(calls) == 2, (
+        f"两条失败路径都该跑一次 verify_password(实际 {len(calls)} 次)"
+        " —— 少了的那次就是时序侧信道")
+    assert calls[1] == "", "查无此人时传给 verify_password 的应当是空串(坏串回 False)"
     await get_engine().dispose()
