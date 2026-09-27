@@ -536,7 +536,10 @@ git commit -m "认证 T1:鉴权内核 app/auth.py(唯一边界)+ 配置两项 + 
 
 **Interfaces:**
 - Consumes: Task 1 的 `hash_password`
-- Produces: `scripts/seed_users.py` 的 `seed(session) -> int`(返回写入条数);
+- Produces: `scripts/seed_users.py` 的 `seed(session) -> int`
+  ⇒ ⚠️ **返回 `len(ACCOUNTS)`,即「处理了几个账号」,不是「新插入几行」**
+  (计划初稿的 Interfaces 行写的是「写入条数」,与它自己下面的代码块**矛盾** ——
+  复审抓到的。今天没有别的调用方,但别再把它读成「新插入数」);
   两个账号 `cinfly` / `demo-user`,密码都 `123456`,`role` 都 `admin`
 
 - [ ] **Step 1: 写 `db/auth.sql`**
