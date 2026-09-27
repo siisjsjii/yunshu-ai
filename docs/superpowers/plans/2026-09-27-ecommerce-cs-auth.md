@@ -517,10 +517,17 @@ git commit -m "认证 T1:鉴权内核 app/auth.py(唯一边界)+ 配置两项 + 
 --    CREATE TABLE 上响亮地报 1050。那是有意的 —— 静默跳过会让
 --    「表已存在但形状不对」永远补不上。
 --
--- ⚠️ **ORM 侧没有同名模型**(`app/db/models.py` 里没有 User),
---    所以 `init_db.py` 的 create_all **不会**顺手把这张表建出来 ——
---    与 db/ch10.sql(那条会报 1050)**相反**:这里是**全新库也必须跑这一份**。
---    漏掉它的后果是功能性的:登录端点直接 `Unknown table 'users'`。
+-- ⚠️ **ORM 侧有同名模型**(`app/db/models.py` 的 `User`,本任务 Step 4 加的)⇒
+--    `init_db.py` 的 create_all **会把这张表建出来**(它建「不存在的表」)——
+--    ⇒ **正常路径只需要 `init_db.py`,不需要跑这一份**;在表已存在时跑它会在
+--    那条 CREATE 上响亮地报 **1050**。**那是刻意的,不是脏库** ——
+--    与 `db/ch10.sql` 的 `topic_classifications`、`db/ch08.sql` 的 `tool_audit_logs`
+--    是**同一个**已知取舍(本仓既有的三处同族;写法与理由见 CLAUDE.md 的建库一段)。
+--    想让**这份 DDL 成为形状的权威**就先 `DROP TABLE users;` 再跑一遍,
+--    然后用 `SHOW CREATE TABLE users\G` 核对。
+--
+-- ⚠️ 两条路径的形状差异**只有文本**(纯注释与列序):列定义两边逐字一致。
+--    这份文件的价值是「形状肉眼可读 + 有 COMMENT」,不是「建表的那一步」。
 --
 -- ⚠️ **不给 `conversations.user` 加外键**(spec §5.1 的取舍):那一列已有
 --    581 行值、宽度 varchar(128),加 FK 要一条迁移,而收益只是「写错的 user
@@ -541,21 +548,18 @@ CREATE TABLE users (
   COMMENT='登录账号(认证功能,2026-09-27)';
 ```
 
-- [ ] **Step 2: 起库并执行 DDL**
+- [ ] **Step 2: 确认 MySQL 在跑(⚠️ **本步不建表**)**
 
-Run:
-```bash
-docker ps --format '{{.Names}}' | grep -q mysql && echo "MySQL 在跑"
-.venv/Scripts/python.exe scripts/init_db.py
-```
-然后执行 `db/auth.sql`(用你惯用的客户端;本仓既有做法见 `dev-notes/ch08.md` 里那条
-`SHOW CREATE TABLE` 核对)。核对:
-```sql
-SHOW CREATE TABLE users\G
-```
-Expected: 出现 `uk_users_username` 唯一键与上面四列。
+⚠️ **建表要等 Step 4 之后** —— `create_all` 得先在 `app/db/models.py` 里看到
+`User` 模型才知道有这张表。这里只确认库是活的:
 
-> ⚠️ **全新库**这一步也必须跑(理由见 SQL 头部注释:**ORM 里没有这张表**)。
+Run: `docker ps --format '{{.Names}}' | grep mysql`
+Expected: 打出 `mysql`。
+
+> **建表 = Step 5 末尾跑一次 `init_db.py` + `SHOW CREATE TABLE users\G` 核对。**
+> ⚠️ **不要**跑 `db/auth.sql`:表已存在时它会在 CREATE 上报 **1050** ——
+> **那是刻意的、不是脏库**(与 `db/ch08.sql` / `db/ch10.sql` 同一个已知取舍,
+> 理由写在那份 SQL 的头部注释里)。
 
 - [ ] **Step 3: 写失败测试 `tests/test_seed_users_db.py`**
 
@@ -602,36 +606,40 @@ async def _rows() -> dict[str, User]:
 
 @pytest.mark.anyio
 async def test_seed_creates_both_accounts_and_does_not_append_on_rerun():
-    await _seed_now()
-    first = await _rows()
-    assert set(NAMES) <= set(first), f"两个账号都该在,实际 {sorted(first)}"
+    try:
+        await _seed_now()
+        first = await _rows()
+        assert set(NAMES) <= set(first), f"两个账号都该在,实际 {sorted(first)}"
 
-    await _seed_now()                       # 再跑一遍
-    second = await _rows()
-    assert len(second) == len(first), (
-        f"重跑让行数从 {len(first)} 变成 {len(second)} ⇒ 不是幂等"
-    )
-    assert all(second[u].password_hash != first[u].password_hash for u in NAMES), (
-        "两次哈希相同 ⇒ 种子脚本没重算盐(覆盖没真的发生)"
-    )
+        await _seed_now()                       # 再跑一遍
+        second = await _rows()
+        assert len(second) == len(first), (
+            f"重跑让行数从 {len(first)} 变成 {len(second)} ⇒ 不是幂等"
+        )
+        assert all(second[u].password_hash != first[u].password_hash for u in NAMES), (
+            "两次哈希相同 ⇒ 种子脚本没重算盐(覆盖没真的发生)"
+        )
+    finally:
+        await get_engine().dispose()            # 本仓 db 文件的既有收尾方式
 
 
 @pytest.mark.anyio
 async def test_seeded_passwords_verify_and_roles_are_admin():
-    await _seed_now()
-    rows = await _rows()
-    for username, password, role in ACCOUNTS:
-        assert verify_password(password, rows[username].password_hash), (
-            f"{username} 的密码验不过 ⇒ 账号建了但登不上"
-        )
-        assert rows[username].role == role == ADMIN
-
-
-@pytest.mark.anyio
-async def test_engine_disposes_cleanly():
-    """收尾:`get_engine()` 是 lru_cache 单例,别的 db 文件都这么收。"""
-    await get_engine().dispose()
+    try:
+        await _seed_now()
+        rows = await _rows()
+        for username, password, role in ACCOUNTS:
+            assert verify_password(password, rows[username].password_hash), (
+                f"{username} 的密码验不过 ⇒ 账号建了但登不上"
+            )
+            assert rows[username].role == role == ADMIN
+    finally:
+        await get_engine().dispose()
 ```
+
+> ⚠️ **不要**为了「收尾」再写一条 `test_engine_disposes_cleanly`(计划初稿里有,
+> **已删**):那条**不断言任何东西** —— 正是复审 rubric 要拦的「空测试」。
+> 收尾照 `tests/test_api_conversations_db.py` 的既有形状:每个用例 `finally` 里 dispose。
 
 - [ ] **Step 4: 加 ORM 模型 `User`(`app/db/models.py`)**
 
@@ -721,10 +729,15 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-- [ ] **Step 6: 跑测试**
+- [ ] **Step 6: 建表 + 跑测试**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_seed_users_db.py -p no:cacheprovider`
-Expected: **2 passed**(需要 MySQL)
+```bash
+.venv/Scripts/python.exe scripts/init_db.py      # create_all:把 missing 的 users 建出来
+.venv/Scripts/python.exe -m pytest tests/test_seed_users_db.py -p no:cacheprovider
+```
+Expected: 打出「2 passed」(**要 MySQL**;真实数字以实际为准)。
+再用客户端核形状:`SHOW CREATE TABLE users\G` ⇒ 应出现 `uk_users_username` 唯一键
+与上面五列。
 
 - [ ] **Step 7: 真跑一次种子脚本并核对库**
 
