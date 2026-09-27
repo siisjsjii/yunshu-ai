@@ -298,34 +298,42 @@ for (const name of ["index.html", "admin.html"]) {
         `${served.equals(diskBytes) ? "内容与磁盘逐字节相同" : "内容对不上"}`);
 }
 
-// ── ⑧(观察,不判红)并发 401 时,浮层的等待者会丢 ────────────────
-//: `auth.js` 的浮层是**一个**(模块级 `overlay`),而 `showLogin(onDone)`
-//: **每次调用都覆盖** `go.onclick` ⇒ 同一时刻有 N 个调用方在等登录时,
-//: 只有**最后一次**那个 `onDone` 活下来,前 N-1 个的 promise **永远不落定**。
-//: 这一段**只测量、不判红** —— brief 里的 auth.js 是逐字实现的,缺陷在
-//: brief 里;把它量出来交给 controller 定夺,比在这里静悄悄改掉更诚实。
-console.log("\n⑧(观察 · 不判红)三个并发 401 的调用,登录之后有几个回来了");
-reset();
-const before8 = hitCount("/api/conversations");
+// ── ⑧ 并发 401:**每一个**等待者都要被唤醒 ──────────────────────
+//: **修前的读数**(2026-09-28 实测,逐次复现 4 次全一样):3 个并发 401 ⇒
+//: 登录之后只回来 **1** 个。根因:`showLogin` 每次调用都 `go.onclick = submit`,
+//: 而 `submit` 闭包着**自己那一个** `onDone` ⇒ 后一个调用方把前一个的唤醒者
+//: **替换**掉了,前面那些 promise **永远不落定**。
+//: 可达路径:`admin.html` 的「首页」一进去就 `renderHome()` —— 五张卡由
+//: `Promise.allSettled(HOME_LOADERS.map(…))` **并发**打五条 `req()`;token
+//: **过期**时(不是「没有」:没有时 authBoot 会先拦下)那五条一起 401
+//: ⇒ 登录后**四张卡永远停在「读取中…」**,而页面不报任何错。
+//: 修法是把「一个 `onDone`」换成 `waiters` 队列(见 auth.js)。
+//: ⚠️ **重复跑多轮**,并且每轮都从零(清 token)开始 —— 单轮 3/3 可能只是
+//: 恰好最后那个等待者被点到,那区分不了「真修好」与「这一轮走运」。
+const ROUNDS = 4;
+console.log(`\n⑧ 并发 401:${ROUNDS} 轮 × 3 个并发,**每一个**都要回来(修前读数 = 1/3)`);
 const goBtn = overlayEl()._byId.get("auth-go");
-const wiresBefore = goBtn.onclickWires || 0;
-const ws = [1, 2, 3].map(() => watch(sandbox.authFetch("/api/conversations")));
-check(await waitFor(() => (goBtn.onclickWires || 0) - wiresBefore === 3, 5000),
-      "三个 401 都回来了(登录按钮被重新接线 3 次 = 3 个调用方在等)");
-await clickLogin("demo-user", "123456");
-await waitFor(() => ws.some((w) => w.settled), 3000);
-await sleep(800);
-const cameBack = ws.filter((w) => w.settled).length;
-console.log(`  读数:3 个并发调用里,登录之后回来了 ${cameBack} 个` +
-            `(前 ${3 - cameBack} 个还在等 —— 它们的 promise 永远不会落定)`);
-if (cameBack < 3) {
-  console.log("  ⚠️ 这是 **brief 里那段 auth.js 的**性质,不是实现走样:`showLogin` 每次调用");
-  console.log("     都把登录按钮的 `onclick` 换成新的 `submit`,于是只有最后一个等待者被唤醒。");
-  console.log("     可达路径:`admin.html` 的「首页」一进去就 `renderHome()` —— 五张卡");
-  console.log("     由 `Promise.allSettled(HOME_LOADERS.map(…))` **并发**打五条 `req()`。");
-  console.log("     token **过期**时(不是「没有」:没有时 authBoot 会先拦下)那五条一起 401");
-  console.log("     ⇒ 登录后**四张卡永远停在「读取中…」**,而页面不报任何错。");
+let roundsAll3 = 0;
+for (let round = 1; round <= ROUNDS; round++) {
+  reset();
+  const wiresBefore = goBtn.onclickWires || 0;
+  const ws = [1, 2, 3].map(() => watch(sandbox.authFetch("/api/conversations")));
+  //: 等三个 401 **都**回来再点(接线次数 = 有几个调用方在等),不靠 sleep 猜。
+  if (!await waitFor(() => (goBtn.onclickWires || 0) - wiresBefore === 3, 5000)) {
+    fail(`第 ${round} 轮:三个 401 没都回来(按钮只被接线 ${(goBtn.onclickWires || 0) - wiresBefore} 次)`);
+    break;
+  }
+  await clickLogin("demo-user", "123456");
+  await waitFor(() => ws.every((w) => w.settled), 5000);
+  await sleep(200);
+  const back = ws.filter((w) => w.settled).length;
+  const got200 = ws.filter((w) => w.status === 200).length;
+  console.log(`  第 ${round} 轮:回来了 ${back}/3,其中重放成功(200)的 ${got200} 个`);
+  if (back === 3 && got200 === 3) roundsAll3++;
+  else fail(`第 ${round} 轮只回来了 ${back}/3(修前 1/3,修后应当是 3/3)`);
 }
+check(roundsAll3 === ROUNDS,
+      `${ROUNDS} 轮**全部**是 3/3 —— 不是某一轮碰巧(修前是 1/3)`);
 
 // ── ⑨(附加)顶栏「谁 · 退出」:问得出当前用户,点退出要清 token ────
 //: 这一段钉的是浮层**之外**那半个:`mountUserBadge` 真的从 `/api/auth/me`
@@ -355,8 +363,7 @@ check(reloads === 1, `而且触发了一次 location.reload(${reloads} 次)—�
 // ── 汇总 ────────────────────────────────────────────────────────
 console.log("\n================================================================");
 console.log(failures ? `有 ${failures} 条失败(见上面的 !!!)`
-                     : "brief 那六条行为逐条通过(外加 ⑦⑨ 两条附加断言)");
-console.log("⚠️ ⑧ 那一段**不参与判红** —— 它是缺陷**读数**,不是回归判据。");
+                     : "brief 那六条行为逐条通过(外加 ⑦⑧⑨ 三条附加断言)");
 console.log("⚠️ 本探针**验不到**的:布局 / CSS(浮层的 position:fixed 与 z-index 压不压得住)、");
 console.log("   真实的鼠标点击、两个页面的实际观感 —— 那些仍然要人眼看。");
 process.exitCode = failures ? 1 : 0;

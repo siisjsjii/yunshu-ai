@@ -1824,12 +1824,11 @@
   //      「未登录」,而用户明明刚刚登录过。
   //   ② 首页那五张卡**是并发打的**(`renderHome` 下面那句 `HOME_LOADERS.map`
   //      一把发五条)。**token 过期**(不是「没有」—— 那条被下面的 gate 挡住了)
-  //      时它们会一起 401,而并发 401 撞上 `auth.js` 那个**单例浮层**是会丢
-  //      等待者的:`showLogin` 每调一次都 `go.onclick = submit` 一次,
-  //      只有**最后**一个等待者能被唤醒。
-  //      实测读数(逐次复现,4 次全一样):3 个并发 ⇒ 登录后只回来 **1** 个。
-  //      见 `.superpowers/auth_t6_login_probe.mjs` 的 ⑧ 号观察、以及它转录的
-  //      `.superpowers/auth_t6_login_probe.txt`。
+  //      时它们会一起 401。并发 401 撞上 `auth.js` 那个**单例浮层**是丢过等待者
+  //      的(修前实测,逐次复现:3 并发 ⇒ 登录后只回来 **1** 个 ⇒ 四张卡永远停在
+  //      「读取中…」,页面不报错);现在 `auth.js` 用 `waiters` 队列唤醒**全部**
+  //      (探针 ⑧ 连跑 4 轮都是 3/3,见 `.superpowers/auth_t6_login_probe.mjs`
+  //      与它的转录 `.superpowers/auth_t6_login_probe.txt`)。
   //      先登录再放行,这五条从一开始就带着 token,根本不走那条路。
   authBoot(() => {
     mountUserBadge($("who"));

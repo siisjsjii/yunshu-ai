@@ -28,6 +28,13 @@
   // ── 登录浮层 ──────────────────────────────────────────────
   let overlay = null;
 
+  //: 登录成功后要唤醒的**全部**等待者。
+  //: ⚠️ **只留一个回调是错的**(实测):`admin.html` 的首页会**并发**发 5 个 `req()`,
+  //: token 过期时 5 条一起 401 ⇒ 只唤醒最后一个的话,另外 4 张卡**永远停在
+  //: 「读取中…」**,不报错、不复位 —— 一条路恢复了,其余静默失败。
+  //: ⇒ 唤醒**全部**(先拷走再清空:回调里可能又发起新请求,别让它们改到正在遍历的队列)。
+  let waiters = [];
+
   function buildOverlay() {
     const box = document.createElement("div");
     box.id = "auth-overlay";
@@ -46,8 +53,12 @@
     return box;
   }
 
-  /** 弹登录浮层。`onDone` 在**登录成功**后调用一次(调用方拿它重放请求)。 */
+  /** 弹登录浮层。`onDone` **排进等待队列**(不是替换掉上一个):
+   *  登录成功后**与其余等待者一起**被唤醒一次(调用方拿它重放请求)。
+   *  ⚠️ 排队的而不是就地唤醒 —— 同一时刻可能有多个调用方在等(见 `waiters`)。
+   *  登录**失败**时队列**不动**,所以「填错密码再来一次」照样能唤醒大家。 */
   function showLogin(onDone) {
+    if (onDone) waiters.push(onDone);
     if (!overlay) overlay = buildOverlay();
     overlay.style.display = "flex";
     const err = overlay.querySelector("#auth-err");
@@ -76,7 +87,15 @@
         setToken(body.token);
         overlay.style.display = "none";
         overlay.querySelector("#auth-pass").value = "";
-        if (onDone) await onDone();
+        //: 先**拷走再清空**(不是就地遍历):某个等待者被唤醒后可能立刻又发一条
+        //: 请求、又在 `waiters` 上追加 —— 那不该落进这一轮。
+        //: ⚠️ 一个等待者抛了**不许拖住别人**:本条路径上「其余的人静默挂着」
+        //:    正是这个函数要修的那个故障,不能在收尾处又走回去。
+        const pending = waiters;
+        waiters = [];
+        for (const w of pending) {
+          try { await w(true); } catch (e) { /* 一个等待者出错不许拖住别人 */ }
+        }
       } catch (e) {
         err.textContent = `连不上服务(${e.message})`;
       } finally {
