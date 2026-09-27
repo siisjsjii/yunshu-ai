@@ -177,9 +177,16 @@ def test_expired_token_is_rejected():
     """有效期靠 `exp`,由 PyJWT 自己校验 —— 这条钉住「真的设了 exp」。
 
     `jwt_expire_minutes` 传**负数**造一个出生即过期的 token(比 sleep 快且不骰子)。
+
+    ⚠️ **必须用 `model_copy` 换那一个字段,不能 `_settings(jwt_expire_minutes=-1)`**:
+    配置项带 `gt=0`(下界是**故意的** —— 写错要在启动时炸,不能等运行时变成
+    「token 永不过期」这种静默故障),构造时传 −1 会被 pydantic 拒 ⇒
+    那条用例会死在 `ValidationError` 上,**而它根本没验到「过期」**。
+    (计划初稿就是这么写的 —— 实现者实测抓到并用 `model_copy` 修好;
+    这里同步改掉,免得下游照抄。)
     """
-    tok = create_token(username="cinfly", role=ADMIN,
-                       settings=_settings(jwt_expire_minutes=-1))
+    expired = _settings().model_copy(update={"jwt_expire_minutes": -1})
+    tok = create_token(username="cinfly", role=ADMIN, settings=expired)
     with pytest.raises(AuthError):
         decode_token(tok, _settings())
 
@@ -205,9 +212,23 @@ def test_alg_none_token_is_rejected():
         decode_token(forged, _settings())
 
 
-def test_token_without_sub_or_role_is_rejected():
-    """缺 claim 的 token 不许当成匿名用户放过去。"""
-    bare = jwt.encode({"exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+def test_token_without_sub_is_rejected():
+    """**缺 `sub`** 的 token 不许当成匿名用户放过去。
+
+    ⚠️ **两条 claim 必须分开测**(计划初稿把 `sub` 与 `role` **一起省掉** ——
+    那样**删掉任何一条守卫它都照样绿**,本仓「假绿形态」里最经典的一种)。
+    这里只**少给 `sub`**,`role` 给对的。
+    """
+    bare = jwt.encode({"role": ADMIN, "exp": int(time.time()) + 3600},
+                      SECRET, algorithm="HS256")
+    with pytest.raises(AuthError):
+        decode_token(bare, _settings())
+
+
+def test_token_with_an_unknown_role_is_rejected():
+    """**角色不认识**的 token 也不许放过去(只少给 `role` 那一半)。"""
+    bare = jwt.encode({"sub": "cinfly", "role": "root", "exp": int(time.time()) + 3600},
+                      SECRET, algorithm="HS256")
     with pytest.raises(AuthError):
         decode_token(bare, _settings())
 
@@ -478,9 +499,19 @@ def require_admin(
 - [ ] **Step 5: 跑测试,确认全绿**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_auth.py -p no:cacheprovider`
-Expected: **12 passed**(⚠️ 计划初稿在这里写过「13」—— **那是错的**,Step 2 里一共
-12 个 `def test_…`。**以实际为准**,并把真实数字写进你的报告;数量对不上时**别改测试去凑数**,
-先数一遍是不是自己漏写了一整条。)
+Expected: **13 passed**。
+
+⚠️ 这个数**改过两次**,过程记在这里免得后来人对不上账:
+初稿写「13」是**错的**(那时 Step 2 里只有 12 个 `def test_…`);
+实现者第一轮实测 **12** 并报了上来;随后 `test_token_without_sub_or_role_is_rejected`
+**拆成两条**(见那条的 ⚠️)才真的是 **13**。
+⇒ **以实际为准**,把真实数字写进报告;**对不上时别改测试去凑数**,先数一遍。
+
+⚠️ **输出里有 8 条 `InsecureKeyLengthWarning`(PyJWT ≥2.14)是预期的、不要消掉**:
+RFC 7518 要求 HS256 密钥 ≥32 字节,而用户拍板的演示密钥 `itcinfly` 是 8 字节。
+**这条警告在真实运行时每个请求都有**(不是测试专属)。**不 filter、不 lengthen** ——
+filter 掉等于把一条安全提醒静音,而换密钥违背用户点名的选型。
+代价与回退写在 spec §9:真部署时 `.env` 里换成 32 字节随机值即可。
 
 - [ ] **Step 6: 跑一条真机(`alg:none` 那条依赖 PyJWT 的行为)**
 
