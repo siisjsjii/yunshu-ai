@@ -827,7 +827,15 @@
     const head = `<span class="cite-close" title="关闭">×</span>
       <div class="cite-path">${esc(c.section_path || c.category || "来源")}</div>`;
     box.innerHTML = `${head}<div class="cite-answer">正在载入源文档…</div>`;
-    box.querySelector(".cite-close").addEventListener("click", () => box.remove());
+    // ⚠️ **用事件委托,不要在 `box.querySelector(".cite-close")` 上直接绑。**
+    //    下面还有**三处** `box.innerHTML = …`(无源文件 / 载入成功 / 载入失败),
+    //    加上上面这行共**四处**。每次整体替换 innerHTML 都会**销毁**原来那个 `.cite-close`
+    //    并造一个**新的、没有监听器**的 ⇒ 直接绑的话,`×` 只在「正在载入…」那一瞬间可点,
+    //    之后**永远点不动**(用户报的「关闭按钮点 x 关不掉」就是这个)。
+    //    委托绑在 `box` 自己身上,而它自始至终不被替换 ⇒ 绑一次,四次替换之后都还在。
+    box.addEventListener("click", (e) => {
+      if (e.target.closest(".cite-close")) box.remove();
+    });
     document.body.appendChild(box);
 
     const docs = await loadDocList();
