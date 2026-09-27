@@ -16,6 +16,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 
+from app.auth import require_admin
 from app.config import Settings, get_settings
 from app.db.models import KnowledgeChunk
 from app.db.session import get_session
@@ -30,7 +31,10 @@ from app.retrieval.search import RetrievedChunk
 from app.schemas import UploadDocumentRequest
 from app.tools.registry import build_retriever
 
-router = APIRouter()
+#: 工作台用 `require_admin`(不是 `require_user`)—— 挂错的话**任何登录用户**
+#: 都能核准知识入库,而**所有测试照样绿**(conftest 的默认装置给的是 admin)。
+#: `tests/test_auth_wiring.py::test_workbench_routes_require_admin` 专钉这一条。
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
 

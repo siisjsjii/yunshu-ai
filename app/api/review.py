@@ -88,6 +88,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 
+from app.auth import require_admin
 from app.config import Settings, get_settings
 from app.db.models import KnowledgeChunk, LowConfidenceQuestion, ReviewQueue
 from app.db.session import get_session
@@ -117,7 +118,8 @@ VECTORIZE_FAILED_DETAIL = "知识入库失败(向量化未完成),该待审项�
 #: 却以为自己在看历史。
 STATUSES = ("pending", "approved", "rejected")
 
-router = APIRouter()
+#: 工作台守卫(require_admin)—— 理由见 `app/api/kb.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 
 class ApproveRequest(BaseModel):

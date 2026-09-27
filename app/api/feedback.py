@@ -24,18 +24,21 @@
 
 import asyncio
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import AuthenticatedUser, require_user
 from app.config import Settings, get_settings
 from app.db.models import LowConfidenceQuestion
 from app.db.session import get_session
 from app.flywheel.tasks import start_flywheel_job_safely
 from app.kb.assess import ENTRY_USER_FEEDBACK, record_low_confidence
 from app.retrieval.search import KnowledgeRetriever
+from app.services.history import get_owned_conversation
 from app.tools.errors import ToolInfrastructureError
 from app.tools.registry import build_retriever
 
@@ -98,7 +101,8 @@ async def _search_bounded(retriever, query: str, *, settings: Settings):
             f"知识检索超时(超过 {settings.retrieval_timeout_seconds} 秒)"
         ) from exc
 
-router = APIRouter()
+#: router 级守卫 —— 理由见 `app/api/chat.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class FeedbackRequest(BaseModel):
@@ -144,6 +148,7 @@ def _snapshot(chunks, *, settings: Settings) -> list[dict] | None:
 @router.post("/api/feedback")
 async def post_feedback(
     body: FeedbackRequest,
+    user: Annotated[AuthenticatedUser, Depends(require_user)],
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -152,7 +157,32 @@ async def post_feedback(
     **`up` 走日志而不是池子**:池子是「答不上的问题」的待办队列,👍 进去会让
     飞轮去修一个**已经答对**的问题。留日志是为了让「用户满意」与「用户根本没点」
     在排查时能分开 —— 这与池子无关,所以不落库。
+
+    **`conversation_id` 是请求体里来的 ⇒ 必须先查归属**(认证,2026-09-27;
+    复审 R17)。见下面第一段注释。
     """
+    # 归属检查(认证,2026-09-27,复审 R17):`conversation_id` 是**请求体里来的**,
+    # 此前这里一个字都不查 ⇒ 任何登录用户都能把一行池子记录挂到**别人的会话**上
+    # (写 `low_confidence_questions.source_conversation_id`),审核页上那条缺口
+    # 因此会指向一个毫不相干的会话。与读端点
+    # (`app/api/conversations.py:list_messages`)**同一个出口**:别人的会话与
+    # 不存在的会话**都**回 404「会话不存在」—— 回 403 等于承认那个 id 存在,
+    # 那就是一个可枚举的接口。
+    #
+    # ⚠️ **它排在整个函数的第一句,不是「落池之前」**(⚠️ 这一条比 R17 的字面要求
+    # 更严一点,理由如下,别把它挪到 `up` 那一支后面):
+    #   ① 下面那次幂等 SELECT 也是按 `conversation_id` 查的,而它的结论会从响应体
+    #      里漏出去(`already_pooled`)—— 挪到它后面就等于留下一个「**别人的**会话
+    #      有没有把这个问题落进池子」的探针;
+    #   ② 再往后就是回捞:一次白跑的 Milvus + 重排往返,而响应体同样是 404
+    #      (顺序反了**看不出来**)。`tests/test_api_feedback.py` 那条 404 用例
+    #      断「检索器一次都没被调过」,钉的就是这个顺序。
+    conv = await get_owned_conversation(
+        session=session, conversation_id=body.conversation_id, user_id=user.username
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
     if body.value == "up":
         logger.info("feedback up:conv=%s(不落池)", body.conversation_id)
         return {"ok": True, "pooled": False}

@@ -2,6 +2,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.auth import require_user
 from app.config import Settings, get_settings
 from app.llm import create_extract_model
 from app.sanitize import redact_api_key
@@ -10,7 +11,8 @@ from app.services.extract import ExtractionError, extract_structured
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+#: router 级守卫 —— 理由见 `app/api/chat.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def get_extract_model(settings: Settings = Depends(get_settings)):

@@ -47,6 +47,15 @@ PROBE_FAIL = "t12probe-fail"
 PROBE_BAD = "t12probe-bad"
 PROBE_EMPTY = "t12probe-empty"
 PROBE_HANG = "t12probe-hang"
+#: R17 那条归属用例的探针会话(它**不**属于本用例的登录身份)。
+PROBE_FOREIGN = "t12probe-foreign"
+
+#: 本文件所有 db 用例的请求身份 —— `tests/conftest.py` 那个 autouse 的
+#: `_default_login` 装置注入的正是 `AuthenticatedUser(username="tests-default-user", …)`。
+#: **字面量住在 conftest 里,这里只是复述**(本文件不改那个装置)。
+#: ⚠️ 对不上不会静默:`POST /api/feedback` 第一句就查归属,身份对不上 ⇒ 每个用例
+#: 都在 404 上当场红。
+TEST_USER = "tests-default-user"
 
 #: 探针问题文本。**每个探针一句独有的** —— 顺带当第二个过滤条件(见文件头)。
 Q_UP = "t12 探针:这句话只该在日志里,不该进池子"
@@ -56,6 +65,7 @@ Q_FAIL = "t12 探针:检索挂了也得进池子"
 Q_BAD = "t12 探针:非法 value 一个字都不许落"
 Q_EMPTY = "t12 探针:知识库里没有这一条"
 Q_HANG = "t12 探针:回捞永远不返回"
+Q_FOREIGN = "t12 探针:这条 👎 想挂到别人的会话上"
 
 _REQUIRED_SETTINGS = dict(
     openai_base_url="https://example.invalid/v1",
@@ -194,6 +204,41 @@ async def _delete_probe(conversation_id: str) -> int:
         ).scalar_one()
 
 
+async def _seed_probe(conversation_id: str, *, user: str = TEST_USER) -> None:
+    """本用例开工前:清掉上次残留的池子行 + **建一行归属正确的探针会话**。
+
+    认证(2026-09-27)起 `POST /api/feedback` **第一句就查归属**(复审 R17)⇒
+    探针会话在库里不存在的话,端点回 404、一行都不落,本文件**全部** db 用例
+    会集体红在「没有这个会话」上,而不是它们各自要验的那件事上。
+
+    `user=` 是给那条 404 用例用的(它要一个**别人的**会话)。
+    ⚠️ 归属值必须与 `tests/conftest.py` 的 `_default_login` 一致 ——
+    对不上不会静默,每个用例都会 404 当场红。
+    """
+    await _delete_probe(conversation_id)
+    async with get_sessionmaker()() as session:
+        # `status` 在 ORM 侧只有**客户端**默认值(`default="active"`,没有
+        # `server_default`)⇒ 裸 SQL 必须显式给,否则 1364。
+        await session.execute(
+            text(
+                "INSERT INTO conversations (id, user, status) "
+                "VALUES (:id, :u, 'active') "
+                "ON DUPLICATE KEY UPDATE user = VALUES(user)"
+            ),
+            {"id": conversation_id, "u": user},
+        )
+        await session.commit()
+
+
+async def _drop_probe_conversation(conversation_id: str) -> None:
+    """删掉探针**会话**那一行(认证之后才有它)。"""
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            text("DELETE FROM conversations WHERE id = :c"), {"c": conversation_id}
+        )
+        await session.commit()
+
+
 async def _teardown(conversation_id: str) -> None:
     """用例收尾:删探针行 → **删后**复查为 0 → 关连接池。
 
@@ -207,6 +252,10 @@ async def _teardown(conversation_id: str) -> None:
     """
     left = await _delete_probe(conversation_id)
     assert left == 0, f"探针行没删干净,池子里还剩 {left} 行"
+    # 探针**会话**也删掉(认证之后才有这一行)。留着骗不到本文件的任何断言
+    # (谓词一律按 `source_conversation_id` 过滤),只是别让开发库里越堆越多
+    # `t12probe-*` —— 而且下面那条「会话不存在」的用例靠它保证前提。
+    await _drop_probe_conversation(conversation_id)
     await get_engine().dispose()
 
 
@@ -345,7 +394,7 @@ async def test_up_writes_nothing_to_the_pool(client_factory, flywheel_hooks):
     """
     retriever = FakeRetriever()
     client = client_factory(retriever=retriever)
-    await _delete_probe(PROBE_UP)          # 防上一次崩在断言中间留下的行
+    await _seed_probe(PROBE_UP)            # 清上一次的残留 + 建归属正确的探针会话
     try:
         r = await client.post("/api/feedback",
                               json=_body(PROBE_UP, Q_UP, value="up"))
@@ -386,7 +435,7 @@ async def test_down_writes_one_row_with_user_feedback_entry_point(
     """
     retriever = FakeRetriever(SNAPSHOT_CHUNKS)
     client = client_factory(retriever=retriever)
-    await _delete_probe(PROBE_DOWN)
+    await _seed_probe(PROBE_DOWN)
     try:
         r = await client.post("/api/feedback",
                               json=_body(PROBE_DOWN, Q_DOWN, value="down"))
@@ -438,7 +487,7 @@ async def test_repeated_down_for_the_same_message_writes_only_one_row(client_fac
     **没有对应的列**(它只是前端顺手带上来的定位信息)。
     """
     client = client_factory()
-    await _delete_probe(PROBE_DUP)
+    await _seed_probe(PROBE_DUP)
     try:
         body = _body(PROBE_DUP, Q_DUP, value="down", message_id=9999)
         first = await client.post("/api/feedback", json=body)
@@ -477,7 +526,7 @@ async def test_empty_recall_writes_a_json_null_snapshot(client_factory):
     """
     retriever = FakeRetriever([])          # 空召回,但**不抛**
     client = client_factory(retriever=retriever)
-    await _delete_probe(PROBE_EMPTY)
+    await _seed_probe(PROBE_EMPTY)
     try:
         r = await client.post("/api/feedback",
                               json=_body(PROBE_EMPTY, Q_EMPTY, value="down"))
@@ -530,7 +579,7 @@ async def test_retriever_failure_still_pools_the_row_and_logs_loudly(
     **照样绿**;只注入后者的话,验的又不是生产真实的那条路。
     """
     client = client_factory(retriever=RaisingRetriever(exc_cls("检索炸了")))
-    await _delete_probe(PROBE_FAIL)
+    await _seed_probe(PROBE_FAIL)
     try:
         with caplog.at_level(logging.WARNING, logger="app.api.feedback"):
             r = await client.post("/api/feedback",
@@ -586,7 +635,7 @@ async def test_a_hanging_recall_is_bounded_and_lands_on_the_same_sentinel(
     """
     client = client_factory(
         retriever=HangingRetriever(), retrieval_timeout_seconds=0.01)
-    await _delete_probe(PROBE_HANG)
+    await _seed_probe(PROBE_HANG)
     try:
         with caplog.at_level(logging.WARNING, logger="app.api.feedback"):
             r = await asyncio.wait_for(
@@ -623,7 +672,7 @@ async def test_unknown_value_is_rejected_and_pools_nothing(client_factory):
     而那看起来只是「用户点了某个按钮」。
     """
     client = client_factory()
-    await _delete_probe(PROBE_BAD)
+    await _seed_probe(PROBE_BAD)
     try:
         r = await client.post("/api/feedback",
                               json=_body(PROBE_BAD, Q_BAD, value="meh"))
@@ -632,3 +681,76 @@ async def test_unknown_value_is_rejected_and_pools_nothing(client_factory):
         assert await _count_by_question(Q_BAD) == 0
     finally:
         await _teardown(PROBE_BAD)
+
+
+# --------------------------------------------------------------------------
+# 三、归属(认证,2026-09-27;复审 R17)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.db
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "value, owner",
+    [
+        ("down", None),                     # 这个 id 在库里压根不存在
+        ("down", TEST_USER + "-someone"),   # 存在,但**不是**他的
+        ("up", TEST_USER + "-someone"),     # 👍 那一支也要过同一道闸
+    ],
+    ids=["不存在/down", "别人的/down", "别人的/up"],
+)
+async def test_conversation_you_do_not_own_is_404_and_writes_nothing(
+    client_factory, value, owner
+):
+    """**`conversation_id` 来自请求体** ⇒ 归属必须自己查,否则就是一次越权写。
+
+    为什么这条非有不可:`source_conversation_id` 决定审核页上那条缺口**指向哪个
+    会话**;不查归属的话,任何登录用户都能把一行池子记录挂到别人的会话上
+    (与 `ChatRequest.user_id` 那条同名缺口同一个形状,只是不读回内容)。
+    而**没有这条用例时它没有任何守卫** —— 挂上守卫与不挂守卫,本文件其余用例
+    **全部照样绿**(它们用的都是自己名下、或不存在的探针会话)。
+
+    三件事一起断:
+
+    ① **404,而不是 403/200** —— 「别人的会话」与「不存在的会话」**必须同一个出口**
+       (403 等于承认这个 id 存在,那就是一个可枚举的接口)。所以两种 owner 走
+       同一条用例,文案还逐字比对;
+    ② **一行都没落**(按会话 + 按问题各数一次)—— 这是承重断言。只断状态码的话,
+       一个「先落池、再 404」的实现(照 `refund.py` 那条注释:`_persist` 打在检查
+       之前)照样绿,而库里已经躺着一次成功的越权写;
+    ③ **检索器一次都没被调过** —— 归属检查必须排在回捞**之前**。排在后面的话,
+       一次越权请求会白跑一趟 Milvus + 重排,而响应体一模一样(顺序在响应上
+       **看不出来**)。`up` 那一支同理:它今天不落池,但**幂等 SELECT 也是按
+       `conversation_id` 查的**,排到它后面就等于漏一个「别人的会话有没有把
+       这个问题落进池子」的探针(结论从 `already_pooled` 漏出去)。
+    """
+    retriever = FakeRetriever(SNAPSHOT_CHUNKS)
+    client = client_factory(retriever=retriever)
+    if owner is None:
+        # 这一档要的是「**这个 id 在库里根本没有**」。⚠️ 光清池子行不够:
+        # 上一次跑崩在断言中间的话会话行还在(`_teardown` 才删它),于是这一档
+        # 实际上变成了「别人的会话」—— 断言照样绿,而它自称测的那件事一次都没测到。
+        await _delete_probe(PROBE_FOREIGN)
+        await _drop_probe_conversation(PROBE_FOREIGN)
+    else:
+        await _seed_probe(PROBE_FOREIGN, user=owner)
+    try:
+        r = await client.post(
+            "/api/feedback", json=_body(PROBE_FOREIGN, Q_FOREIGN, value=value)
+        )
+        assert r.status_code == 404, (
+            f"不是自己的会话必须 404,实际 {r.status_code}:{r.text}"
+        )
+        assert r.json()["detail"] == "会话不存在", (
+            "文案必须与「会话不存在」**逐字相同** —— 分开写就等于承认这个 id 存在"
+        )
+        left = await _rows(PROBE_FOREIGN)
+        assert left == [], f"越权写:这个会话上一行都不许落,实际 {left}"
+        assert await _count_by_question(Q_FOREIGN) == 0, (
+            "按问题文本再数一次 —— 一个忽略入参、把行写到别处的实现只按会话过滤照不出来"
+        )
+        assert retriever.calls == [], (
+            f"归属检查必须在回捞之前(排在后面会白跑一趟检索),实际搜了 {retriever.calls}"
+        )
+    finally:
+        await _teardown(PROBE_FOREIGN)

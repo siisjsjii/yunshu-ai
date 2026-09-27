@@ -45,10 +45,12 @@ session 壳钉住「展开发生在 SQL 里」。
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 
+from app.auth import require_admin
 from app.db.session import get_session
 from app.topic.taxonomy import LABELS
 
-router = APIRouter()
+#: 工作台守卫(require_admin)—— 理由见 `app/api/kb.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 #: 每个类目的**条数**与**不同问题数**。
 #:

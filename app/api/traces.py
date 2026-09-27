@@ -77,12 +77,14 @@ import httpx
 from fastapi import APIRouter, Depends, Query
 
 from app import observability
+from app.auth import require_admin
 from app.config import Settings, get_settings
 from app.sanitize import redact_api_key
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+#: 工作台守卫(require_admin)—— 理由见 `app/api/kb.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 #: 页面每次切进「链路」都重拉(照「主题分布」那条),所以默认值给**小**。
 DEFAULT_LIMIT = 20

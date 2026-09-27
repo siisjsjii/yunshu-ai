@@ -35,7 +35,11 @@ from app.tools.errors import ToolInfrastructureError
 from app.tools.executor import APPROVED, execute_tool
 from app.tools.registry import build_retriever, build_registry
 
-router = APIRouter()
+#: 守卫挂在**router 级**(不是每个端点各写一遍):9 行 vs 25 处,少 16 个
+#: 「调用点自己记得做」的机会 —— 本仓那条「不变量要放在唯一写口上」。
+#: 它同时让 `tests/test_auth_wiring.py` 那条结构性测试成为可能
+#: (那条测试**不经过** conftest 的「默认已登录」装置,专抓「忘了挂」)。
+router = APIRouter(dependencies=[Depends(require_user)])
 
 logger = logging.getLogger(__name__)
 

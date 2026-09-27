@@ -62,7 +62,8 @@ JSON_ARRAY = "ARRAY"
 #: 预览取前多少字(spec §5.1)。
 PREVIEW_CHARS = 30
 
-router = APIRouter()
+#: router 级守卫 —— 理由见 `app/api/chat.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 async def _preview(session: AsyncSession, conversation_id: str) -> str:

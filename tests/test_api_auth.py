@@ -31,6 +31,8 @@ brief 原稿写的是 `TestClient(app)`。本机 2026-09-27 实测三种形状:
 **六条断言逐字未动**,改的只有「谁来发这个请求」。
 """
 
+import re
+
 import httpx
 import pytest
 
@@ -56,6 +58,16 @@ async def client():
 async def _seed_now() -> None:
     async with get_sessionmaker()() as session:
         await seed(session)
+
+
+def _fill_path_params(path: str) -> str:
+    """`/api/kb/jobs/{job_id}` → `/api/kb/jobs/x`。
+
+    填的是一眼假的占位符:守卫是**依赖**,在解析路径参数之前就跑,所以这些端点
+    一律 401,永远走不到「这个 job_id 存在吗」那一步。填真 id 反而会把用例绑在
+    那些端点的数据契约上。
+    """
+    return re.sub(r"\{[^}]+\}", "x", path)
 
 
 @pytest.mark.anyio
@@ -96,6 +108,54 @@ async def test_login_body_is_validated(client, _no_default_login):
 async def test_me_without_token_is_401_and_not_403(client, _no_default_login):
     r = await client.get("/api/auth/me")
     assert r.status_code == 401, f"缺 header 必须 401(不是 403),实际 {r.status_code}"
+
+
+@pytest.mark.anyio
+async def test_every_guarded_route_really_answers_401_without_a_token(
+    client, _no_default_login
+):
+    """**router 级那 9 行守卫真的在请求路径上执行** —— 不是只写在声明里。
+
+    为什么这条非有不可:`tests/test_auth_wiring.py` 是**静态**的 —— 它读
+    `APIRoute.dependencies`,证明「守卫挂上去了」。而一件事没有被任何**运行时**
+    用例证明过:那 9 个 `APIRouter(dependencies=[...])` 到底有没有被 FastAPI 带进
+    请求处理。静态绿 + 运行时没人验,正是本仓编目过的假绿形状
+    (「看起来接上、其实没接」)。
+
+    判据是**逐条枚举**出来的路由(不是手抄一份清单 —— 手抄的清单会与代码漂移,
+    而且漏掉的那条正好是没人验的那条):直接拿 `tests/test_auth_wiring.py` 那个
+    扫描器(通篇就这一处实现,两个文件读同一份),把 `PUBLIC` 之外的**每一个**
+    操作都打一枪不带 token 的请求。
+
+    ⚠️ **空 body 也回 401,不是 422**(本机实测):`solve_dependencies` 先跑
+    router 级依赖,它抛的 `HTTPException` 当场穿出去;而「请求体不合法」是
+    收集起来、等依赖解完之后才一起判的。所以这里的 POST 一律发 `{}` 就够 ——
+    真发合法请求体反而会让用例依赖那些端点的入参契约(那是别人要管的)。
+
+    ⚠️ 本文件的 `pytestmark = pytest.mark.db` 是**模块级**的,所以这条也跟着
+    要 MySQL —— 而它**本身不需要库**(401 在碰库之前就回去了)。记在这里,
+    免得有人以为「它跑得慢是因为在查库」。
+    """
+    from test_auth_wiring import PUBLIC, _iter_api_routes
+
+    guarded = [
+        (sorted(r.methods)[0], _fill_path_params(r.path))
+        for r in _iter_api_routes()
+        if (sorted(r.methods)[0], r.path) not in PUBLIC
+    ]
+    # 扫描器护栏(与本仓 `test_the_scan_actually_finds_routes` 同款):
+    # 空列表上「一条都不红」恒真,那就成了一条空绿。
+    assert len(guarded) >= 26, f"只枚举到 {len(guarded)} 条 —— 枚举塌了:{guarded}"
+
+    bad = []
+    for method, path in guarded:
+        r = await client.request(method, path, json={} if method == "POST" else None)
+        if r.status_code != 401:
+            bad.append((method, path, r.status_code))
+    assert not bad, (
+        f"这些端点不带 token 也放行了(守卫没挂到请求路径上):{bad}\n"
+        f"(期望一律 401「未认证」)"
+    )
 
 
 @pytest.mark.anyio

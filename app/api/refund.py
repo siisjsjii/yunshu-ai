@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 #: 「服务端出问题」的细节泄漏给调用方。
 INFRA_FAILURE_DETAIL = "数据服务暂时不可用"
 
-router = APIRouter()
+#: router 级守卫 —— 理由见 `app/api/chat.py` 同一行。
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def _infra_failure(api_key: str) -> HTTPException:
