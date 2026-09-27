@@ -1519,12 +1519,24 @@ def test_workbench_routes_require_admin():
     assert not wrong, f"这些工作台端点不是 require_admin:{wrong}"
 
 
+#: 「守卫」的词表 —— 用来把「挂了守卫」与「依赖了别的东西」分开。
+#: ⚠️ 计划初稿在这里写的是 `_guard_names(login) == set()`,**那条恒假**(实现者实测):
+#: `_guard_names` 收的是**全部**依赖名,而登录端点当然依赖 `get_session`/`get_settings`
+#: —— 判据要的是「**没有守卫**」,不是「没有依赖」。
+GUARDS = {"require_user", "require_admin"}
+
+
 def test_login_is_public_and_me_is_user_only():
     by_key = {(sorted(r.methods)[0], r.path): r for r in _iter_api_routes()}
-    assert _guard_names(by_key[("POST", "/api/auth/login")]) == set(), \
+    assert _guard_names(by_key[("POST", "/api/auth/login")]) & GUARDS == set(), \
         "登录端点不能要 token(否则永远登不上)"
-    assert "require_user" in _guard_names(by_key[("GET", "/api/auth/me")])
-    assert "require_admin" not in _guard_names(by_key[("GET", "/api/auth/me")])
+    # ⚠️ **要断「挂的是哪一个」,不能只断「有没有守卫」**:
+    # T3 复审实测 —— 把 `/me` 的 `require_user` 换成 `require_admin`,
+    # **T3 全部 7 条测试照样绿**。粗断言放走的那一个变异,后果是
+    # 非 admin 用户一进页面就看到一个「登录也清不掉」的登录浮层。
+    me = _guard_names(by_key[("GET", "/api/auth/me")])
+    assert "require_user" in me, f"/me 必须挂 require_user,实际 {me}"
+    assert "require_admin" not in me, f"/me **不能**要 admin(否则非 admin 永远进不去),实际 {me}"
 ```
 
 - [ ] **Step 2: 跑它,确认红**
