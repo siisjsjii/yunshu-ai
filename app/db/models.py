@@ -567,3 +567,43 @@ class TopicClassification(Base):
     classified_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
+
+
+class User(Base):
+    """登录账号(认证功能,2026-09-27)。
+
+    ⚠️ **形状的权威是 `db/auth.sql`**:本模型只给 `seed_users.py` 与登录端点用。
+    列宽与 `conversations.user` 同为 128 —— 两边不一致的话,账号名能写进 token
+    却写不进会话,报错指向 DataError。
+
+    与两条建库路径的关系照 `db/ch10.sql` 的同款已知取舍(`TopicClassification`
+    docstring 的 ③):**本表是全新的 ⇒ `scripts/init_db.py` 的 `create_all`
+    会把它建出来**(那句「永不加列」管的是列,建表它照建)⇒
+      · **正常路径只跑 `init_db.py`**,不需要跑 `db/auth.sql`;
+      · 在表已存在时跑 `db/auth.sql` 会在那条 CREATE 上响亮地报 **1050**
+        —— **那是刻意的,不是脏库**;
+      · 想让 DDL 成为形状的权威:`DROP TABLE users;` → 跑那份 → `SHOW CREATE TABLE`。
+
+    `created_at` **只给 Python 侧的 `default`**(与其余各表的 `server_default=func.now()`
+    不同):`db/auth.sql` 那一列写的是裸 `DATETIME NOT NULL`、**没有 DEFAULT** ——
+    两侧不一致的话,形状差异就不只是文本了。这里保持与 DDL 对齐。
+    """
+
+    __tablename__ = "users"
+
+    __table_args__ = (
+        # 必须在**两侧**各声明一份,且**名字相同**:DDL 与 ORM 是两条建库路径。
+        # ⚠️ 写成列上的 `unique=True`(而不是这个具名约束)**不会报任何错**,
+        # 但 create_all 那条路建出来的唯一键**自动叫 `username`**,与 DDL 的
+        # `uk_users_username` **不同名** —— 正是 ch07 `uk_conv_seq` /
+        # ch10 `uk_pool_question` 消掉的那种「看谁建的库」的形状差异
+        # (实测:本表用 `unique=True` 时 `SHOW INDEX FROM users` 读回 `username`)。
+        UniqueConstraint("username", name="uk_users_username"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False,
+                                                 default=datetime.now)
