@@ -78,6 +78,47 @@ def per_class_prf(y_true, y_pred, labels) -> list[dict]:
     return rows
 
 
+def mislabelled_flow(y_true, y_pred, labels) -> dict[tuple[str, str], int]:
+    """**误判流向矩阵** —— 行 = 真实标签,列 = 预测标签,格 = 「本该是 i、却被判成 j」的次数。
+
+    spec §8.2 的第 2 张矩阵(`evals/topic/matrix_flow.csv`,17×17)。它**不是**
+    经典混淆矩阵 —— 多标签没有唯一的预测类,所以这里**只记「认错」**,不记「漏了」:
+
+    一条样本**只在**同时满足下面两条时贡献格子 `(i, j) *`:
+
+    1. `i ∈ 真值` 且 `i ∉ 预测`  —— i 被漏了;
+    2. `j ∈ 预测` 且 `j ∉ 真值`  —— j 是凭空多出来的;
+    3. 再多一条:样本里**至少要有**一个 j(否则 `i` 就只是单纯的漏召回)。
+
+    第 2 个条件(即 `j ∉ 真值`)是这张表**唯一容易写错的地方**:去掉它,
+    真实 `[退换货, 尺码]` / 预测 `[尺码]` 会被记成「把退换货认成了尺码」——
+    而那是**漏召回**,与「认错」是两种不同的病、要两种不同的修法。
+    (`tests/test_topic_metrics.py` 里有两条用例从正反两面钉着它。)
+
+    ⚠️ **网格是稠密的**:返回的 dict 恰好有 `len(labels) ** 2` 个键,没命中的格子是 `0`。
+    `matrix_flow.csv` 是一张 17×17 的表 —— 空格子必须印 0,而不是缺列。
+    附带一个好处:判对的格子(对角线)也**存在且为 0**,读的人不会把「缺格」
+    误读成「没统计」。
+
+    ⚠️ **只认 `labels` 里的类目**(与 `per_class_prf` 同款):真值/预测里出现
+    `labels` 之外的字符串时**不进任何格子**,也不会变出额外的键。今天不可达
+    (预测由 `labels` 解码而来),写在这里是为了不让它将来变成一条静默丢数据的路。
+
+    ⚠️ 一个格子里的数**不是「有几条样本」**:一条样本可以同时给多个格子各加一次
+    (真值 `[退换货, 尺码]` 预测 `[运费]` ⇒ `(退换货,运费)` 与 `(尺码,运费)` 各 1)。
+    所以行/列之和都**不等于**任何一列的 support —— 别拿它去对 `per_class_prf` 的数。
+    """
+    y_true_sets, y_pred_sets = _aligned(y_true, y_pred)
+    flow = {(i, j): 0 for i in labels for j in labels}
+    for true_set, pred_set in zip(y_true_sets, y_pred_sets):
+        missed = [i for i in labels if i in true_set and i not in pred_set]
+        wrong = [j for j in labels if j in pred_set and j not in true_set]
+        for i in missed:
+            for j in wrong:
+                flow[(i, j)] += 1
+    return flow
+
+
 def subset_accuracy(y_true, y_pred) -> float:
     """**整条完全一致率** —— 标签集合逐条完全相同才算对(最严、最诚实)。
 
