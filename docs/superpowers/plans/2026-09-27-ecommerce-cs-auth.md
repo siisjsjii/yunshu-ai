@@ -1214,15 +1214,47 @@ def _guard_names(route: APIRoute) -> set[str]:
     return names
 
 
-def _api_routes():
-    for r in app.routes:
-        if isinstance(r, APIRoute) and r.path.startswith("/api/"):
+def _iter_api_routes():
+    """遍历**所有**真实端点(**递归** —— 理由见下面那条护栏的 docstring)。
+
+    ⚠️ **fastapi 0.141.1 实测**(2026-09-27):`include_router` 往 `app.routes` 里放的是
+    一个 `_IncludedRouter` **包装对象**,**不是** `APIRoute`。所以
+    `for r in app.routes: if isinstance(r, APIRoute)` **一条都遍历不到**。
+    真正的路由挂在包装的 `.original_router.routes` 上(再往下一层还是包装就继续递归)。
+    """
+    def walk(routes):
+        for r in routes:
+            if isinstance(r, APIRoute):
+                yield r
+            else:
+                inner = getattr(r, "original_router", None)
+                if inner is not None:
+                    yield from walk(inner.routes)
+
+    for r in walk(app.routes):
+        if r.path.startswith("/api/"):
             yield r
+
+
+def test_the_scan_actually_finds_routes():
+    """⚠️ **上面那条扫描器的护栏 —— 没有它,这一整个文件是一条空绿。**
+
+    `assert not unguarded` 在**空列表**上恒真:一个「一条都没遍历到」的扫描器
+    (比如 fastapi 换了个包装类型、或者写成了非递归)会**安静地通过**,
+    而它一个端点都没检查过 —— 这正是本文件要防的那种假绿,只不过换到了它自己身上。
+
+    27 = spec §6.4 的操作数(25 既有 + login + me)。**只多不少** ——
+    将来加端点时这个数字不会假红(留了余量),但「遍历塌成 0」一定会。
+    """
+    found = [(sorted(r.methods)[0], r.path) for r in _iter_api_routes()]
+    assert len(found) >= 27, (
+        f"只扫到 {len(found)} 条端点 —— 扫描器塌了(不是端点少了):{found}"
+    )
 
 
 def test_every_api_route_is_guarded_or_whitelisted():
     unguarded = []
-    for r in _api_routes():
+    for r in _iter_api_routes():
         key = (sorted(r.methods)[0], r.path)
         if key in PUBLIC:
             continue
@@ -1239,7 +1271,7 @@ def test_workbench_routes_require_admin():
     任何登录用户都能核准知识,而**所有测试照样绿**(默认装置给的是 admin)。"""
     workbench = ("/api/kb/", "/api/review/", "/api/topics/", "/api/traces/")
     wrong = []
-    for r in _api_routes():
+    for r in _iter_api_routes():
         if not r.path.startswith(workbench):
             continue
         if "require_admin" not in _guard_names(r):
@@ -1248,7 +1280,7 @@ def test_workbench_routes_require_admin():
 
 
 def test_login_is_public_and_me_is_user_only():
-    by_key = {(sorted(r.methods)[0], r.path): r for r in _api_routes()}
+    by_key = {(sorted(r.methods)[0], r.path): r for r in _iter_api_routes()}
     assert _guard_names(by_key[("POST", "/api/auth/login")]) == set(), \
         "登录端点不能要 token(否则永远登不上)"
     assert "require_user" in _guard_names(by_key[("GET", "/api/auth/me")])
