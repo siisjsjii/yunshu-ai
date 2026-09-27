@@ -1,0 +1,53 @@
+预检通过:/api/ticket=422 /api/refund=422(当前代码)
+
+== 验收 1:多轮意图(物流 → 退款 → 物流)每轮 intent 判对 ==
+  PASS  第 1 轮(物流) intent=物流
+  PASS  第 2 轮(退款) intent=退款退货
+  PASS  第 3 轮(物流) intent=物流
+  ── 第 2 轮 trace(上下文有没有接上,看这一行):["resolve_references", "classify_intent:退款退货", "refund:问题/历史里取到订单号 1005", "refund:fetch ok", "refund_expand_retrieve:3 路 7 命中 top=0.69", "refund:judge 能退", "refund:offer 1005", "log_turn"]
+  ── 第 1 轮 trace:["resolve_references", "classify_intent:物流", "agent:step1 tool=query_order", "agent:converged", "log_turn"]
+
+== 验收 2:意图 JSON 可解析 + 怪问题落「其他」 ==
+  PASS  普通问题的 intent 落在九类闭集内:闲聊(confidence=0.98)
+  PASS  怪问题落「其他」并走 fallback_reply:["resolve_references", "classify_intent:其他", "fallback_reply", "log_turn"]
+  PASS  回复是固定兜底话术:抱歉,我没太理解您的意思,可以再说得具体一些吗?
+
+== 验收 3:「这个能退吗」补全指代 → 走退款子流程 → 拿到订单与政策 ==
+  PASS  trace 有 resolve_references(每轮都会有的节点,弱判据)
+  PASS  指代补全成立:子流程取到上下文里的订单号 1007
+  PASS  子流程取到了这一单(refund:fetch ok)
+  PASS  政策证据非空:检索命中 4 条、citations 帧 4 条(首条:这个能退吗（机械键盘）)
+  ── 第 2 轮 trace:["resolve_references", "classify_intent:退款退货", "refund:问题/历史里取到订单号 1007", "refund:fetch ok", "refund_expand_retrieve:3 路 4 命中 top=0.97", "refund:judge 不能退", "refund:explain", "log_turn"]
+
+== 验收 4:不带订单号问退款 → 订单卡片 → resume 走完 → 落库 ==
+  PASS  挂起轮帧序列恰好是 meta,order_choice(没有 done)
+  PASS  订单卡片载荷可点:20240915,20240901,20240818,20240808
+  PASS  挂起轮没往 messages 写任何行
+  PASS  续跑轮走完且没有再次挂起:[meta,citations,token,refund_offer,done]
+  PASS  回填的订单号被采纳(refund:fetch ok,而不是 not_found)
+  PASS  退款入口的帧与 trace 同向(refund_offer 帧=yes)
+  PASS  refund_offer 的订单号 = resume 载荷里的 20240915
+  PASS  表单类目与单一来源一致:商品质量问题,不想要了,发错货,少发/漏发,与描述不符
+  PASS  退款单提交成功(HTTP 200,回显一致:id=1150 status=pending order_no=20240915 reason=商品质量问题)
+  PASS  refund_requests 里有对应行:20240915|商品质量问题|pending
+  PASS  非法类目 422 且没有写出任何行(库里仍是 1 行)
+  PASS  无待续流程时 resume → 409
+  PASS  409 的响应体是普通 JSON,不是 SSE 流(content-type: application/json)
+  PASS  409 的文案是固定话术:{"detail":"该会话没有待处理的流程,请直接发送消息开始新一轮。"}
+
+════════════════════════════════════════════════════════════════
+⚠️  以下部分**只能人工验**(浏览器,脚本覆盖不到):验收标准 4 的前端一半
+    脚本已经验到边界:卡片载荷的形状(选项非空、order_no/status/product/amount
+    四值齐全)、以及点击/提交时前端要发的两个请求(resume 与 POST /api/refund)
+    真的走通了。**没有验**的是 index.html 把这帧画成了可点的卡片、点击时发对了载荷。
+    人工步骤(约 2 分钟):
+      1) 浏览器开 http://localhost:8000(新开一个会话);
+      2) 发「我想退款」;
+      3) 应出现**可点的订单卡片**(订单号 / 状态 / 商品 / 金额);点第一张;
+      4) 回复应接着流进同一个气泡,并出现**退款原因下拉 + 提交按钮**(选项来自帧);
+      5) 选一个原因提交,应看到回执(退款单已创建);
+      6) 复核:SELECT * FROM refund_requests WHERE conversation_id='6c93e6648acb4de68d35b07f4b95c53d';
+         (本次脚本用过的会话 id 与订单号就在上面几条 PASS 行里)
+════════════════════════════════════════════════════════════════
+
+结果:24 通过,0 失败,0 项未复现(见上面的 WARN 行 —— 它们**没有**被验过,别当通过)

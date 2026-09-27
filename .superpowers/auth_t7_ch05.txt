@@ -1,0 +1,13 @@
+== 验收 1:政策类问题走到强制检索节点 ==
+  FAIL  trace 里没有强制检索节点:null
+== 验收 2:Agent 自己调工具作答 ==
+  PASS  Agent 自己调了工具,且每个调用都有结果(1 次)(trace=["resolve_references", "classify_intent:物流", "agent:step1 tool=query_order", "agent:converged", "log_turn"])
+== 验收 3:投诉 → 两个独立选项 ==
+  PASS  choices 帧的 options 同时含 handoff 与 ticket:handoff,ticket
+  PASS  投诉未进 Agent(agent_steps=0)
+== 验收 4:闲聊拿到固定话术 ==
+  PASS  闲聊固定话术:你好呀~我是本店客服小猫,有什么可以帮您的吗?
+== 验收 5:复杂问题 ReAct 不止一步 ==
+  PASS  ReAct 走了 3 步、2 次工具调用、0 次工具失败(trace=["resolve_references", "classify_intent:订单", "agent:step1 tool=query_order", "agent:step2 tool=query_product", "agent:converged", "log_turn"])
+
+结果:5 通过,1 失败

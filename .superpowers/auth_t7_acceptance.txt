@@ -1,0 +1,196 @@
+=== 前置:服务可达性 ===
+  ✅ http://localhost:8000 可达
+
+=== 验收 1:流式回复 ===
+event: meta
+data: {"session_id": "9c0fcdc47e6d42ae91eb8e0a9caa166d", "model": "deepseek-flash"}
+
+event: order_choice
+data: {"options": [{"order_no": "20240915", "status": "已付款", "product": "机械键盘", "amount": "60.32"}, {"order_no": "20240901", "status": "已取消", "product": "机械键盘", "amount": "507.56"}, {"order_no": "20240818", "status": "已取消", "product": "无线耳机"
+  ✅ 收到 meta 首帧
+  ❌ token 帧只有 0 个,不是逐 token 推送
+  ❌ 没有 done 帧
+  ── 拼回后的完整回复(中文完整性证据):
+  ❌ 第一轮回复为空 —— 编码损坏
+
+
+=== 验收 2:两轮上下文 ===
+  第一轮:已为您查到订单 20240915（机械键盘，金额 60.32，下单时间 2026-08-27 17:51），目前状态为「已付款」，尚未显示发货记录。
+
+具体发货时间和延迟原因需要仓库进一步核实，我这边无法直接确认。需要我帮您转人工客服跟进这笔订单吗？
+  第二轮:抱歉,我没太理解您的意思,可以再说得具体一些吗?
+
+  ❌ 第二轮回复中没有 20240915 —— 上下文没接住
+
+=== 验收 3:结构化抽取 ===
+{"order_id":"20240915","request_type":"换货","expected_solution":"希望将鞋子更换为大一号的尺码。"}
+
+  ✅ 抽出 order_id
+  ✅ 抽出 request_type
+  ✅ 抽出 expected_solution
+
+=== 验收 4:工具调用链路(需求 4) ===
+  订单 1003 的确定性物流状态:已签收
+  调用的工具:[query_order]  结果:[ok]
+  回复:订单 1003 目前状态为「已完成」,商品是双肩包(金额 405.44 元,2026-03-24 下单),说明包裹已签收或流程已结束。
+
+如果您想查看具体的物流节点轨迹,我这边看不到更细的信息,可以帮您转人工核实,需要吗?
+  ❌ 期望选中 query_logistics,实际调用了 [query_order]
+  ✅ 工具执行成功
+  ✅ 回复中复述了工具返回的状态「已签收」(工具结果真的被用上了)
+
+=== 验收 5:知识类问题走强制检索(验收标准 2) ===
+  调用的工具:[]  结果:[](ch05 起知识路由不发工具帧,空是正常的)
+  citations 帧条目数:0
+  回复:
+  ❌ trace 里没有 retrieve_knowledge —— 没走知识路由:null
+  ❌ 没有 citations 帧或条目为 0(检索被阈值滤空,或根本没检索)
+  ❌ 回复为空 —— 没有任何 token 帧(端点出错?)。「没跌进兜底」在空回复上不成立,不给绿
+  ❌ 回复为空
+
+=== 验收 6:邮费换说法召回(ch03 验收标准 1) ===
+  调用的工具:[query_faq]  结果:[ok]
+  intent=物流  citations 帧条目数:0  含运费标志词:no  query_faq 调用结果:[ok]
+  trace=["resolve_references", "classify_intent:物流", "agent:step1 tool=query_faq", "agent:converged", "log_turn"]
+  回复:邮费即运费:单笔订单满 99 元包邮,未满则收取 10 元运费,偏远地区运费另计;超大件商品每公斤加收 3 元。
+
+最终金额以下单页按收货地区和重量显示的为准,您方便告诉我收货地区或订单号吗?我可以帮您进一步确认。
+  ✅ Agent 自调 query_faq 拿到了非空结果(B:qf=[ok])—— 这条**只证明工具返回了结果**;帧里没有召回文本,运费条款是否真被用上由下面的要点断言负责
+  ✅ 回复没有跌进兜底话术(没走 fallback_reply)
+  ✅ 回复里含运费要点(包邮门槛 / 基础运费)
+  ✅ 回复非空且含 86 个 CJK 字符
+
+=== 验收 7:中断建库后重跑补齐(ch03 验收标准 2) ===
+  起始:总行数=141 已向量化=141 待向量化=0 Milvus条数=106
+  打回待向量化:10 行
+  build_kb 已在 25 秒处被打断(退出码 124)
+  中断后:总行数=141 已向量化=131 待向量化=10 Milvus条数=106
+  重跑后:总行数=141 已向量化=141 待向量化=0 Milvus条数=106
+  ✅ 重跑后没有待向量化的行(漏掉的块被捡起补齐)
+  ❌ Milvus 条数(106)!= 已向量化行数(141) —— 双写没对齐
+     ↳ 若 Milvus 更多:集合里残留了已删行的陈旧向量,跑 build_kb --reindex 重建
+
+=== 验收 8:上传 → 向量化 → 改说法召回(ch04 验收标准 1) ===
+  上传返回:{"name":"超大件运费-108.md","type":"policy","title":"超大件运费","chunks_added":0,"chunks_skipped":1}
+  ✅ 上传成功,已切分入库
+Traceback (most recent call last):
+  File "<string>", line 7, in <module>
+    with urllib.request.urlopen(f"{base}/api/kb/jobs/{jid}") as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 189, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 495, in open
+    response = meth(req, response)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 604, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 533, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 466, in _call_chain
+    result = func(*args)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 613, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 401: Unauthorized
+  ❌ 向量化任务超时
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; print(json.load(sys.stdin)["status"])
+                           ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 2 column 1 (char 1)
+  ❌ 向量化任务未完成:
+Traceback (most recent call last):
+  File "<string>", line 16, in <module>
+    asyncio.run(main())
+    ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 196, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 119, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "<string>", line 10, in main
+    chunks = await build_retriever(session).search(os.environ["QUERY"])
+                   ~~~~~~~~~~~~~~~^^^^^^^^^
+TypeError: build_retriever() missing 1 required positional argument: 'settings'
+  ❌ 未召回「超大件商品运费单独计费」—— 上传或向量化链路没生效
+
+=== 验收 9:挖知识幂等(ch04 验收标准 2) ===
+Traceback (most recent call last):
+  File "<string>", line 7, in <module>
+    with urllib.request.urlopen(f"{base}/api/kb/jobs/{jid}") as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 189, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 495, in open
+    response = meth(req, response)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 604, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 533, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 466, in _call_chain
+    result = func(*args)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\urllib\request.py", line 613, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 401: Unauthorized
+  ❌ 第一次挖知识超时
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; print(json.load(sys.stdin)["status"])
+                           ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 2 column 1 (char 1)
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; print(json.load(sys.stdin).get("message",""))
+                           ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mike\AppData\Local\Programs\Python\Python313\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 2 column 1 (char 1)
+  ❌ 第一次挖知识失败:
+
+================================
+通过 13 项，失败 15 项

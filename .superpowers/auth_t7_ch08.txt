@@ -1,0 +1,68 @@
+== 起环境:两个 MCP Server(8101/8102)+ 客服服务(8000)==
+  两个 MCP Server 已就绪(logistics=3317 aftersales=3320)
+  8101 暴露的工具:query_logistics
+  客服服务已就绪(pid 3331)
+
+== 验收 2:业务 MCP Server 的工具能查到真数据(基线,未改任何文件)==
+  题面:订单 1011 到哪了
+  intent=物流 / 调用的工具:query_logistics  / error 帧 0 条
+  PASS  done 帧拼回后非空(178 字节):您的订单1011目前显示**派送中**,最新轨迹在成都分拨中心:7月30日11:19已发出,7月31日13:19进入
+  PASS  审计里有 source='mcp:logistics' 的调用:query_logistics|mcp:logistics|success|0|1256
+  WARN  落点成立:回复里出现了订单 1011 的物流状态「派送」⇒ 工具数据确实被用进了答复。**仍然不计为通过**(模型判定,不是代码判定)
+
+== 验收 1:往 app/tools/builtin/ 丢一个新模块 → 重启客服服务 → 它就能用 ==
+  已写入 app/tools/builtin/zz_echo_note.py(未跟踪文件,退出时由 git clean 还原)
+  (第 2 次启动才起来 —— 上一次的端口还没归还)
+  客服服务已重启(pid 3501)
+  调用的工具:query_logistics echo_note 
+  PASS  回复里有那句话(十六进制码点构造的 needle 命中)
+  PASS  审计里有 source='builtin'、tool_name='echo_note' 的成功调用
+
+== 还原验收 1 的临时模块,重启客服服务(后面几项要在干净的服务上跑)==
+  已还原(临时模块 git clean 掉、mcp_servers/logistics.py git checkout 回原样)
+  客服服务已重启(pid 3553)
+
+== 验收 3:给 MCP Server 加工具 → 只重启该 Server → 客服服务不用动 ==
+  补丁:patched
+  8101 现在的工具:query_logistics query_delivery_estimate
+  PASS  Server 侧已暴露新工具 query_delivery_estimate(直接读 tools/list,不经模型)
+  PASS  客服服务没被重启过:监听 8000 的进程前后都是 43088(netstat 读的),且脚本起的进程(MSYS pid 3553)仍活着
+  题面:订单 1011 预计什么时候能送到? / 调用的工具:query_delivery_estimate 
+  PASS  客服系统真的调到了新工具(审计:query_delivery_estimate|mcp:logistics|success|0|1465)
+
+== 验收 4:走确认流并点「确认提交」= 工单真的建出来 ==
+  题面:订单 1011 的物流,帮我建个工单
+  提问轮的帧:event: meta event: ticket_confirm event: token event: tool_call event: tool_result 
+  PASS  acc4:模型调了 create_ticket 之后,卡片帧真的出现了(挂起,本轮不发 done —— done=0 条)
+  续跑轮的帧:event: done event: meta event: token event: tool_result (error 帧 0 条)
+  会话 27accd73c25944e0a1909975407c516c / tickets:0 → 1
+  PASS  tickets 表多了一行(0 → 1)
+  PASS  回复里有工单号 T-20260928014428-6939(与库里那一行**同一个**号)
+  PASS  审计里 create_ticket 是 success
+
+== 验收 5:同一条路径,这回点「取消」= 工单**不**建,审计记权限拒绝 ==
+  题面:订单 1011 的物流,帮我建个工单
+  提问轮的帧:event: meta event: ticket_confirm event: token event: tool_call event: tool_result 
+  PASS  acc5:模型调了 create_ticket 之后,卡片帧真的出现了(挂起,本轮不发 done —— done=0 条)
+  续跑轮的帧:event: done event: meta event: token event: tool_result (error 帧 0 条)
+  会话 554faab51c204e3ba36dbc8e95d22898 / tickets:0 → 0
+  PASS  tickets 表**没有**多行(0 → 0)
+  PASS  审计里 create_ticket 是 permission_denied
+
+== 验收 6:TOOL_TIMEOUT_SECONDS=0.001 —— 只读可重试,写操作**结构性**不重试 ==
+  客服服务已就绪(pid 3731,TOOL_TIMEOUT_SECONDS=0.001)
+  只读那轮的审计行(tool|source|status|retry|ms):
+    query_logistics|mcp:logistics|timeout|2|629
+    query_logistics|mcp:logistics|timeout|2|3629
+  PASS  只读工具超时且重试到用尽:query_logistics|mcp:logistics|timeout|2|629
+  PASS  duration_ms=629 ≥ 500(整轮尝试的墙钟:3 次尝试 + 2×0.3s 延迟 ⇒ 下界 600ms)
+  题面:订单 1011 的物流,帮我建个工单
+  提问轮的帧:event: meta event: ticket_confirm event: token event: tool_call event: tool_result 
+  PASS  acc6_w:模型调了 create_ticket 之后,卡片帧真的出现了(挂起,本轮不发 done —— done=0 条)
+  续跑轮的帧:event: error event: meta event: token event: tool_result (error 帧 1 条)
+    error 文案:This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.rollback(). Original exception was:  (Backgr
+  写操作的审计行:create_ticket|builtin|timeout|0|6
+  PASS  写操作超时且 retry_count=0 —— 「永不重试」是结构保证(kind 推出),不是配置约定
+
+════════════════════════════════════════════════════════════════════════
+结果:18 通过,0 失败,1 项未复现(见上面的 WARN 行 —— 它们**没有**被验过,别当通过)
