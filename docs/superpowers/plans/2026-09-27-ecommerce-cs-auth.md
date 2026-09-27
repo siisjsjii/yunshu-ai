@@ -1789,7 +1789,11 @@ git commit -m "认证 T5:9 个 router 挂守卫(用户面 require_user / 工作�
 
 - [ ] **Step 3: 改 `index.html`**
 
-1. `<head>` 之外、`<script>` **之前**加 `<script src="/static/auth.js"></script>`
+1. `<head>` 之外、`<script>` **之前**加 `<script src="/auth.js"></script>`
+   ⚠️ **不是 `/static/auth.js`**(计划初稿写错过,实现者 curl 实测):`app/main.py` 把静态目录
+   **挂在 `/` 上**(`app.mount("/", StaticFiles(directory=_static_dir, html=True))`)⇒
+   文件在**根路径**下,`/static/auth.js` 会 **404**。失败形态很坏:页面照常渲染、
+   而 `window.authFetch` 是 `undefined` ⇒ **整页静默什么都不做**。
    (⚠️ 必须**先**加载 —— 下面那把 IIFE 依赖 `window.authFetch`)。
 2. 8 处 `fetch(` 改成 `authFetch(`:`:544`(feedback)、`:691`(chat/stream **加 `stream: true`**)、
    `:787` / `:859`(kb/documents)、`:999`(refund)、`:1069`(ticket)、
@@ -1806,7 +1810,7 @@ git commit -m "认证 T5:9 个 router 挂守卫(用户面 require_user / 工作�
 
 - [ ] **Step 4: 改 `admin.html`**
 
-1. 同样先引 `<script src="/static/auth.js"></script>`。
+1. 同样先引 `<script src="/auth.js"></script>`(⚠️ 理由同上,**不是** `/static/…`)。
 2. 唯一一处 `fetch(`(`:441` 的 `req()`)改成 `authFetch(path, opts)` —— **改这一处就全覆盖**。
 3. 顶栏加 `#who` 容器 + 同样的 `authBoot` 包裹(启动处换成
    `authBoot(() => { mountUserBadge(...); switchTab("首页"); })`)。
