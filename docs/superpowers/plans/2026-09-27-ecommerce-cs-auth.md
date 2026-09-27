@@ -1194,6 +1194,42 @@ async def get_owned_conversation(*, session, conversation_id: str,
 
 改后的那条**断言方向是反的**,这正是它的价值:它钉的是「客户端**不能**自称是谁」。
 
+- [ ] **Step 7b: 跟改 `tests/test_api_conversations.py`(⚠️ **11 处会同时断**,一处修完)**
+
+那个文件是**替身**测试,**经 HTTP** 打端点 —— 实测有 **11 处**:
+`c.get("/api/conversations")` **4 处**(`:276` / `:304` / `:321` / `:351`)
+与 `c.get(f"/api/conversations/{CONV_A}/messages")` **7 处**
+(`:386` / `:410` / `:445` / `:479` / `:509` / `:536` / `:566`)。
+
+**它们为什么会断**:
+- 列表那 4 处:端点改成按**当前登录用户**过滤,而默认装置给的是
+  `tests-default-user` ⇒ 探针行(`user="demo-user"`)**一条都回不来**;
+- 明细那 7 处:新增的归属检查 ⇒ `CONV_A` 不属于 `tests-default-user` ⇒ **404**。
+
+**一处修完**:在 `conv_client` 那个装置的 `make()` 里显式覆盖
+(探针行本来就是 `demo-user`,于是 11 处**一个字都不用动**):
+
+```python
+        app.dependency_overrides[get_session] = _override
+        # 认证(2026-09-27):本文件的探针会话都属于 `demo-user`,而端点现在
+        # **按当前登录用户**过滤/校验归属 ⇒ 这里显式让「当前登录用户」就是
+        # `demo-user`。**刻意不依赖 conftest 那个全局默认装置** ——
+        # 默认给的是 `tests-default-user`,与本文件的探针不是一个用户,
+        # 而那种不一致会以「列表空 / 明细 404」的形式红,读起来像端点坏了。
+        app.dependency_overrides[require_user] = lambda: AuthenticatedUser(
+            username="demo-user", role=ADMIN)
+        return TestClient(app)
+```
+
+⚠️ `conv_client` 的收尾是 `app.dependency_overrides.clear()` —— 它会把 conftest 那个
+全局装置也一并清掉,而**卸载顺序是「后装的先拆」**(本装置比 autouse 后装 ⇒ 先拆),
+autouse 那边随后 `pop` 两个已经不存在的键(no-op)⇒ **安全**,不用改。
+
+⚠️ **名字与 docstring 要跟着改**:`test_list_filters_by_demo_user` 这个名字与它
+docstring 里那句「(无认证,前端从来不传 `user_id`)」**当场变假** ——
+改成「按**当前登录用户**过滤」,并把 `demo-user` 的来源说清楚(是**这个装置**指定的,
+不是常量)。本仓那条「别让本次改动把别处的注释变假」。
+
 - [ ] **Step 8: ⚠️ 写路径的归属:**如实记账,不在本任务做**
 
 `ensure_conversation` 今天对**已存在**的行**忽略**传入的 user_id ⇒ 知道别人 32 位
@@ -1203,6 +1239,71 @@ async def get_owned_conversation(*, session, conversation_id: str,
 (端点要能分辨「不存在」与「别人的」并各自翻 404),牵动 3 个调用点;
 而它需要先知道一个**不可猜**的 uuid4 hex。**用户要求的是「按用户查会话历史」(读路径)**。
 ⇒ 本任务只收严**读**路径,写路径作为**已知缺口**记账。
+
+- [ ] **Step 8b: ⚠️ 在 `tests/conftest.py` 加「默认已登录」装置(**本任务必须做**)**
+
+⚠️ **为什么它在 T4 而不是 T5**(计划初稿把它排在 T5,**那会让 T4 的树是红的**):
+本任务给 `POST /api/chat/stream` / `/api/ticket` / `/api/refund` 与两个读端点的
+**签名**加上了 `user: Annotated[AuthenticatedUser, Depends(require_user)]` ——
+**依赖写在签名里就已经生效**,不必等 T5 挂 router 级守卫。
+⇒ 没有下面这个装置的话,**每一个经 HTTP 打这些端点的既有用例都会 401**,
+而 T4 的实现者会卡在「一片红,但红的原因不是我的改动」。
+
+> ⚠️ `_no_default_login` **Task 3 已经定义过了**(`return None` 就够,那个开关只认
+> **名字在不在**)⇒ **本步只加下面这一个**,不要再写一遍那个 —— 同名的 fixture
+> 写两遍会让 pytest 在收集阶段直接报错。
+
+```python
+@pytest.fixture(autouse=True)
+def _default_login(request):
+    """**每条用例**默认带一个已登录的 admin。
+
+    ## 为什么要有它
+
+    认证一挂,`app/api/` 下 25 个操作全部要 token ⇒ 16 个既有测试文件里
+    **约 79 处**端点调用会集体变红,而它们**测的都不是认证**。
+    在**一处**注入默认身份,那 79 处一个字都不用改。
+
+    ## 它与「假绿」的关系(必须配套 `tests/test_auth_wiring.py`)
+
+    它让「这个端点受不受保护」在测试里**恒真** —— 少挂一个守卫照样全绿。
+    那件事由 `tests/test_auth_wiring.py` **不经过本装置**地钉住。
+    **两条必须同时在**,少一条就是本仓编目过的形态 ⑦。
+
+    ## 为什么是 admin 而不是 user
+
+    默认给 `user` 的话,工作台那 18 个端点在既有测试里会**集体 403**;
+    而 admin 是**超集**(能打用户面也能打工作台)—— 与 spec §6.4 的语义一致。
+
+    ## ⚠️ 开关为什么用 `request.fixturenames` 而**不是参数**
+
+    写成 `def _default_login(_no_default_login)` 的话,那个名字**永远**在
+    `fixturenames` 里 ⇒ 默认登录**永远**被跳过 ⇒ 那 79 处调用**集体 401**。
+    (实测过:临时 conftest + 两条用例,只有这一版对。)
+    """
+    if "_no_default_login" in request.fixturenames:
+        yield None
+        return
+
+    from app.auth import ADMIN, AuthenticatedUser, require_admin, require_user
+    from app.main import app as fastapi_app
+
+    fake = AuthenticatedUser(username="tests-default-user", role=ADMIN)
+    fastapi_app.dependency_overrides[require_user] = lambda: fake
+    fastapi_app.dependency_overrides[require_admin] = lambda: fake
+    yield
+    fastapi_app.dependency_overrides.pop(require_user, None)
+    fastapi_app.dependency_overrides.pop(require_admin, None)
+```
+
+- [ ] **Step 8c: 跑一次**面广一点**的回归,确认「一片红」没发生**
+
+Run:
+```bash
+.venv/Scripts/python.exe -m pytest tests/test_api_chat.py tests/test_api_refund.py tests/test_api_conversations.py tests/test_api_conversations_db.py tests/test_chat_service.py tests/test_history.py -p no:cacheprovider
+```
+Expected: 全绿。**红了先看是不是「请求体还带 `user_id`」或「探针用户名不是 `demo-user`」**
+—— 那两类是 Step 7 / Step 7b 已点名要改的;其余的红要当**真缺陷**查。
 
 - [ ] **Step 9: 跑相关测试**
 
@@ -1375,63 +1476,21 @@ router = APIRouter(dependencies=[Depends(require_admin)])
 > **为什么用 router 级**:9 行 vs 25 处,少 16 个「调用点自己记得做」的机会;
 > 而且它让上面那条结构性测试成为可能(本仓「不变量放在唯一写口上」)。
 
-- [ ] **Step 4: 在 `tests/conftest.py` 加默认登录装置**
+- [ ] **Step 4: 核对 `tests/conftest.py` 的默认登录装置**已经在**了(⚠️ **不要重复加**)**
 
-```python
-@pytest.fixture
-def _no_default_login():
-    """**关掉**下面那个「默认已登录」装置 —— 只有认证自己的测试需要它。
+⚠️ **它由 Task 4 落地**(那才是第一个让端点需要 token 的任务 —— 依赖写在**端点签名**里
+就已经生效,不必等本任务的 router 级守卫;理由与代码见 T4 的 Step 8b)。
+本步**一个字都不改**,只核对:
 
-    它的存在理由:那几条用例测的就是「没登录时会怎样」,被默认装置一盖,
-    断言的「401」会变成 200 而**红得莫名其妙**(或者更糟:有人把断言改成 200)。
-    """
-    return None
-
-
-@pytest.fixture(autouse=True)
-def _default_login(request):
-    """**每条用例**默认带一个已登录的 admin。
-
-    ## 为什么要有它
-
-    认证一挂,`app/api/` 下 25 个操作全部要 token ⇒ 16 个既有测试文件里
-    **约 79 处**端点调用会集体变红,而它们**测的都不是认证**。
-    在**一处**注入默认身份,那 79 处一个字都不用改。
-
-    ## 它与「假绿」的关系(必须配套 `tests/test_auth_wiring.py`)
-
-    它让「这个端点受不受保护」在测试里**恒真** —— 少挂一个守卫照样全绿。
-    那件事由 `tests/test_auth_wiring.py` **不经过本装置**地钉住。
-    **两条必须同时在**,少一条就是本仓编目过的形态 ⑦。
-
-    ## 为什么是 admin 而不是 user
-
-    默认给 `user` 的话,工作台那 18 个端点在既有测试里会**集体 403**;
-    而 admin 是**超集**(能打用户面也能打工作台)—— 与 spec §6.4 的语义一致。
-
-    ## ⚠️ 开关为什么用 `request.fixturenames` 而**不是参数**
-
-    写成 `def _default_login(_no_default_login)` 的话,那个名字**永远**在
-    `fixturenames` 里 ⇒ 默认登录**永远**被跳过 ⇒ 那 79 处调用**集体 401**。
-    (实测过:临时 conftest + 两条用例,只有下面这一版对。)
-    """
-    if "_no_default_login" in request.fixturenames:
-        yield None
-        return
-
-    from app.auth import ADMIN, AuthenticatedUser, require_admin, require_user
-    from app.main import app as fastapi_app
-
-    fake = AuthenticatedUser(username="tests-default-user", role=ADMIN)
-    fastapi_app.dependency_overrides[require_user] = lambda: fake
-    fastapi_app.dependency_overrides[require_admin] = lambda: fake
-    yield
-    fastapi_app.dependency_overrides.pop(require_user, None)
-    fastapi_app.dependency_overrides.pop(require_admin, None)
+```bash
+grep -n "_default_login\|_no_default_login" tests/conftest.py
 ```
+Expected: 两个 fixture 都在;`_default_login` 是 **autouse**,
+且用 `"_no_default_login" in request.fixturenames` 判断
+(⚠️ **不是**把它写成参数 —— 见 T4 Step 8b 里那条说明)。
 
-⚠️ **`_no_default_login` 由 Task 3 先定义**(`return None` 就够 —— 上面那个开关
-只认**名字在不在**),本任务**保留**它、不要改它的形状。
+⚠️ 若它**不在**(T4 漏了):**就地补上**(代码抄 T4 的 Step 8b),
+并把「T4 漏了」写进你的报告 —— 那是**跨任务的缺口**,不是本任务的实现问题。
 
 - [ ] **Step 5: 跑两个方向都验一遍**
 
