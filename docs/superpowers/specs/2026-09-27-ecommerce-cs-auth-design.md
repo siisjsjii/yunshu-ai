@@ -102,10 +102,22 @@ created_at    DATETIME     NOT NULL
 一个活着的 `AsyncSession` 绑到一个跨函数的返回值上(本仓那条「读库的值要用新
 session」的同族考虑),而且 `frozen` 让「端点悄悄改了自己的身份」不可能。
 
-⚠️ **必须用 `HTTPBearer(auto_error=False)` 自己抛 401**(实现时用 Context7 核一遍):
-FastAPI 的 `HTTPBearer` 在**缺 header 时默认抛 403**,而本需求要的是 401
-(「没有就报401」)。两者对前端是两件事:401 ⇒ 去登录;403 ⇒ 登录了但没权限。
-⇒ 依赖里显式 `raise HTTPException(401, "未认证", headers={"WWW-Authenticate": "Bearer"})`。
+⚠️ **必须用 `HTTPBearer(auto_error=False)`,401 自己抛**。理由**不是**「FastAPI 会
+抛 403」—— 那句是**旧行为**,本机实测(fastapi **0.141.1**,2026-09-27,
+`.venv` 里跑的):
+
+| | 缺 header | 坏 token |
+|---|---|---|
+| `HTTPBearer()`(auto_error=True) | **401** `{"detail":"Not authenticated"}` + `WWW-Authenticate: Bearer` | **200 放行** |
+| `HTTPBearer(auto_error=False)` + 自己抛 | 401 `{"detail":"未认证"}` | 200 放行 |
+
+真正的两条理由:
+1. **文案要中文**(`detail: "未认证"`,与全仓其余错误文案一致);`auto_error=True`
+   给的是 `"Not authenticated"`。
+2. **「缺 header」与「token 坏了/过期了」必须是同一个出口**(都由 `require_user` 抛,
+   逐字相同的 401)—— `HTTPBearer` 那个 scheme **从不校验 token 内容**(上表第二列
+   两种配置都放行垃圾串),所以内容校验无论如何都得在 `require_user` 里做;
+   让两件事分居两个地方就会漂移。
 
 **401 与 403 的分工(前端只对 401 弹登录)**:
 
@@ -316,3 +328,27 @@ curl() { command curl -H "Authorization: Bearer $TOKEN" "$@"; }
 ## 12. 实现订正
 
 (实现期间发现与本文档的偏离写在这里,注明「为什么」——本仓每份 spec 的既有做法。)
+
+### §12.1(写计划时,2026-09-27)—— §6.1 那句「FastAPI 缺 header 默认抛 403」是**错的**
+
+**订正前的原话**:「⚠️ **必须用 `HTTPBearer(auto_error=False)` 自己抛 401**:FastAPI 的
+`HTTPBearer` 在**缺 header 时默认抛 403**,而本需求要的是 401」。
+
+**实测**(fastapi **0.141.1**,本机 `.venv`,2026-09-27):
+`HTTPBearer()`(auto_error=True)缺 header 时回的是 **401** +
+`WWW-Authenticate: Bearer`,detail 为 `"Not authenticated"`。
+403 是 FastAPI 的**旧**行为(`/how-to/authentication-error-status-code` 那页整段讲的是
+**怎么把它改回 403**,即「403 不是现在的默认」)。
+
+**结论:实现方式一个字不用改**(仍然用 `auto_error=False` + 自己抛 401),
+但**理由换了**:要的是**中文文案**与**「缺 header」和「token 坏了」走同一个出口**
+(两条都写进了 §6.1)。
+
+**为什么值得记一笔**:这条如果不实测,计划里就会带着一句「库的行为」的**假陈述**
+去派活,而它是**从 Context7 的官方文档里读出来的** —— 我先把文档读成了旧版行为、
+又在 §6.1 里把它写成了当前事实。本仓那条「语言/库 X 在情况 Z 下的断言,要么带
+可复现证据,要么显式标注未验证」在这里又兑现了一次。
+
+**顺带实测到的第二件事**(对实现有直接影响):`HTTPBearer` 的两种配置**都放行
+垃圾 token**(回 200)—— 那个 scheme 只看 header 的形状,**从不校验内容** ⇒
+「token 坏了」永远只能由 `require_user` 自己解码时拒绝。
