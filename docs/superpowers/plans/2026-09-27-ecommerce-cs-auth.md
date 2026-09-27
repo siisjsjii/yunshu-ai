@@ -567,6 +567,11 @@ git commit -m "认证 T1:鉴权内核 app/auth.py(唯一边界)+ 配置两项 + 
 -- 账号本身**不在这份文件里**:scrypt 的盐是随机的,写进 SQL 就得把某一轮的盐
 -- 焊死在文件里,且改密码要人来重算。见 `scripts/seed_users.py`(幂等、可重跑)。
 
+-- ⚠️ `SET NAMES utf8mb4;` **不能少** —— `db/` 下**其余 8 份 DDL 全都带它**,
+--    而本机 locale 是 cp936:不走它的话,从 cp936 客户端执行时下面那条
+--    `COMMENT='登录账号…'` 里的中文会被**按 cp936 重编码**(本仓 cp936 家族的第 N 次)。
+SET NAMES utf8mb4;
+
 CREATE TABLE users (
   id            BIGINT       NOT NULL AUTO_INCREMENT,
   username      VARCHAR(128) NOT NULL,
@@ -680,16 +685,22 @@ async def test_seeded_passwords_verify_and_roles_are_admin():
 class User(Base):
     """登录账号(认证功能,2026-09-27)。
 
-    ⚠️ **形状的权威是 `db/auth.sql`**:本模型只给 `seed_users.py` 与登录端点用,
-    而 `init_db.py` 的 create_all **不会**在全新库上建这张表(两边都对得上,
-    但**建表要靠那份 DDL**)。列宽与 `conversations.user` 同为 128 —— 两边不一致
-    的话,账号名能写进 token 却写不进会话,报错指向 DataError。
+    ⚠️ **`init_db.py` 的 create_all 会建出这张表**(因为本模型存在)——
+    所以**正常路径只需要 `init_db.py`**,不需要跑 `db/auth.sql`(表已在时跑它会
+    1050,**那是刻意的**,见那份 DDL 的头部注释)。两份文件**列定义逐字一致**。
+    列宽与 `conversations.user` 同为 128 —— 两边不一致的话,账号名能写进 token
+    却写不进会话,报错指向 DataError。
     """
 
     __tablename__ = "users"
+    # ⚠️ **唯一键要具名**,不能用 `unique=True`:后者生成的键名是 `username`,
+    # 而 `db/auth.sql` 里写的是 `uk_users_username` ⇒ 两条建表路径会**多出一处
+    # 名字差异**(本仓 ch08 的 `idx_conv` vs `ix_tool_audit_logs_conversation_id`
+    # 就是同一族)。具名之后差异只剩「表 COMMENT」一处,与既有那几份同款。
+    __table_args__ = (UniqueConstraint("username", name="uk_users_username"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False,
