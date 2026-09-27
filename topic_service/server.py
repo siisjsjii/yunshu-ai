@@ -34,14 +34,23 @@ def create_app(classifier) -> FastAPI:
     def healthz() -> dict:
         """服务活着 + **它到底读到了什么**。
 
-        把 `labels` 的条数与 `threshold` / `max_length` 印出来,是刻意的:
-        那两个数**唯一合法的来源是产物** ⇒ 「服务手里那份与 `models/topic-clf`
-        里那份不一样」这件事在这里**当场看得见**,而不是等到分布图整张错之后
-        没人说得出为什么。
+        这三个数(`threshold` / `max_length` / `labels`)与它们**唯一合法的来源是产物**
+        ⇒ 「服务手里那份与 `models/topic-clf` 里那份不一样」这件事在这里**当场看得见**,
+        而不是等到分布图整张错之后没人说得出为什么。
+
+        ⚠️⚠️ **`labels` 必须是那张表本身,不能只印 `num_labels`**(订正轮 1 · I-1)。
+        订正前这里只有 `num_labels` —— 那对**顺序**这一维**是瞎的**:
+        把 `labels.json` **整体反序**(17 个类目一条不差)⇒ 服务照常起、
+        `num_labels` 还是 17、阈值与长度全对、scores 全在 0–1、写库成功、
+        分布页画得出来 —— **每一类都错位,没有任何东西报错**,而这是本服务
+        **唯一的可核对出口**。计数只能抓「加/减了类目」,抓不到重排;
+        spec §2.7 / §9.1 点名的恰恰是**重排**那一种。
         """
         return {
             "status": "ok",
             "model_dir": classifier.model_dir,
+            # ⚠️ 顺序也要印 —— `num_labels` 对顺序零覆盖(见 docstring)。
+            "labels": list(classifier.labels),
             "num_labels": len(classifier.labels),
             "threshold": classifier.threshold,
             "max_length": classifier.max_length,
@@ -56,6 +65,20 @@ def create_app(classifier) -> FastAPI:
 
         **返回条数恒等于输入条数、顺序一一对应** —— 那是 Task 13 批处理的契约
         (它靠「条数对不上就抛」保整批原子;那份脚本是 **Task 13** 的活,今天还没有)。
+
+        ⚠️ **同一个 `self.model` 会被多线程并发前向**(两个端点都是同步 `def`,
+        Starlette 把它们丢进线程池 ⇒ 并发请求 = 并发前向)。**今天刻意不加锁**
+        (订正轮 1 · M-3),理由是:
+
+        ① 按 spec §9.2 的设计,唯一的调用方 `scripts/classify_topics.py`(**Task 13**)
+           **串行**跑批 —— 一批一次 `POST`,批与批之间不并发;
+        ② `model.eval()` 下只有**只读**前向,没有参数更新(`__init__` 里已经关掉 dropout)。
+
+        ⚠️ **这处取舍有先例,而且是「有先例的反面」**:本仓给**共享 torch 模型**加过锁 ——
+        `app/retrieval/embedder.py` 的 `_encode_lock`(后台任务与聊天检索会同时打进来,
+        并发 encode 不保证安全)。**那个先例的前提这里没有:没有第二个调用方、没有并发成分。**
+        ⇒ 若将来出现**第二个**调用方且它会并发打进来,加锁的位置在**这一层**
+        (不是 `TopicClassifier` 里):要包住的是「一次前向」,不是「一个实例」。
         """
         return {"results": classifier.predict(req.texts)}
 

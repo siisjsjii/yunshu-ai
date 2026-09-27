@@ -8,8 +8,6 @@
 (计划订正 14-A / 14-B / 14-D 就是这三条;14-C 是「没调用模型」那条。)
 """
 
-import pytest
-
 from app.topic.taxonomy import LABELS
 from topic_service.model import TopicClassifier
 
@@ -69,15 +67,25 @@ def test_label_order_comes_from_the_artifact(tmp_path):
     assert c.labels != list(LABELS)             # ← 且**不是**代码里那份(判别力在这一句)
 
 
-def test_the_label_set_is_the_same_either_way(tmp_path):
-    """顺序来自产物,**类目集合**仍必须等于 `taxonomy.LABELS`(spec §9.1 那条断言)。
+def test_a_missing_label_in_the_artifact_is_not_padded_back(tmp_path):
+    """产物里**少一个类目** ⇒ 服务照实少一个,不补齐到 17。
 
-    ⚠️ 这两件事要**分开**断:顺序错了是「分布图整张错」,集合错了是「类目表两处漂移」。
-    合在一句里时,打乱顺序的正确实现会**误红**,而漏一个类目的实现可能**误绿**。
+    ⚠️ **订正轮 1 · M-1:这条原本近乎空转。** 原稿写进去的是**打乱的 `LABELS`**、
+    比较对象又是 `sorted(LABELS)` —— 而 `sorted()` 恰好把顺序抹掉、
+    两边**按构造就是同一个集合** ⇒ **恒真**。它能抓的只有「加/减了类目」,
+    却把一个恒真的形状摆在那里(本仓「同义反复」家族:原稿的 14-A/14-B/14-C 也是)。
+
+    ⇒ 换成**真有可断对象**的版本:产物给 **16** 个类目(17 个里去掉 `其他`),
+    服务必须**照实**报那 16 个(顺序与集合都要对)。一个把 `taxonomy.LABELS` 写死
+    或补齐到 17 的实现**当场红** —— 那正是这一条要抓的东西。
+
+    ⚠️ 它**不是**「顺序来自产物」的重复(那是 14-A 的活):那条的产物内容与
+    `LABELS` **同集、只换序**,这条的产物**少一个元素**。
     """
-    scrambled = list(reversed(LABELS))
-    c = _classifier(tmp_path, [[0.0] * len(LABELS)], labels=scrambled)
-    assert sorted(c.labels) == sorted(LABELS)
+    partial = [label for label in LABELS if label != "其他"]          # 16 个
+    c = _classifier(tmp_path, [[0.0] * len(LABELS)], labels=partial)
+    assert c.labels == partial                    # ← 逐位相同,不是 `sorted(...)`
+    assert len(c.labels) == len(LABELS) - 1
 
 
 def test_threshold_comes_from_the_artifact(tmp_path):
@@ -115,7 +123,17 @@ def test_all_below_threshold_yields_empty_labels(tmp_path):
 
 
 def test_scores_are_probabilities(tmp_path):
-    out = _classifier(tmp_path, [[0.0] * len(LABELS)]).predict(["x"])
+    """`scores` 必须是**概率** —— `topic_classifications.scores` 与分布页那两列读的就是它。
+
+    ⚠️ **订正轮 1 · I-2:这条原本是「同义反复」家族的第四个。**
+    原稿的 logits 是**全 `0.0`**,而 `0.0 ∈ [0, 1]` —— 于是**一个拿掉 sigmoid、
+    直接把裸 logits 当 scores 返回的实现照样绿**(复审实测 M9:去掉 sigmoid 之后
+    只有解码同源那条红,这条绿)。
+
+    ⇒ 现在用 **`5.0`**(裸 logits 会**越界**),`sigmoid(5.0) = 0.9933` 仍在区间内。
+    **判据**:一条「值落在某区间」的断言,喂进去的输入必须**在那个区间之外**才可能有判别力。
+    """
+    out = _classifier(tmp_path, [[5.0] * len(LABELS)]).predict(["x"])
     assert all(0.0 <= v <= 1.0 for v in out[0]["scores"].values())
     assert set(out[0]["scores"]) == set(LABELS)
 
@@ -185,11 +203,30 @@ def _client(tmp_path, logits, **kwargs):
     return TestClient(create_app(_classifier(tmp_path, logits, **kwargs)))
 
 
-def test_healthz_reports_ok(tmp_path):
-    """`GET /healthz` 是 Task 13 / 验收脚本「服务起没起」的唯一探针。"""
-    r = _client(tmp_path, [[0.0] * len(LABELS)]).get("/healthz")
+def test_healthz_reports_what_it_read_from_the_artifact(tmp_path):
+    """`GET /healthz` 是 Task 13 / 验收脚本「服务起没起」的唯一探针 —— **也是唯一的可核对出口**。
+
+    ⚠️ **订正轮 1 · I-1 / M-2**:原来这条只断 `status == "ok"` ⇒ 把
+    `17 / 0.5 / 64` 全写死也照样绿,而它守的是「服务手里那份 == 产物那份」。
+    更糟的是那个端点的**载荷本身对顺序是瞎的**:它印的是 `num_labels`(**一个计数**),
+    于是把 `labels.json` **整体反序**(17 个类目一条不差)⇒ 服务照常起、
+    `num_labels` 还是 17、scores 全在 0–1、写库成功、分布页画得出来,
+    **而每一类都错位、没有任何东西报错**(spec §2.7 / §9.1 逐字点名的那条陷阱)。
+
+    ⇒ 这里**用非默认的产物**断四个读数,`labels` 那一行是 I-1 加的
+    (顺序也印出来了,末端点自己就不再对顺序瞎)。
+    """
+    scrambled = list(reversed(LABELS))
+    r = _client(tmp_path, [[0.0] * len(LABELS)], labels=scrambled,
+                threshold=0.7, max_length=48).get("/healthz")
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+    body = r.json()
+    assert body["status"] == "ok"
+    # ⚠️ 顺序那一行是这一条的重点:计数与阈值都抓不到「整体反序」。
+    assert body["labels"] == scrambled
+    assert body["num_labels"] == len(LABELS)
+    assert body["threshold"] == 0.7
+    assert body["max_length"] == 48
 
 
 def test_predict_endpoint_returns_one_result_per_text(tmp_path):
