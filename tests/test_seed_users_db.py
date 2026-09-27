@@ -47,8 +47,10 @@ async def test_seed_creates_both_accounts_and_does_not_append_on_rerun():
 
         await _seed_now()                       # 再跑一遍
         second = await _rows()
+        # 这条钉的是「两次运行留下的行数不变」;**它不挡「追加」** —— 挡住追加的是
+        # 唯一键 `uk_users_username`(追加的实现当场 1062,而不是静默多出一行)。
         assert len(second) == len(first), (
-            f"重跑让行数从 {len(first)} 变成 {len(second)} ⇒ 不是幂等"
+            f"重跑让行数从 {len(first)} 变成 {len(second)} ⇒ 两次运行留下的行数不同"
         )
         assert all(second[u].password_hash != first[u].password_hash for u in NAMES), (
             "两次哈希相同 ⇒ 种子脚本没重算盐(覆盖没真的发生)"

@@ -23,6 +23,11 @@
 -- 账号本身**不在这份文件里**:scrypt 的盐是随机的,写进 SQL 就得把某一轮的盐
 -- 焊死在文件里,且改密码要人来重算。见 `scripts/seed_users.py`(幂等、可重跑)。
 
+-- ⚠️ `SET NAMES utf8mb4;` **不能少** —— `db/` 下**其余 8 份 DDL 全都带它**,
+--    而本机 locale 是 cp936:不走它的话,从 cp936 客户端执行时下面那条
+--    `COMMENT='登录账号…'` 里的中文会被**按 cp936 重编码**(本仓 cp936 家族的第 N 次)。
+SET NAMES utf8mb4;
+
 CREATE TABLE users (
   id            BIGINT       NOT NULL AUTO_INCREMENT,
   username      VARCHAR(128) NOT NULL,
