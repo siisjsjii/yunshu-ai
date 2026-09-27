@@ -3960,7 +3960,31 @@ APP = Path(__file__).resolve().parents[1] / "app"
 
 #: 主链路上**不许**出现的名字。加一个就加一条 —— 别写成通配,
 #: 通配会把「日志里提了一句 topic」也判成违规,那会诱人去放宽它。
-FORBIDDEN = re.compile(r"^\s*(?:import|from)\s+(topic_service|app\.topic\.(?:model|metrics))\b", re.M)
+#
+# ⚠️⚠️ **计划订正 16(controller,2026-09-27)—— 这一条漏了一种写法** ⚠️⚠️
+# 下面那个正则只认 `from app.topic.model import …` 与 `import app.topic.model`,
+# **漏掉 `from app.topic import model`**(以及 `from app.topic import model, metrics`)。
+# 而**本仓另一条同款守卫明确把三种惯用写法都放行过** ——
+# `tests/test_topic_clean.py::test_both_sides_use_the_same_clean` 的 docstring 逐字写着:
+# 「原来只认 `from app.topic.clean import … clean` **一种写法**,一个**正确**的
+# 任务 3 / 任务 13 若写成 `from app.topic import clean` 或 `import app.topic.clean`
+# 就会被判红 —— 那会逼它们为了变绿而**改自己的 import**」。
+# ⇒ **这里是它的镜像**:那条守卫怕**误红**,这条怕**误绿**。
+# **三条惯用写法一个都不许漏**,并**各配一条元测试**(把写法喂进去 ⇒ 必须命中)。
+FORBIDDEN = re.compile(
+    r"^\s*(?:import\s+topic_service\b"
+    r"|from\s+topic_service\b"
+    r"|import\s+app\.topic\.(?:model|metrics)\b"
+    r"|from\s+app\.topic\.(?:model|metrics)\b"
+    r"|from\s+app\.topic\s+import\s+.*\b(?:model|metrics)\b)",
+    re.M,
+)
+
+#: ⚠️ **已知不可覆盖**:动态导入(`importlib.import_module("app.topic.model")`)、
+#: `__import__`、以及把模块名拼成字符串 —— **正则看不见**。
+#: ⇒ **如实写进测试的 docstring**,别让这条守卫读起来比它实际覆盖的宽
+#: (本仓已编目:一句「看起来成立」的注释不是守卫)。
+#: 真正兜住动态导入的是**别的东西**(比如服务是**独立进程**、主链路里根本没有它的地址)。
 
 #: 扫描范围:请求路径那几处。
 SCOPE = ("agent", "api/chat.py")
