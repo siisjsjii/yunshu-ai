@@ -46,14 +46,21 @@ def _conv(conv_id, user, created_at, *, summary_upto_msg_id=0, layer1_from_msg_i
     )
 
 
-def _msg(msg_id, conversation_id, role, content, *, created_at=T0):
-    """一条消息。`id` 显式给 —— 替身按 `m.id` 排序,全 None 会 TypeError。"""
+def _msg(msg_id, conversation_id, role, content, *, created_at=T0,
+         tool_calls=None, citations=None):
+    """一条消息。`id` 显式给 —— 替身按 `m.id` 排序,全 None 会 TypeError。
+
+    `tool_calls` / `citations` 默认 None = 真实库里没写过这两样的那些行
+    (两列都可空),所以绝大多数用例不需要传。
+    """
     return MessageRecord(
         id=msg_id,
         conversation_id=conversation_id,
         role=role,
         content=content,
         created_at=created_at,
+        tool_calls=tool_calls,
+        citations=citations,
     )
 
 
@@ -333,6 +340,76 @@ def test_messages_endpoint_returns_raw_text_not_truncated(conv_client):
         items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
     assert items[0]["content"] == long_reply          # ← 逐字相等
     assert "…" not in items[0]["content"]
+
+
+def test_messages_endpoint_returns_tool_calls_and_citations(conv_client):
+    """回载的每一条必须带 `tool_calls` 与 `citations` —— 它们是「工具齿轮」与
+    「文档链接」在回载时的**唯一**来源(前端从 assistant 行的 `tool_calls` 画齿轮,
+    从 `citations` 做 `[n]` 可点)。
+
+    两条都断**逐字相等**,不是「非空」:值写错了(`args` 被换成 summary、
+    `n` 编号错位)在前端表现为「齿轮名字对不上」或「点了弹错来源」,
+    而「非空」级别的断言对这两种实现**一样绿**。
+
+    ⚠️ 这条用例只验**端点有没有把这两列原样带出来**;「它们真的被写进库、
+    并且 JSON 往返回来仍是同一个结构」是 db 用例的事
+    (`tests/test_api_conversations_db.py`)—— 那正是本仓记过的
+    「替身会替被测对象完成语义」那一族。
+    """
+    tool_calls = [
+        {"id": "call_1", "name": "query_order", "args": {"order_no": "1002"},
+         "type": "tool_call"}
+    ]
+    citations = [
+        {"n": 1, "chunk_id": "77", "section_path": "退货退款政策 > 无理由退货",
+         "question": "无理由退货的期限是多久?", "answer": "七天。", "category": "退换货"}
+    ]
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    msgs = [
+        _msg(1, CONV_A, "user", "订单 1002 能退吗"),
+        _msg(2, CONV_A, "assistant", "按政策可以退[1]。",
+             tool_calls=tool_calls, citations=citations),
+    ]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
+
+    assert [i["role"] for i in items] == ["user", "assistant"]
+    # user 行两列都是 None(真实形状:没有任何写入方往 user 行上写过它们)
+    assert items[0]["tool_calls"] is None
+    assert items[0]["citations"] is None
+    # assistant 行**逐字**相等(深层结构一起比:只断某字段的写法盖不住
+    # 「args 内层字典被拍平成字符串」这类有损往返)
+    assert items[1]["tool_calls"] == tool_calls
+    assert items[1]["citations"] == citations
+
+
+def test_messages_endpoint_hides_the_tool_calls_of_filtered_out_rows(conv_client):
+    """被滤掉的那些行**不许把它们的 `tool_calls` 顺带泄漏**进结果。
+
+    动机是**一条真实的错法**:为了让「工具齿轮还在」,一个省事的实现会拿
+    「本轮全部 assistant 行(含被 `content != ''` 滤掉的那条空气泡)」去
+    拼 `tool_calls` —— 那样用户会看见一个**他当初没看见过的齿轮**
+    (空气泡那一轮的齿轮在直播时就画过了,而回载把它算了两遍会更糟:
+    同一轮出现两个同名齿轮)。这条用「空气泡带一个不同的工具名」把它钉住:
+    出现 `query_product` ⇒ 有东西从被滤掉的行里漏出来了。
+    """
+    convs = {CONV_A: _conv(CONV_A, "demo-user", T0)}
+    msgs = [
+        _msg(1, CONV_A, "assistant", "",
+             tool_calls=[{"id": "c1", "name": "query_product", "args": {},
+                          "type": "tool_call"}]),
+        _msg(2, CONV_A, "assistant", "这一单已取消",
+             tool_calls=[{"id": "c2", "name": "query_order", "args": {},
+                          "type": "tool_call"}]),
+    ]
+    client = conv_client(conversations=convs, messages=msgs)
+    with client as c:
+        items = c.get(f"/api/conversations/{CONV_A}/messages").json()["items"]
+
+    assert [i["content"] for i in items] == ["这一单已取消"]
+    names = [tc["name"] for i in items for tc in (i["tool_calls"] or [])]
+    assert names == ["query_order"], names
 
 
 def test_messages_endpoint_404s_for_unknown_conversation(conv_client):

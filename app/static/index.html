@@ -236,6 +236,10 @@
     animation: pulse 1s ease-in-out infinite;
   }
   .badge.settled .dot { animation: none; }
+  /* 回载画的齿轮**没有状态**(成败没有落库):停掉脉动,但**不置 `.settled`**
+     —— 那个类在直播路径里是「工具返回了」的意思,而返回**不等于成功**
+     (失败还要再加 `.failed`)。借它来止闪 = 给历史里的齿轮**编一个成功**。 */
+  .badge.static .dot { animation: none; }
   @keyframes pulse { 50% { opacity: .25; } }
 
   .error { color: #b00020; }
@@ -1084,12 +1088,19 @@
     scrollToEnd();
   }
 
-  // 「直接在气泡里写一段话」的助手气泡(回载那一路 —— ch10-A 之前转人工也走它,
-  // 那个调用点改成发一条真实消息后,回复由直播路径自己画)。
-  // 它的回合问题取 `lastUserText`:调用点正好是「紧跟在一段用户消息之后」
-  // (回载逐条画:助手行前面就是那条 `addUser`),而**回载里没有这条**时(会话第一条
-  // 就是助手消息)`lastUserText` 是 `null` ⇒ 👎 会拒发并在气泡里说明,
-  // 不会拿上一个会话的问题去凑(见 `attachFeedback`)。
+  // 「直接在气泡里写一段话」的助手气泡 —— **今天只有一个调用点**:
+  // `renderHistory` 里那个「端点回了一个既不是 user 也不是 assistant 的角色」
+  // 的兜底分支(生产上不可达,见那里的说明)。正常的助手行走
+  // `addAssistant + addBadge + makeCitesClickable` 那一套(它们要齿轮与引用)。
+  //
+  // (历史:ch10-A 之前「转人工」的固定话术走它,那个调用点改成发一条真实消息后
+  //  回复由直播路径自己画;ch10-followup 之前回载的助手行也走它,那个调用点
+  //  改成上面那套三样了。)
+  //
+  // 它的回合问题取 `lastUserText`:兜底分支的调用点仍然「紧跟在一段用户消息
+  // 之后」(回载逐条画:助手行前面就是那条 `addUser`),而**回载里没有这条**时
+  // (会话第一条就是助手消息)`lastUserText` 是 `null` ⇒ 👎 会拒发并在气泡里
+  // 说明,不会拿上一个会话的问题去凑(见 `attachFeedback`)。
   function appendAssistantText(text) {
     const ctx = addAssistant(lastUserText);
     ctx.body.textContent = text;
@@ -1194,9 +1205,16 @@
   }
 
   // 回载:把该会话**用户看见过的原文**重新画一遍。
-  // 助手行走 `appendAssistantText`(= 直播路径收尾时的同一形态),不是手搓
-  // 标记:两条路径画出来的气泡必须一模一样,否则侧栏切回来的和刚流出来的
-  // 会长得不一样 —— 而这种漂移不截图对比是看不出来的。
+  // 正文取的是**原文**(端点不回截短版/梗概,理由见 `app/api/conversations.py`
+  // 的 `list_messages`)。
+  //
+  // 助手行**按角色分三样**画:工具齿轮(`m.tool_calls`)+ 正文 + 引用
+  // (`m.citations` → 正文里的 [n] 可点)。用的仍是**直播路径那几件渲染件**
+  // (`addAssistant` / `addBadge` / `makeCitesClickable`),不是手搓标记:
+  // 两条路径画出来的气泡必须一模一样,否则侧栏切回来的和刚流出来的会长得
+  // 不一样 —— 而这种漂移不截图对比是看不出来的。
+  // (ch10-followup 之前这里走的是 `appendAssistantText` —— 那个函数现在只用于
+  //  **未知角色**的兜底,见下面的分支。)
   function renderHistory(items) {
     logEl.replaceChildren();
     // 逐条重画 ⇒ `lastUserText` 也必须**从头来**:不清的话,切换到一个
@@ -1204,12 +1222,51 @@
     // 本轮问题传给 `appendAssistantText`(👎 就会挂到别的会话的问题上)。
     lastUserText = null;
     items.forEach((m) => {
-      if (m.role === "user") addUser(m.content);
-      // ⚠️ 条件是 `role === "user"`,**剩下的都画成助手气泡** —— 也就是说
-      // 端点上真出现第三种角色(今天实测只有 user/assistant 两种),它会被
-      // **静默**画成助手气泡,不报错。这是有意取的简化(不为一个不存在的
-      // 角色加分支),但**别据此宣称这里「显式判断了角色」**。
-      else appendAssistantText(m.content);
+      if (m.role === "user") {
+        addUser(m.content);
+      } else if (m.role === "assistant") {
+        // ── 助手行**分三样**画回来:齿轮 + 正文 + 引用 ──────────────
+        //
+        // 与直播路径**共用同一套渲染件**(`addAssistant` / `addBadge` /
+        // `makeCitesClickable`),不是手搓标记 —— 两条路径画出来的气泡必须
+        // 一模一样,否则侧栏切回来的和刚流出来的会长得不一样,而这种漂移
+        // 不截图对比是看不出来的(同 `appendAssistantText` 上面那段)。
+        //
+        // `lastUserText` 的语义**不变**:它仍是「这个助手气泡前面最近的那条
+        // 用户消息」,给 👎 用(本函数开头重置过,见那里的说明)。
+        const ctx = addAssistant(lastUserText);
+        // 工具齿轮:`tool_calls` 的形状实测是
+        // `[{"id":…, "name":…, "args":…, "type":"tool_call"}]` —— 名字在
+        // **顶层 `name`**(与 `tool_call` 帧的 `payload.name` 同源),
+        // **不是** OpenAI 原生那层 `function.name`。取不到名字的项直接跳过:
+        // 宁可少画一个齿轮,也不要画一个写着「调用了 undefined」的。
+        (m.tool_calls || []).forEach((tc) => {
+          if (!tc || !tc.name) return;
+          // `static` 只做一件事:**停掉脉动**(否则历史里每个齿轮都会一直闪,
+          // 看起来像还有活没干完)。它**不表示**任何成败。
+          addBadge(ctx.badges, tc.name).classList.add("static");
+        });
+        // ⚠️ **回载的齿轮没有状态**:`tool_result` 帧的「成功 / 失败」
+        // (`ok`)**没有落库**(`messages` 表里没有这一列)⇒ 这里既不调
+        // `settleBadge`、也不加 `.settled` / `.failed`,**更不去猜**
+        // (比如「工具行有内容就当成功」—— 回载里根本没有工具行,而那是
+        // 一个**自信的错答案**)。要补的话得先加一列,那是另一个决定。
+        ctx.body.textContent = m.content || "";
+        // 引用:让正文里的 [n] 变成可点的文档链接(`makeCitesClickable`
+        // 在没有 citations 时**直接 return**,所以旧会话 / 没有引用的轮次
+        // 只是留下不可点的编号 —— 那是**已知且已接受的代价**,不是 bug)。
+        ctx.citations = m.citations || [];
+        makeCitesClickable(ctx);
+        scrollToEnd();
+      } else {
+        // ⚠️ **未知角色仍然兜底画成助手气泡**(不报错、也不丢内容)。
+        // 端点今天只回 user / assistant 两种(它自己的 where 就写死了
+        // `role != 'tool'`),所以这一支在生产上**不可达**;留着它是为了
+        // 「端点将来多回一种角色时」不至于把内容整条吞掉 —— 那时它会显示成
+        // 一个没有齿轮、没有引用的助手气泡,而那**明显**不对,比静默丢一条好。
+        // **别据此宣称这里「显式判断了角色」**:兜底那一支恰恰是不判断。
+        appendAssistantText(m.content);
+      }
     });
     scrollToEnd();
   }

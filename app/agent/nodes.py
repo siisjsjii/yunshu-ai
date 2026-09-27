@@ -1073,6 +1073,19 @@ def make_log_turn_node(*, session, emit):
                 Message(role="user", content=state["user_input"]),
                 *_lc_to_records(state.get("turn_messages") or []),
             ],
+            # 当轮回答的引用**落库**(历史回载要靠它把 `[n]` 还原成可点的文档链接;
+            # 不落库的话回载里那些编号是死字 —— 这正是要修的缺陷)。
+            #
+            # ⚠️ 读这个通道是**安全**的:`citations` 在 `ChatState` 里声明过,而
+            # `resolve_references` **每轮把它清零**(见那段逐轮重置的说明,
+            # `tests/test_agent_resolve.py` 钉着)—— 所以这里读到的只可能是
+            # **本轮**的引用,不会把上一轮的写到这一轮上。(本仓 ch06 那条
+            # 「通道与它的清零必须同处一地」的又一次应用:这里能放心读,
+            # 是因为清零那一半有人守着。)
+            #
+            # `or None`:没有引用的轮次传 **None**,不传 `[]` —— 空数组与
+            # 「没引用」在库里长得一样而含义不同(见 `append_turn` 的说明)。
+            citations=state.get("citations") or None,
         )
         return {"trace": ["log_turn"]}
 

@@ -55,7 +55,11 @@ async def load_history(*, session, conversation_id: str) -> list[Message]:
 
 
 async def append_turn(
-    *, session, conversation_id: str, messages: Sequence[Message]
+    *,
+    session,
+    conversation_id: str,
+    messages: Sequence[Message],
+    citations: list[dict] | None = None,
 ) -> list[int]:
     """把一轮的消息一次性写入,**返回新行的 id 列表(与入参同序)**。
 
@@ -77,6 +81,29 @@ async def append_turn(
     「同一事实只有一个来源」的落点:哪个 id 属于刚写进去的行,只有这里知道。
     与它同族的是 `append_summary_and_advance` 的 `-> int`(`seq` 从落库那一步
     返回,而不是让调用方再查一遍)。
+
+    ---- `citations`(历史回载把「文档链接」还回去)----
+
+    当轮回答引用到的知识块,挂到**本轮最后一条 `content` 非空的 assistant 行**
+    上。三条都写在断言里(`tests/test_history.py`),理由是各自的一种「静默挂错」:
+
+    · **必须是「最后一条」**:一轮 ReAct 里 assistant 行**有多条**(带
+      `tool_calls` 的那条常常 `content` 为空),而带 `[n]` 编号、用户真正看见过
+      正文的是最后那条。
+    · **必须 `content` 非空**:挂到空气泡上 ⇒ 回载端点那句 `content != ''`
+      根本不回它 ⇒ 弹层挂在一个**画不出来的行**上,点了 [n] 什么都不发生。
+    · **`[]` 与 `None` 都不挂**:空数组与「没引用」在库里长得一样而含义不同
+      (同表的 `tool_calls` 也是 `or None` 的写法)。
+
+    形状与 `app/agent/nodes.py` 造 citations 帧时那份**逐字相同**
+    (`{"n": i, "chunk_id", "section_path", "question", "answer", "category"}`)
+    —— 前端 `makeCitesClickable` 读的正是这几个键,换个键名 = 帧到了、库也写了,
+    **弹层却渲染不出来**,而没有任何东西会红。
+
+    ⚠️ 这一步**只在内存里给某一行挂一个值**,不多一次 IO、也不做任何校验 ——
+    它和那几行本身在**同一次 `commit`** 里生效(所以不存在「引用写进去了、
+    消息没写进去」这种半截状态)。正因为没有可能失败的分支,这里**刻意不写
+    `try`**：加了兜底反而会造出一条「引用静默丢失」的路,而它不报错。
     """
     records: list[MessageRecord] = []
     for message in messages:
@@ -89,6 +116,21 @@ async def append_turn(
         )
         session.add(record)
         records.append(record)
+
+    if citations:
+        # 两遍走:**先**把全部行建出来(**顺序与入参严格一致**,`flush` 拿到的
+        # 自增 id 才与入参同序,返回值那条契约不能破),**再**回头挂引用。
+        # 写成一遍(边建边判「这条是不是最后一条」)就得先知道后面还有没有 ——
+        # 那要么多一次扫描,要么把「最后一条」的判据散到两个地方。
+        attach_at = None
+        for i, message in enumerate(messages):
+            # `message.content` 为**空串**(空气泡)的不挂 —— 见 docstring。
+            if message.role == "assistant" and message.content:
+                attach_at = i
+        if attach_at is not None:
+            # `list(...)` 复制一份:调用方(与 state)手里那个列表随后还可能被
+            # 改动,而这一列要的是**落库那一刻**的快照。
+            records[attach_at].citations = list(citations)
 
     await session.flush()          # 拿自增主键;一条 mapper 的插入顺序即 add 顺序
     new_ids = [record.id for record in records]

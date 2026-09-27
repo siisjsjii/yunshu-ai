@@ -210,7 +210,18 @@ bash scripts/acceptance_ch10.sh                                  # ch10 验收 �
 #    **`db/ch08.sql`(新表 tool_audit_logs)**、
 #    **`db/ch09.sql`(新表 `review_queue` + `eval_runs`,外加
 #    `low_confidence_questions` 的两列 `evidence_snapshot` / `matched_review_id`)**、
-#    **`db/ch10.sql`(新表 `topic_classifications`,ch10-B 的归类结果)**。
+#    **`db/ch10.sql`(新表 `topic_classifications`,ch10-B 的归类结果)**、
+#    **`db/followup_messages_citations.sql`(`messages` 加一列 `citations`)**
+#    ⚠️ 最后那份**不带章号,因为它不是一章的产物** —— 起因是「聊天页历史回载
+#    丢掉了工具齿轮与文档链接」这个缺陷(2026-09-27 修)。
+#    它的走法**与 ch09 那份同款(是一条 ALTER)**:**旧库必须手动跑它**
+#    (`init_db.py` 永不加列,`create_all` 对已存在的 `messages` 是空操作);
+#    **全新库不要跑它** —— ORM 侧有这一列,`create_all` 会连它一起建出来,
+#    那份 DDL 再跑一遍就在 ALTER 上报 **1060**(与 ch08/ch10 的 1050 同族,
+#    **刻意不幂等**)。漏掉它的后果**不是「少个功能」**:`messages` 缺这一列 ⇒
+#    **每一个请求**的落库(`append_turn`)与**每一次回载**都在 `Unknown column`
+#    那一步炸。两条路径的差异只有**列序**(ALTER 追加在表末、create_all 按 ORM
+#    声明序;纯文本差异,没有一条 SQL 按位置取值),写在那个文件头里。
 #    ⚠️ `db/ch10.sql` 与 `db/ch08.sql` **同款**:它只有 `CREATE TABLE`,而 ORM 侧有同名模型
 #    (`TopicClassification`)⇒ `init_db.py` 的 create_all **已经把它建出来了** ⇒
 #    **在全新库上跑它会在那条 CREATE 上响亮地报 `ERROR 1050`(表已存在)。
@@ -251,8 +262,10 @@ bash scripts/acceptance_ch10.sh                                  # ch10 验收 �
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
 #    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`
-#    (**`db/ch09.sql` 与 `db/ch10.sql` 不在此列** —— 前者第一句是 ALTER(空库上 1146)、
-#    后者只有 CREATE(会 1050);那两份的走法各自写在上面与它们自己的文件头里)。
+#    (**`db/ch09.sql` / `db/ch10.sql` / `db/followup_messages_citations.sql` 都不在此列**
+#    —— ch09 那份第一句是 ALTER(空库上 1146)、ch10 只有 CREATE(会 1050)、
+#    followup 那份是 ALTER(空库上 1060,列已存在);那三份的走法各自写在上面
+#    与它们自己的文件头里)。
 
 # ch03(前置:docker start milvus-standalone)
 .venv/Scripts/python.exe scripts/build_kb.py                    # 建库;重跑=幂等补齐(中断了直接再跑)

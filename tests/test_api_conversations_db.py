@@ -69,11 +69,11 @@ def _conv(conv_id, user, created_at, *, summary_upto_msg_id=0, layer1_from_msg_i
     )
 
 
-def _msg(conversation_id, role, content, *, tool_calls=None):
+def _msg(conversation_id, role, content, *, tool_calls=None, citations=None):
     """探针消息。`id` 由自增给,**逐条插入**以保证 id 顺序 = 插入顺序。"""
     return MessageRecord(
         conversation_id=conversation_id, role=role, content=content,
-        tool_calls=tool_calls, created_at=T_OLD,
+        tool_calls=tool_calls, citations=citations, created_at=T_OLD,
     )
 
 
@@ -259,6 +259,52 @@ async def test_list_messages_is_id_ascending_and_hides_tool_rows():
         assert [i["content"] for i in items] == ["第一句", "第二答"]
         assert all("order_no" not in i["content"] for i in items)
         assert all(i["content"] != "" for i in items)
+    finally:
+        await _cleanup()
+        await get_engine().dispose()
+
+
+@pytest.mark.anyio
+async def test_tool_calls_and_citations_survive_the_json_columns_on_a_real_table():
+    """`tool_calls` / `citations` 两列的**JSON 往返**在真库上验(替身验不出来)。
+
+    替身交回来的是**同一个 Python 对象**(内存里的 list),所以「列类型写错成
+    TEXT」「写入时被 `str()` 序列化过一次」这类缺陷在单测里全绿 —— 而它到前端
+    的形态是 `ctx.citations` 拿到一个**字符串**,`citations.find` 直接
+    `TypeError`(`makeCitesClickable` 的 `if (!ctx.citations.length) return`
+    只挡长度 0,不挡字符串),于是 [n] 引用点不开,而**服务端一切正常**。
+    这里用**新 session** 读回(身份映射持弱引用,同 session 重读可能拿到内存里
+    那个原对象,断言就变成「靠 refcount 走运」)。
+
+    两条都**逐字比深层结构**:只断「非空」的话,`args` 内层字典被拍平成字符串
+    照样绿 —— 而那正是 `test_history.py` 里同款断言存在的理由。
+    """
+    tool_calls = [
+        {"id": "call_1", "name": "query_order", "args": {"order_no": "1002"},
+         "type": "tool_call"}
+    ]
+    citations = [
+        {"n": 1, "chunk_id": "77", "section_path": "退货退款政策 > 无理由退货",
+         "question": "无理由退货的期限是多久?", "answer": "七天。", "category": "退换货"}
+    ]
+    await _cleanup()
+    try:
+        await _insert([_conv(PROBE_MSGS, "demo-user", T_NEW)])
+        await _insert([_msg(PROBE_MSGS, "user", "订单 1002 能退吗")])
+        await _insert([_msg(PROBE_MSGS, "assistant", "", tool_calls=tool_calls)])
+        await _insert([_msg(PROBE_MSGS, "tool", '{"status":"已取消"}')])
+        await _insert([_msg(PROBE_MSGS, "assistant", "按政策可以退[1]。",
+                            citations=citations)])
+
+        items = await _messages(PROBE_MSGS)
+        assert [i["role"] for i in items] == ["user", "assistant"]
+        # 前提:探针真的写进去了(否则下面那句在「端点恒返回空列表」时也绿)
+        assert len(items) == 2, [(i["role"], i["content"]) for i in items]
+        # 没有引用的那条:**是 None,不是 []**(空数组与「没引用」不可区分 ——
+        # 用户在回载里会看到一个「有引用区、但点不开」的回复)
+        assert items[0]["citations"] is None, items[0]["citations"]
+        assert items[0]["tool_calls"] is None, items[0]["tool_calls"]
+        assert items[1]["citations"] == citations, items[1]["citations"]
     finally:
         await _cleanup()
         await get_engine().dispose()

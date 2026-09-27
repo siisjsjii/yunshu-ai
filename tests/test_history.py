@@ -7,7 +7,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db.base import get_sessionmaker
-from app.db.models import Conversation, ConversationSummary
+from app.db.models import Conversation, ConversationSummary, MessageRecord
 from app.schemas import Message
 from app.services.history import (
     advance_anchors,
@@ -217,6 +217,113 @@ def test_append_turn_returns_new_row_ids_in_order():
     assert len(first) == 1
     assert len(second) == 2
     assert first[0] < second[0] < second[1]      # 自增且同序
+
+
+#: 一条**真实形状**的引用(键与 `app/agent/nodes.py` 造 citations 帧时那份
+#: 完全一致:五个来源键 + `n` 编号)。回载前端拿它做 `[n]` 可点与弹层。
+CITATIONS = [
+    {"n": 1, "chunk_id": "77", "section_path": "退货退款政策 > 无理由退货",
+     "question": "无理由退货的期限是多久?", "answer": "七天。", "category": "退换货"},
+    {"n": 2, "chunk_id": "78", "section_path": "售后手册 > 保修说明",
+     "question": "保修期多久?", "answer": "一年。", "category": "售后"},
+]
+
+#: `_lc_to_records` 落库时那两样形状(同一轮的两个 assistant 行分别长这样)。
+TOOL_CALLS = [
+    {"id": "call_1", "name": "query_order", "args": {"order_no": "1002"},
+     "type": "tool_call"}
+]
+
+
+async def _stored_rows() -> list[MessageRecord]:
+    """**新 session** 读该会话的全部行(按 id 升序)。
+
+    为什么不能用 `load_history` 看这件事:`app/schemas.Message` 上没有
+    `citations` 字段(它只服务模型上下文),所以那一路看不到这一列的写入。
+    也不能在 `append_turn` 那个 session 里读 —— 身份映射持弱引用,读到的
+    可能正是内存里那个刚 `add` 进去的对象,断言就变成「靠 refcount 走运」
+    (本仓记过的那条)。
+    """
+    async with get_sessionmaker()() as session:
+        return (
+            await session.execute(
+                select(MessageRecord)
+                .where(MessageRecord.conversation_id == SCRATCH)
+                .order_by(MessageRecord.id)
+            )
+        ).scalars().all()
+
+
+def test_append_turn_attaches_citations_to_the_last_text_assistant_row():
+    """引用只挂**本轮最后一条 content 非空的 assistant 行**。
+
+    为什么是「最后一条非空」而不是「最后一条 assistant」:一轮 ReAct 里
+    **assistant 行有多条**(带 tool_calls 那条常常 content 为空),而带 `[n]`
+    编号、用户真正看见过正文的是**最后那条**. 挂到空气泡上 ⇒ 回载时弹层
+    挂在一个**根本不会被画出来的行**上(端点的 `content != ''` 把它滤掉),
+    用户点了 [n] 什么也不会发生;挂到更早那条上 ⇒ 弹层挂在**上一句**上,
+    而两者都不报错。
+
+    **这条用例的输入必须真的有多条 assistant 行**(含一条空 content 的),
+    否则「最后一条」与「第一条」是同一行,断言对错的实现一样绿 —— 本仓
+    第 5 类假绿(输入小到触发不了被测行为)。
+    """
+    async def run():
+        async with get_sessionmaker()() as session:
+            await ensure_conversation(session=session, session_id=SCRATCH, user_id="u")
+            await append_turn(
+                session=session,
+                conversation_id=SCRATCH,
+                messages=[
+                    Message(role="user", content="订单 1002 能退吗"),
+                    # ① 只申请工具调用、一个字的正文都没有(生产上就是这么落的)
+                    Message(role="assistant", content="", tool_calls=TOOL_CALLS),
+                    Message(role="tool", content='{"status":"已取消"}',
+                            tool_call_id="call_1"),
+                    # ② 用户看见过的那条 —— 引用挂它身上
+                    Message(role="assistant", content="按政策可以退[1][2]。"),
+                ],
+                citations=CITATIONS,
+            )
+
+    asyncio_run(run())
+    rows = asyncio_run(_stored_rows())
+    assert [r.role for r in rows] == ["user", "assistant", "tool", "assistant"]
+    # 深层结构整体比对(只断「非空」的话,内层字典被拍平成字符串照样绿)
+    assert rows[3].citations == CITATIONS, rows[3].citations
+    # **空的 assistant 行不许挂**:它是空气泡,回载时根本不存在
+    assert rows[1].citations is None, rows[1].citations
+    assert rows[0].citations is None and rows[2].citations is None
+
+
+def test_append_turn_does_not_write_an_empty_citations_array():
+    """`citations=[]` 与 `citations=None` **都不写** —— 留在 `None`。
+
+    写一个空数组上去的后果不是「多一列」,是**语义不可分**:回载时
+    「这一轮没有引用」与「这一轮有引用区、只是空的」在库里长得一样
+    (`JSON_TYPE` 是 'ARRAY' 而不是 'NULL'),而前端只能靠「数组空不空」
+    判断 —— 也就是说这个区分**在能被用到的每一个地方都丢了**。
+    (同族:`app/db/models.py` 的 `tool_calls` 也走 `or None`。)
+    """
+    async def run():
+        async with get_sessionmaker()() as session:
+            await ensure_conversation(session=session, session_id=SCRATCH, user_id="u")
+            await append_turn(          # 显式空列表
+                session=session, conversation_id=SCRATCH,
+                messages=[Message(role="user", content="一"),
+                          Message(role="assistant", content="答一")],
+                citations=[],
+            )
+            await append_turn(          # 缺省(等价于 None)
+                session=session, conversation_id=SCRATCH,
+                messages=[Message(role="user", content="二"),
+                          Message(role="assistant", content="答二")],
+            )
+
+    asyncio_run(run())
+    rows = asyncio_run(_stored_rows())
+    assert [r.content for r in rows] == ["一", "答一", "二", "答二"]
+    assert all(r.citations is None for r in rows), [r.citations for r in rows]
 
 
 def test_advance_anchors_moves_only_the_anchor_it_is_given():

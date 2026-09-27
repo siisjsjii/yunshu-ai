@@ -132,6 +132,28 @@ async def list_messages(
     它是**替换物**,原文还在库里,回梗概等于让用户看不见自己说过的话。
     本端点因此**不导入 `app.memory.layers`** —— 让它连误用的机会都没有。
 
+    ---- 每一条里多带的两样(2026-09-27 修复:回载丢掉了「齿轮」与「文档链接」)----
+
+    每条 item 另带 `tool_calls` 与 `citations`(都是**原样透传**该行的列值,
+    端点不做任何加工/合并/翻译)。前端拿它们把直播时看见过的东西画回来:
+
+    · `tool_calls` → 工具齿轮(名字取每项的 `name`,与 `tool_call` 帧的
+      `payload.name` 同一个来源 —— 实测真实库里这一列的形状是
+      `[{"id":…, "name":…, "args":…, "type":"tool_call"}]`,**不是** OpenAI 生
+      `function.name` 那一层);
+    · `citations` → `[n]` 可点(`app/static/index.html:makeCitesClickable`)。
+
+    为什么**仍然不回** `role='tool'` 行:齿轮从 assistant 行的 `tool_calls` 画
+    就够了 —— 工具结果行在那条链路上**没有任何消费者**;而且它携带的是
+    `{"order_no": …}` 这类**原始工具载荷**(见 `TOOL_ROLE` 那段),放出来就是
+    一个用户从没见过的气泡。`tool_result` 帧里的「成功/失败」**没有落库**
+    (没有那一列),所以回载的齿轮**画不出失败态** —— 这是已知局限,不是省略。
+
+    ⚠️ **齿轮的恢复率受下面第一条过滤限制**(本机 2026-09-27 实测,数字见
+    返回那段的注释):带 `tool_calls` 的 assistant 行里**大多数** `content` 为空
+    (空气泡),它们被滤掉 ⇒ 那一轮的齿轮回不来。今天只有「先说了开场白、
+    再申请调用工具」那一种形状能恢复。**别据此宣称「工具齿轮已经全部保留」**。
+
     **两条「用户没看见过的内部机制」都不回载**(spec §5.2 裁定):
 
     ① `role='tool'` 的行 —— ch07 起工具结果也落这张表(见 `TOOL_ROLE` 那段),
@@ -202,6 +224,21 @@ async def list_messages(
                 "role": m.role,
                 "content": m.content,
                 "created_at": m.created_at.isoformat(),
+                # 前端靠这两样把「直播时看见过的东西」还回来:
+                # `tool_calls` 画工具齿轮(名字取每项的 `name`),
+                # `citations` 让正文里的 `[n]` 变成可点的文档链接
+                # (`app/static/index.html` 的 `makeCitesClickable`)。
+                #
+                # ⚠️ **齿轮的恢复率受上一条过滤限制,如实记**(本机 2026-09-27 读数,
+                # `SELECT JSON_TYPE(tool_calls), content='' … WHERE role='assistant'`):
+                # 带 `tool_calls`(JSON 数组)的 assistant 行共 **336** 条,其中
+                # **303 条 `content` 为空**(被上面那条 `content != ''` 滤掉 ⇒
+                # 它们的齿轮**不会**出现在回载里)、**33 条有正文**(⇒ 齿轮回得来)。
+                # 也就是说「空气泡那一轮的工具调用」今天**丢了** —— 而那正是
+                # ReAct 最常见的形状。要补的话得在 SQL 之外做一层「按轮归并」,
+                # 那是另一个决定,不在本次修复范围内(见 dev-notes / 缺陷报告)。
+                "tool_calls": m.tool_calls,
+                "citations": m.citations,
             }
             for m in rows
         ]

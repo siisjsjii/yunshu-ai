@@ -501,7 +501,7 @@ async def test_log_turn_persists_the_react_exchange_including_tool_rows(monkeypa
     """
     captured: list[Message] = []
 
-    async def _capture(*, session, conversation_id, messages):
+    async def _capture(*, session, conversation_id, messages, citations=None):
         captured.extend(messages)
         return list(range(1, len(messages) + 1))
 
@@ -535,6 +535,69 @@ async def test_log_turn_persists_the_react_exchange_including_tool_rows(monkeypa
     # 落库的是**完整**的工具结果,不是展示用的 summary(同 `_stream_round`
     # 回灌给模型的那条口径:`outcome.content`,不是 `outcome.summary`)。
     assert tool_row.content == '{"status": "已发货"}'
+
+
+@pytest.mark.anyio
+async def test_log_turn_passes_the_turn_citations_through_to_append_turn(monkeypatch):
+    """`log_turn` 必须把 **state 里的当轮引用**交给 `append_turn`。
+
+    没有这一句,引用就永远进不了库 ⇒ 历史回载里 `[n]` 是**死字**
+    (点不开、也不报错),而这正是要修的缺陷本身。
+
+    ⚠️ 为什么读 `state.get("citations")` 是**安全**的:`citations` 是
+    `ChatState` 里声明过的通道(`app/agent/state.py`),而
+    `resolve_references` **每轮把它清零**(`app/agent/nodes.py` 那段逐轮
+    重置的说明)—— 也就是说不会把**上一轮**的引用写到这一轮上。
+    清零那一半已有测试钉着(`tests/test_agent_resolve.py` /
+    `tests/test_agent_graph.py`),这里钉的是**读与传**这一半。
+
+    判别力:把 `citations=state.get("citations")` 删掉 ⇒ `citations` 是 None,
+    下面那条 `is None` 断言当场红(而不是「只发了一帧」那种什么都挡不住的断言)。
+    """
+    seen: dict = {}
+
+    async def _capture(*, session, conversation_id, messages, citations=None):
+        seen["citations"] = citations
+        return list(range(1, len(messages) + 1))
+
+    monkeypatch.setattr(nodes, "append_turn", _capture)
+    node = make_log_turn_node(session=object(), emit=lambda p: None)
+    citations = [{"n": 1, "chunk_id": "77", "section_path": "退货政策",
+                  "question": "q", "answer": "a", "category": "退换货"}]
+    await node({
+        "conversation_id": "c1",
+        "user_input": "能退吗",
+        "reply": "按政策可以退[1]。",
+        "turn_messages": [AIMessage(content="按政策可以退[1]。")],
+        "citations": citations,
+    })
+    assert seen["citations"] == citations
+
+
+@pytest.mark.anyio
+async def test_log_turn_passes_none_when_the_turn_has_no_citations(monkeypatch):
+    """没引用的那一轮传 `None`,**不是 `[]`** —— 与 `append_turn` 那边同一条理由
+    (空数组与「没引用」在库里不可区分)。
+
+    这条同时是上面那条的**反向对照**:只断「传了引用」的话,一个
+    `citations=state.get("citations") or [{"n": 1}]` 之类的实现照样绿。
+    """
+    seen: dict = {}
+
+    async def _capture(*, session, conversation_id, messages, citations=None):
+        seen["citations"] = citations
+        return list(range(1, len(messages) + 1))
+
+    monkeypatch.setattr(nodes, "append_turn", _capture)
+    node = make_log_turn_node(session=object(), emit=lambda p: None)
+    await node({
+        "conversation_id": "c1",
+        "user_input": "订单到哪了",
+        "reply": "已发货。",
+        "turn_messages": [AIMessage(content="已发货。")],
+        "citations": [],
+    })
+    assert seen["citations"] is None, seen["citations"]
 
 
 def test_to_lc_messages_uses_the_mysql_id_as_the_langchain_id():

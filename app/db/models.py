@@ -55,6 +55,22 @@ class MessageRecord(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # assistant 的「工具调用申请」是**数组**(可能一次申请多个),故用 JSON 列。
     tool_calls: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 该轮回答引用到的知识块(`[{"n": 1, "chunk_id": …, "section_path": …}, …]`,
+    # 形状与 `app/agent/nodes.py` 的 `citations` 帧**逐字相同**)。
+    #
+    # ⚠️ **这不是一章的产物**,所以 DDL 是 `db/followup_messages_citations.sql`
+    # (不带章号)—— 起因是历史回载把「工具齿轮」与「文档链接」两样都丢了。
+    #
+    # 为什么非落库不可:引用原先只在**内存**里造一次、发一帧就没了
+    # (`app/agent/nodes.py` 的 `retrieve_knowledge`),回载时 `[n]` 因此是
+    # **死字**(点不开、也不报错)。旧会话在这一列上是 NULL ⇒ 它们退成
+    # 不可点的编号,这是**已知且已接受的代价**。
+    #
+    # ⚠️ **`None` 在这里会落成字面 JSON `null`,不是 SQL NULL**(JSON 列的
+    # `none_as_null=False`;同 ch09 的 `evidence_snapshot`,那条教训写过一次)。
+    # 想按「有没有引用」筛选时别用 `IS NULL` / `IS NOT NULL` 任何一边,
+    # 用 `JSON_TYPE(citations) = 'ARRAY'`。
+    citations: Mapped[list | None] = mapped_column(JSON, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
