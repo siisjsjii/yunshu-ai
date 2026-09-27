@@ -3515,6 +3515,41 @@ git commit -m "ch10-B T12: topic_classifications 表(唯一键保证幂等 + JSO
 
 ## Task 13: 批处理 `scripts/classify_topics.py`
 
+> ⚠️⚠️ **计划订正 15(controller,2026-09-27)—— 五处;前两处是**计划里根本没写**的东西** ⚠️⚠️
+>
+> **15-A(`model_version` 计划里一个字都没有,而那一列是 `NOT NULL`)。**
+> T12 建的表有 `model_version varchar NOT NULL`;T11 复审裁定(**Q4**):
+> `train_meta.json` 里**确实没有权重指纹**(只有语料 `data_fingerprint` 及 `trained_at_utc` 等)。
+> ⇒ **`model_version = f"{meta['base']}@{meta['data_fingerprint']}::{meta['trained_at_utc']}"`**
+> —— **不能单用 `data_fingerprint`**(它的 docstring 逐字写着它是「**语料**的、**一次运行**的」指纹
+> ⇒ 两份**权重不同**的训练可以有同一个值,而那正是这一列要分的东西)。
+> **< 128 字符**(列宽),**不许把整个 dict 塞进去**(分布页要 `COUNT(DISTINCT model_version)`)。
+> **并在代码注释里写明这是个诚实的近似** —— 严格的权重指纹要改 `save_artifacts`(`sha256(model.safetensors)`)
+> 并**重跑训练**,那是 T9/T10 的账,不该在这里补。
+>
+> **15-B(`classify_batch` 只吃替身,而 `main()` 需要的**真** HTTP 客户端计划里没有)。**
+> T11 复审裁定(**Q3**),**照这个写**:
+> - 替身 `predict()` **返回裸 list**(逐字照本节 Step 1 的 `_FakeClient`,不许改);
+> - **真**客户端的 `predict()`:`payload = json.loads(resp.text)` ⇒
+>   **显式校验它是 `dict` 且含 `"results"`**(形状漂移要**响亮**失败)⇒ `return payload["results"]`;
+> - **补一条客户端侧单测**(假 transport 回 `{"results": [...]}`)钉住那个键 ——
+>   它今天**只在服务侧被钉**,客户端侧一个字都没有;
+> - ⛔ **不许**让 `classify_batch` 自己去拆 `["results"]`(那会把 HTTP 形状漏进纯逻辑层,替身也就与本节 Step 1 不符)。
+>
+> **15-C(空标签的处置 —— T12 交过来的账)**:**`labels: []` 是合法 JSON,`NOT NULL` 拦不住**。
+> ⇒ **允许写**(服务返回空是**合法的模型输出**:全部低于阈值)。
+> **但必须数出来并打印**「本批有空标签 N 条」——
+> 否则「服务每次都返回空」会被分布页读成「这些问题没有主题」,而那是**故障被读成业务结果**
+> (本节 Step 1 第一条测试防的就是这个,但那条防的是**抛异常**,防不了**返回空**)。
+>
+> **15-D(多一条形状校验,很便宜)**:`classify_batch` 要校验每条结果的
+> **`labels` 里每个名字都在 `taxonomy.LABELS` 里** —— 那是「标签顺序/类目表两处漂移」这条链上
+> **最靠近数据的那一道**;代价一行。
+>
+> **15-E(Step 6 会真的往共享表里写行)**:`low_confidence_questions` 是**共享且只追加**的,
+> `topic_classifications` 也是。⇒ 报告里**必须报准确条数**,并且**任何「查最近这几条」式的断言必须按
+> `low_confidence_question_id` 过滤**(本仓记过「被上次运行的数据污染 ⇒ 偶尔红偶尔绿」那一类)。
+
 **Files:**
 - Create: `scripts/classify_topics.py`
 - Create: `tests/test_classify_topics.py`
