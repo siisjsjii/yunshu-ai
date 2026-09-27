@@ -12,7 +12,14 @@ async def ensure_conversation(*, session, session_id: str, user_id: str) -> Conv
     """取会话,不存在则新建。
 
     已存在时**忽略传入的 user_id**,以创建时记录的为准 —— 否则任何客户端
-    都能改掉一条会话的归属(本章端点没有认证)。
+    都能改掉一条会话的归属。
+
+    ⚠️ **本函数不校验归属**(它只按 id 取 / 建):已存在的行**不管属于谁**都原样
+    返回。认证(2026-09-27)之后,三个写端点(`/api/chat/stream` / `/api/ticket` /
+    `/api/refund`)在调用本函数之后**各自**比对 `conv.user` 与登录用户,不符就 404;
+    两个读端点走下面的 `get_owned_conversation`(那条把「必须是我的」写进 SQL)。
+    ⇒ 将来任何新的调用方,**归属得自己查** —— 这里给不出保证,而漏掉的后果是
+    「拿别人的会话读 / 写」且没有任何东西报错。
     """
     conversation = (
         await session.execute(
@@ -34,7 +41,11 @@ async def get_owned_conversation(*, session, conversation_id: str,
     ⚠️ **「别人的会话」与「不存在的会话」必须是同一个答案**(端点都翻成 404):
     回 403 等于承认「这个 id 存在」,那就给了枚举的口子。它与
     `ensure_conversation` 那条「已存在时忽略传入的 user_id」的分工是:
-    那边保的是**归属不被改写**,这边保的是**读不到别人的**。
+    那边保的是**归属不被改写**,这边把「必须是我的」写进 SQL。
+
+    (写路径**另有一份**:三个写端点在 `ensure_conversation` 之后各自比对
+    `conv.user` —— 它们不能复用本函数,因为「不存在就新建」是它们要的行为。
+    两处判据**同一个出口**(404)。)
     """
     return (await session.execute(
         select(Conversation)

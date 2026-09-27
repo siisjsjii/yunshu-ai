@@ -28,7 +28,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.api import chat as chat_api
 from app.config import Settings
-from app.db.models import Ticket
+from app.db.models import Conversation, Ticket
 from app.db.session import get_session
 from app.main import app
 from app.memory.store import SessionStore
@@ -38,7 +38,7 @@ from app.tools.registry import _spec_from_tool
 # `tests/` 放进 sys.path)—— **不要**写成 `tests.test_api_chat`:那会让同一份
 # 替身以两个不同的模块名被加载两遍,`FakeSession` 变成两个类,
 # `isinstance` 判断会莫名其妙地为假。已实测 `import test_api_chat` 可用。
-from test_api_chat import FakeSession
+from test_api_chat import DEFAULT_LOGIN_USER, FakeSession
 
 SID = "00000000000000000000000000000001"
 
@@ -142,6 +142,61 @@ def test_build_ticket_invokes_the_tool_and_returns_its_payload():
     #   自己就会 commit,把工具那行 `await session.commit()` 删掉它照样绿 ——
     #   所以换成上面这条只有真工具会满足的断言。)
     assert session.conversations[SID].status == "pending_human"
+
+
+def test_a_foreign_session_is_refused_and_no_ticket_lands():
+    """**不能往别人的会话里建工单**(认证,2026-09-27)。
+
+    `ensure_conversation` 对**已存在**的行忽略传入的 `user_id` ⇒ 不查这一下的话,
+    知道别人 32 位会话 id 的人能往那条会话上写一张工单。
+
+    **三条**:404(与读端点同一个出口)、`tickets` 一行都没建、第二次仍是 404
+    (不是 409 —— 锁必须放掉,否则那条会话永久钉死)。
+
+    ⚠️ 会话是**预置**的、`user` 是别人的:`ensure_conversation` 只负责新建,
+    不换一个 owner 出来的话这条用例根本走不到那道判据上。
+    """
+    session = _TicketSession()
+    session.conversations[SID] = Conversation(
+        id=SID, user="someone-else", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    client = _client(session)
+    try:
+        first = client.post("/api/ticket", json={"session_id": SID})
+        second = client.post("/api/ticket", json={"session_id": SID})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 404, first.text
+    assert first.json()["detail"] == "会话不存在"
+    assert session.tickets == [], "往别人的会话里建出了工单"
+    # 第二次仍是 404 而不是 409:失败退出路径放了锁(本仓记过账:漏放 = 永久 409)
+    assert second.status_code == 404, second.text
+    assert client.store.lock_for(SID).locked() is False
+
+
+def test_own_existing_session_still_creates_a_ticket():
+    """**正面对照**:会话已存在、且是自己的 ⇒ 照常建单。
+
+    只有「别人的 ⇒ 404」的话,一个**一律 404** 的实现(判据写反、或拿错比较对象)
+    照样满足它。这条同时钉住「已存在的会话不会被那道检查误伤」——
+    `ensure_conversation` 走的是"已存在就返回"那一支,返回值的 `user` 必须被
+    拿来与登录用户比**相等**,不是比不等。
+    """
+    session = _TicketSession()
+    session.conversations[SID] = Conversation(
+        id=SID, user=DEFAULT_LOGIN_USER, status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    client = _client(session)
+    try:
+        resp = client.post("/api/ticket", json={"session_id": SID})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200, resp.text
+    assert [t.conversation_id for t in session.tickets] == [SID]
 
 
 def test_session_id_length_is_bounded_like_chat_request():

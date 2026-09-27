@@ -23,7 +23,7 @@ from sqlalchemy.exc import OperationalError
 from app.api import chat as chat_api
 from app.config import Settings, get_settings
 from app.db.base import get_sessionmaker
-from app.db.models import RefundRequest
+from app.db.models import Conversation, RefundRequest
 from app.main import app
 from app.memory.store import SessionStore
 from app.refund.categories import REFUND_REASON_CATEGORIES
@@ -31,7 +31,15 @@ from app.refund.categories import REFUND_REASON_CATEGORIES
 pytestmark = pytest.mark.db
 
 SCRATCH = "refundtest0000000000000000000000"
+#: 别人的会话(认证,2026-09-27 加):归属那道判据要一条**已存在、不是你的**会话
+#: 才走得到 —— `ensure_conversation` 只负责新建,自己建的会话 owner 一定是自己。
+FOREIGN = "refundforeign00000000000000000"
 ORDER_NO = "20240915"
+
+#: `tests/conftest.py` 的 `_default_login` 装置默认投的用户名(认证,2026-09-27)。
+#: **预置会话的 owner 必须与它一致**,否则端点的归属检查会 404 —— 而那是夹具的
+#: 事,不是被测代码的事。
+DEFAULT_LOGIN_USER = "tests-default-user"
 
 _REQUIRED_SETTINGS = dict(
     openai_base_url="https://example.invalid/v1",
@@ -51,12 +59,14 @@ async def _cleanup():
     """
     yield
     async with get_sessionmaker()() as s:
-        await s.execute(
-            text("DELETE FROM refund_requests WHERE conversation_id = :c"), {"c": SCRATCH}
-        )
-        await s.execute(
-            text("DELETE FROM conversations WHERE id = :c"), {"c": SCRATCH}
-        )
+        for conv_id in (SCRATCH, FOREIGN):
+            await s.execute(
+                text("DELETE FROM refund_requests WHERE conversation_id = :c"),
+                {"c": conv_id},
+            )
+            await s.execute(
+                text("DELETE FROM conversations WHERE id = :c"), {"c": conv_id}
+            )
         await s.commit()
 
 
@@ -121,6 +131,67 @@ async def _rows_for_scratch() -> list[RefundRequest]:
             .scalars()
             .all()
         )
+
+
+async def _seed_conversation(conv_id: str, user: str) -> None:
+    """在真库里预置一条会话(端点只读它、不再新建)。"""
+    async with get_sessionmaker()() as s:
+        s.add(Conversation(id=conv_id, user=user, status="active",
+                           summary_upto_msg_id=0, layer1_from_msg_id=0))
+        await s.commit()
+
+
+async def _rows_for(conv_id: str) -> list[RefundRequest]:
+    async with get_sessionmaker()() as s:
+        return (
+            (
+                await s.execute(
+                    select(RefundRequest).where(RefundRequest.conversation_id == conv_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.anyio
+async def test_a_foreign_session_is_refused_and_no_row_lands(client_factory):
+    """**不能往别人的会话上提退款单**(认证,2026-09-27)。
+
+    `ensure_conversation` 对**已存在**的行忽略传入的 `user_id` ⇒ 不查这一下的话,
+    知道别人 32 位会话 id 的人能往那条会话上挂一张退款单。会话因此**预置**成
+    别人的(自己建的 owner 恒是自己,走不到那道判据上)。
+
+    **三条**:404(与读端点同一个出口)、`refund_requests` 一行都没落、第二次仍是
+    404(不是 409 —— 锁必须放掉,本仓记过账:漏放 = 该会话永久 409)。
+    """
+    await _seed_conversation(FOREIGN, "someone-else")
+    client = client_factory()
+    first = await client.post("/api/refund", json=_body(session_id=FOREIGN))
+    second = await client.post("/api/refund", json=_body(session_id=FOREIGN))
+
+    assert first.status_code == 404, first.text
+    assert first.json()["detail"] == "会话不存在"
+    assert await _rows_for(FOREIGN) == [], "往别人的会话上落了一行退款单"
+    assert second.status_code == 404, second.text
+    assert client.store.lock_for(FOREIGN).locked() is False
+
+
+@pytest.mark.anyio
+async def test_own_existing_conversation_still_accepts_a_refund(client_factory):
+    """**正面对照**:会话已存在、且是自己的 ⇒ 照常落库。
+
+    只有「别人的 ⇒ 404」的话,一个**一律 404** 的实现(判据写反、或拿错比较对象)
+    照样满足它;这条同时钉住「已存在的会话不被那道检查误伤」——
+    判据是比**相等**,不是比不等。
+    """
+    await _seed_conversation(SCRATCH, DEFAULT_LOGIN_USER)
+    client = client_factory()
+    r = await client.post("/api/refund", json=_body())
+
+    assert r.status_code == 200, r.text
+    rows = await _rows_for(SCRATCH)
+    assert [row.order_no for row in rows] == [ORDER_NO]
 
 
 @pytest.mark.anyio

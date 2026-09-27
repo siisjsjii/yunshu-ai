@@ -140,6 +140,13 @@ async def chat_stream(
         conv = await ensure_conversation(
             session=session, session_id=session_id, user_id=user_id
         )
+        # 认证(2026-09-27):**归属检查必须在 `load_history` 之前**。
+        # `ensure_conversation` 对已存在的行**忽略**传入的 user_id(它只负责新建),
+        # 所以不查这一下的话,知道别人 `session_id` 的人把那条会话的**完整历史**
+        # 读进模型上下文,模型再把答案流回给他 —— 那是一条**读**路径,不只是脏写。
+        # ⚠️ 与读端点同一个出口:**404**(403 等于承认「这个 id 存在」)。
+        if conv.user != user_id:
+            raise HTTPException(status_code=404, detail="会话不存在")
         # `resume` 分支**不推导预算**:它不组装上下文(从 checkpoint 还原)、
         # 也不进 Agent 节点,推导出来没有读者。`build_graph` 拿到 None 时现算
         # 一份(纯函数,同一个值),所以那条路上也不会缺。
@@ -632,9 +639,15 @@ async def create_ticket_endpoint(
 
     try:
         # 归属取 token 里的用户名(认证,2026-09-27);此前写死 `"demo-user"`。
-        await ensure_conversation(
+        conv = await ensure_conversation(
             session=session, session_id=request.session_id, user_id=user.username
         )
+        # 归属检查(认证,2026-09-27):`ensure_conversation` 对已存在的行**忽略**
+        # 传入的 user_id(它只负责新建)⇒ 不查这一下,知道别人会话 id 的人能往那条
+        # 会话上**建工单**。⚠️ 与读端点同一个出口:**404**(403 等于承认它存在),
+        # 且必须打在**任何写动作之前**。
+        if conv.user != user.username:
+            raise HTTPException(status_code=404, detail="会话不存在")
         registry = build_registry(
             session=session, conversation_id=request.session_id, settings=settings
         )

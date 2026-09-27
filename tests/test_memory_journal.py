@@ -18,7 +18,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 
-from test_api_chat import FakeChunk, FakeSession, client_factory
+from test_api_chat import DEFAULT_LOGIN_USER, FakeChunk, FakeSession, client_factory
 
 from app import main as main_module
 from app.config import Settings
@@ -327,7 +327,7 @@ def test_history_ctx_from_the_endpoint_carries_the_real_session_and_window(
     """
     db = FakeSession()
     db.conversations["c-anchored"] = Conversation(
-        id="c-anchored", user="demo-user", status="active",
+        id="c-anchored", user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=1, layer1_from_msg_id=3,
     )
     for role, content in [
@@ -358,7 +358,7 @@ def test_history_ctx_reads_summary_rows_from_the_database(client_factory, caplog
     """
     db = FakeSession()
     db.conversations["c-sum"] = Conversation(
-        id="c-sum", user="demo-user", status="active",
+        id="c-sum", user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=2, layer1_from_msg_id=4,
     )
     db.summaries.append(

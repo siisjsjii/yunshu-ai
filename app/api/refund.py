@@ -107,9 +107,16 @@ async def create_refund(
 
     try:
         # 归属取 token 里的用户名(认证,2026-09-27);此前写死 `"demo-user"`。
-        await ensure_conversation(
+        conv = await ensure_conversation(
             session=session, session_id=request.session_id, user_id=user.username
         )
+        # 归属检查(认证,2026-09-27):`ensure_conversation` 对已存在的行**忽略**
+        # 传入的 user_id(它只负责新建)⇒ 不查这一下,知道别人会话 id 的人能往那条
+        # 会话上**挂一张退款单**。⚠️ 与读端点同一个出口:**404**(403 等于承认它
+        # 存在),且必须打在 `_persist` **之前** —— 顺序反了就是"先落库再拒绝",
+        # 调用方看到拒绝、库里却躺着一次成功的申请(与类目校验那条同一个道理)。
+        if conv.user != user.username:
+            raise HTTPException(status_code=404, detail="会话不存在")
         row = await _persist(session, request)
         return {
             "id": row.id,

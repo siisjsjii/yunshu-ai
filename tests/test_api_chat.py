@@ -730,10 +730,13 @@ def test_first_request_seeds_the_history_that_is_already_in_mysql(client_factory
     下一次请求必须从 MySQL 补回来(spec §7.4 的「重启自愈」)。
 
     判据取「state 里出现了**库里那条**的内容」:把播种整段删掉,这里一条都看不到。
+
+    ⚠️ 会话的 `user` 是 `DEFAULT_LOGIN_USER`(认证,2026-09-27):预置成别的用户名
+    会让端点先 404,而这条用例测的是**播种**。
     """
     db = FakeSession()
     db.conversations["s-seed"] = Conversation(
-        id="s-seed", user="demo-user", status="active",
+        id="s-seed", user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=0, layer1_from_msg_id=0,
     )
     db.add(MessageRecord(conversation_id="s-seed", role="user", content="上一轮的问题"))
@@ -1114,6 +1117,111 @@ def test_session_id_wider_than_the_column_is_rejected_as_422(client_factory):
 
     assert too_long.status_code == 422
     assert at_limit.status_code == 200
+
+
+#: `tests/conftest.py` 的 `_default_login` 装置默认投的这个用户名(认证,2026-09-27)。
+#: **预置会话的 `user` 必须与它一致**:端点在 `ensure_conversation` 之后要查归属
+#: (不一致 ⇒ 404),夹具里随手写别的用户名会让用例红在一个与它所测内容无关的地方。
+DEFAULT_LOGIN_USER = "tests-default-user"
+
+#: 别人的会话 id(32 位,与 `conversations.id` 的列宽一致)。
+FOREIGN_CONV = "foreignsession000000000000000000"
+#: 自己的会话 id。
+OWN_CONV = "ownsession0000000000000000000000"
+
+
+def _spy_load_history(monkeypatch) -> list[str]:
+    """记下 `load_history` 被查过哪些会话 —— 归属检查**必须**打在它**之前**。
+
+    只断「返回 404」的话,一个把检查写在 `load_history` **之后**的实现照样绿,
+    而它正是这条修复要挡住的那件事(别人的历史已经进了模型上下文)。
+    """
+    read: list[str] = []
+    real = chat_api.load_history
+
+    async def spy(*, session, conversation_id):
+        read.append(conversation_id)
+        return await real(session=session, conversation_id=conversation_id)
+
+    monkeypatch.setattr(chat_api, "load_history", spy)
+    return read
+
+
+def test_a_foreign_session_is_refused_before_the_history_is_read(
+    client_factory, monkeypatch
+):
+    """**知道别人的 `session_id` ≠ 能读那条会话**(认证,2026-09-27)。
+
+    `ensure_conversation` 对**已存在**的行**忽略**传入的 `user_id`(它只负责新建),
+    所以在这一道检查之前,端点会拿客户端给的 `session_id` 去 `load_history` ——
+    那条会话的**完整历史**进模型上下文,答案再流回给调用方。这是一条**读**路径,
+    不只是「往别人的会话里脏写一条」。
+
+    **三条断言缺一不可**:
+    · 404 —— 与读端点同一个出口(403 等于承认「这个 id 存在」);
+    · **历史一次都没被读** —— 本用例的要害,见 `_spy_load_history`;
+    · 什么都没落库 —— 受害者的会话里不得多出一条消息。
+    """
+    db = FakeSession()
+    db.conversations[FOREIGN_CONV] = Conversation(
+        id=FOREIGN_CONV, user="someone-else", status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    db.add(MessageRecord(conversation_id=FOREIGN_CONV, role="user", content="别人的历史"))
+    db.add(MessageRecord(conversation_id=FOREIGN_CONV, role="assistant", content="别人的回答"))
+
+    read = _spy_load_history(monkeypatch)
+    client, _ = client_factory(batches=[[FakeChunk("您好")]], session=db)
+    with client as c:
+        resp = c.post(
+            "/api/chat/stream", json={"session_id": FOREIGN_CONV, "message": "你好"}
+        )
+        # 第二次:锁必须已经放掉。漏放的后果不是"慢" —— 持锁的锁既不被 TTL 也不被
+        # LRU 回收,那条会话**从此永久 409**;所以这条与「404」是两件事。
+        again = c.post(
+            "/api/chat/stream", json={"session_id": FOREIGN_CONV, "message": "在吗"}
+        )
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "会话不存在"
+    assert read == [], (
+        f"别人的历史被读进了上下文(读了 {read})—— 归属检查必须写在 load_history 之前"
+    )
+    assert [m.content for m in db.messages] == ["别人的历史", "别人的回答"], (
+        "受害者的会话里多出了东西"
+    )
+    assert again.status_code == 404, (
+        f"第二次是 {again.status_code} 而不是 404 ⇒ 锁没放掉(409 会把这条会话永久钉死)"
+    )
+
+
+def test_own_session_still_streams(client_factory, monkeypatch):
+    """**正面对照**:自己的会话照常跑通。
+
+    只有「别人的 ⇒ 404」的话,一个**一律 404** 的实现(把判据写反 / 拿错比较对象)
+    照样满足它 —— 所以这里连「历史照常被读」一起断(`read == [OWN_CONV]`)。
+    """
+    db = FakeSession()
+    db.conversations[OWN_CONV] = Conversation(
+        id=OWN_CONV, user=DEFAULT_LOGIN_USER, status="active",
+        summary_upto_msg_id=0, layer1_from_msg_id=0,
+    )
+    db.add(MessageRecord(conversation_id=OWN_CONV, role="user", content="我上一轮问的"))
+
+    read = _spy_load_history(monkeypatch)
+    client, _ = client_factory(batches=[[FakeChunk("您好")]], session=db)
+    with client as c:
+        resp = c.post(
+            "/api/chat/stream", json={"session_id": OWN_CONV, "message": "再问一句"}
+        )
+
+    assert resp.status_code == 200, resp.text
+    # ⚠️ 断言**集合**不是列表:非续跑那一轮 `load_history` 会被**合法地**调两次
+    # (一次给分层、一次给播种,见 `app/api/chat.py` 的两处调用),条数不是契约。
+    assert set(read) == {OWN_CONV}, (
+        "自己的会话当然要被读(否则「别人的 ⇒ 404」在「一律不读」的实现下也恒真)"
+    )
+    assert [m.role for m in db.messages] == ["user", "user", "assistant"], db.messages
 
 
 def test_token_user_wins_over_a_smuggled_user_id(client_factory):
@@ -1896,10 +2004,14 @@ def _stuffed_session(rows: int = _DEGRADE_ROWS) -> FakeSession:
     默认取 24:降级**确定发生**(那才是 `test_degrade_...` 要验的),
     而层 2 离触发线还远 —— 免得那条用例在无人察觉的情况下起一个真的后台线程
     (它自带 engine 与 HTTP 客户端,而「单测全程不联网」是硬规矩)。
+
+    ⚠️ 预置会话的 `user` **必须**是 `DEFAULT_LOGIN_USER`(认证,2026-09-27):
+    端点现在会比对 `conv.user` 与登录用户,不符就 404 —— 写成别的用户名会让这一族
+    用例集体红在一个与它们所测内容(分层 / 摘要 / 日志)完全无关的地方。
     """
     db = FakeSession()
     db.conversations[SCRATCH_CONV] = Conversation(
-        id=SCRATCH_CONV, user="demo-user", status="active",
+        id=SCRATCH_CONV, user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=0, layer1_from_msg_id=0,
     )
     for i in range(rows):
@@ -1922,7 +2034,7 @@ def _layered_session() -> FakeSession:
     """
     db = FakeSession()
     db.conversations[LAYERED_CONV] = Conversation(
-        id=LAYERED_CONV, user="demo-user", status="active",
+        id=LAYERED_CONV, user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=0, layer1_from_msg_id=5,
     )
     db.add(MessageRecord(conversation_id=LAYERED_CONV, role="user", content="订单 1002 能退吗"))
@@ -2260,7 +2372,7 @@ def test_an_over_budget_last_round_is_dropped_rather_than_blowing_the_window(
     )
     db = FakeSession()
     db.conversations[SCRATCH_CONV] = Conversation(
-        id=SCRATCH_CONV, user="demo-user", status="active",
+        id=SCRATCH_CONV, user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=0, layer1_from_msg_id=0,
     )
     db.add(MessageRecord(conversation_id=SCRATCH_CONV, role="user", content="这一轮的开头"))
@@ -2301,7 +2413,7 @@ def test_layer1_within_budget_triggers_neither_degrade_nor_summary(client_factor
     )
     db = FakeSession()
     db.conversations[SCRATCH_CONV] = Conversation(
-        id=SCRATCH_CONV, user="demo-user", status="active",
+        id=SCRATCH_CONV, user=DEFAULT_LOGIN_USER, status="active",
         summary_upto_msg_id=0, layer1_from_msg_id=0,
     )
     db.add(MessageRecord(conversation_id=SCRATCH_CONV, role="user", content="你好"))
