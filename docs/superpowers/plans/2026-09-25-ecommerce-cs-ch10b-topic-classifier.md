@@ -4231,8 +4231,34 @@ git commit -m "ch10-B T15: 管理台主题分布页(Vibe Coding)"
 > 而其中 108 行**没有人看过**,那正是本仓最忌讳的「看起来做完了、其实没做」。
 
 
+> ⚠️⚠️ **计划订正 19(controller,2026-09-27)—— 四条,第一条会让验收**假红** ⚠️⚠️
+>
+> **19-A(`/tmp` 在 bash 与 Python 眼里不是同一个地方 —— 我实测)**
+> ```
+> bash  的 /tmp  ->  /tmp
+> Python 的 /tmp ->  D:\tmp          ← 不同!
+> Python 的 tempfile.gettempdir() -> C:\Users\mike\AppData\Local\Temp
+> ```
+> ⇒ Step 1 那句 `.venv/Scripts/python.exe … --report /tmp/ch10_report.md` **把报告写到 `D:\tmp\`**,
+> 而下一行 bash 的 `[ -s /tmp/ch10_report.md ]` **查的是 MSYS 的 `/tmp`** ⇒
+> **报告明明生成了,检查却判红**(或反之)。这是**跨工具路径**的陷阱,不是口味问题。
+> ⇒ **统一改用 `$TEMP`**(bash 与 Python 都认,且实测与 `tempfile.gettempdir()` 一致),
+> 或干脆写到仓库内的临时目录。**凡是在这两个工具之间传递的文件路径,都要按这一条核一遍。**
+>
+> **19-B(`CLAUDE.md` 还要补一处 —— T12 报上来的)**:「建库 / 升级」那一段的文件清单
+> **至今没有 `db/ch10.sql`**。必须补上,并**写清它在全新库上会响亮地报 `ERROR 1050`**
+> (ORM 侧有同名模型,`init_db.py` 的 `create_all` 已经把表建出来了;**那是刻意的,不是脏库**)——
+> 否则有人会在全新库上跑它、把 1050 **读成「库脏了」**。
+>
+> **19-C(Step 8 的回归范围窄了)**:`-m "not db"` **测不到本任务的验收面** ——
+> 验收 ② 明确要**写库**,而 db 那一组才是它的覆盖。⇒ **改成跑全量**
+> (本仓 `pytest` 不带 `-m` 就是全部,需 MySQL 起着),并**打印出通过数**(不信「没报错就是过了」)。
+>
+> **19-D**:脚本里凡调 Python 一律用**显式的 `.venv/Scripts/python.exe`**,不用裸 `python`
+> (裸 `python` 今天恰好解析到 venv,但那是**环境碰巧**,不是保证)。
+
 **Files:**
-- Modify: `scripts/acceptance_ch10.sh`(任务 A3 建的那个,补 ①–③ 三节)
+- Modify: `scripts/acceptance_ch10.sh`(任务 A3 建的那个,补 ①–③ 三节;✅ **已核存在:49560 字节**)
 - Modify: `CLAUDE.md`
 - Modify: `dev-notes/ch10.md`
 
