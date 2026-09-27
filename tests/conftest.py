@@ -93,3 +93,18 @@ def flywheel_hooks(monkeypatch) -> FlywheelHookCalls:
 def _no_flywheel_threads(flywheel_hooks):
     """**每条用例**都自动生效:不接受 `flywheel_hooks` 的用例也拿不到真线程。"""
     return flywheel_hooks
+
+
+@pytest.fixture
+def _no_default_login():
+    """**关掉**「默认已登录」装置的开关。
+
+    只有认证自己的测试请求它 —— 那几条测的就是「没登录时会怎样」,
+    被默认装置一盖,断言的「401」会变成 200 而**红得莫名其妙**。
+
+    ⚠️ 这里只是**占个名字**:真正的开关在 **Task 4**(计划裁定 R9 —— 原先排在
+    Task 5,后来跟着 `Depends(require_user)` 一起挪到了 T4)加的 autouse 装置里,
+    它靠 `"_no_default_login" in request.fixturenames` 认这个名字。
+    ⇒ **本任务不许改它的形状**(名字即契约),那个装置才加它的逻辑。
+    """
+    return None

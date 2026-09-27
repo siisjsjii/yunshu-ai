@@ -219,3 +219,23 @@ class ExtractResult(BaseModel):
             "用户未明说时,依据诉求类型给出最合理的一种。"
         ),
     )
+
+
+class LoginRequest(BaseModel):
+    """登录请求。
+
+    两个字段都**只做长度**校验:密码**不设** min_length —— 密码策略是产品决定,
+    而这里多一条校验会让「旧账号的短密码登录被 422 拒掉」,报错还指向参数形状。
+    """
+
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class TokenResponse(BaseModel):
+    """登录响应。`expires_at` 是 ISO 串(前端拿它显示"什么时候要重新登录")。"""
+
+    token: str
+    username: str
+    role: str
+    expires_at: str

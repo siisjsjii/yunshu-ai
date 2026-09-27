@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
@@ -115,6 +116,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="电商智能客服 ch02", lifespan=lifespan)
+# 认证(2026-09-27):登录是**公开**端点,它自己不带守卫 —— 守卫挂在它的
+# 内部路径上(`/api/auth/me` 走 require_user)。同样**必须在 `mount("/")`
+# 之前**(`tests/test_topics_boundary.py` 有一条按注册顺序断的用例)。
+app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(extract_router)
 app.include_router(kb_router)
