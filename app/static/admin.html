@@ -68,6 +68,26 @@
   .topic-caveat { border: 2px solid #c98a00; background: #fff8e8; color: #7a5200;
     padding: 8px 10px; border-radius: 4px; font-size: 13px; margin-bottom: 10px; }
 
+  /* ── 链路(工作台里的 Langfuse 视图)── */
+  /* ⚠️ 三种状态**三种颜色**,这不是装饰:服务端把「观测没开」「连不上」
+     「通了但没数据」在响应形状上分开了(app/api/traces.py),页面要是把它们
+     画成一个灰框,那前两种就又长回同一个样子了 —— 而两者的处置完全不同
+     (一个去配 .env、一个去看服务)。 */
+  .trace-state { border: 2px solid #cdd9e4; background: #f5f9fd; color: #33475b;
+    padding: 10px 12px; border-radius: 4px; font-size: 13px; line-height: 1.6; }
+  .trace-state.warn { border-color: #c98a00; background: #fff8e8; color: #7a5200; }
+  .trace-state.bad { border-color: #b23b3b; background: #fdf0f0; color: #8a2626; }
+  .trace-state.empty { border-style: dashed; color: #5b7186; }
+  table.trace { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.trace th, table.trace td { border: 1px solid #cdd9e4; padding: 6px 8px;
+    text-align: left; vertical-align: top; }
+  table.trace th { background: #f0f7fd; }
+  table.trace td.num, table.trace th.num { text-align: right; white-space: nowrap; }
+  .lvl { font-size: 11px; padding: 1px 6px; border-radius: 999px;
+    border: 1.5px solid #7f8c99; color: #5b7186; }
+  .lvl.error { border-color: #b23b3b; color: #b23b3b; background: #fdf0f0; font-weight: 700; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+
   .doc-list { list-style: none; margin: 0; padding: 0; }
   .doc-list li { display: flex; align-items: center; gap: 10px;
     padding: 8px 6px; border-bottom: 1px dashed #cdd9e4; cursor: pointer; }
@@ -188,6 +208,7 @@
     <button class="tab" data-tab="待审" type="button">待审</button>
     <button class="tab" data-tab="评测" type="button">评测</button>
     <button class="tab" data-tab="主题分布" type="button">主题分布</button>
+    <button class="tab" data-tab="链路" type="button">链路</button>
   </nav>
 
   <div id="tab-入库">
@@ -287,6 +308,22 @@
         分类由 <code>scripts/classify_topics.py</code> 跑批写入
         <code>topic_classifications</code>,这里只读。
         <strong>实时对话主链路不经过它</strong>(旁路)。
+      </p>
+    </div>
+  </div>
+
+  <div id="tab-链路" style="display:none">
+    <div class="card">
+      <h2>链路追踪(Langfuse)</h2>
+      <div class="topic-sum" id="trace-sum">加载中…</div>
+      <div id="trace-state" class="trace-state" style="display:none"></div>
+      <div id="trace-table"></div>
+      <p class="muted" style="margin-top:10px">
+        数据由<strong>服务端代理</strong>读取(<code>GET /api/traces/recent</code>,
+        走 Langfuse 的 <code>v2</code> 接口,Basic 鉴权)——
+        <strong><code>LANGFUSE_*</code> 不下发到浏览器</strong>。
+        右侧的链接会<strong>跳到 Langfuse 网页</strong>:Langfuse 禁止被 iframe 嵌入
+        (响应头里是 <code>frame-ancestors 'none'</code>),所以只能跳转、不能内嵌。
       </p>
     </div>
   </div>
@@ -1076,7 +1113,7 @@
   $("q-flywheel").addEventListener("click", startFlywheel);
 
   // ── 标签页切换 ──
-  const TAB_NAMES = ["入库", "待审", "评测", "主题分布"];
+  const TAB_NAMES = ["入库", "待审", "评测", "主题分布", "链路"];
   function switchTab(name) {
     for (const b of document.querySelectorAll(".tab")) {
       b.classList.toggle("active", b.dataset.tab === name);
@@ -1089,6 +1126,10 @@
     // 「主题分布」同理 —— 而且**每次切进来都重拉**:跑批写完表之后,
     // 停在这一页上的人应该能靠「切走再切回」看到新数(没有轮询)。
     if (name === "主题分布") renderTopics();
+    // 「链路」同理 —— 也**每次切进来都重拉**。它读的是 Langfuse 那边**每时每刻
+    // 在变**的东西,所以比「主题分布」更没有理由缓存(那一页还能靠「跑完批处理
+    // 再切回来」看新数)。
+    if (name === "链路") renderTraces();
   }
   for (const b of document.querySelectorAll(".tab")) {
     b.addEventListener("click", () => switchTab(b.dataset.tab));
@@ -1160,6 +1201,175 @@
       row.append(name, bar, num);
       box.appendChild(row);
     }
+  }
+
+  // ── 链路(工作台里的 Langfuse 视图)──
+  //
+  // ⚠️ 这个页面**唯一**要防的误读是「**故障被读成业务结果**」。
+  //    三种状态在**响应形状**上就是分开的(`app/api/traces.py` 的模块 docstring):
+  //      · 观测没开      ⇒ `available: false` + `reason: "观测未启用"`
+  //      · 连不上 / 超时 ⇒ `available: false` + `reason: "连接失败: …"`
+  //      · 通了没数据    ⇒ `available: true` + `items: []`
+  //    ⇒ 这里的三个分支**必须**长得不一样。前两者都渲染成空表,与 ch09 那次
+  //      「Milvus 挂着而 `POST /api/feedback` 照回 200」是同一个形状的错误。
+  //    ⚠️ `items` 键**只在 available 为真时才存在** —— 所以读它的**之前**
+  //      必须先判 available;反过来写的话,「没开」与「连不上」会双双变成
+  //      一个安静的空表(不报错、也没有信息)。
+  //
+  // ⚠️ 不许**无界轮询**:与「待审」那个飞轮按钮不同,这里没有轮询 ——
+  //    每次切进来拉一次就够了(照「主题分布」)。
+  const TRACE_LIMIT = 20;
+
+  function fmtLatency(v) {
+    if (typeof v !== "number" || !isFinite(v)) return "—";
+    return v >= 1 ? `${v.toFixed(2)} s` : `${Math.round(v * 1000)} ms`;
+  }
+
+  function fmtStart(iso) {
+    const t = new Date(iso);
+    if (isNaN(t.getTime())) return iso || "—";     // 形状变了也别让整页空掉
+    const p = (n) => String(n).padStart(2, "0");
+    return `${p(t.getMonth() + 1)}-${p(t.getDate())} ` +
+      `${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
+  }
+
+  function shortId(s) { return s ? String(s).slice(0, 8) : "—"; }
+
+  //: ⚠️ `url` 由**服务端**给(深链形状是它在服务端核过的,见
+  //: `app/api/traces.py` 的模块 docstring)。**拿不到就不给链接** ——
+  //: 给一个点开 404 的链接比不给更糟:用户会以为工作台坏了,而真实原因
+  //: 只是项目 id 那一跳没拿到。
+  function traceLink(text, url, title) {
+    const a = document.createElement("a");
+    a.textContent = text;
+    if (url) {
+      a.href = url;
+      a.target = "_blank";              // 别把管理台导航走
+      a.rel = "noopener";
+    } else {
+      a.className = "muted";
+    }
+    if (title) a.title = title;
+    return a;
+  }
+
+  function showTraceState(kind, text) {
+    const st = $("trace-state");
+    st.className = "trace-state" + (kind ? " " + kind : "");
+    st.textContent = text;
+    st.style.display = "block";
+  }
+
+  function traceHeaderCell(label, cls) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    if (cls) th.className = cls;
+    return th;
+  }
+
+  async function renderTraces() {
+    const box = $("trace-table");
+    const sum = $("trace-sum");
+    const st = $("trace-state");
+    box.replaceChildren();
+    st.style.display = "none";
+    sum.textContent = "加载中…";
+
+    const r = await req(`/api/traces/recent?limit=${TRACE_LIMIT}`);
+    if (!r.ok || !r.body) {
+      sum.textContent = "";
+      showTraceState("bad", `读不到链路数据(HTTP ${r.status})。` +
+        (r.status === 404 ? "接口没挂上?" : "检查服务是否起在 8000。"));
+      return;
+    }
+    const d = r.body;
+
+    // ① ② 不可用(两种原因分开画)
+    if (!d.available) {
+      sum.textContent = "";
+      const notEnabled = d.reason === "观测未启用";
+      showTraceState(
+        notEnabled ? "warn" : "bad",
+        d.reason || "链路数据不可用(服务端没给原因)");
+      if (notEnabled) {
+        st.textContent +=
+          " —— 在 .env 里配齐 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / " +
+          "LANGFUSE_BASE_URL,重启服务后这一页就有数据了。";
+      }
+      return;
+    }
+
+    // ③ 通了
+    const items = d.items || [];
+    sum.textContent = `最近 ${TRACE_LIMIT} 条观测 · 拿到 ${items.length} 条` +
+      (d.project_url ? "" : " · ⚠ 项目地址没取到,只显示 id、不给跳转链接");
+    if (!items.length) {
+      showTraceState("empty",
+        "还没有链路数据 —— 观测已启用、也连得上 Langfuse,但那边一条都没有。" +
+        "去聊天页聊一轮,再切回这里。");
+      return;
+    }
+
+    const table = document.createElement("table");
+    table.className = "trace";
+    const head = document.createElement("tr");
+    head.append(
+      traceHeaderCell("时间"), traceHeaderCell("会话"), traceHeaderCell("名称"),
+      traceHeaderCell("耗时", "num"), traceHeaderCell("等级"), traceHeaderCell("在 Langfuse 打开"),
+    );
+    table.appendChild(head);
+
+    for (const it of items) {
+      const tr = document.createElement("tr");
+
+      const tdTime = document.createElement("td");
+      tdTime.textContent = fmtStart(it.start_time);
+
+      // 会话列给**短 id**(8 位),完整 id 放 title —— 36 位的 uuid 会把这一列撑爆,
+      // 而这一列的作用是「同一次会话的行长得一样、能对上」,不是给人抄。
+      const tdSess = document.createElement("td");
+      tdSess.className = "mono";
+      tdSess.appendChild(traceLink(shortId(it.session_id), it.session_url, it.session_id || ""));
+
+      const tdName = document.createElement("td");
+      tdName.textContent = it.name || "—";
+      if (it.type) {
+        const t = document.createElement("span");
+        t.className = "muted";
+        t.textContent = ` (${it.type})`;
+        tdName.appendChild(t);
+      }
+
+      const tdLat = document.createElement("td");
+      tdLat.className = "num";
+      tdLat.textContent = fmtLatency(it.latency);
+
+      const tdLvl = document.createElement("td");
+      const lv = document.createElement("span");
+      // 只有 DEFAULT 是「正常」;其余(ERROR / WARNING)都标出来 ——
+      // 这个页面最有用的一件事就是**一眼看到哪条炸了**。
+      lv.className = "lvl" + (it.level && it.level !== "DEFAULT" ? " error" : "");
+      lv.textContent = it.level || "—";
+      tdLvl.appendChild(lv);
+
+      const tdLink = document.createElement("td");
+      if (it.trace_url) {
+        tdLink.appendChild(traceLink("追踪", it.trace_url, `trace ${it.trace_id}`));
+      }
+      if (it.session_url) {
+        if (tdLink.childNodes.length) tdLink.appendChild(document.createTextNode(" · "));
+        tdLink.appendChild(traceLink("会话", it.session_url, it.session_id));
+      }
+      if (!tdLink.childNodes.length) {
+        // 服务端拿不到项目 id ⇒ **不给链接**,只把 id 摆出来(可以自己去搜)。
+        tdLink.className = "muted";
+        tdLink.textContent = `id ${shortId(it.id)}`;
+      }
+
+      tr.append(tdTime, tdSess, tdName, tdLat, tdLvl, tdLink);
+      table.appendChild(tr);
+    }
+    box.appendChild(table);
   }
 
   // ── 评测结果 ──

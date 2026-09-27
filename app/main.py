@@ -15,6 +15,7 @@ from app.api.kb import router as kb_router
 from app.api.refund import router as refund_router
 from app.api.review import router as review_router
 from app.api.topics import router as topics_router
+from app.api.traces import router as traces_router
 from app.config import get_settings
 from app.logging_setup import setup_logging
 from app.memory import budget
@@ -132,6 +133,10 @@ app.include_router(review_router)
 # `mount("/")` 之前** —— 挂反了静态目录的 catch-all 会先匹配,端点是 404
 # 而服务照常起。`tests/test_topics_boundary.py` 有一条按注册顺序断的用例。
 app.include_router(topics_router)
+# ch10 工作台「链路」标签页(只读代理 Langfuse)。同样**必须在 `mount("/")` 之前**
+# —— 挂反了静态目录的 catch-all 会先匹配,端点是 404 而服务照常起
+# (`tests/test_api_traces.py` 有一条真打 HTTP 的用例钉着)。
+app.include_router(traces_router)
 
 # 静态页必须**最后**挂:mount("/") 会接管根路径,先挂会抢走 /api/*。
 _static_dir = Path(__file__).parent / "static"

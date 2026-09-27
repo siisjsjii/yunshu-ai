@@ -50,6 +50,18 @@ class Settings(BaseSettings):
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
     langfuse_base_url: str = "https://us.cloud.langfuse.com"
+    #
+    # ch10 · 工作台「链路」标签页那一跳(`app/api/traces.py` 读**查询**接口)。
+    #   ⚠️ **不加界的后果不是「慢」,是永不返回** —— 与 ch09 那条最贵的
+    #   「不传 timeout ⇒ SDK 不设超时 ⇒ 挂起不是异常 ⇒ `finally` 永不执行」
+    #   是同一个形状,只不过这里碰的是 httpx 而不是 openai SDK。
+    #   与模型那条不同的是:这里的调用方是**管理台的一次页面加载**,不是
+    #   业务流,所以界可以给得很小 —— 5s 远超一次真实往返
+    #   (2026-09-27 实测:本机 → `us.cloud.langfuse.com` 的
+    #   `GET /api/public/v2/observations?limit=2` 在 1s 之内回来)。
+    #   ⚠️ 它同时管**两跳**(观测 + 项目 id),所以页面最坏等 `2 × 这个数`。
+    #   一句话回退:`.env` 里 `LANGFUSE_API_TIMEOUT_SECONDS=60`。
+    langfuse_api_timeout_seconds: float = Field(default=5.0, gt=0)
 
     # ---- ch09 · 置信度闸(spec §4)----
     # 判据 = w_top1*top1 + w_count*min(条数/max_count,1) + w_gap*clamp(top1-top2,0,1)
