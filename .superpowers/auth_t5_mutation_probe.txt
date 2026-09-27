@@ -1,0 +1,55 @@
+
+==========================================================================
+M1 拿掉 /api/kb/* 的 router 级 require_admin(等于「忘了挂守卫」)
+文件=kb.py  原始 sha=3a7a04e0b17f30a5  预期=red
+变异后:exit=1 -> red :: 3 failed, 2 passed in 4.73s  [OK]
+    FAILED tests/test_auth_wiring.py::test_every_api_route_is_guarded_or_whitelisted
+    FAILED tests/test_auth_wiring.py::test_workbench_routes_require_admin - Asser...
+    FAILED tests/test_auth_wiring.py::test_the_guard_matrix_matches_spec_64_exactly
+还原后 sha=3a7a04e0b17f30a5  == 原始(逐字节相同)
+
+==========================================================================
+M2 把 /api/auth/me 的 require_user 换成 require_admin
+文件=auth.py  原始 sha=011c89a91ad6cffa  预期=red
+变异后:exit=1 -> red :: 2 failed, 3 passed in 4.95s  [OK]
+    FAILED tests/test_auth_wiring.py::test_the_guard_matrix_matches_spec_64_exactly
+    FAILED tests/test_auth_wiring.py::test_login_is_public_and_me_is_user_only - ...
+还原后 sha=011c89a91ad6cffa  == 原始(逐字节相同)
+
+==========================================================================
+M4 拿掉 /api/traces 的守卫(只跑运行时那条 401 用例)
+文件=traces.py  原始 sha=b6bbdae387c0c199  预期=red
+变异后:exit=1 -> red :: 1 failed, 7 passed, 4 warnings in 9.00s  [OK]
+    FAILED tests/test_api_auth.py::test_every_guarded_route_really_answers_401_without_a_token
+还原后 sha=b6bbdae387c0c199  == 原始(逐字节相同)
+
+==========================================================================
+M5 拿掉 /api/conversations 的 router 守卫(签名里还有一道 ⇒ 预期仍绿)
+文件=conversations.py  原始 sha=6c455708d50daa22  预期=green
+变异后:exit=0 -> green :: 13 passed, 4 warnings in 3.53s  [OK]
+还原后 sha=6c455708d50daa22  == 原始(逐字节相同)
+
+==========================================================================
+M6(复审反例)把 /api/extract 的 require_user 换成 require_admin
+文件=extract.py  原始 sha=9358fa04653210fc  预期=red
+变异后:exit=1 -> red :: 1 failed, 4 passed in 4.96s  [OK]
+    FAILED tests/test_auth_wiring.py::test_the_guard_matrix_matches_spec_64_exactly
+    红了这几条=['test_the_guard_matrix_matches_spec_64_exactly']  期望=['test_the_guard_matrix_matches_spec_64_exactly']  [OK]
+还原后 sha=9358fa04653210fc  == 原始(逐字节相同)
+
+==========================================================================
+M3 拿掉 /api/feedback 的归属检查(越权写缺口回来)
+文件=feedback.py  原始 sha=f61aba18b161ad87  预期=red
+变异后:exit=1 -> red :: 3 failed, 11 passed in 6.09s  [OK]
+    FAILED tests/test_api_feedback.py::test_conversation_you_do_not_own_is_404_and_writes_nothing[\u4e0d\u5b58\u5728/down]
+    FAILED tests/test_api_feedback.py::test_conversation_you_do_not_own_is_404_and_writes_nothing[\u522b\u4eba\u7684/down]
+    FAILED tests/test_api_feedback.py::test_conversation_you_do_not_own_is_404_and_writes_nothing[\u522b\u4eba\u7684/up]
+还原后 sha=f61aba18b161ad87  == 原始(逐字节相同)
+
+==========================================================================
+复原状态下重跑(证明「还原之后真的能过」,不是「本来就红」):
+  tests/test_auth_wiring.py -> exit=0 :: 5 passed in 2.41s  [OK]
+  tests/test_api_auth.py -> exit=0 :: 8 passed, 4 warnings in 3.57s  [OK]
+  tests/test_api_feedback.py -> exit=0 :: 14 passed in 3.65s  [OK]
+
+结论:全部探针行为符合预期

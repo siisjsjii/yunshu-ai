@@ -108,7 +108,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      **不是 NULL** ⇒ `WHERE labels IS NULL` 一行都筛不出来。同一族的账 ch09 在
      `evidence_snapshot` 上已经付过一次(见下面「已知问题与未达成项」)。
 
-**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop、认证。
+**ch03 不做**:关键词召回、混合检索(BGE-M3 的 sparse/colbert)、重排 —— 只跑 dense 单路。**ch04 不做**:文档删除/编辑、任务持久化、并发任务队列。**ch07 不做**:跨会话长期记忆、用户画像、语义检索捞历史、主题重要度、摘要淘汰清理(表只追加)。**ch08 不做**:Skill 机制、接更多外部系统、工具的**热重载**(改完**我们自己的代码**不重启 —— §3.2 的界线只到「新增一个内置文件」为止)。**ch09 不做**(spec §1 非目标):低置信度问题**按主题归类的微调分类器**(用户点名「下一步的事」);**`Faithfulness` 之类的生成段 LLM-as-judge 指标**(用户 2026-09-23 订正:需求里那半个词指的是**置信度兜底机制**,`eval_runs` 只落**检索段**指标);**不改 ch08 的工具系统 / 确认流 / MCP 接入**;跨会话长期记忆与用户画像照旧不做。另:Langfuse 用 **Cloud** 不自部署(用户 2026-09-23 拍板,spec §2.1),prompt 版本管理 / 数据集与实验那一半没接。**全程不做**:多轮 Agent Loop。
+(**认证**原本也在此列,由**用户 2026-09-27 要求**补上 —— 见
+`docs/superpowers/specs/2026-09-27-ecommerce-cs-auth-design.md` 与
+`dev-notes/ch10.md`。)
 
 文档即设计源:`docs/superpowers/specs/` 下的 spec 是权威设计文档(内有「实现订正」小节,记录代码与最初设计的偏离及原因);`dev-notes/chNN.md` 是按阶段实时记录的开发留痕。改行为前先读 spec 对应章节。
 
@@ -126,6 +129,12 @@ bash scripts/acceptance.sh                                      # 端到端验�
 # 工作台(ch04 起叫「管理台」,ch10 跟进改名):浏览器开 http://localhost:8000/admin.html
 # 六个目录:首页 / 入库 / 待审 / 评测 / 主题分布 / 链路。首页五张卡是各页的摘要 + 入口;
 # 「评测」页的「运行评测」按钮跑的是与命令行逐字相同的那条命令(见下面的 ch10 一段)。
+
+# 认证(2026-09-27;前置同 ch01:MySQL + 真实 key)
+.venv/Scripts/python.exe scripts/seed_users.py                   # 预置演示账号(cinfly / demo-user;幂等)
+# ↑ 登录页那两个账号从这儿来;改密码 / 加账号都改这个脚本的 ACCOUNTS 再跑一次。
+#   ⚠️ 账号**不是配置项**(不在 `.env` 里):scrypt 的盐是随机的,写进配置就得把某一轮的盐焊死。
+#   `.env` 里只有 `JWT_SECRET` / `JWT_EXPIRE_MINUTES` 两个设置项,演示值见入库的 `.env.example`。
 
 # ch07(前置:MySQL + Milvus + 真实 key)
 .venv/Scripts/python.exe scripts/run_summary_eval.py            # 摘要标注样例评估(11 条,打网络)
@@ -229,8 +238,11 @@ bash scripts/acceptance_ch10.sh                                  # ch10 验收 �
 #    **`db/ch09.sql`(新表 `review_queue` + `eval_runs`,外加
 #    `low_confidence_questions` 的两列 `evidence_snapshot` / `matched_review_id`)**、
 #    **`db/ch10.sql`(新表 `topic_classifications`,ch10-B 的归类结果)**、
+#    **`db/auth.sql`(新表 `users`,认证功能的账号表,2026-09-27)**、
 #    **`db/followup_messages_citations.sql`(`messages` 加一列 `citations`)**
-#    ⚠️ 最后那份**不带章号,因为它不是一章的产物** —— 起因是「聊天页历史回载
+#    ⚠️ 后两份**都不带章号,因为它们都不是一章的产物** —— `db/auth.sql` 是 2026-09-27
+#    那次「加登录」的功能追加(`db/followup_messages_citations.sql` 是它的先例);
+#    followup 那份的起因是「聊天页历史回载
 #    丢掉了工具齿轮与文档链接」这个缺陷(2026-09-27 修)。
 #    它的走法**与 ch09 那份同款(是一条 ALTER)**:**旧库必须手动跑它**
 #    (`init_db.py` 永不加列,`create_all` 对已存在的 `messages` 是空操作);
@@ -249,6 +261,22 @@ bash scripts/acceptance_ch10.sh                                  # ch10 验收 �
 #    两条路径的形状差异逐条记在 `app/db/models.py` 的 `TopicClassification` docstring 里。
 #    漏掉它的后果是**功能性的**:`/api/topics/distribution` 与 `classify_topics.py` 直接
 #    `Unknown table`(这张表**没有别的写方**,批处理是唯一入口)。
+#    ⚠️ **`db/auth.sql` 与 `db/ch08.sql` / `db/ch10.sql` 同族**(**不是**与 ch09 那份同族):
+#    它只有一句 `CREATE TABLE users`,而 ORM 侧有同名模型(`app/db/models.py` 的 `User`)
+#    ⇒ `init_db.py` 的 create_all **已经把它建出来了** ⇒ **在全新库上跑它会在那条
+#    CREATE 上响亮地报 `ERROR 1050`(表已存在)。那是刻意的、不是脏库** ——
+#    与 `db/ch06.sql` 的 refund_requests、`db/ch08.sql` 的 tool_audit_logs、
+#    `db/ch10.sql` 的 topic_classifications 是**同一个**已知取舍(本仓的第四处)。
+#    ⇒ **正常路径只需要 `init_db.py`,不需要跑这一份**;想让**这份 DDL 成为形状的权威**
+#    才需要 `DROP TABLE users;` 再跑一遍,然后 `SHOW CREATE TABLE users\G` 核对。
+#    两条路径的形状差异**只有文本**(列定义逐字一致;DDL 那份多了表级 `COMMENT`)——
+#    逐条写在 `db/auth.sql` 的文件头里。
+#    漏掉它的后果是**功能性的**:`users` 表不存在 ⇒ `POST /api/auth/login` 与
+#    `scripts/seed_users.py` 直接 `Unknown table`,**一个账号都登不进去**。
+#    ⚠️ **走法别照抄 ch09 那份**:`db/ch09.sql` 第一句就是 ALTER ⇒
+#    **老库升级要「先 ch09.sql、再 init_db.py」**;这份的走法与 ch08/ch10 一致
+#    (**先 `init_db.py`**;1050 之后 `DROP TABLE users;` 再跑)。
+#    账号数据**不在这份 DDL 里**(scrypt 的盐是随机的),由 `scripts/seed_users.py` 幂等写入。
 #    漏掉 ch09 那份的后果**不是「少个功能」**:飞轮每条 `WHERE matched_review_id IS NULL`
 #    的选择谓词、审核页的每一行、趋势表的每一轮都读那两列/两张表 ⇒ 一进 `/api/review/*`
 #    或 `eval_trend.py` 就是 `Unknown column`。⚠️ 走法与其余几份**相反**(DDL 头部写着,
@@ -280,9 +308,10 @@ bash scripts/acceptance_ch10.sh                                  # ch10 验收 �
 #    `db/ch08.sql` 再跑 `init_db.py`,要么 1050 之后 `DROP TABLE tool_audit_logs;` 再跑一遍
 #    那份 DDL,然后用 `SHOW CREATE TABLE tool_audit_logs\G` 核对(见 `dev-notes/ch08.md`)。
 #    全新 checkout 的顺序:`init_db.py` → 依次 `db/ch03.sql` / `ch04` / `ch06` / `ch07` / `ch08`
-#    (**`db/ch09.sql` / `db/ch10.sql` / `db/followup_messages_citations.sql` 都不在此列**
-#    —— ch09 那份第一句是 ALTER(空库上 1146)、ch10 只有 CREATE(会 1050)、
-#    followup 那份是 ALTER(空库上 1060,列已存在);那三份的走法各自写在上面
+#    (**`db/ch09.sql` / `db/ch10.sql` / `db/auth.sql` /
+#    `db/followup_messages_citations.sql` 都不在此列**
+#    —— ch09 那份第一句是 ALTER(空库上 1146)、ch10 与 auth 只有 CREATE(会 1050)、
+#    followup 那份是 ALTER(空库上 1060,列已存在);那四份的走法各自写在上面
 #    与它们自己的文件头里)。
 
 # ch03(前置:docker start milvus-standalone)
@@ -306,9 +335,15 @@ app/config.py     pydantic-settings 读 .env;四个必填字段(三个 OPENAI_* 
 app/llm.py        ChatOpenAI 工厂,_build 收口全部硬约束
 app/prompts.py    System/抽取 Prompt + 消息组装;Message -> BaseMessage 转换的**唯一**出口
 app/schemas.py    纯数据模型,唯一被到处引用的类型源
-app/db/           base(引擎/会话工厂)、models(**9 张表**:conversations / messages / tickets /
+app/auth.py       认证功能(2026-09-27):**全仓唯一**的鉴权边界(写法对齐 `app/observability.py`)。
+                  别的模块只认 10 个名字:`AuthError` / `AuthenticatedUser` / `USER` / `ADMIN` /
+                  `hash_password` / `verify_password` / `create_token` / `decode_token` /
+                  `require_user` / `require_admin`。身份(用户名 + role)**放在 token 的 claims 里**
+                  ⇒ 每个受保护请求**零次库往返**(代价:改 role 后旧 token 到过期前仍带旧 role)。
+app/db/           base(引擎/会话工厂)、models(**13 张表**:conversations / messages / tickets /
                   knowledge_chunks / low_confidence_questions / qa_extraction_staging /
-                  refund_requests / conversation_summaries / tool_audit_logs)、session(FastAPI 依赖)
+                  refund_requests / conversation_summaries / tool_audit_logs /
+                  review_queue / eval_runs / topic_classifications / users)、session(FastAPI 依赖)
 app/tools/        ch08 起是**工具系统**,不再是「五个 @tool 放一个文件」:
                   spec.py(ToolSpec + **唯一**的 JSON Schema 校验器 validate_args)、
                   policy.py(权限声明表 kind_of,未声明 = 只读)、
@@ -325,9 +360,18 @@ app/services/     chat.py(纯校验的 prepare_turn)、extract.py(抽取)、hist
 app/api/          chat.py、extract.py、conversations.py(ch07 两个只读端点)、
                   feedback.py(ch09 飞轮入口 ③:`POST /api/feedback`)、
                   review.py(ch09 待审队列的四个端点)、
-                  topics.py(ch10-B 只读分布)、traces.py(ch10 跟进:Langfuse 只读代理)
+                  topics.py(ch10-B 只读分布)、traces.py(ch10 跟进:Langfuse 只读代理)、
+                  auth.py(2026-09-27:登录 `POST /api/auth/login` + `GET /api/auth/me`)
+                  ⚠️ **鉴权挂在各 router 的 `APIRouter(dependencies=[…])` 上**(不逐个端点写):
+                  用户面 `require_user`、工作台 `require_admin`,**唯一公开**的是登录端点。
+                  全矩阵 **27 个操作**,权威清单是 spec §6.4 的三张表;
+                  `tests/test_auth_wiring.py` 把那张表**整张抄进测试断全等**(集合 + 守卫类型)——
+                  只断「有没有守卫」是瞎的:把某个端点的守卫换成 admin 也照样全绿(复审实测)。
 app/static/       聊天页 + **工作台** admin.html(单页,无构建工具链;
-                  ch10 跟进起有**六个目录**:首页 / 入库 / 待审 / 评测 / 主题分布 / 链路)
+                  ch10 跟进起有**六个目录**:首页 / 入库 / 待审 / 评测 / 主题分布 / 链路);
+                  auth.js(2026-09-27:两页共用的**唯一**「401 怎么办」出口 ——
+                  `authFetch` 带 token、401 ⇒ 清 token + 弹浮层 + **登录后重放那一次调用**,
+                  ⚠️ 静态目录挂在 `/` ⇒ 页面上引用的是 **`/auth.js`,不是 `/static/auth.js`**)
 app/retrieval/    ch03 在线检索:embedder.py(BGE-M3 懒加载)、milvus.py、search.py(KnowledgeRetriever)
 app/kb/           ch03 离线管线(不在请求路径上):chunker / ingest / writer / mining;
                   ch04 的 jobs.py(JobStore)与 orchestrate.py(后台任务);
