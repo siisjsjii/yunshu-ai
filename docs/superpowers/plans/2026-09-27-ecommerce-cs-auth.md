@@ -1945,6 +1945,14 @@ git commit -m "认证 T7:7 个验收脚本各加三行(遮蔽 curl),100 处调�
 # 不配的话服务也能跑:会用一个**每次启动随机生成**的密钥,代价是重启后旧 token 全失效。
 JWT_SECRET=itcinfly
 JWT_EXPIRE_MINUTES=720
+
+# 演示账号(**预置在库里**,不是配置项 —— 记在这里是因为另一处代码声称它们在这儿:
+# `scripts/seed_users.py` 的 docstring 写着「`.env.example` 里已经印着同一组账号密码」,
+# 而 T4 的复审实测那句话**今天是假的**。⇒ 本节让那句话**成真**;
+# ⚠️ 或者反过来把那句 docstring 改成「用户拍板写死在脚本里」——两条路都行,**别两边都不做**。
+# 改密码/加账号都改 `scripts/seed_users.py` 的 ACCOUNTS 再跑一次(幂等)。
+#   cinfly    / 123456   (role=admin)
+#   demo-user / 123456   (role=admin;存量 581 条会话都属于它)
 ```
 
 - [ ] **Step 4: `dev-notes/ch10.md` 补一段(阶段 13)**
