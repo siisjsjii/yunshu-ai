@@ -445,3 +445,103 @@ class EvalRun(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), index=True
     )
+
+
+class TopicClassification(Base):
+    """低置信度问题的**多标签主题归类结果**(ch10-B,DDL: `db/ch10.sql`)。
+
+    一行 = 一条池子行的归类结果。写入方是**离线批处理**
+    (`scripts/classify_topics.py`,旁路推理服务算完写进来),**请求路径上没有任何东西
+    读写它** —— 它是结果表,不是状态表。
+
+    ### ① 唯一键 `uk_pool_question`:重跑 = 覆盖,不是追加
+
+    与 ch09 的 `review_queue` **刻意不加唯一键**规矩相反,而这是对的 ——
+    两件事**性质相反**:
+      · `review_queue` 判的是**语义**(模型判「两句话是不是同一个意思」)。字面唯一键
+        只能管**字面全等** ⇒ 一次**合理的语义归并**会响亮地 1062(该报「归并成功」,
+        得到的却是「插入失败」)⇒ 「同义不同字」的两行**本来就该能共存**。
+      · 本表判的是**确定性重算**:同一输入 + 同一权重 ⇒ 同一个结果。所以「同一条池子行
+        只能有一行」是**真**不变量,而唯一键正是 upsert(`ON DUPLICATE KEY UPDATE`)那把
+        「覆盖」写法的前提 —— 没有它,重跑会在池子旁边**静静堆出第二份、第三份结果**,
+        分布页的每一类条数跟着翻倍,而**没有任何东西会报错**。
+
+    ### ② `labels` / `scores` 是 JSON 列 —— 读法一律 `JSON_TYPE()`
+
+    ⚠️ 不要用 `IS NULL` / `IS NOT NULL` 读这两列:`JSON` 类型的 `none_as_null=False`
+    ⇒ Python 的 `None` 落库是**字面 JSON `null`**,SQL 上**不是 NULL**。ch09 用血换过
+    这一条(T19 拿 `IS NOT NULL` 去数「有快照的行」,把 JSON `null` 数成了非空)。
+    本表两列都是 `NOT NULL`,今天够不到那个坑,但**读法照旧钉死**。
+    连带:传空标签(`[]` / `{}`)是**合法 JSON**,数据库拦不住 —— 「服务连不上就**响亮
+    失败、绝不写空标签**」是**批处理脚本**的职责(spec §9.2),不是约束的职责。
+
+    ### ③ 与 `db/ch10.sql` 的形状差异
+
+    两条建库路径 = `scripts/init_db.py` 的 `create_all` / `db/ch10.sql` 手工执行。
+    本表是**全新的** ⇒ `create_all` **会**把它建出来(`init_db.py` 那句「永不加列」
+    管的是列,建表它照建),所以全新库上跑 `db/ch10.sql` 会响亮地报 **1050** ——
+    **刻意的**,与 `db/ch08.sql` 的 `tool_audit_logs` 完全同款。想看 DDL 那份形状:
+    `DROP TABLE topic_classifications;` → 跑 `db/ch10.sql` → `SHOW CREATE TABLE`。
+
+    下面这份清单逐条对过**三处**:① 编译出的 `CreateTable(...)`;② 本机 MySQL
+    **8.0.46** 上 `create_all` 真正建出来的 `SHOW CREATE TABLE`;
+    ③ `DROP TABLE` 后跑 `db/ch10.sql` 原文建出来的 `SHOW CREATE TABLE`
+    (两次读数都在 T12 报告里)。
+
+    **已对齐的**(列名 / 列序 / 可空性 / 类型名 / **唯一索引的名字** / 索引覆盖):
+    · 六列在两条路径上**同序同名**,`IS_NULLABLE` 全是 `NO`;
+    · `DATA_TYPE` 两边都是 `bigint / bigint / json / json / varchar / datetime`;
+    · 唯一键**两侧同名** `uk_pool_question` —— 本表刻意**把 ch08/ch09 那种「索引名不同」
+      的差异消掉**:`__table_args__` 里显式 `UniqueConstraint(..., name=...)`,
+      照 ch07 `ConversationSummary.uk_conv_seq` 的先例(只在一侧声明名字的话,
+      两条路的索引名会不一样,而**没有任何东西会报错**)。
+
+    **差异清单(都是已知的、纯文本的,不影响行为)**:
+    ① **`unsigned` 有无**:DDL 里两个 `BIGINT`(`id` / `low_confidence_question_id`)
+       都带 `UNSIGNED`,ORM 的 `BigInteger` 编译成**有符号** `BIGINT` ⇒ 列范围
+       2^64-1 vs 2^63-1(自增值今天碰不到)。与 `ReviewQueue` / `EvalRun` /
+       `low_confidence_questions.matched_review_id` 是**同一处**已知差异。
+       ⚠️ `id` 只能写 `BigInteger`:ORM 的 `Integer` 编译成 4 字节 `INT`,那是**真的**
+       形状不同(不是文本差异)。
+    ② **COMMENT**:DDL 有表级 + 六个列级中文注释,ORM 侧没有 `comment=` ——
+       与既有各表同款。**逐列对一遍再写**(ch08 那次把条数数漏过一回,别写
+       「只剩两处」这种源不支持的绝对断言)。
+    ③ **`classified_at` 的默认值措辞**:DDL 建出来是 `DEFAULT CURRENT_TIMESTAMP`,
+       `create_all` 建出来是 `DEFAULT (now())`(`func.now()` 被渲染成表达式)。
+       **两条路逐字不同、语义相同**(都是「插入时取当前时间」)。
+       ⚠️ 「发出去的文本」不等于「`SHOW CREATE TABLE` 读回来的文本」:`CreateTable` 发的
+       确实是 `now()`,而 **MySQL 把它规范化成 `(now())`** —— 别从发出去的文本往上推落库
+       形状(读法见 `ReviewQueue` 的 ③,2026-09-25 实测)。
+    ④ **列序**不涉及(本表没走 ALTER,不是 `db/ch09.sql` 那种「往末尾追加列」的情形)。
+    ⑤ **索引名**不涉及(见上,**已对齐**)。
+    """
+
+    __tablename__ = "topic_classifications"
+
+    __table_args__ = (
+        # 必须在**两侧**各声明一份,且**名字相同**:DDL 与 ORM 是两条建库路径。
+        # 唯一键是「重跑 = 覆盖」的前提 —— 只在一侧声明,两条路建出来的表**形状不同**,
+        # 行为变成「看谁建的库」,而没有任何东西会报错(同 `ConversationSummary` 的
+        # `uk_conv_seq`、`RefundRequest.status` 的 default/server_default 那两处教训)。
+        UniqueConstraint("low_confidence_question_id", name="uk_pool_question"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # **刻意不挂 ForeignKey** —— 与 `ToolAuditLog.conversation_id` 同款理由:
+    # 这是**结果表**,记的是「当时算出来的东西」。挂了外键,池子行的清理会受约束
+    # (甚至反过来影响池子那一侧),而分布页要的只是「这条问题归了哪几类」。
+    # 代价如实记账:一个**不存在的**池子 id 也能写进来(本文件的测试探针正是这样,
+    # 所以 PROBE_ID 不必真的在池子里),「悬空结果」数据库不拦。
+    low_confidence_question_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # 双双 NOT NULL:空标签该让**批处理**响亮失败(spec §9.2),不该落一行「没有主题」
+    # 的结果 —— 那会让分布页把「推理服务挂了」读成「这些问题没有主题」。
+    labels: Mapped[list] = mapped_column(JSON, nullable=False)
+    scores: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 训练产物指纹(`models/topic-clf/train_meta.json` 原样带出)——
+    # 「这个结果是谁算的」。**故意不给 default**:漏传必须当场 1364,
+    # 而不是被补成一个看不出哪来的值(同 `ConversationSummary.content`)。
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 与 `ReviewQueue.created_at` 同款:两侧默认值都要,否则两条路径形状不同。
+    classified_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
