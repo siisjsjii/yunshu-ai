@@ -502,7 +502,15 @@ async def _main(args: argparse.Namespace) -> int:
     verb = "会写" if summary["dry_run"] else "已写"
     _emit("")
     _emit(f"{verb} {summary['written']} 行;本次空标签 {summary['empty_labels']} 条")
-    _emit(f"分布页会看到:总行数 {summary['total_rows']} / 不同问题数 "
+    # ⚠️ **名字是「已归类的池子行数」,不是「不同问题数」**(订正轮 1 M10,复审独立同意)。
+    #    这两个数**口径不同**,而此前**撞名**:这里印的是
+    #    `COUNT(DISTINCT low_confidence_question_id)`(那一列上有唯一键 ⇒ 与行数恒等,
+    #    今天 **65**);分布接口那个是「池子里多少条**不同题面**」(今天 **33**,
+    #    计划订正 17-A 改过的语义)。同一轮输出里两个数两个意思、名字一模一样,
+    #    读的人只会以为其中一个算错了。
+    #    ⇒ **改印出来的名,语义一个字没动**(`distribution_numbers` 与其 docstring 原样;
+    #    接口那个名是 17-A 刚订正、分布页正在读的,更不能动)。
+    _emit(f"分布页会看到:总行数 {summary['total_rows']} / 已归类的池子行数 "
           f"{summary['distinct_questions']}")
     return 0
 

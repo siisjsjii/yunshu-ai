@@ -46,16 +46,20 @@
 #   ① 分类对     :done 帧的 intent == 转人工                (分类器的问题)
 #   ② 工具被调了 :SSE 里有 transfer_to_human 的 tool_call 帧 (模型没调工具)
 #   ②b 那次调用成了:同一个 `tool_call_id` 的 tool_result 是 `ok: true` (调了但失败了)
-#   ③ 用户拿到了 :回复里有**工号 A###** 或**等待/排队**   (结果没被转述给用户)
+#   ③ 用户拿到了 :回复里有**工号 A###** 或**等待位次·时长**或**只说「接入」**(结果没被转述给用户)
 #
 # **只断 ① 的话,「分类对了但模型没调工具、用户什么也没得到」会全绿通过。**
 #
 # ⚠️ **③ 的口径是 spec 的字面口径,不是「只认工号」**(fix round 1,I1):
 #   spec §12 验收 ④ 与 §11.4 写的是「工号**/等待时长**」—— 那个斜杠是**或**。
 #   实测 9 句里 4 句只给了「当前排队第 2/3 位,预计等待约 7/8 分钟」而没报工号,
-#   而那种回复**用户是拿到了结果的**。⇒ ③ 判红 = **两个 artefact 一个都没有**;
-#   同时**两个子数分开打**(报出工号 / 只给了等待),不许合成一个 ——
+#   而那种回复**用户是拿到了结果的**。⇒ ③ 判红 = **三类 artefact 一个都没有**;
+#   同时**三个子数分开打**(报出工号 / 只给位次·时长 / 只说「接入」),不许合成一个 ——
 #   合成会把「模型时时报工号、时时不报」这个不一致**平均掉**,而那正是要看的。
+#   ⚠️ **订正轮 1 把第三类补上了**(复审 F6):实测「已为您转接人工客服,**当前排在您前面
+#   还有 1 位,预计 7 分钟左右接入**」曾因**不含「排队」「等待」**被判红 —— 位次与时长
+#   都给了。⇒ needle 加「排在」「预计」;再加一类最弱的「接入」。**加词就是放松判据**,
+#   这一层的性质(关键词匹配,不是语义判定)如实写在下面的局限清单里。
 #
 # ⚠️ **②b 不是装饰**(fix round 1,I2):没有它的话,「工具**失败了**(`ok:false`)、
 #   而模型自己编了一个 `A###`」会判绿 —— ③ 只看回复文本时它看不出来。
@@ -166,6 +170,16 @@ fi
 H_HANDOFF="8f6c 4eba 5de5"                # 转人工
 H_WAIT="7b49 5f85"                        # 等待
 H_QUEUE="6392 961f"                       # 排队
+# ⚠️ **③ 的 artefact 集在订正轮 1 被放宽过**,理由是一条**实测的假红**:
+#   模型回复「已为您转接人工客服,**当前排在您前面还有 1 位,预计 7 分钟左右接入**」
+#   —— 位次与时长都给了,却因为**没有「排队」「等待」这两个词**被判红(ch10-A 那层
+#   原本是这两个词的字面匹配)。5 次运行里红了 1 次,而红落在**承重句**上。
+#   ⇒ 补进「排在」「预计」:它们是同一件事(等待位次 / 预计时长)的另一种说法。
+H_LINEUP="6392 5728"                      # 排在(「排在您前面还有 N 位」)
+H_ETA="9884 8ba1"                         # 预计(「预计 N 分钟左右接入」)
+# 第三类(最弱):只说「接入」这类话 —— 用户知道在转接了,但**没拿到位次也没拿到时长**。
+# **单独计数、不合成**(合成会把「模型时时报位次、时时只报一句套话」这个不一致平均掉)。
+H_JOIN="63a5 5165"                        # 接入
 
 # ⚠️ **一律用显式的 `.venv/Scripts/python.exe`**(计划订正 19-D):裸 `python` 今天
 # 恰好解析到 venv,但那是**环境碰巧**,不是保证 —— 跑批/评测那几节依赖 venv 里的
@@ -193,7 +207,7 @@ PASS=0; FAIL=0; WARN=0
 PROBE_MISS=0
 # 3 句里的几个读数:模型调了工具的句数 / 三层全过的句数 / 其中报出工号的句数 /
 # 其中只给了等待·排队的句数。**后两个必须分开打**(见 §读数区那段注释)。
-CALL_OK=0; ALL3_OK=0; H_ROUNDS=0; AGENT_NO_OK=0; WAIT_ONLY=0
+CALL_OK=0; ALL3_OK=0; H_ROUNDS=0; AGENT_NO_OK=0; WAIT_ONLY=0; HANDOFF_ONLY=0
 
 ok()   { echo "  PASS  $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
@@ -446,6 +460,23 @@ except (OSError, UnicodeDecodeError):
 needle = "".join(chr(int(h, 16)) for h in sys.argv[2].split())
 raise SystemExit(0 if needle in text else 1)' "$1" "$2"
 }
+# 一组 needle 里**有没有一个在**。$1=文件;其余 = 各 needle(hex 码点)。
+# 退出码沿用 `has_needle` 的三值语义:**0**=至少一个在 / **1**=都不在 / **2**=**读不了**。
+# ⚠️ 2 不许当 1 —— 那是「装置故障冒充结论」(见 `has_needle` 上面那段的规矩)。
+any_needle() {   # $1=文件;其余=needle
+  local file="$1"; shift
+  local h rc
+  for h in "$@"; do
+    has_needle "$file" "$h"; rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      1) : ;;
+      *) return 2 ;;
+    esac
+  done
+  return 1
+}
+
 # 「针**不在**」这种**否定**断言。$1=文件 $2=hex $3=绿话 $4=红话(针在时)
 #
 # ⚠️ **本节的断言全是肯定断言,所以这条今天没人调用** —— 留着它是刻意的:
@@ -631,6 +662,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ⚠️ 本文件落在 `<repo>/.ch10_acceptance/` 下 ⇒ 上溯**一层**才是仓库根
@@ -885,8 +917,16 @@ def check_report(a) -> int:
     #    而一份**每个数都错**的报告照样含这几个字样。数字从 markdown 里**重新解析**一遍,
     #    与机器可读的那份逐个比 —— 两者分家就是「给人看的那份在撒谎」。
     row = _md_row(md_text, "## 5.", "micro-F1")
-    if row is None or len(row) < 4:
-        bad("report.md 的 §5 三列并排表里找不到 micro-F1 那一行 —— 数值交叉核对判不了")
+    # ⚠️ **两种失败分开报**(订正轮 1,复审 M8):旧写法一律说「找不到那一行」,
+    #    而实测过「**行找到了、只是单元格数不对**」—— 红是对的、**诊断是错的**,
+    #    读的人会去查表标题而不是查那一行的形状。
+    if row is None:
+        bad("report.md 的 §5 表里**找不到** micro-F1 那一行(表还在不在?节标题换了?)"
+            "—— 数值交叉核对判不了")
+        problems += 1
+    elif len(row) < 4:
+        bad("report.md 的 §5 里 micro-F1 那一行只有 %d 个单元格(期望 >= 4:指标名 + 三列)"
+            "—— 数值交叉核对判不了" % len(row))
         problems += 1
     else:
         got = [_as_float(c) for c in row[1:4]]
@@ -901,8 +941,12 @@ def check_report(a) -> int:
                          for k in ("all", "real", "synthetic")]))
             problems += 1
     row2 = _md_row(md_text, "## 2.", "**micro-F1**")
-    if row2 is None or len(row2) < 2:
-        bad("report.md 的 §2 里找不到 micro-F1 那个格子")
+    if row2 is None:
+        bad("report.md 的 §2 里**找不到** micro-F1 那一行(与 M8 同款:先分清「没找到」"
+            "与「找到但形状不对」)")
+        problems += 1
+    elif len(row2) < 2:
+        bad("report.md 的 §2 里 micro-F1 那一行只有 %d 个单元格(期望 >= 2)" % len(row2))
         problems += 1
     else:
         got2 = _as_float(row2[1])
@@ -973,8 +1017,13 @@ def check_report(a) -> int:
         ok("测试集文件自己的 provenance 计数也是 真实 %d / 合成 %d(与报告一致)"
            % (comp["real"], comp["synthetic"]))
     else:
-        bad("测试集文件的 provenance 计数 %s != 报告里的 %s"
-            % (json.dumps(comp, ensure_ascii=False), json.dumps(prov, ensure_ascii=False)))
+        # ⚠️ **红话里必须印期望的常量**(订正轮 1,复审 M7):判据是拿 `comp` 比**常量
+        #    80/40**,而旧红话印的是 `comp` 与 `prov` ⇒ 实测会印出
+        #    `{"real": 80, "synthetic": 41} != {"real": 80, "synthetic": 41}`
+        #    (**两个操作数一模一样**,读起来像脚本自己坏了)。
+        bad("测试集文件的 provenance 计数 %s != 期望的 真实 %d / 合成 %d(报告里记的是 %s)"
+            % (json.dumps(comp, ensure_ascii=False), TEST_REAL, TEST_SYNTH,
+               json.dumps(prov, ensure_ascii=False)))
         problems += 1
 
     # ── (9) 切分算术:合计 = 输入 − 不可信靶子 / 三份互不相交 ───────────────
@@ -1038,7 +1087,7 @@ def check_report(a) -> int:
 # 验收 ②:跑批 + 分布接口
 # ══════════════════════════════════════════════════════════════════════════
 
-def _independent_distribution():
+def _independent_distribution(limit):
     """分布接口那几个数的**另一条算法**:把 `labels` 拉回 Python 数一遍。
 
     ⚠️ 这正是 `app/api/topics.py` **刻意不做**的那件事(它在 SQL 里用 `JSON_TABLE` 展开)。
@@ -1048,6 +1097,14 @@ def _independent_distribution():
     「不同问题数」按**池子的题面**数(`low_confidence_questions.question`),这正是
     计划订正 17-A 的语义:按 `low_confidence_question_id` 去重会与行数**恒等**
     (那一列上有唯一键),得到的是个没意义的数。⇒ 回归到旧写法时,这里会与接口分家。
+
+    ⚠️ 订正轮 1 起它**还担两件事**(复审 F1/F2:那两条判据原先只读跑批脚本**自己印的数**,
+    于是一次「落库变空操作」与一次「打印为 0、实际写空标签」都能全绿跑过整节):
+
+    | 读什么 | 用来核什么 |
+    |---|---|
+    | `empty_this_batch` | 本轮处理的那 `limit` 条池子行里,**库里真写着空标签的有几条** ⇒ 与跑批自报的那个数比 |
+    | `max_classified_at` | 全表 `MAX(classified_at)` ⇒ 与**本轮开始前的库时钟**比,证「这一轮真的写过库」 |
     """
     import asyncio
 
@@ -1058,29 +1115,80 @@ def _independent_distribution():
     async def run():
         engine = get_engine()
         async with engine.connect() as conn:
-            return (await conn.execute(sql_text(
-                "SELECT t.labels, q.question FROM topic_classifications t "
+            rows = (await conn.execute(sql_text(
+                "SELECT t.low_confidence_question_id, t.labels, q.question, t.classified_at "
+                "FROM topic_classifications t "
                 "LEFT JOIN low_confidence_questions q ON q.id = t.low_confidence_question_id"
             ))).all()
+            # 跑批读的就是池子**最旧的 limit 条**(`ORDER BY id LIMIT n`,那个 ORDER BY
+            # 由 `tests/test_classify_topics.py` 对着编译出的 SQL 钉住)⇒ 这一轮写的是
+            # 这 n 个 id。**必须是同一把尺子**:不然拿「全表空标签数」去比「本轮自报数」
+            # 会在「上一轮留下过空标签」时得到一条假红。
+            first_ids = {r[0] for r in (await conn.execute(
+                sql_text("SELECT id FROM low_confidence_questions ORDER BY id LIMIT :n"),
+                # `limit` 缺省(没传 `--limit`)时按「全池」算 —— 用一个大数走同一条 SQL,
+                # 而不是选一条不同的语句(两条语句 = 两套语义,早晚漂开)。
+                {"n": int(limit) if limit else 10 ** 9},
+            )).all()}
+            return rows, first_ids
 
     try:
-        rows = asyncio.run(run())
+        rows, first_ids = asyncio.run(run())
     except Exception as exc:                      # noqa: BLE001 —— 连不上库是装置故障
         return None, "%s: %s" % (type(exc).__name__, exc)
     counts: dict[str, int] = {}
     distinct: dict[str, set] = {}
     questions = set()
-    for labels_value, question in rows:
+    empty_all = 0
+    empty_this_batch = 0
+    newest = None
+    for pool_id, labels_value, question, classified_at in rows:
         if isinstance(labels_value, str):
             labels_value = json.loads(labels_value or "[]")
+        labels_value = list(labels_value or [])
         if question:
             questions.add(question)
-        for label in labels_value or []:
+        if not labels_value:
+            empty_all += 1
+            if pool_id in first_ids:
+                empty_this_batch += 1
+        if classified_at is not None and (newest is None or classified_at > newest):
+            newest = classified_at
+        for label in labels_value:
             counts[label] = counts.get(label, 0) + 1
             if question:
                 distinct.setdefault(label, set()).add(question)
     return {"rows": len(rows), "counts": counts, "questions": len(questions),
-            "distinct": {k: len(v) for k, v in distinct.items()}}, None
+            "distinct": {k: len(v) for k, v in distinct.items()},
+            "empty_all": empty_all, "empty_this_batch": empty_this_batch,
+            "batch_ids": len(first_ids), "max_classified_at": newest}, None
+
+
+def db_now(a) -> int:
+    """打印**库自己的时钟**(`SELECT NOW()`,格式 `YYYY-MM-DD HH:MM:SS`)。
+
+    为什么不用客户端时钟:实测本机 Docker 里的 MySQL 跑在 **UTC**,而主机是本地时区
+    —— 两者差 8 小时,拿客户端的「现在」去比 `classified_at` 会得到一条**永远为真
+    或永远为假**的断言(而那两样都不报错)。⇒ **同一把钟才可比。**
+    """
+    import asyncio
+
+    from sqlalchemy import text as sql_text
+
+    from app.db.base import get_engine
+
+    async def run():
+        engine = get_engine()
+        async with engine.connect() as conn:
+            return (await conn.execute(sql_text("SELECT NOW()"))).scalar()
+
+    try:
+        value = asyncio.run(run())
+    except Exception as exc:                      # noqa: BLE001
+        emit("!!! 读库时钟失败:%s: %s" % (type(exc).__name__, exc))
+        return 2
+    emit(value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value, "strftime") else str(value))
+    return 0
 
 
 def check_dist(a) -> int:
@@ -1118,15 +1226,23 @@ def check_dist(a) -> int:
     if not empties:
         boom("跑批日志里找不到「空标签 N 条」⇒ 这一条判不了")
         return 2
-    if all(n == 0 for n in empties):
-        ok("本次没有空标签行(服务返回空会被分布页读成「这些问题没有主题」—— 故障读成业务)")
+    # ⚠️ **订正轮 1(复审 F3)把这一条翻过来了。** 旧写法是「有空标签 ⇒ FAIL」,
+    #    而那是**错的**:`labels: []` **是合法的模型输出**(一个低信号问题全部低于阈值),
+    #    `scripts/classify_topics.py` 的订正 15-C 与
+    #    `tests/test_classify_topics.py::test_empty_labels_are_allowed_but_counted`
+    #    明写着「**允许写,但必须被数出来**」。照旧写法,一次**合法**的模型输出会让
+    #    承重验收判红,而且红话给出的诊断(「而那不是业务结果」)与代码明写的行为相反。
+    #    ⇒ 现在判的是**两个数一不一致**(脚本印的 vs 库里真写的),不是「必须是 0」。
+    reported_empty = empties[-1]
+    if len(set(empties)) == 1:
+        ok("跑批报的空标签条数前后一致(%d 条)—— 它是不是真的,下面拿库核" % reported_empty)
     else:
-        bad("有 %s 条空标签行 ⇒ 旁路服务有返回为空的时候,而那不是业务结果" % max(empties))
+        bad("跑批前后两行报的空标签条数不一致:%s(同一轮里两个数对不上)" % empties)
         problems += 1
-    m = re.search(r"总行数 (\d+) / 不同问题数 (\d+)", text)
+    m = re.search(r"总行数 (\d+) / 已归类的池子行数 (\d+)", text)
     batch_total, batch_distinct = (int(m.group(1)), int(m.group(2))) if m else (None, None)
     if m is None:
-        boom("跑批日志里找不到「总行数 N / 不同问题数 M」⇒ 与接口的交叉核对判不了")
+        boom("跑批日志里找不到「总行数 N / 已归类的池子行数 M」⇒ 与接口的交叉核对判不了")
         return 2
 
     if a.curl_rc != 0:
@@ -1181,7 +1297,7 @@ def check_dist(a) -> int:
         bad("model_versions 是空的 —— 分布页说不清这张图是谁算的")
         problems += 1
 
-    indep, err = _independent_distribution()
+    indep, err = _independent_distribution(a.limit)
     if indep is None:
         boom("独立复算连不上库 ⇒ 分布数字的交叉核对判不了(%s)" % err)
         return 2
@@ -1212,16 +1328,65 @@ def check_dist(a) -> int:
     else:
         bad("bucket 与独立复算对不上的:%s(最多列 3 个)" % " ; ".join(mismatch[:3]))
         problems += 1
+    # ── 空标签:**拿库里的实际行数**核跑批自己报的那个数(订正轮 1,复审 F1)──────
+    # ⚠️ 复审的实测:把跑批脚本的 `"labels": labels` 改成 `[] if written == 0 else labels`
+    #    (**计数逻辑一字不动**)⇒ 一行空标签**真的落进了库**,而旧判据只看脚本印的数
+    #    ⇒ **`通过 54 / 失败 0`** 照样报出来,还打印「本次没有空标签行」。
+    #    库侧的独立证据当时就在同一份转录里(`各 bucket 条数合计` 79 → 78)。
+    #    ⇒ 判据改成**两个数比**:跑批自报的 vs 库里那一批行真写着的。
+    if indep["empty_this_batch"] == reported_empty:
+        ok("本轮处理的那 %d 条池子行在库里写着空标签的有 %d 条 == 跑批自报的 %d 条"
+           "(空标签是合法模型输出,但**必须被数出来** —— 订正 15-C)"
+           % (indep["batch_ids"], indep["empty_this_batch"], reported_empty))
+    else:
+        bad("跑批自报空标签 %d 条,而库里本轮那 %d 条行里**真写着空标签的有 %d 条** ⇒ "
+            "那个读数是脚本自报的、不来自库 —— **故障会被读成业务结果**"
+            % (reported_empty, indep["batch_ids"], indep["empty_this_batch"]))
+        problems += 1
+    read("空标签:全表 %d 条 / 本轮那 %d 条里 %d 条 / 跑批自报 %d 条"
+         % (indep["empty_all"], indep["batch_ids"], indep["empty_this_batch"], reported_empty))
+
+    # ── 这一轮**真的写过库**吗(订正轮 1,复审 F2)────────────────────────────
+    # ⚠️ 复审的实测:把跑批脚本的 `await session.execute(stmt)` 换成 `return len(values)`
+    #    (**落库变空操作**)⇒ 日志照印「已写 20 行」,整节 **54/0、退出码 0**。
+    #    ⇒ 一个「批处理再也不写库」的回归可以全绿地跑过整个验收,因为这一节其余判据
+    #    看的都是表的**总量**,而池子早就全归过类 ⇒ 总量不变。
+    #    判据:`classified_at` 的**最大值**必须 >= **这一轮开始前取的库时钟**。
+    #    ⚠️ 两头都用**库的**时钟:实测本机 Docker 里的 MySQL 跑的是 **UTC**(与主机差 8 小时),
+    #    拿客户端的「现在」比会得到一条永远为真(或永远为假)的断言 —— 而那两样都不报错。
+    if got_n == 0:
+        skip("池子这一轮读到 0 行 ⇒ 「这一轮真的写过库」无从谈起(它本来就该什么都不写)")
+    elif not (a.db_start or "").strip():
+        boom("拿不到库时钟(--db-start 是空的)⇒ 「这一轮真的写过库」判不了")
+        problems += 1
+    else:
+        try:
+            t0 = datetime.strptime(a.db_start.strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            boom("库时钟的格式不是 YYYY-MM-DD HH:MM:SS([%s])⇒ 这一条判不了" % a.db_start)
+            t0 = None
+            problems += 1
+        newest = indep["max_classified_at"]
+        if t0 is not None and newest is not None and newest >= t0:
+            ok("库里最新的 classified_at=%s >= 本轮开始前的库时钟 %s ⇒ 这一轮真的写过库"
+               % (newest, t0))
+        elif t0 is not None:
+            bad("库里最新的 classified_at=%s **早于**本轮开始前的库时钟 %s ⇒ "
+                "跑批说它写了 %d 行,而库里一条新写都没有(**落库是个空操作**)"
+                % (newest, t0, got_n))
+            problems += 1
+
     read("分布读数:total=%d / 不同问题数=%d / bucket 条数合计=%d / 前 3 个 bucket=%s"
          % (total, dq, s, "、".join("%s:%s" % (b["label"], b["count"]) for b in buckets[:3])))
-    # ⚠️ **同一个中文名,两个意思**(读这条之前先别急着当 bug):`scripts/classify_topics.py`
-    #    印的那个「不同问题数」是 `COUNT(DISTINCT low_confidence_question_id)` = 「有多少条
-    #    池子行已被归类」(唯一键保证与行数恒等);而**接口**那个是「池子里有多少条不同题面」
-    #    (计划订正 17-A 改过的语义)。今天 65 vs 33 —— 两个数都对,只是不是同一件事。
-    #    这里**只打出来入账,不断言**:断言成哪一个都会把另一个说成错的。
+    # ⚠️ **同一个中文名,曾经两个意思**(订正轮 1 起名字分开,语义一个字没改):
+    #    `scripts/classify_topics.py` 印的那个是 `COUNT(DISTINCT low_confidence_question_id)`
+    #    = 「**已归类的池子行数**」(唯一键保证与行数恒等),而**接口**那个是
+    #    「池子里有多少条**不同题面**」(计划订正 17-A 改过的语义)。今天 65 vs 33。
+    #    名字是复审 M10 钉的:改**印出来的名**,不动任何语义(接口那个名是 17-A 刚订正、
+    #    页面正在读的)。这里仍然**只打出来入账、不断言** —— 断言成哪一个都会把另一个说成错的。
     if batch_distinct is not None and batch_distinct != dq:
-        read("跑批自己印的「不同问题数」=%s 与接口的 %d **不是同一个数**(跑批那个是"
-             "「有多少条池子行已被归类」,接口那个是「池子里多少条不同题面」)"
+        read("跑批印的「已归类的池子行数」=%s 与接口的「不同问题数」%d **不是同一个数**"
+             "(前者是「有多少条池子行已被归类」,后者是「池子里多少条不同题面」)"
              % (batch_distinct, dq))
     return 1 if problems else 0
 
@@ -1336,6 +1501,10 @@ def main(argv=None) -> int:
     p.add_argument("--dist", required=True)
     p.add_argument("--curl-rc", type=int, required=True)
     p.add_argument("--limit", type=int, default=None)
+    #: 跑批**开始之前**取的**库时钟**(`db-now` 模式)⇒ 用来证「这一轮真的写过库」。
+    p.add_argument("--db-start", default="")
+
+    sub.add_parser("db-now", help="打印库自己的时钟(给 --db-start 用)")
 
     p = sub.add_parser("predict-check")
     p.add_argument("--predict", required=True)
@@ -1345,7 +1514,7 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     handler = {"report-check": check_report, "dist-check": check_dist,
-               "predict-check": check_predict}[args.mode]
+               "predict-check": check_predict, "db-now": db_now}[args.mode]
     return handler(args)
 
 
@@ -1505,29 +1674,41 @@ check_handoff() {
   # 实测(2026-09-25/26,本机 9 句):4 句只给了「当前排队第 2/3 位,预计等待约
   # 7/8 分钟」而没报工号 —— 那种回复**用户是拿到了结果的**,不该被判成产品坏了。
   # ⚠️ 所以这一层断的是「**结果有没有被转述**」,不是「模型有没有照抄某一个字段」;
-  #    判红 = **两个 artefact 一个都没有**(既没工号、也没等待/排队)。
+  #    判红 = **三类 artefact 一个都没有**(工号 / 位次·时长 / 只说「接入」)。
+  # ⚠️⚠️ **这一类判据是关键词匹配,不是语义判定**(订正轮 1 记):它的假红已经发生过一次
+  #    —— 「排在您前面还有 1 位,预计 7 分钟左右接入」不含「排队」「等待」两词而被判红。
+  #    放宽的办法是**加词**(「排在」「预计」「接入」,见文件头),而**加词就等于放松判据**;
+  #    更严的做法(对着 `tool_result` 的字段断)会改成「工具给了什么」而不是
+  #    「用户拿到了什么」—— 那不是这一层要问的问题。⇒ 口径就是这样,如实写在局限里。
   agent_no=$(printf '%s' "$reply" | grep -oE 'A[0-9]{3}' | head -1)
-  # 「等待」或「排队」:两串都走 `has_needle`(hex needle,见文件头)。**三值必须分开**:
-  # 0=在 / 1=不在 / 2=文件读不了(装置故障)—— 在 `||` 链里把 2 当 1 就是
-  # 「装置故障冒充结论」。
-  has_wait=no
-  has_needle "$reply_file" "$H_WAIT";  rc_wait=$?
-  has_needle "$reply_file" "$H_QUEUE"; rc_queue=$?
-  case "$rc_wait:$rc_queue" in
-    0:*|*:0) has_wait=yes ;;
-    1:1) : ;;                                   # 两串都确实不在 ⇒ 才是「没转述」
-    *) boom "$label:装置故障:读不了回复文件(has_needle 返回 $rc_wait/$rc_queue)—— 这一轮判不了"; return 4 ;;
+  # 位次·时长那一类(等待 / 排队 / 排在 / 预计):`any_needle` 三值分开 ——
+  # 0=至少一个在 / 1=都不在 / 2=**读不了**(装置故障,不许当 1)。
+  has_wait=no; has_join=no
+  any_needle "$reply_file" "$H_WAIT" "$H_QUEUE" "$H_LINEUP" "$H_ETA"; rc_wait=$?
+  case "$rc_wait" in
+    0) has_wait=yes ;;
+    1) : ;;                                     # 都确实不在 ⇒ 这一类的确没给
+    *) boom "$label:装置故障:读不了回复文件(any_needle 返回 $rc_wait)—— 这一轮判不了"; return 4 ;;
   esac
-  if [ -z "$agent_no" ] && [ "$has_wait" = "no" ]; then
-    "$report_bad" "$label ③ 调用成功了(ok=true),但回复里**既没有工号 A###、也没有等待/排队信息** —— 模型没把这次转接的结果转述给用户(这是**模型没转述**,不是产品没转出去)。回复前 200 字:$(head_chars "$reply_file" 200)"
+  any_needle "$reply_file" "$H_JOIN"; rc_join=$?
+  case "$rc_join" in
+    0) has_join=yes ;;
+    1) : ;;
+    *) boom "$label:装置故障:读不了回复文件(any_needle 返回 $rc_join)—— 这一轮判不了"; return 4 ;;
+  esac
+  if [ -z "$agent_no" ] && [ "$has_wait" = "no" ] && [ "$has_join" = "no" ]; then
+    "$report_bad" "$label ③ 调用成功了(ok=true),但回复里**工号 / 等待位次·时长 / 接入 三类一个都没有** —— 模型没把这次转接的结果转述给用户(这是**模型没转述**,不是产品没转出去)。回复前 200 字:$(head_chars "$reply_file" 200)"
     return 3
   fi
   ALL3_OK=$((ALL3_OK+1))
-  # **两个子数分开记**(见下面读数区的说明):报出工号 / 只给了等待·排队。
+  # **三个子数分开记**(见下面读数区的说明):报出工号 / 只给了位次·时长 / 只说了「接入」。
+  # 合成一个数会把「模型时时报位次、时时只报一句套话」这个不一致**平均掉**。
   if [ -n "$agent_no" ]; then
     AGENT_NO_OK=$((AGENT_NO_OK+1)); artefact="工号=$agent_no"
+  elif [ "$has_wait" = "yes" ]; then
+    WAIT_ONLY=$((WAIT_ONLY+1)); artefact="只给了等待位次/时长(**没报工号**)"
   else
-    WAIT_ONLY=$((WAIT_ONLY+1)); artefact="只给了等待/排队(**没报工号**)"
+    HANDOFF_ONLY=$((HANDOFF_ONLY+1)); artefact="只说了「接入」这类话(**既没工号也没位次·时长**)"
   fi
   "$report_ok" "$label 三层全过:intent=转人工,调了 transfer_to_human(ok=true),${artefact}"
   return 0
@@ -1627,6 +1808,10 @@ echo "== 验收 ②:跑批归类 + 分布接口能读到 =="
 if [ "$TOPIC_OK" -eq 0 ]; then
   boom "装置故障:旁路服务($TOPIC_PORT)没起来 ⇒ 跑批与分布这一节判不了(不是产品红)"
 else
+  # ⚠️ **跑批开始之前**取一次**库自己的时钟**(订正轮 1,复审 F2):用来证「这一轮真的
+  #    写过库」。取不到就是空串,检查脚本会据此报**装置故障**(而不是静默跳过那一条)。
+  DB_T0=$("$PYTHON" "$WORK/topic_helpers.py" db-now 2>/dev/null)
+  echo "  ── 本轮开始前的库时钟:$DB_T0"
   "$PYTHON" scripts/classify_topics.py --limit 20 > "$WORK/classify.log" 2>&1
   CLASSIFY_RC=$?
   echo "  ── 跑批输出:"
@@ -1637,7 +1822,7 @@ else
   DIST_RC=$?
   topic_results "$WORK/dist_results.txt" dist-check \
     --batch-log "$WORK/classify.log" --batch-rc "$CLASSIFY_RC" \
-    --dist "$WORK/dist.json" --curl-rc "$DIST_RC" --limit 20
+    --dist "$WORK/dist.json" --curl-rc "$DIST_RC" --limit 20 --db-start "$DB_T0"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1699,7 +1884,8 @@ echo "     结果真的转出去了(意图 + 调用且 ok=true + 回复里有工
 # 但「报了工号」与「只给了等待」是**两种不同的回复**,合成一个数会把模型的不一致
 # **平均掉** —— 而那个不一致正是本节要看的东西(实测 9 句里 4 句只给了等待)。
 echo "       其中 **回复里报出工号** 的:$AGENT_NO_OK/$H_ROUNDS"
-echo "       其中 **只给了等待/排队**(没报工号)的:$WAIT_ONLY/$H_ROUNDS   ← 模型没报工号,但用户拿到了结果"
+echo "       其中 **只给了等待位次/时长**(没报工号)的:$WAIT_ONLY/$H_ROUNDS   ← 模型没报工号,但用户拿到了结果"
+echo "       其中 **只说了「接入」这类话**(既没工号也没位次·时长)的:$HANDOFF_ONLY/$H_ROUNDS   ← 这一类是**最弱**的 artefact(订正轮 1 加的)"
 if [ "$H_ROUNDS" -lt 3 ]; then
   boom "只有 $H_ROUNDS/3 句可判 —— 其余几轮的转录是坏的,比例读数的分母不完整"
 fi
@@ -1788,6 +1974,12 @@ echo '  * **③ 走的是 `/predict`,不是对话链路** ⇒ 「用户说话之
 echo '    (主链路零调用分类器是 §9.4 的设计,由两条**源码扫描**测试守着)。'
 echo '  * **错别字鲁棒性没有任何测试覆盖**(spec §13 第 6 条):保留 + 注入错别字是设计'
 echo '    选择,而本脚本这三个探针**一个错别字都没有**。这是本章的已知盲区,不许写成「已解决」。'
+# ⚠️ 下面这一条是复审的残余风险 #4,也是**最该写进去**的一条:读验收的人容易把
+#    「54/0」当成**质量门**,而 ① 只断「报告跑得出来、数与数据对得上」。
+echo '  * **⚠️ 这四节验收对「分类质量」零上界**:① 断的是「报告跑得出来、印出来的数与'
+echo '    report.json 对得上、测试集/切分的算术成立」——**它不断 F1 有多高**。'
+echo '    一份 F1 掉到 0.2 的权重,只要 ③ 那句「买大了想退」还能命中 ≥2 类、解码仍自洽,'
+echo '    照样会得到「通过 N / 失败 0」。**读这个数的时候别把它当成质量门。**'
 # ── ④(转人工)的局限 ─────────────────────────────────────────────────
 # ⚠️ **这几行一律用单引号**:里面有反引号(在双引号里会被 bash 当**命令替换**执行 ——
 # ch09 实测踩过,喷了一屏 `import: command not found` 而脚本照样打「通过」)。
@@ -1797,8 +1989,14 @@ echo '  * **第 ② 层失败的成因是结构性的,不是本脚本能修的�
 echo '    意味着「发生不发生」取决于模型记不记得调工具,而模型只被要求决定**意图标签**。'
 echo '    这是 ch06「模型只决定标签、不决定走向」的唯一一处例外(spec §11.3/§13.5),'
 echo '    **没有结构保证,只有这个比例**。'
-echo '  * **③ 的口径是「工号**或**等待/排队」(spec 的字面),它证明的是「结果被转述了」**;'
-echo '    「模型报不报工号」是**另一个**读数,已单列(报出工号 / 只给等待),**没有合成一个数**。'
+echo '  * **③ 的口径是「工号**或**等待位次·时长**或**只说「接入」」(spec 的字面是前两类,'
+echo '    第三类是本轮放宽加的)—— 它证明的是「结果被转述了」**;'
+echo '    「模型报不报工号」是**另一个**读数,已单列(报出工号 / 只给位次·时长 / 只说「接入」),'
+echo '    **没有合成一个数**。'
+echo '  * ⚠️ **③ 是关键词匹配,不是语义判定**:它认的是五串字(等待/排队/排在/预计/接入)与'
+echo '    工号正则。放宽过一次(订正轮 1):「排在您前面还有 1 位,预计 7 分钟左右接入」'
+echo '    曾因不含「排队」「等待」被判红 —— 而**加词就等于放松判据**。'
+echo '    ⇒ 一条**措辞完全不同但确实转述了**的回复仍可能判红(已知,未再放宽)。'
 echo '  * **「投诉 vs 转人工」的边界不在本脚本覆盖内**:那两条边界负例在'
 echo '    `evals/intent_cases.jsonl` 上由 `scripts/run_intent_eval.py` 测(打网络、不进验收)。'
 # ⚠️ **这一行原先自相矛盾**(审查 M3):标题说「确实不留痕」,正文说「留痕由

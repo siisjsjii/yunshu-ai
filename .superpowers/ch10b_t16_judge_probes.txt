@@ -10,7 +10,7 @@ FAIL 入库的 evals/topic/report.json 与本次运行不同(差异字段:grid)�
 ==> ✅ 判红在「报告里印的 micro-F1 与 report.json 对不上」
 ########## J3 ##########
 FAIL 测试集变过:报告记的是 1b78c2d8c7dd2664,盘上是 19bf270f20e86b60 ⇒ 这份报告描述的已经不是这份数据
-FAIL 测试集文件的 provenance 计数 {"real": 81, "synthetic": 40} != 报告里的 {"real": 80, "synthetic": 40}
+FAIL 测试集文件的 provenance 计数 {"real": 81, "synthetic": 40} != 期望的 真实 80 / 合成 40(报告里记的是 {"real": 80, "synthetic": 40})
 ==> ✅ 判红在「测试集 sha256 与报告记录的不符」
 ########## J4 ##########
 FAIL 各 bucket 条数合计 0 < total 65 ⇒ 有行的标签没被展开

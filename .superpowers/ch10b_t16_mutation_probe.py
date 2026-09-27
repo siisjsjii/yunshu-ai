@@ -11,7 +11,7 @@
 
 | 类 | 改什么 | 问什么 |
 |---|---|---|
-| `--product` | **产品代码 / 数据** | 「产品坏了,验收会不会红、**红在哪一条**」——一整轮验收(约 4 分钟) |
+| `--product` | **产品代码 / 数据** | 「产品坏了,验收会不会红、**红在哪一条**」——一整轮验收(实测 **103–107 秒**;订正轮 1 把这里原先写的「约 4 分钟」改对了 —— 那是个没量过的数) |
 | `--judge` | **喂给判词内核的输入** | 「某一条判据**是不是恒真**」——不跑服务、秒级 |
 
 ⚠️ 两类都要:**产品级**证明装置在真链路上有判别力;**判词级**把每一条判据单独拎出来
@@ -118,6 +118,29 @@ PRODUCT_MUTATIONS = {
             ("COUNT(DISTINCT q.question) AS distinct_questions",
              "COUNT(DISTINCT t.low_confidence_question_id) AS distinct_questions"),
         ],
+    },
+    # ★ **复审 F1 的原始破坏**:「跑批印 0 条空标签,而库里真的写了空标签」。
+    # 判据此前读的是**脚本自己印的数** ⇒ 整节 54/0 全绿(库侧的独立证据就在同一份转录里:
+    # `各 bucket 条数合计` 79→78)。订正轮 1 起判据拿**库里的实际行数**比。
+    "M4": {
+        "path": "scripts/classify_topics.py",
+        "why": "跑批写库时把 labels 一律写成空(而印出来的空标签数仍是 0)⇒ 验收 ② 必须红",
+        "expect": "②:跑批自报 0 条,而库里的空标签行数 != 0",
+        "edits": [(
+            '            "labels": list(row["labels"]),',
+            '            "labels": [],',
+        )],
+    },
+    # ★ **复审 F2 的原始破坏**:「落库变空操作」。日志照印「已写 20 行」,
+    # 而库里一条新写都没有;其余判据看的都是表的**总量** ⇒ 池子早已全归过类时总量不变。
+    "M5": {
+        "path": "scripts/classify_topics.py",
+        "why": "把 upsert 的 execute 摘掉(落库变空操作,而打印照旧)⇒ 验收 ② 必须红",
+        "expect": "②:库里最新的 classified_at 早于本轮开始前的库时钟",
+        "edits": [(
+            "    await session.execute(stmt)\n    return len(values)",
+            "    return len(values)",
+        )],
     },
     # ① 的切分算术是「合计 = 输入 − 不可信靶子」。从 train 里抽掉一行 ⇒ 合计少 1,
     # 而那条「落进三份的 id 集合 == 靶子可信的输入集合」也会跟着报出丢了哪个 id。
@@ -326,7 +349,7 @@ def _fake_batch_log(limit: int = 20, total: int = 65, distinct: int = 33,
         "池子里读到 %d 行(--limit %d)\n"
         "分批 1 次,归类 %d 行,其中**空标签 %d 条**\n"
         "已写 %d 行;本次空标签 %d 条\n"
-        "分布页会看到:总行数 %d / 不同问题数 %d\n"
+        "分布页会看到:总行数 %d / 已归类的池子行数 %d\n"
         % (limit, limit, limit, empty, limit, empty, total, distinct),
         encoding="utf-8")
     return path
@@ -345,7 +368,10 @@ def judge_dist_semantics() -> int:
     dist = base / "dist_fake.json"
     dist.write_text(json.dumps(payload), encoding="utf-8")
     rc, out = _run_helper("dist-check", "--batch-log", str(log), "--batch-rc", "0",
-                          "--dist", str(dist), "--curl-rc", "0", "--limit", "20")
+                          "--dist", str(dist), "--curl-rc", "0", "--limit", "20",
+                          # 这一条探针只问「语义判据」——库时钟给个必然满足的值,
+                          # 免得「这一轮真的写过库」那条也红(两条一起红就分不清是谁抓到的)。
+                          "--db-start", "1970-01-01 00:00:00")
     emit(out.strip())
     hit = "没意义的数" in out
     emit("==> %s" % ("✅ 判红在「不同问题数退回按 low_confidence_question_id 去重」" if hit

@@ -1,0 +1,6 @@
+验收 ①                 PASS=32 FAIL=0 WARN=0 BOOM=0
+验收 ②                 PASS=13 FAIL=0 WARN=0 BOOM=0
+验收 ③                 PASS=9 FAIL=0 WARN=0 BOOM=0
+验收 ④                 PASS=1 FAIL=0 WARN=0 BOOM=0
+输出干净性自检              PASS=1 FAIL=0 WARN=0 BOOM=0
+合计 PASS = 56

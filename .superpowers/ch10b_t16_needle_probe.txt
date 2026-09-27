@@ -1,0 +1,6 @@
+PASS 复审那句(只有位次+时长,没有「排队」「等待」)(WAIT=0 期望在 / JOIN=0 期望在)
+PASS 原文那种(含「排队」「等待」)(WAIT=0 期望在 / JOIN=1 期望不在)
+PASS 只说接入(最弱的一类)(WAIT=1 期望不在 / JOIN=0 期望在)
+PASS 什么都没转述(该判红)(WAIT=1 期望不在 / JOIN=1 期望不在)
+
+全部符合预期:抽取的函数=543 字节,码点=H_ETA H_HANDOFF H_JOIN H_LINEUP H_QUEUE H_WAIT

@@ -41,8 +41,13 @@ SET NAMES utf8mb4;
 -- ⚠️ `labels` / `scores` 是 JSON 列:读它们一律用 `JSON_TYPE()`,**不用 `IS NULL` /
 --    `IS NOT NULL`**(`none_as_null=False` ⇒ Python 的 `None` 落库是字面 JSON `null`,
 --    SQL 上不是 NULL;ch09 T19 拿 `IS NOT NULL` 数「有快照的行」把 JSON `null` 数成了非空)。
---    两列都 NOT NULL —— 空标签该让批处理**响亮失败**(spec §9.2),而不是落一行
---    「没有主题」的结果,让分布页把「推理服务挂了」读成「这些问题没有主题」。
+--    两列都 NOT NULL —— 但**空标签(`labels: []`)是合法的模型输出,允许写**
+--    (订正 15-C;⚠️ **这句话此前写反过**:它一度写成「空标签该让批处理响亮失败」,
+--    而 coding 侧从来不是那么做的 —— 见 `scripts/classify_topics.py` 的 §b 与
+--    `tests/test_classify_topics.py::test_empty_labels_are_allowed_but_counted`)。
+--    「服务**连不上** ⇒ 一行都不写」与「服务**返回空** ⇒ 照写 + **印出条数**」是**两件事**;
+--    后者必须被数出来,否则分布页会把「服务每次都返回空」读成「这些问题没有主题」——
+--    那才是「故障被读成业务结果」。
 CREATE TABLE topic_classifications (
   id                         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
   low_confidence_question_id BIGINT UNSIGNED NOT NULL COMMENT '关联 low_confidence_questions.id',

@@ -85,7 +85,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   3. **train / serve 同源**:清洗(`app/topic/clean.py`)与类目表(`app/topic/taxonomy.py`)
      两侧**import 同一份**,不是各写一遍 —— 写成测试守着(spec §5.1 / §9.1)。
   4. **跑批整批原子**:`classify_topics.py` 一次运行**一个事务**,服务故障 ⇒ **什么都不写**。
-     绝不写空标签:`labels=[]` 会被分布页读成「这些问题没有主题」—— **故障被读成业务结果**。
+     ⚠️ **但「服务连不上」与「服务返回空」是两件事,别写成一件**(订正轮 1 修:
+     这句话此前写成「绝不写空标签」,而 **`labels=[]` 是合法的模型输出**,照写)——
+     **连不上 ⇒ 一行都不写;返回空 ⇒ 照写 + 必须把条数印出来**。
+     不数出来的后果才是那条命门:**分布页会把「服务每次都返回空」读成
+     「这些问题没有主题」—— 故障被读成业务结果**(见 `scripts/classify_topics.py` §b 的
+     订正 15-C 与 `tests/test_classify_topics.py::test_empty_labels_are_allowed_but_counted`)。
   5. **`labels` 是 JSON 列,读它要用 `JSON_TYPE` 而不是 `IS NULL`**:ORM 的 `JSON` 类型
      (`none_as_null=False`)把 Python 的 `None` 落成**字面 JSON `null`**,它在 SQL 上
      **不是 NULL** ⇒ `WHERE labels IS NULL` 一行都筛不出来。同一族的账 ch09 在
@@ -185,7 +190,8 @@ bash scripts/acceptance_ch09.sh                                   # ch09 验收 
 bash scripts/acceptance_ch10.sh                                  # ch10 验收 ①–④
 # ↑ **它自己起四样东西**:客服服务(8000)+ 两个 MCP Server(尽力而为)+ **旁路服务(8103)**
 #   ⇒ 跑之前先清掉 8000/8101/8102/8103 的残留进程(否则 curl 到旧代码 —— 本仓记过的那种假红)。
-#   ⚠️ **一次约 2–4 分钟**:① 会把评测脚本**跑两遍**(比两次运行的产物是否逐字节相同)。
+#   ⚠️ **一次实测 100–110 秒**:① 会把评测脚本**跑两遍**(比两次运行的产物是否逐字节相同)。
+#   (原先这里写「约 2–4 分钟」—— **那是个没量过的数**,订正轮 1 按实测改。)
 #   ⚠️ **必须在 Git Bash 里跑**:从 cmd/PowerShell/Python 的 `subprocess` 直接调 `bash` 会解析到
 #   **WSL 的 bash**(CreateProcess 把 System32 排在 PATH 之前),那里 `localhost` 与 `/tmp`
 #   都不是 Windows 这边的 ⇒ 一屏假红。脚本自己有一道 `OSTYPE` 自检把这种情况拦在开头。
@@ -304,7 +310,8 @@ app/flywheel/     ch09 数据飞轮(**池子的下游**):normalize.py(口语 →
 knowledge/        知识语料(3 份 Markdown,首行带 <!--type: ...--> 类型标记)
 scripts/          build_kb.py、mine_qa.py(离线建库与挖知识)、calibrate_evidence.py、
                   intent_cost.py、eval_trend.py、run_flywheel_eval.py
-app/topic/        ch10-B 分类器的**纯函数内核**(零 torch、零 IO):taxonomy.py(17 类权威表 +
+app/topic/        ch10-B 分类器的**纯函数内核**(⚠️ **除 `model.py` 之外**零 torch、零 IO ——
+                  `model.py` 既 `import torch` 又读写产物目录,别把这一行读成整包的属性):taxonomy.py(17 类权威表 +
                   BOUNDARY + 9→17 投影)、clean.py(脱敏/格式,训练与推理**同源**)、
                   labeling.py(分层切分 + 证据校验 + `is_unusable_target` + 错别字注入)、
                   metrics.py(四个指标 + 两张矩阵,**零第三方依赖**)、model.py(产物的**唯一读侧**
