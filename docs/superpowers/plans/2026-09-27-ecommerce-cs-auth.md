@@ -1519,6 +1519,16 @@ def test_workbench_routes_require_admin():
     assert not wrong, f"这些工作台端点不是 require_admin:{wrong}"
 
 
+#: ⚠️⚠️ **下面这三条断言是「抽样」,不足以守住 spec §6.4 —— 权威版本在代码里。**
+#: 实现后的 `tests/test_auth_wiring.py` 另加了 **`EXPECTED_GUARDS`(27 行)+
+#: `test_the_guard_matrix_matches_spec_64_exactly`(集合全等 + **类型**逐行全等)** ——
+#: **那才是最终形状,照它抄**。为什么抽样不够(复审给的可复现反例):
+#: 把 `/api/extract` 的守卫换成 `require_admin` ⇒ 下面这三条**全绿**
+#: (`require_admin ∈ GUARDS`、工作台前缀测试**跳过**该路径、运行时无 token 照样 401),
+#: 而 `conftest` 把**两个**守卫都替成同一个 admin 假用户 ⇒
+#: **`/api/extract` 悄悄变成只有管理员能用,没有一条测试红**。
+#: (那条矩阵测试改完之后,这个变异**只让它一条变红** —— 实测。)
+
 #: 「守卫」的词表 —— 用来把「挂了守卫」与「依赖了别的东西」分开。
 #: ⚠️ 计划初稿在这里写的是 `_guard_names(login) == set()`,**那条恒假**(实现者实测):
 #: `_guard_names` 收的是**全部**依赖名,而登录端点当然依赖 `get_session`/`get_settings`
