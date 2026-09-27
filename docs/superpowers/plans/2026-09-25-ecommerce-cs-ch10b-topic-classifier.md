@@ -3549,6 +3549,34 @@ git commit -m "ch10-B T12: topic_classifications 表(唯一键保证幂等 + JSO
 > **15-E(Step 6 会真的往共享表里写行)**:`low_confidence_questions` 是**共享且只追加**的,
 > `topic_classifications` 也是。⇒ 报告里**必须报准确条数**,并且**任何「查最近这几条」式的断言必须按
 > `low_confidence_question_id` 过滤**(本仓记过「被上次运行的数据污染 ⇒ 偶尔红偶尔绿」那一类)。
+>
+> ---
+>
+> ⚠️⚠️ **计划订正 17(controller,2026-09-27)—— T13 交付后回填的三条** ⚠️⚠️
+>
+> **17-B(`main()` 的写侧,计划里一个字都没有 —— 这是本节最大的缺口)。**
+> 15-B 补了 **HTTP 侧**、15-A 补了 `model_version`,**唯独落下「写进 MySQL 的那一侧」**
+> ⇒ 实现者只能自己设计,于是产生了下面这处**偏离**:
+> **`write` 是同步回调 ⇒ 落库是「整次运行一个事务」,不是 §9.2 字面写的「一批一事务」。**
+> **裁定:接受这个偏离,并把它写进计划。** 理由(实现者给的,我认同):
+> ① 方向**更严** —— **不留半份结果**;而「半份结果」在分布页上与完整结果**长得一模一样**,
+>    没有任何东西能分辨;② 代价是异常时前面成功的批次也不落库,但**重跑幂等**(唯一键保证覆盖),
+>    **不丢**;③ §9.2 那句「一批一事务」的原意是「别写半份」,这个实现**更彻底地**满足了它。
+> ⚠️ **要一并写清**:`write` 回调的**契约**(它收到什么、负责什么、失败怎么办),
+> 否则下一个读的人会以为它是「一批一次」的。
+>
+> **17-C(两处措辞,都是「名字/注释与实际不符」那一族)**:
+> ① Step 1 的 `test_a_batch_is_all_or_nothing` **docstring 写「第 7 条」,而装置里坏的那条在第 6 个**;
+> ② 四条用例一律 `pytest.raises(Exception)` —— **分不出错因**(服务连不上 / 形状不对 / 条数不符
+>    会得到同一个异常类型)。实现者**逐字保留了原稿**、另加了三条改用窄类型的。
+> ⇒ **订正:把这四条收窄到各自的异常类型**,并把「第 7 条」改对。
+> (**名字与语义不符**本仓已编目;`raises(Exception)` 是它的同族 —— 一条**永远通过**的断言。)
+>
+> **17-D(流程)**:`.superpowers/ch10b_t13_*`(探针 / 证据 / pytest 转录)留在本机 **未 `git add`**。
+> **判据一致**:`CLAUDE.md` 那条「**被跟踪文档引用为凭据 ⇒ 入库**」——
+> 今天**没有**任何被跟踪的文档引用它们,**不必入库**;
+> ⚠️ **但 dev-notes 一旦引用某个读数,那个读数的凭据就要先 `git add`**(本仓 T8 那次就是这么办的)。
+> ⇒ **controller 写 dev-notes 时逐条核**。
 
 **Files:**
 - Create: `scripts/classify_topics.py`
@@ -3687,6 +3715,24 @@ git commit -m "ch10-B T13: 批处理(整批原子 + 服务故障响亮失败 + �
 ---
 
 ## Task 14: `GET /api/topics/distribution`
+
+> ⚠️⚠️ **计划订正 17-A(controller,2026-09-27)—— 分布页的「不同问题数」今天是个没意义的数** ⚠️⚠️
+>
+> **T13 报上来的,我在库里独立复核过**:
+> ```
+> SELECT COUNT(*), COUNT(DISTINCT low_confidence_question_id) FROM topic_classifications  ->  65, 65
+> SELECT COUNT(*), COUNT(DISTINCT question)                  FROM low_confidence_questions ->  65, 33
+> ```
+> ⇒ **`COUNT(DISTINCT low_confidence_question_id)` 与 `COUNT(*)` 恒等**(那一列有唯一键 `uk_pool_question`),
+> 而本任务原稿那句注释说它是为了处理「池子有大量重复题面」—— **它处理不了**。
+> 页面会显示「总行数 65 / 不同问题数 **65**」,而池子里**只有 33 条不同的题面**。
+> ⇒ **改法**:要数「不同问题」就得**回池子按题面数** ——
+> `LEFT JOIN low_confidence_questions q ON q.id = t.low_confidence_question_id`
+> 再 `COUNT(DISTINCT q.question)`(**summary 与每个 bucket 的 `distinct` 都要改**)。
+> ⚠️ 注意那 33 是**题面**的不同数,**不是清洗后的**;若想按清洗后文本数,就在 SQL 之外用 `clean()` 数一层
+> —— **别在 SQL 里假装洗过**(`clean()` 是 Python 侧的唯一实现,这一章已经为「清洗两处实现」付过一次账)。
+> ⚠️ **顺手核对语义**:`total` 应当 = **分类结果的条数**(65),
+> 而「不同问题数」是**池子的题面数**(33) —— 两个数**口径不同**,报告的措辞要说清,别让人以为对不上是 bug。
 
 **Files:**
 - Create: `app/api/topics.py`
